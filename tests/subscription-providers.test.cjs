@@ -2,7 +2,7 @@ const test = require('node:test')
 const assert = require('node:assert/strict')
 const fs = require('node:fs')
 const path = require('node:path')
-const { buildArgs, createParser, parseModels, run, inspect, cursorEffortModel, cursorReasoningModels } = require('../electron/subscription-providers.cjs')
+const { buildArgs, createParser, parseModels, run, inspect, cursorEffortModel, cursorReasoningModels, cursorLaunch } = require('../electron/subscription-providers.cjs')
 const { ORBIT_RESPONSE_SCHEMA } = require('../electron/tool-schema.cjs')
 const { TOOL_HANDOFF } = require('../electron/tool-schema.cjs')
 
@@ -57,6 +57,38 @@ test('Cursor reasoning selects only advertised variants, preserving fast/thinkin
   const args = buildArgs('cursor', { model: 'fixture-high', reasoningEffort: 'low', availableModels: models })
   assert.equal(args[args.indexOf('--model') + 1], 'fixture-low')
   assert.deepEqual(parseModels('gemini-fixture\tGemini fixture'), ['gemini-fixture'])
+})
+
+test('a saved Cursor level is dropped for a model without variants and still refused where variants exist', () => {
+  const models = ['auto', 'fixture-high', 'fixture-low']
+  assert.deepEqual(cursorLaunch('auto', 'high', models), { model: 'auto', dropped: 'high' })
+  assert.deepEqual(cursorLaunch('', 'high', models), { model: '', dropped: 'high' }, 'the CLI default model has no variants either')
+  assert.deepEqual(cursorLaunch('auto', '', models), { model: 'auto' })
+  assert.deepEqual(cursorLaunch('fixture-high', 'low', models), { model: 'fixture-low' })
+  assert.throws(() => cursorLaunch('fixture-high', 'max', models), /Cursor: уровень max недоступен для fixture-high/)
+  assert.deepEqual(buildArgs('cursor', { model: 'auto', reasoningEffort: 'high', availableModels: models }).slice(-2), ['--model', 'auto'])
+})
+
+test('Cursor run on a model without variants ignores the saved level, reports it and keeps the run alive', async () => {
+  const providerOptions = { command: 'cursor-level-fixture' }
+  const turn = async (model, reasoningEffort) => {
+    const events = []; let launched
+    const result = await run('cursor', { prompt: 'Hi', workspace: process.cwd(), model, reasoningEffort, providerOptions, onEvent: event => events.push(event) }, { runCli: async (_, args, options) => {
+      if (args[0] === '--list-models') { for (const line of ['auto - Automatic', 'fixture-high  Fixture', 'fixture-low  Fixture']) options.onLine(line); return { stdout: '' } }
+      launched = args
+      options.onLine(JSON.stringify({ type: 'result', subtype: 'success', result: 'Done' }))
+    } })
+    return { result, events, model: launched[launched.indexOf('--model') + 1] }
+  }
+  const auto = await turn('auto', 'high')
+  assert.equal(auto.model, 'auto')
+  assert.equal(auto.result.reasoningEffort, '', 'the level that really ran is reported')
+  assert.ok(auto.events.some(event => event.kind === 'observation' && /уровень high не применён/.test(event.text)), 'the dropped level is visible in the trace')
+  const chosen = await turn('fixture-high', 'low')
+  assert.equal(chosen.model, 'fixture-low')
+  assert.equal(chosen.result.reasoningEffort, undefined, 'an applied level is not restated')
+  assert.ok(!chosen.events.some(event => event.kind === 'observation'))
+  await assert.rejects(turn('fixture-high', 'max'), /Cursor: уровень max недоступен для fixture-high/)
 })
 
 test('Google discovery and inference receive the same explicit proxy without changing process environment', async () => {

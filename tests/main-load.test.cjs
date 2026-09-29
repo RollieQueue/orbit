@@ -37,7 +37,7 @@ function loadMain() {
 
 test('the main process loads and registers its IPC channels', () => {
   const { handlers, appEvents } = loadMain()
-  for (const channel of ['runtime:start', 'runtime:stop', 'runtime:list', 'runtime:get', 'state:load', 'state:save', 'providers:health', 'quota:get', 'workspace:pick', 'memory:list', 'memory:pin', 'memory:stats', 'memory:forget-chat', 'memory:sharing', 'capabilities:list', 'capabilities:pin']) {
+  for (const channel of ['runtime:start', 'runtime:stop', 'runtime:list', 'runtime:get', 'runtime:changes', 'state:load', 'state:save', 'providers:health', 'quota:get', 'workspace:pick', 'memory:list', 'memory:pin', 'memory:stats', 'memory:forget-chat', 'memory:sharing', 'capabilities:list', 'capabilities:pin']) {
     assert.ok(handlers.has(channel), `${channel} is registered`)
   }
   assert.ok(!handlers.has('providers:ask'), 'the direct, unguarded provider channel stays removed')

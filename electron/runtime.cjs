@@ -7,7 +7,8 @@ const { executeWorkspaceTool, WORKSPACE_TOOLS } = require('./runtime-tools.cjs')
 const { ORBIT_RESPONSE_SCHEMA } = require('./tool-schema.cjs')
 const { projectPacket, saveNote } = require('./shared-context.cjs')
 const { ProjectIndex } = require('./project-index.cjs')
-const { FileActivity } = require('./file-activity.cjs')
+const { FileActivity, normalizeRel } = require('./file-activity.cjs')
+const { ChangeLog, nativeChange, commandChange } = require('./change-log.cjs')
 const { TeamRouter, ROUTER } = require('./router.cjs')
 const chatMemory = require('./chat-memory.cjs')
 const { renderRecall } = require('./memory.cjs')
@@ -49,6 +50,8 @@ const SKILL_REVIEW_TURNS = 10
 const SHARE_EVERY_MS = 6 * 3600000
 // A command can change many files at once (a formatter, a generator); past this it is not attributed to anyone.
 const COMMAND_ATTRIBUTION_LIMIT = 40
+// How long a finishing run waits for file change records still being made (a Git call is bounded by 5 s on its own).
+const CHANGE_DRAIN_MS = 1500
 // How long the first turn waits for the project index before it goes on without it.
 const INDEX_WAIT_MS = 2500
 // Fields that change by themselves; they must not hide an otherwise identical repeated result.
@@ -306,8 +309,13 @@ class OrbitRuntime {
       startedAt: run.startedAt, finishedAt: run.finishedAt, limits: run.limits, usage: run.usage,
       agents: [...run.agentNodes.values()].map(publicAgent),
       traces: run.traces, messages: run.messages, communications: run.communications, summary: run.summary, error: run.error,
-      files: run.fileActivity.snapshot(), router: { ...run.router.stats },
+      files: run.fileActivity.snapshot(), changes: run.changes.snapshot(), router: { ...run.router.stats },
     })
+  }
+  // A run's file changes with their diff text: the live run first, then the saved one.
+  getRunChanges(runId) {
+    const run = this.runs.get(runId)
+    return run ? run.changes.snapshot() : (this.runStore?.get?.(runId)?.changes || [])
   }
   persist(run) {
     clearTimeout(run.persistTimer); run.persistTimer = null
@@ -390,7 +398,7 @@ class OrbitRuntime {
       usage: { providerTurns: 0, workerTurns: 0, inputTokens: null, outputTokens: null },
       agentNodes: new Map(), agentControllers: new Map(), agentOperations: new Map(), tasks: new Map(), traces: [], messages: [], communications: [], messageWaiters: new Map(), controller: new AbortController(),
       activeTurns: 0, turnQueue: [], operations: new Set(), providerBuffers: new Map(), finishedAt: null, summary: null, error: null,
-      fileActivity: new FileActivity(workspace), commands: { running: 0, serial: 0 }, priorRuns: [], priorDigest: null,
+      fileActivity: new FileActivity(workspace), changes: new ChangeLog(workspace), changeQueue: Promise.resolve(), changePending: 0, commands: { running: 0, serial: 0, writes: 0 }, priorRuns: [], priorDigest: null,
       memoryTouched: new Set(), skillUse: new Map(), skillLearning: payload.skillLearning !== false, skillReminded: false, skillSaved: false,
     }
     run.router = new TeamRouter(run, {
@@ -416,7 +424,7 @@ class OrbitRuntime {
       if (TERMINAL.has(run.status)) return
       const task = this.executeAgent(run, root)
       run.tasks.set(root.id, task)
-      task.then((result) => this.finishRun(run, result), (error) => this.failRun(run, error))
+      task.then((result) => run.changePending ? this.drainChanges(run).then(() => this.finishRun(run, result)) : this.finishRun(run, result), (error) => this.failRun(run, error))
     })
     this.pruneRuns()
     return run.runId
@@ -711,13 +719,46 @@ class OrbitRuntime {
   }
   // Files touched by a vendor's own tools (Codex file changes, Claude Read/Edit/Write) arrive as provider events.
   trackNativeFiles(run, agent, event) {
+    const call = run.changes.remember(agent.id, event)
+    const changed = new Set() // one tool call names a file once, however often its event lists it
     for (const touch of run.fileActivity.nativeEvent(agent.id, event)) {
       if (touch.isNew) this.publishFiles(run, agent)
       if (touch.action !== 'write') continue
       agent.workDone++
       run.router.notifyWrite(agent, touch.path)
       this.projectIndex?.touch(run.workspace, [touch.path]).catch(() => {})
+      if (changed.has(touch.path)) continue
+      changed.add(touch.path)
+      this.captureChange(run, agent, touch.path, call?.tool || event.tool, first => nativeChange(run.workspace, touch.path, call, first, run.changes.startedAt))
     }
+  }
+  // Change records are made one after another in the background: reading files and asking Git must not slow the provider stream.
+  captureChange(run, agent, target, tool, describe) {
+    const rel = normalizeRel(run.workspace, target)
+    if (!rel) return
+    const first = run.changes.claim(rel)
+    run.changePending++
+    run.changeQueue = run.changeQueue.then(async () => this.recordChange(run, agent, { path: rel, tool, ...await describe(first) })).catch(() => {}).then(() => { run.changePending-- })
+  }
+  // A run ends after the records still being made, but never waits long for them.
+  async drainChanges(run, ms = CHANGE_DRAIN_MS) {
+    let timer
+    try { await Promise.race([run.changeQueue, new Promise(resolve => { timer = setTimeout(resolve, ms) })]) } finally { clearTimeout(timer) }
+  }
+  recordChange(run, agent, input) {
+    const change = run.changes.add({ agentId: agent.id, ...input })
+    if (!change) return
+    this.emit(run, 'change.added', { change }, false)
+    // Behind a finished run (a record that took longer than the drain) the saved copy is completed soon, before Orbit may close.
+    if (!run.persistTimer) { run.persistTimer = setTimeout(() => this.persist(run), TERMINAL.has(run.status) ? 100 : 1000); run.persistTimer.unref?.() }
+  }
+  // Orbit's own file tools report the exact text before and after a write.
+  reportWrite(run, agent, tool, { path: target, before, after }) {
+    const rel = normalizeRel(run.workspace, target)
+    if (!rel) return
+    run.changes.claim(rel)
+    run.commands.writes++ // a command that overlapped this write cannot claim the file
+    this.recordChange(run, agent, { path: rel, tool, source: 'exact', before, after })
   }
   async trackWorkspaceTool(run, agent, name, args, result) {
     if (name === 'read_file') this.touchFile(run, agent, args.path, 'read')
@@ -734,15 +775,20 @@ class OrbitRuntime {
     if (!this.projectIndex) return executeWorkspaceTool('run_command', args, context)
     const commands = run.commands, serial = ++commands.serial
     try { await this.projectIndex.refresh(run.workspace) } catch { /* Attribution is best effort. */ }
+    const writes = commands.writes
     commands.running++
     let result
     try { result = await executeWorkspaceTool('run_command', args, context) } finally { commands.running-- }
     try {
       const otherChats = [...this.runs.values()].some(other => other !== run && !TERMINAL.has(other.status) && overlappingWorkspaces(other.workspace, run.workspace))
-      const alone = commands.serial === serial && commands.running === 0 && run.activeTurns === 0 && !otherChats
+      const alone = commands.serial === serial && commands.running === 0 && commands.writes === writes && run.activeTurns === 0 && !otherChats
       const diff = await this.projectIndex.refresh(run.workspace, { force: true })
       const changed = [...new Set([...diff.added, ...diff.changed, ...diff.removed])]
-      if (alone && changed.length && changed.length <= COMMAND_ATTRIBUTION_LIMIT) for (const file of changed) { this.touchFile(run, agent, file, 'write'); agent.workDone++ }
+      if (alone && changed.length && changed.length <= COMMAND_ATTRIBUTION_LIMIT) for (const file of changed) {
+        this.touchFile(run, agent, file, 'write'); agent.workDone++
+        const kind = diff.added.includes(file) ? 'create' : diff.removed.includes(file) ? 'delete' : 'modify'
+        this.captureChange(run, agent, file, 'run_command', () => commandChange(run.workspace, file, kind))
+      }
     } catch { /* see above */ }
     return result
   }
@@ -965,6 +1011,8 @@ SKILLS (reusable procedures learned in earlier work; capability_read {id} loads 
       })), agent)
       const result = await abortable(providerTask, signal, run.limits.timeoutMs, 'Provider turn time budget exhausted')
       if (result?.model) { this.updateAgent(run, agent, { model: result.model }); if (agent.id === 'root') run.model = result.model }
+      // A provider that could not apply the requested level (Cursor `auto` has no variants) reports the one that really ran.
+      if (typeof result?.reasoningEffort === 'string' && result.reasoningEffort !== agent.reasoningEffort) { this.updateAgent(run, agent, { reasoningEffort: result.reasoningEffort }); if (agent.id === 'root') run.reasoningEffort = result.reasoningEffort }
       if (result?.usage) this.recordUsage(run, result.usage)
       this.emit(run, 'run.info', { agentId: agent.id, providerId: agent.providerId, model: agent.model, usage: { ...run.usage } })
       return result
@@ -1372,7 +1420,7 @@ SKILLS (reusable procedures learned in earlier work; capability_read {id} loads 
       if (!await this.approve(run, agent, { tool: name, arguments: args })) throw new Error('User declined this operation')
     }
     if (WORKSPACE_TOOLS.has(name)) {
-      const context = { workspace: run.workspace, accessMode: run.accessMode, signal: this.agentSignal(run, agent), maxOutputChars: run.limits.maxOutputChars }
+      const context = { workspace: run.workspace, accessMode: run.accessMode, signal: this.agentSignal(run, agent), maxOutputChars: run.limits.maxOutputChars, onFileChange: change => this.reportWrite(run, agent, name, change) }
       const result = name === 'run_command' ? await this.runTrackedCommand(run, agent, args, context) : await executeWorkspaceTool(name, args, context)
       return this.trackWorkspaceTool(run, agent, name, args, result)
     }

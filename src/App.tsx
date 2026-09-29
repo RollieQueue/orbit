@@ -1,6 +1,11 @@
 import { useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from 'react'
-import type { Agent, AppState, Capability, ChatThread, Communication, FileTouch, LibraryStats, MemoryEntry, MemoryScope, Message, Project, QuotaSnapshot, RunSnapshot, RunStatus, Settings, TierStats, Workspace } from './types'
+import type { Agent, AppState, Capability, ChatThread, Communication, InspectorTab, LibraryStats, MemoryEntry, MemoryScope, Message, Project, QuotaSnapshot, RunSnapshot, RunStatus, Settings, TierStats, Workspace } from './types'
 import { AgentGraph } from './AgentGraph'
+import { Markdown, assistantOutput, plural, statusText, timeOf } from './format'
+import { RunHistory, RunHistoryList, runChangedFiles } from './AgentHistory'
+import { ChangesTab } from './ChangesTab'
+import { FilesTab } from './FilesTab'
+import { fileMap } from './file-map'
 import { SwarmSettings } from './SwarmSettings'
 import { ReasoningPicker, reasoningLevels, effortLabels } from './ReasoningPicker'
 import { QuotaPanel, QuotaChip, handoverLabel, handoverReason, handoverText, windowsFor, usedNow, windowName } from './QuotaPanel'
@@ -18,22 +23,8 @@ const uid = () => crypto.randomUUID()
 const now = () => new Date().toISOString()
 const nameOf = (path: string) => path.replace(/[\\/]+$/, '').split(/[\\/]/).pop() || 'Проект'
 const active = (status?: RunStatus) => status === 'working' || status === 'waiting'
-const statusText = (status?: RunStatus) => ({ idle: 'Готов', waiting: 'В очереди', working: 'Работает', done: 'Завершён', completed: 'Завершён', error: 'Ошибка', failed: 'Ошибка', cancelled: 'Остановлен', interrupted: 'Прерван' }[status || 'idle'])
-const timeOf = (time?: string) => { if (!time) return ''; const date = new Date(time); return Number.isNaN(date.valueOf()) ? time : date.toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' }) }
 const errorText = (error: unknown) => error instanceof Error ? error.message : String(error)
-const plural = (n: number, forms: [string, string, string]) => `${n} ${forms[n % 10 === 1 && n % 100 !== 11 ? 0 : n % 10 >= 2 && n % 10 <= 4 && (n % 100 < 10 || n % 100 >= 20) ? 1 : 2]}`
 const routeLabel: Record<string, string> = { direct: 'напрямую', explicit: 'адресат указан отправителем', match: 'подобран по файлам и теме', reply: 'ответ автору сообщения', escalation: 'передано руководителю' }
-// Live events carry each agent's own file lists, so the team-wide view is derived from them.
-function fileMap(run: RunSnapshot): FileTouch[] {
-  const files = new Map<string, FileTouch>()
-  const entry = (path: string) => { let item = files.get(path); if (!item) { item = { path, readers: [], writers: [] }; files.set(path, item) } return item }
-  for (const agent of run.agents) {
-    for (const path of agent.files?.wrote || []) entry(path).writers.push(agent.id)
-    for (const path of agent.files?.read || []) entry(path).readers.push(agent.id)
-  }
-  return [...files.values()]
-}
-const changedFiles = (run?: RunSnapshot) => new Set((run?.agents || []).flatMap(agent => agent.files?.wrote || [])).size
 function stored<T>(key: string, fallback: T): T { try { return JSON.parse(localStorage.getItem(key) || 'null') ?? fallback } catch { return fallback } }
 function normalize(value: Partial<AppState>): AppState {
   const projects = (Array.isArray(value.projects) ? value.projects : []).filter(p => p?.id && p.workspace?.path).map(p => ({ ...p, chats: (Array.isArray(p.chats) ? p.chats : []).map(c => ({ ...c, messages: (Array.isArray(c.messages) ? c.messages : []).filter(m => m.id !== 'welcome') })) }))
@@ -108,42 +99,6 @@ function Icon({ name, size = 18 }: { name: string; size?: number }) {
   }
   return <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">{paths[name] || paths.chat}</svg>
 }
-function inline(text: string): ReactNode[] {
-  return text.split(/(`[^`]+`|\*\*[^*]+\*\*|\[[^\]]+\]\(https?:\/\/[^\s)]+\))/g).map((part, i) => {
-    if (part.startsWith('`') && part.endsWith('`')) return <code key={i}>{part.slice(1, -1)}</code>
-    if (part.startsWith('**') && part.endsWith('**')) return <strong key={i}>{part.slice(2, -2)}</strong>
-    const link = part.match(/^\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)$/)
-    if (link) return <a key={i} href={link[2]} target="_blank" rel="noreferrer" onClick={e => { if (window.orbit) { e.preventDefault(); void window.orbit.openExternal(link[2]) } }}>{link[1]}</a>
-    return part
-  })
-}
-function assistantOutput(text: string): string {
-  if (!/^\s*\{/.test(text)) return text
-  try {
-    const envelope = JSON.parse(text)
-    if (typeof envelope.content === 'string') return envelope.content || 'Выполняет действия…'
-  } catch { /* Display the content string while the envelope is streaming. */ }
-  const match = text.match(/^\s*\{\s*"content"\s*:\s*"((?:[^"\\]|\\.)*)/)
-  if (match) {
-    // A chunk can end inside a JSON escape (including a Unicode escape).
-    const content = match[1].replace(/\\u[0-9a-f]{0,3}$/i, '')
-    try { return JSON.parse(`"${content}"`) || 'Формирует ответ…' } catch { /* Wait for a complete escape. */ }
-  }
-  return 'Формирует ответ…'
-}
-
-function Markdown({ text }: { text: string }) {
-  return <div className="markdown">{text.split(/(```[\s\S]*?```)/g).map((block, index) => {
-    if (block.startsWith('```')) { const split = block.indexOf('\n'); return <pre key={index}><span className="code-language">{split < 0 ? 'code' : block.slice(3, split)}</span><code>{split < 0 ? block.slice(3, -3) : block.slice(split + 1, -3)}</code></pre> }
-    return block.split(/\n\s*\n/).filter(Boolean).map((part, n) => {
-      const lines = part.split('\n')
-      if (lines.every(line => /^\s*[-*] /.test(line))) return <ul key={`${index}-${n}`}>{lines.map((line, j) => <li key={j}>{inline(line.replace(/^\s*[-*] /, ''))}</li>)}</ul>
-      if (lines.every(line => /^\s*\d+\. /.test(line))) return <ol key={`${index}-${n}`}>{lines.map((line, j) => <li key={j}>{inline(line.replace(/^\s*\d+\. /, ''))}</li>)}</ol>
-      return <p key={`${index}-${n}`}>{lines.map((line, j) => <span key={j}>{j > 0 && <br />}{/^#{1,6} /.test(line) ? <strong className="md-heading">{inline(line.replace(/^#{1,6} /, ''))}</strong> : inline(line)}</span>)}</p>
-    })
-  })}</div>
-}
-
 function ModelPicker({ value, models, onChange, label = 'Модель' }: { value: string; models: string[]; onChange: (value: string) => void; label?: string }) {
   const [custom, setCustom] = useState(false)
   const choices = [...new Set([...models, ...(value ? [value] : [])])]
@@ -168,6 +123,8 @@ export default function App() {
   const [projectMenu, setProjectMenu] = useState(false)
   const [selection, setSelection] = useState<Record<string, string>>({})
   const [selectedAgent, setSelectedAgent] = useState('root')
+  // openTeam(runId, tab) asks the inspector to open on a tab; `seq` remounts an inspector that is already showing that run.
+  const [inspectorRequest, setInspectorRequest] = useState<{ runId: string; tab: InspectorTab; seq: number } | null>(null)
   const [notice, setNotice] = useState('')
   const [storageError, setStorageError] = useState('')
   const [runtimeStorageError, setRuntimeStorageError] = useState('')
@@ -200,6 +157,9 @@ export default function App() {
   const selected = selectedAgent === 'router' && currentRun ? routerAgent : currentRun?.agents.find(a => a.id === selectedAgent) || currentRun?.agents[0]
   const lastAnswerOfRun = new Map<string, string>()
   for (const message of chat?.messages || []) if (message.author === 'orbit' && message.runId) lastAnswerOfRun.set(message.runId, message.id)
+  // A finished run that never answered (failed, stopped) keeps its team strip and history under the user's message.
+  const historyAnchor = new Map(lastAnswerOfRun)
+  for (const message of chat?.messages || []) if (message.author === 'user' && message.runId && !historyAnchor.has(message.runId) && runs[message.runId] && !active(runs[message.runId].status)) historyAnchor.set(message.runId, message.id)
   const currentHealth = health.find(p => p.id === state.settings.providerId)
   const connected = Object.fromEntries(health.map(p => [p.id, p.available]))
   // The sidebar dot summarises the connected subscriptions: any exhausted, any close to the limit, otherwise fine.
@@ -264,6 +224,7 @@ export default function App() {
           const existing = run.communications || []
           run.communications = existing.some(item => item.id === communication.id) ? existing.map(item => item.id === communication.id ? { ...item, ...communication } : item) : [...existing, communication]
         }
+        if (event.change) { const change = event.change; const existing = run.changes || []; run.changes = (existing.some(item => item.id === change.id) ? existing.map(item => item.id === change.id ? { ...item, ...change } : item) : [...existing, change]).slice(-500) }
         if (event.type === 'run.finished') { run.status = event.status || 'completed'; run.summary = event.summary; run.finishedAt = now() }
         if (event.type === 'run.failed') { run.status = 'failed'; run.error = event.error; run.finishedAt = now() }
         if (event.type === 'run.cancelled') { run.status = 'cancelled'; run.finishedAt = now() }
@@ -311,6 +272,8 @@ export default function App() {
             messages: mergeById(snapshot.messages || [], live?.messages || []),
             communications: mergeById(snapshot.communications || [], live?.communications || []),
           }
+          // The saved list has no diff texts, the live events do: keep both, and keep the run without `changes` when neither has any.
+          if (snapshot.changes || live?.changes) restored[snapshot.runId].changes = mergeById(snapshot.changes || [], live?.changes || []).slice(-500)
         }
         return restored
       })
@@ -388,7 +351,15 @@ export default function App() {
     setIndexBusy(true)
     try { setIndexInfo(await window.orbit.projectIndexStatus(project.workspace.path, true)) } catch (error) { setNotice(errorText(error)) } finally { setIndexBusy(false) }
   }
-  function openTeam(runId: string) { setSelection(previous => ({ ...previous, [chatKey]: runId })); setSelectedAgent('root'); setAgentsOpen(true) }
+  function openTeam(runId: string, tab?: InspectorTab, agentId = 'root') {
+    setSelection(previous => ({ ...previous, [chatKey]: runId })); setSelectedAgent(agentId); setAgentsOpen(true)
+    if (tab) setInspectorRequest(previous => ({ runId, tab, seq: (previous?.seq || 0) + 1 }))
+  }
+  // Picking another run forgets an earlier «open on this tab» request, so coming back to a run does not jump to that tab again.
+  function pickRun(runId: string) {
+    setSelection(previous => ({ ...previous, [chatKey]: runId })); setSelectedAgent('root')
+    if (runId !== currentRun?.runId) setInspectorRequest(null)
+  }
   function updateSettings(patch: Partial<Settings>) { setState(previous => ({ ...previous, settings: { ...previous.settings, ...patch } })) }
   function setGlobalMemory(enabled: boolean) {
     if (!project) return
@@ -441,10 +412,12 @@ export default function App() {
       return { ...next, projects: next.projects.map(p => p.id !== targetProject ? p : { ...p, chats: p.chats.map(c => c.id === targetChat && c.title === 'Новый чат' ? { ...c, title: prompt.replace(/\s+/g, ' ').slice(0, 54) } : c) }) }
     })
     nearBottom.current = true
+    // The panel follows the new run only if the user was watching the newest one or the panel is closed; an older run they are reading stays.
+    const followNewRun = !agentsOpen || !currentRun || currentRun.runId === chatRuns.at(-1)?.runId
     try {
       const runId = await window.orbit.startTask({ projectId: targetProject, chatId: targetChat, prompt, history, workspace: project.workspace.path, ...state.settings, memoryEnabled: true, globalMemoryEnabled, reasoningEffort: selectedEffort, model: state.settings.models[state.settings.providerId]?.trim() || undefined })
       setRuns(previous => ({ ...previous, [runId]: { ...(previous[runId] || snapshotBase({ runId, projectId: targetProject, chatId: targetChat })), workspace: project.workspace.path, prompt, providerId: state.settings.providerId } }))
-      setSelection(previous => ({ ...previous, [key]: runId }))
+      if (followNewRun) setSelection(previous => ({ ...previous, [key]: runId }))
       setState(previous => addChatMessage(previous, targetProject, targetChat, { ...userMessage, runId }))
     } catch (error) {
       setState(previous => ({ ...previous, projects: previous.projects.map(p => p.id !== targetProject ? p : { ...p, chats: p.chats.map(c => c.id !== targetChat ? c : { ...c, messages: c.messages.filter(m => m.id !== userMessage.id) }) }) }))
@@ -495,7 +468,7 @@ export default function App() {
       {(storageError || runtimeStorageError) && <div className="error-banner" role="alert">{storageError || runtimeStorageError}</div>}
       {!!otherActiveChats && <div className="parallel-chat-notice" role="status">Других активных чатов в проекте: {otherActiveChats}. Файлы общие — поручайте изменения разных участков.</div>}
       <div className="conversation" onScroll={event => { const element = event.currentTarget; nearBottom.current = element.scrollHeight - element.scrollTop - element.clientHeight < 100 }}>
-        {!chat?.messages.length ? <div className="welcome"><div className="welcome-symbol"><span className="brand-mark"><span /></span></div><div className="eyebrow">{project ? 'ПРОСТРАНСТВО ДЛЯ ВАШИХ ИДЕЙ' : 'ОДИН АГЕНТ. ВАШИ ПРОЕКТЫ.'}</div><h1>{project ? 'Над чем поработаем?' : 'Начните с проекта.'}</h1><p>{project ? 'Обсудите идею, задайте вопрос или поручите задачу. Агент сам выберет подход и подключит помощников, когда это полезно.' : 'Подключите локальную папку или Git-репозиторий. Чаты, память и работа агентов останутся в контексте проекта.'}</p>{project ? <div className="prompt-suggestions">{['Помоги разобраться в проекте', 'Давай обсудим новую функцию', 'Найди, что можно улучшить'].map(text => <button key={text} disabled={!desktop} onClick={() => setDrafts(previous => ({ ...previous, [chatKey]: text }))}>{text}<Icon name="arrow" size={14} /></button>)}</div> : <button className="primary-button" onClick={() => setPanel('add')}><Icon name="plus" />Подключить проект</button>}<div className="welcome-footnote">Отдельные чаты · Общая и проектная память · Агенты по задаче</div></div> : <div className="message-list">{chat.messages.map(message => <article key={message.id} className={`message ${message.author}`}><div className="message-avatar">{message.author === 'user' ? 'В' : message.author === 'system' ? '!' : <span className="tiny-orbit" />}</div><div className="message-content"><div className="message-meta"><strong>{message.author === 'user' ? 'Вы' : message.author === 'system' ? 'Система' : 'Orbit'}</strong>{message.model && <span>{message.model}</span>}<time>{timeOf(message.time)}</time></div><Markdown text={message.text} />{message.runId && lastAnswerOfRun.get(message.runId) === message.id && <TeamStrip run={runs[message.runId]} onOpen={openTeam} />}</div></article>)}{running && <div className="working-indicator"><span className="status-dot working" /><span>{pending.has(chatKey) && !workingRun ? 'Запускаем агента…' : 'Агент работает'}</span><button onClick={() => setAgentsOpen(true)}>Посмотреть действия <Icon name="agents" size={14} /></button></div>}{currentRun && !running && ['failed', 'error', 'cancelled', 'interrupted'].includes(currentRun.status) && <div className={`run-notice ${currentRun.status}`}><span className={`status-dot ${currentRun.status}`} /><span>{statusText(currentRun.status)}{currentRun.error ? `: ${currentRun.error}` : currentRun.status === 'interrupted' ? '. Приложение закрылось во время работы. Можно продолжить новым сообщением.' : ''}</span><button onClick={() => setAgentsOpen(true)}>Подробности</button></div>}</div>}
+        {!chat?.messages.length ? <div className="welcome"><div className="welcome-symbol"><span className="brand-mark"><span /></span></div><div className="eyebrow">{project ? 'ПРОСТРАНСТВО ДЛЯ ВАШИХ ИДЕЙ' : 'ОДИН АГЕНТ. ВАШИ ПРОЕКТЫ.'}</div><h1>{project ? 'Над чем поработаем?' : 'Начните с проекта.'}</h1><p>{project ? 'Обсудите идею, задайте вопрос или поручите задачу. Агент сам выберет подход и подключит помощников, когда это полезно.' : 'Подключите локальную папку или Git-репозиторий. Чаты, память и работа агентов останутся в контексте проекта.'}</p>{project ? <div className="prompt-suggestions">{['Помоги разобраться в проекте', 'Давай обсудим новую функцию', 'Найди, что можно улучшить'].map(text => <button key={text} disabled={!desktop} onClick={() => setDrafts(previous => ({ ...previous, [chatKey]: text }))}>{text}<Icon name="arrow" size={14} /></button>)}</div> : <button className="primary-button" onClick={() => setPanel('add')}><Icon name="plus" />Подключить проект</button>}<div className="welcome-footnote">Отдельные чаты · Общая и проектная память · Агенты по задаче</div></div> : <div className="message-list">{chat.messages.map(message => <article key={message.id} className={`message ${message.author}`}><div className="message-avatar">{message.author === 'user' ? 'В' : message.author === 'system' ? '!' : <span className="tiny-orbit" />}</div><div className="message-content"><div className="message-meta"><strong>{message.author === 'user' ? 'Вы' : message.author === 'system' ? 'Система' : 'Orbit'}</strong>{message.model && <span>{message.model}</span>}<time>{timeOf(message.time)}</time></div><Markdown text={message.text} />{message.runId && historyAnchor.get(message.runId) === message.id && <><TeamStrip run={runs[message.runId]} onOpen={openTeam} /><RunHistory run={runs[message.runId]} loaded={ready} onOpen={openTeam} /></>}</div></article>)}{running && <div className="working-indicator"><span className="status-dot working" /><span>{pending.has(chatKey) && !workingRun ? 'Запускаем агента…' : 'Агент работает'}</span><button onClick={() => workingRun ? openTeam(workingRun.runId) : setAgentsOpen(true)}>Посмотреть действия <Icon name="agents" size={14} /></button></div>}{currentRun && !running && ['failed', 'error', 'cancelled', 'interrupted'].includes(currentRun.status) && <div className={`run-notice ${currentRun.status}`}><span className={`status-dot ${currentRun.status}`} /><span>{statusText(currentRun.status)}{currentRun.error ? `: ${currentRun.error}` : currentRun.status === 'interrupted' ? '. Приложение закрылось во время работы. Можно продолжить новым сообщением.' : ''}</span><button onClick={() => setAgentsOpen(true)}>Подробности</button></div>}</div>}
         <div ref={bottom} />
       </div>
       <div className="composer-area"><label className="improvement-toggle"><input type="checkbox" checked={!!state.settings.improvementMode} onChange={event => updateSettings({ improvementMode: event.target.checked })} />Бесконечное улучшение{running && <small> · для следующей задачи</small>}</label><form className={`composer ${running ? 'is-running' : ''}`} onSubmit={send}><textarea aria-label="Сообщение агенту" placeholder={!project ? 'Сначала подключите проект' : running ? 'Можно подготовить следующее сообщение…' : 'Напишите агенту…'} value={draft} disabled={!desktop || !project || !chat || !ready} onChange={event => setDrafts(previous => ({ ...previous, [chatKey]: event.target.value }))} onKeyDown={event => { if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); if (!running) void send() } }} rows={2} /><div className="composer-toolbar"><div className="composer-options"><select aria-label="Провайдер" value={state.settings.providerId} onChange={event => updateSettings({ providerId: event.target.value })}>{providers.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}</select><ModelPicker key={state.settings.providerId} value={state.settings.models[state.settings.providerId] || ''} models={modelChoices} onChange={model => updateSettings({ models: { ...state.settings.models, [state.settings.providerId]: model } })} /><ReasoningPicker providerId={state.settings.providerId} model={state.settings.models[state.settings.providerId] || ''} health={currentHealth} value={selectedEffort} onChange={reasoningEffort => updateSettings({ providerOptions: { ...state.settings.providerOptions, [state.settings.providerId]: { ...state.settings.providerOptions?.[state.settings.providerId], reasoningEffort } } })} /><select aria-label="Уровень доступа" title="Доступ наследуется всеми агентами задачи" value={accessChoice} onChange={event => chooseAccess(event.target.value)}><option value="ask">Ask — спрашивать</option><option value="danger-full-access">Full access</option><option value="workspace-write">Только проект</option><option value="read-only">Только чтение</option></select></div>{running ? <button type="button" className="send-button stop-button" aria-label="Остановить агентов" disabled={!workingRun} onClick={() => void stop()}><Icon name="stop" /></button> : <button className="send-button" type="submit" aria-label="Отправить сообщение" disabled={!draft.trim() || !desktop || !project || !chat || !ready}><Icon name="arrow" /></button>}</div></form><div className="composer-caption"><span>{!ready ? 'Восстанавливаем историю…' : currentHealth && !currentHealth.available ? `${providers.find(p => p.id === currentHealth.id)?.name}: ${currentHealth.detail}` : state.settings.models[state.settings.providerId] || 'Модель по настройкам провайдера'} <QuotaChip name={providers.find(p => p.id === state.settings.providerId)?.name || ''} snapshot={quotas[state.settings.providerId]} model={state.settings.models[state.settings.providerId] || ''} onOpen={() => setPanel('quota')} /></span><span>Enter — отправить · Shift + Enter — новая строка</span></div></div>
@@ -503,11 +476,12 @@ export default function App() {
 
     {agentsOpen && <aside className="agents-panel">
       <header><div><Icon name="agents" /><strong>Агенты</strong></div><button className="icon-button" aria-label="Закрыть панель агентов" onClick={() => setAgentsOpen(false)}><Icon name="close" /></button></header>
-      {chatRuns.length > 1 && <select className="run-select" aria-label="Запуск" value={currentRun?.runId || ''} onChange={event => { setSelection(previous => ({ ...previous, [chatKey]: event.target.value })); setSelectedAgent('root') }}>{[...chatRuns].reverse().map((run, i) => <option key={run.runId} value={run.runId}>{i === 0 ? 'Последний' : timeOf(run.startedAt)} · {statusText(run.status)} · {run.prompt.slice(0, 28)}</option>)}</select>}
+      {chatRuns.length > 1 && <RunHistoryList runs={[...chatRuns].reverse()} currentId={currentRun?.runId} onPick={pickRun} />}
+      {chatRuns.length > 1 && currentRun && chatRuns.at(-1)!.runId !== currentRun.runId && active(chatRuns.at(-1)!.status) && <button type="button" className="history-follow" onClick={() => pickRun(chatRuns.at(-1)!.runId)}><span className="status-dot working" />Идёт новый запуск — перейти</button>}
       {!currentRun?.agents.length ? <div className="panel-empty"><Icon name="agents" size={34} /><h3>Команда появится здесь</h3><p>После отправки сообщения здесь будут реальные агенты, их задачи и действия. Подагенты создаются по необходимости.</p></div> : <>
-        <div className="run-summary"><span className={`status-dot ${currentRun.status}`} />{statusText(currentRun.status)}<span>{currentRun.agents.length} агентов</span></div>
+        <div className="run-summary"><span className={`status-dot ${currentRun.status}`} />{statusText(currentRun.status)}<span>{plural(currentRun.agents.length, ['агент', 'агента', 'агентов'])}</span></div>
         <div className="agent-tree">{agentTree(currentRun.agents)}{(currentRun.agents.length > 1 || !!currentRun.communications?.length) && <button className={`agent-row router-row ${selected?.id === 'router' ? 'selected' : ''}`} onClick={() => setSelectedAgent('router')}><span className={`status-dot ${routerAgent.status}`} /><span className="agent-row-label"><strong>{routerAgent.name}</strong><small>Адресует сообщения и следит за общими файлами</small></span><span className="agent-state">{(currentRun.router?.routed ?? 0) + (currentRun.router?.notices ?? 0)}</span></button>}</div>
-        {selected && <AgentInspector key={currentRun.runId} run={currentRun} agent={selected} onSelect={setSelectedAgent} quotas={quotas} />}
+        {selected && <AgentInspector key={inspectorRequest?.runId === currentRun.runId ? `${currentRun.runId}:${inspectorRequest.seq}` : currentRun.runId} run={currentRun} agent={selected} onSelect={setSelectedAgent} quotas={quotas} initialTab={inspectorRequest?.runId === currentRun.runId ? inspectorRequest.tab : undefined} />}
       </>}
     </aside>}
 
@@ -522,16 +496,18 @@ export default function App() {
   </div>
 }
 
-function TeamStrip({ run, onOpen }: { run?: RunSnapshot; onOpen: (runId: string) => void }) {
+function TeamStrip({ run, onOpen }: { run?: RunSnapshot; onOpen: (runId: string, tab?: InspectorTab) => void }) {
   const helpers = (run?.agents || []).filter(agent => agent.id !== 'root')
-  if (!run || !helpers.length) return null
-  const changed = changedFiles(run)
-  return <button type="button" className="team-strip" onClick={() => onOpen(run.runId)} title="Открыть команду этого запуска: действия, переписку и файлы">
-    <span className="team-strip-title"><Icon name="agents" size={13} />Команда · {helpers.length}</span>
-    {helpers.slice(0, 5).map(agent => <span key={agent.id} className="team-chip"><span className={`status-dot ${agent.status}`} />{agent.name}</span>)}
-    {helpers.length > 5 && <span className="team-chip more">+{helpers.length - 5}</span>}
-    {!!changed && <span className="team-files">{plural(changed, ['файл изменён', 'файла изменено', 'файлов изменено'])}</span>}
-  </button>
+  const changed = runChangedFiles(run)
+  if (!run || (!helpers.length && !changed)) return null
+  return <div className="team-strip">
+    {!!helpers.length && <button type="button" className="team-strip-open" onClick={() => onOpen(run.runId)} title="Открыть команду этого запуска: действия, переписку и файлы">
+      <span className="team-strip-title"><Icon name="agents" size={13} />Команда · {helpers.length}</span>
+      {helpers.slice(0, 5).map(agent => <span key={agent.id} className="team-chip"><span className={`status-dot ${agent.status}`} />{agent.name}</span>)}
+      {helpers.length > 5 && <span className="team-chip more">+{helpers.length - 5}</span>}
+    </button>}
+    {!!changed && <button type="button" className="team-files" onClick={() => onOpen(run.runId, 'changes')} title="Открыть изменения этого запуска">{plural(changed, ['файл изменён', 'файла изменено', 'файлов изменено'])}</button>}
+  </div>
 }
 
 function FileChips({ label, files }: { label: string; files: string[] }) {
@@ -539,42 +515,30 @@ function FileChips({ label, files }: { label: string; files: string[] }) {
   return <div className="file-group"><span className="file-group-label">{label}</span><div className="file-pills">{files.slice(0, 12).map(file => <code key={file} title={file}>{file}</code>)}{files.length > 12 && <span className="file-more">+{files.length - 12}</span>}</div></div>
 }
 
-function FilesTab({ run, agent, onSelect }: { run: RunSnapshot; agent: Agent; onSelect: (id: string) => void }) {
-  const [onlySelected, setOnlySelected] = useState(agent.id !== 'router')
-  const nameOfAgent = (id: string) => run.agents.find(member => member.id === id)?.name || id
-  const scoped = agent.id === 'router' ? false : onlySelected
-  const files = fileMap(run).filter(file => !scoped || file.readers.includes(agent.id) || file.writers.includes(agent.id))
-    .sort((a, b) => Number(b.writers.length > 0 && new Set([...b.writers, ...b.readers]).size > 1) - Number(a.writers.length > 0 && new Set([...a.writers, ...a.readers]).size > 1))
-  return <div className="agent-files">
-    <div className="communications-heading"><h3>{scoped ? agent.name : 'Файлы команды'}</h3><p>Кто читал и кто менял файлы в этом запуске. Данные берутся из инструментов Orbit и событий нативных инструментов провайдера. Изменения от команд учитываются, только если их мог сделать один агент.</p></div>
-    {agent.id !== 'router' && <label className="communications-filter"><input type="checkbox" checked={onlySelected} onChange={event => setOnlySelected(event.target.checked)} /><span>Только файлы {agent.name}</span></label>}
-    {!files.length ? <div className="communications-empty"><Icon name="folder" size={26} /><p>{scoped ? 'Этот агент пока не читал и не менял файлы.' : 'Агенты пока не читали и не меняли файлы.'}</p></div> : files.map(file => {
-      const shared = file.writers.length > 0 && new Set([...file.writers, ...file.readers]).size > 1
-      return <article key={file.path} className={`file-row ${shared ? 'shared' : ''}`}>
-        <code title={file.path}>{file.path}</code>
-        {shared && <span className="file-shared">общий файл</span>}
-        <div className="file-agents">{file.writers.map(id => <button key={`w-${id}`} onClick={() => onSelect(id)} title={`${nameOfAgent(id)} изменил файл`}>✎ {nameOfAgent(id)}</button>)}{file.readers.filter(id => !file.writers.includes(id)).map(id => <button key={`r-${id}`} className="reader" onClick={() => onSelect(id)} title={`${nameOfAgent(id)} прочитал файл`}>{nameOfAgent(id)}</button>)}</div>
-      </article>
-    })}
-  </div>
-}
-
-function AgentInspector({ run, agent, onSelect, quotas }: { run: RunSnapshot; agent: Agent; onSelect: (id: string) => void; quotas: Record<string, QuotaSnapshot> }) {
-  const [tab, setTab] = useState<'activity' | 'communications' | 'files' | 'graph'>('activity')
+function AgentInspector({ run, agent, onSelect, quotas, initialTab }: { run: RunSnapshot; agent: Agent; onSelect: (id: string) => void; quotas: Record<string, QuotaSnapshot>; initialTab?: InspectorTab }) {
+  const [tab, setTab] = useState<InspectorTab>(initialTab || 'activity')
+  const [focusPath, setFocusPath] = useState<string | undefined>()
+  // Opened from a run's «файлов изменено» button: the changes of the whole team, for the agent first shown.
+  const [teamWide, setTeamWide] = useState(initialTab === 'changes')
+  const firstAgent = useRef(agent.id)
   const [onlySelected, setOnlySelected] = useState(false)
+  const pickTab = (next: InspectorTab) => { setFocusPath(undefined); setTeamWide(false); setTab(next) }
+  const changedPaths = useMemo(() => new Set((run.changes || []).map(change => change.path)).size, [run.changes])
   const isRouter = agent.id === 'router'
   const allMessages = run.communications || []
   const routed = (message: Communication) => message.kind === 'notice' || (message.via === 'router' && !!message.route && message.route.via !== 'direct')
   const communications = onlySelected ? allMessages.filter(message => isRouter ? routed(message) : message.fromAgentId === agent.id || message.toAgentId === agent.id) : allMessages
   const traces = run.traces.filter(trace => (trace.agentId || 'root') === agent.id)
   const replies = run.messages.filter(message => (message.agentId || 'root') === agent.id)
-  const touched = fileMap(run).length
+  // Live events replace `run` many times a second; the file map only changes with the agents' file lists.
+  const touched = useMemo(() => fileMap(run.agents).length, [run.agents])
   return <div className="agent-inspector-shell">
     <nav className="inspector-tabs" aria-label="Сведения об агентах">
-      <button className={tab === 'activity' ? 'active' : ''} aria-pressed={tab === 'activity'} onClick={() => setTab('activity')}>Действия</button>
-      <button className={`communication-tab ${tab === 'communications' ? 'active' : ''}`} aria-label="Переписка" aria-pressed={tab === 'communications'} onClick={() => setTab('communications')}>Переписка{!!allMessages.length && <span>{allMessages.length}</span>}</button>
-      <button className={`communication-tab ${tab === 'files' ? 'active' : ''}`} aria-label="Файлы" aria-pressed={tab === 'files'} onClick={() => setTab('files')}>Файлы{!!touched && <span>{touched}</span>}</button>
-      <button className={tab === 'graph' ? 'active' : ''} aria-label="Граф агентов" aria-pressed={tab === 'graph'} onClick={() => setTab('graph')}>Граф</button>
+      <button className={tab === 'activity' ? 'active' : ''} aria-pressed={tab === 'activity'} onClick={() => pickTab('activity')}>Действия</button>
+      <button className={`communication-tab ${tab === 'communications' ? 'active' : ''}`} aria-label="Переписка" aria-pressed={tab === 'communications'} onClick={() => pickTab('communications')}>Переписка{!!allMessages.length && <span>{allMessages.length}</span>}</button>
+      <button className={`communication-tab ${tab === 'files' ? 'active' : ''}`} aria-label="Файлы" aria-pressed={tab === 'files'} onClick={() => pickTab('files')}>Файлы{!!touched && <span>{touched}</span>}</button>
+      <button className={`communication-tab ${tab === 'changes' ? 'active' : ''}`} aria-label="Изменения" aria-pressed={tab === 'changes'} onClick={() => pickTab('changes')}>Изменения{!!changedPaths && <span>{changedPaths}</span>}</button>
+      <button className={tab === 'graph' ? 'active' : ''} aria-label="Граф агентов" aria-pressed={tab === 'graph'} onClick={() => pickTab('graph')}>Граф</button>
     </nav>
     <div className="agent-inspector">
     {tab === 'activity' && isRouter ? <>
@@ -607,7 +571,7 @@ function AgentInspector({ run, agent, onSelect, quotas }: { run: RunSnapshot; ag
         {replies.map(message => <div className="agent-output" key={message.id}><div className="eyebrow">ОТВЕТ · {timeOf(message.time)}</div><Markdown text={message.text} /></div>)}
         {!traces.length && !replies.length && <p className="muted">{agent.detail || 'Событий пока нет.'}</p>}
       </div>
-    </> : tab === 'graph' ? <AgentGraph agents={run.agents} selectedId={agent.id} onSelect={onSelect} /> : tab === 'files' ? <FilesTab key={agent.id} run={run} agent={agent} onSelect={onSelect} /> : <div className="agent-communications">
+    </> : tab === 'graph' ? <AgentGraph agents={run.agents} selectedId={agent.id} onSelect={onSelect} /> : tab === 'files' ? <FilesTab key={agent.id} run={run} agent={agent} onSelect={onSelect} onOpenChanges={path => { setFocusPath(path); setTab('changes') }} /> : tab === 'changes' ? <ChangesTab key={agent.id} run={run} agent={agent} onSelect={onSelect} focusPath={focusPath} teamWide={teamWide && agent.id === firstAgent.current} /> : <div className="agent-communications">
       <div className="communications-heading"><h3>{onlySelected ? agent.name : 'Вся команда'}</h3><p>Сообщения между агентами этого запуска. Каждое проходит через маршрутизатор; он же сообщает об изменениях общих файлов.</p></div>
       <label className="communications-filter"><input type="checkbox" checked={onlySelected} onChange={event => setOnlySelected(event.target.checked)} /><span>{isRouter ? 'Только решения маршрутизатора: подбор адресата и уведомления' : `Только с участием ${agent.name}`}</span></label>
       {!communications.length ? <div className="communications-empty"><Icon name="chat" size={26} /><p>{onlySelected ? 'У этого агента пока нет переписки.' : 'Агенты ещё не обменивались сообщениями.'}</p></div> : communications.map(message => <article className={`communication-item ${message.kind === 'notice' ? 'notice' : ''} ${message.conflict ? 'conflict' : ''}`} key={message.id}>

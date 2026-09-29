@@ -2,6 +2,7 @@ const fs = require('node:fs')
 const path = require('node:path')
 const { spawn } = require('node:child_process')
 const { resolveLaunch, terminateProcess } = require('./providers.cjs')
+const { readText } = require('./change-log.cjs')
 
 const WORKSPACE_TOOLS = new Set(['read_file', 'list_files', 'write_file', 'edit_file', 'run_command'])
 // Generated output (this project keeps dozens of packaged Orbit-standalone-* copies next to its source).
@@ -72,6 +73,11 @@ function runCommand(args, context) {
   })
 }
 
+// Tells the caller about a finished write; a broken listener must not fail the tool.
+function reportChange(context, target, before, after) {
+  try { context.onFileChange?.({ path: path.relative(context.workspace, target), before, after }) } catch { /* Change tracking is best effort. */ }
+}
+
 async function executeWorkspaceTool(name, args, context) {
   if (context.signal?.aborted) throw new Error('Run cancelled')
   if (name === 'run_command') return runCommand(args, context)
@@ -105,9 +111,11 @@ async function executeWorkspaceTool(name, args, context) {
   if (name === 'write_file') {
     if (typeof args.content !== 'string') throw new Error('File content must be a string')
     if (Buffer.byteLength(args.content) > 1024 * 1024) throw new Error('File write exceeds the 1 MB limit')
+    const before = context.onFileChange ? await readText(target) : undefined
     await fs.promises.mkdir(path.dirname(target), { recursive: true })
     workspacePath(context.workspace, args.path, true)
     await fs.promises.writeFile(target, args.content, 'utf8')
+    if (before !== undefined && !args.content.includes('\0')) reportChange(context, target, before, args.content)
     return { ok: true, path: path.relative(context.workspace, target), bytes: Buffer.byteLength(args.content) }
   }
   if (name === 'edit_file') {
@@ -119,6 +127,7 @@ async function executeWorkspaceTool(name, args, context) {
     const updated = content.slice(0, index) + args.new_text + content.slice(index + args.old_text.length)
     if (Buffer.byteLength(updated) > 2 * 1024 * 1024) throw new Error('Updated file exceeds the edit size limit')
     await fs.promises.writeFile(target, updated, 'utf8')
+    if (!content.includes('\0') && !updated.includes('\0')) reportChange(context, target, content, updated)
     return { ok: true, path: path.relative(context.workspace, target) }
   }
   throw new Error(`Unknown workspace tool: ${name}`)

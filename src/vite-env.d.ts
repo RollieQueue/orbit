@@ -18,6 +18,7 @@ interface Window {
     listRuns: () => Promise<import('./types').RunSnapshot[]>
     projectIndexStatus: (workspace: string, rebuild?: boolean) => Promise<ProjectIndexStatus | null>
     getRun: (runId: string) => Promise<import('./types').RunSnapshot | null>
+    getRunChanges: (runId: string) => Promise<import('./types').FileChange[]>
     loadState: () => Promise<import('./types').AppState | null>
     saveState: (state: import('./types').AppState) => Promise<unknown>
     listMemory: (workspace: string, chatId?: string) => Promise<import('./types').MemoryEntry[]>
@@ -61,7 +62,7 @@ interface ProviderHealth {
   executable?: string
 }
 interface RuntimeEvent {
-  type: 'run.started' | 'run.info' | 'agent.created' | 'agent.updated' | 'agent.handover' | 'trace.added' | 'message.added' | 'communication.added' | 'run.finished' | 'run.cancelled' | 'run.failed'
+  type: 'run.started' | 'run.info' | 'agent.created' | 'agent.updated' | 'agent.handover' | 'trace.added' | 'message.added' | 'communication.added' | 'change.added' | 'run.finished' | 'run.cancelled' | 'run.failed'
   runId: string
   projectId: string
   chatId: string
@@ -76,6 +77,7 @@ interface RuntimeEvent {
   trace?: import('./types').TraceItem
   message?: import('./types').Message
   communication?: import('./types').Communication
+  change?: import('./types').FileChange
   summary?: string | { text: string; agentCount: number; providerTurns: number }
   error?: string
   warning?: string

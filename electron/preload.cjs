@@ -9,6 +9,7 @@ contextBridge.exposeInMainWorld('orbit', {
   stopTask: (runId) => ipcRenderer.invoke('runtime:stop', runId),
   listRuns: () => ipcRenderer.invoke('runtime:list'),
   getRun: (runId) => ipcRenderer.invoke('runtime:get', runId),
+  getRunChanges: (runId) => ipcRenderer.invoke('runtime:changes', runId),
   loadState: () => ipcRenderer.invoke('state:load'),
   saveState: (state) => ipcRenderer.invoke('state:save', state),
   spawnSubAgent: (payload) => ipcRenderer.invoke('runtime:spawn-subagent', payload),

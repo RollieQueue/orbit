@@ -16,7 +16,7 @@ function buildArgs(id, options) {
   const args = id === 'cursor'
     ? ['--print', '--output-format', 'stream-json', '--trust', ...(fullAccess ? ['--force', '--sandbox', 'disabled'] : ['--mode', 'ask'])]
     : ['--input-format', 'stream-json', '--output-format', 'stream-json', '--agent', 'orbit-transport']
-  const model = id === 'cursor' && options.reasoningEffort ? cursorEffortModel(options.model, options.reasoningEffort, options.availableModels || []) : options.model
+  const model = id === 'cursor' ? cursorLaunch(options.model, options.reasoningEffort, options.availableModels || []).model : options.model
   if (model) args.push('--model', model)
   // Google models have reasoning built in: the CLI is never given an effort flag, whatever was persisted.
   if (id === 'antigravity' && options.schemaPath) args.push('--json-schema', options.schemaPath)
@@ -40,6 +40,14 @@ function cursorEffortModel(model, effort, models) {
   const selected = cursorReasoningModels(models)[model]?.[effort]
   if (!selected) throw new Error(`Cursor: уровень ${effort} недоступен для ${model || 'автоматической модели'}. Выберите модель и обновите список провайдеров.`)
   return selected
+}
+// Cursor spells the level into the model name, so only a model that lists level variants can honour one. A saved level
+// meeting a model without variants (`auto`) has nothing to select and is dropped rather than stopping the run
+// (`dropped` names it); a level missing from a model that does list variants is still refused.
+function cursorLaunch(model, effort, models) {
+  if (!effort) return { model }
+  if (!Object.keys(cursorReasoningModels(models)[model] || {}).length) return { model, dropped: effort }
+  return { model: cursorEffortModel(model, effort, models) }
 }
 function createParser(id, onEvent, requestedModel = '', responseSchema) {
   let model = requestedModel, result, failure = '', text = ''
@@ -163,7 +171,7 @@ async function run(id, options, { runCli }) {
   const command = commandFor(id, options.providerOptions)
   const parserRequestedModel = options.model || ''
   const parser = createParser(id, options.onEvent, options.model, options.responseSchema)
-  let directory
+  let directory, droppedEffort
   try {
     const env = id === 'antigravity' ? await proxyEnvironment(options.providerOptions) : undefined
     if (id === 'cursor' && options.reasoningEffort) {
@@ -174,7 +182,10 @@ async function run(id, options, { runCli }) {
         catalog = { models: parseModels(output || result.stdout), expires: Date.now() + 60000 }
         modelCache.set(`${id}:${command}`, catalog)
       }
-      options = { ...options, model: cursorEffortModel(options.model, options.reasoningEffort, catalog.models), availableModels: catalog.models }
+      const launch = cursorLaunch(options.model, options.reasoningEffort, catalog.models)
+      droppedEffort = launch.dropped
+      options = { ...options, model: launch.model, availableModels: catalog.models, ...(droppedEffort ? { reasoningEffort: '' } : {}) }
+      if (droppedEffort) options.onEvent?.({ providerId: id, kind: 'observation', source: 'diagnostic', text: `Cursor не предлагает вариантов уровня рассуждений для ${options.model || 'автоматической модели'}: уровень ${droppedEffort} не применён, модель запущена как есть.` })
     }
     if (id === 'antigravity') {
       directory = fs.mkdtempSync(path.join(os.tmpdir(), 'orbit-agy-'))
@@ -193,7 +204,8 @@ async function run(id, options, { runCli }) {
       onDiagnostic: text => options.onEvent?.({ providerId: id, kind: 'observation', source: 'stderr', text }),
     })
     const result = parser.finish()
-    return { providerId: id, client: CONFIG[id].label, access: options.accessMode || 'read-only', ...result, model: result.model === parserRequestedModel ? options.model || result.model : result.model }
+    // The level that really ran is reported so the agent is not shown (and does not keep asking for) one that was dropped.
+    return { providerId: id, client: CONFIG[id].label, access: options.accessMode || 'read-only', ...result, model: result.model === parserRequestedModel ? options.model || result.model : result.model, ...(droppedEffort ? { reasoningEffort: '' } : {}) }
   } catch (error) {
     const detail = eligibilityDetail(id, error)
     if (detail) throw new Error(`${detail}\n\n${error.message}`, { cause: error })
@@ -202,4 +214,4 @@ async function run(id, options, { runCli }) {
     removeTemporaryDirectory(directory, 'orbit-agy-')
   }
 }
-module.exports = { inspect, run, buildArgs, createParser, parseModels, cursorReasoningModels, cursorEffortModel, CONFIG }
+module.exports = { inspect, run, buildArgs, createParser, parseModels, cursorReasoningModels, cursorEffortModel, cursorLaunch, CONFIG }

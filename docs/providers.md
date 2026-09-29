@@ -95,8 +95,11 @@ come from its local catalog. Claude receives `--effort`. Google models (Antigrav
 have reasoning built in: Orbit shows no selector for them and never sends an effort
 flag, even when an old value is saved in settings, the pool or a `spawn_agent` call. Cursor
 selects an actually advertised model variant for the chosen level, preserving
-fast/thinking variants, and rejects unavailable combinations. Auto has no effort
-selector. Ollama discovers `/api/show` thinking controls and sends `think` as a
+fast/thinking variants, and rejects a level that a model with variants does not
+advertise. Auto has no effort selector: a level saved for another model, or asked
+for by a `spawn_agent` call, is ignored there instead of failing the agent. The
+trace says so once and the agent inspector stops showing the dropped level.
+Ollama discovers `/api/show` thinking controls and sends `think` as a
 boolean or supported level; incompatible values are rejected before generation.
 Compatible endpoints receive `reasoning_effort`; support depends on the server.
 

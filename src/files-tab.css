@@ -1,0 +1,24 @@
+/* Filters of the inspector's «Файлы» tab. Row markup itself (.file-row, .file-agents) lives in styles.css. */
+.files-controls{display:flex;flex-direction:column;gap:10px;margin:14px 0 16px}
+.files-chips{display:flex;flex-wrap:wrap;align-items:center;gap:6px}
+.files-chip{display:inline-flex;align-items:center;gap:6px;font-size:11px;padding:4px 10px;border-radius:999px;border:1px solid #30383a;background:#1c2121;color:#a4afb3}
+.files-chip:hover{border-color:#3d4a42;color:#cfe3d6}
+.files-chip.active{background:#2a3a30;border-color:#4a5f52;color:#dcece2}
+.files-count{font-size:10px;color:var(--muted)}
+.files-chip.active .files-count{color:#a9c4b3}
+.files-reset{font-size:11px;padding:4px 6px;color:var(--accent);text-decoration:underline;text-underline-offset:2px}
+.files-reset:hover{filter:brightness(1.2)}
+.files-fields{display:flex;flex-wrap:wrap;gap:8px}
+.files-fields input,.files-fields select{font-size:11px;padding:6px 9px;border-radius:7px;border:1px solid #30383a;background:#1c2121;min-width:0}
+.files-fields input:focus,.files-fields select:focus{outline:none;border-color:#4a5f52}
+.files-search{flex:1 1 150px}
+.files-fields select{flex:0 1 auto;max-width:170px}
+.files-meta{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin:-2px 0 8px}
+.files-meta .file-shared{margin:0}
+.files-stat{display:inline-flex;gap:6px;font-size:10px;font-variant-numeric:tabular-nums}
+.files-added{color:#7fcf9c}
+.files-removed{color:#e08c8c}
+.files-changes{font-size:10px;padding:2px 8px;border-radius:999px;border:1px solid #3d4a42;color:#cfe3d6}
+.files-changes:hover{background:#2a3a30}
+.files-show-more{display:block;width:100%;padding:9px 12px;font-size:11px;border:1px solid #2f3238;border-radius:8px;color:var(--muted)}
+.files-show-more:hover{color:var(--accent);border-color:#3d4a42}

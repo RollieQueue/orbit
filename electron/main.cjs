@@ -7,7 +7,7 @@ const { OrbitMemoryStore } = require('./memory.cjs')
 const { ProjectContextStore } = require('./project-context.cjs')
 const { CapabilityStore } = require('./capabilities.cjs')
 const { ProjectIndex } = require('./project-index.cjs')
-const { RunStore, StateStore } = require('./run-store.cjs')
+const { RunStore, StateStore, stripDiffs } = require('./run-store.cjs')
 const { workspaceKey } = require('./storage.cjs')
 const { inspectProviders } = require('./providers.cjs')
 const { QuotaMonitor, PROVIDER_IDS } = require('./quota.cjs')
@@ -344,10 +344,15 @@ handle('runtime:stop', (_event, runId) => runtime.stop(runId))
 handle('runtime:spawn-subagent', (_event, payload) => runtime.spawnSubAgent(payload.runId, payload.parentId, payload))
 handle('runtime:list', () => {
   const records = new Map((runStore?.list() || []).map(run => [run.runId, run]))
-  for (const run of runtime.getRuns()) records.set(run.runId, run)
+  for (const run of runtime.getRuns()) records.set(run.runId, stripDiffs(run))
   return [...records.values()].sort((a, b) => String(b.startedAt).localeCompare(String(a.startedAt)))
 })
 handle('runtime:get', (_event, runId) => runtime.getRun(runId) || runStore?.get(runId) || null)
+// Diff texts are not part of run lists; the inspector asks for one run's changes when the user opens them.
+handle('runtime:changes', (_event, runId) => {
+  if (typeof runId !== 'string' || !/^[\w-]+$/.test(runId)) return []
+  return runtime.getRunChanges?.(runId) || runStore?.getChanges(runId) || []
+})
 handle('state:load', () => stateStore.load())
 handle('state:save', (_event, state) => stateStore.save(state))
 handle('project-context:get', (_event, workspace) => projectContextStore?.getLatest(workspace) || null)

@@ -1,0 +1,34 @@
+/* Unified diff viewer. Orbit has a single dark theme (styles.css :root); reuses --line/--muted/--faint/--accent/--panel. */
+.diff-view{--diff-add-bg:rgba(126,190,146,.14);--diff-add-fg:#a6d8b4;--diff-del-bg:rgba(231,157,157,.13);--diff-del-fg:#e79d9d;--diff-hunk-bg:#20242a;--diff-hunk-fg:#8f9aa3;--diff-gutter:var(--faint);
+  min-width:0;border:1px solid var(--line);border-radius:8px;background:var(--panel);overflow:hidden;display:flex;flex-direction:column}
+.diff-toolbar{display:flex;align-items:center;gap:10px;min-height:32px;padding:4px 8px 4px 12px;border-bottom:1px solid var(--line);font-size:12px}
+.diff-toolbar:empty{display:none}
+.diff-title{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#cfd2d6}
+.diff-stat{font:11px "Cascadia Code",Consolas,monospace;color:var(--muted);white-space:nowrap}
+.diff-stat-add{color:var(--diff-add-fg)}
+.diff-stat-del{color:var(--diff-del-fg)}
+.diff-btn{font-size:11.5px;color:var(--muted);border:1px solid var(--line);border-radius:6px;padding:3px 9px;line-height:1.4;white-space:nowrap}
+.diff-btn:hover:not(:disabled){color:#fff;border-color:#3a3d44}
+.diff-copy{margin-left:auto}
+.diff-title + .diff-stat + .diff-copy,.diff-title + .diff-copy{margin-left:0}
+.diff-more{margin:8px 12px;align-self:flex-start;color:var(--accent)}
+.diff-notice{padding:8px 12px;font-size:12px;color:var(--muted);border-bottom:1px solid var(--line)}
+.diff-notice:last-child{border-bottom:0}
+.diff-notice-truncated{color:#ceb889}
+.diff-scroll{overflow:auto;max-height:min(70vh,640px)}
+.diff-scroll:focus-visible{outline:2px solid var(--accent);outline-offset:-2px}
+.diff-grid{min-width:max-content;font:12px/1.55 "Cascadia Code",Consolas,monospace;color:#d7d9dd;tab-size:4}
+.diff-row{display:grid;grid-template-columns:calc(var(--diff-digits,3) * 1ch + 16px) calc(var(--diff-digits,3) * 1ch + 16px) 2ch minmax(0,1fr);min-width:100%}
+.diff-no{padding:0 8px;text-align:right;color:var(--diff-gutter);user-select:none;-webkit-user-select:none}
+.diff-sign{text-align:center;color:var(--muted);user-select:none;-webkit-user-select:none;font-weight:700}
+.diff-code{white-space:pre;padding:0 14px 0 4px;min-height:1.55em}
+.diff-add{background:var(--diff-add-bg);box-shadow:inset 3px 0 0 var(--diff-add-fg)}
+.diff-add .diff-sign{color:var(--diff-add-fg)}
+.diff-del{background:var(--diff-del-bg);box-shadow:inset 3px 0 0 var(--diff-del-fg)}
+.diff-del .diff-sign{color:var(--diff-del-fg)}
+.diff-hunk{display:block;background:var(--diff-hunk-bg);color:var(--diff-hunk-fg);white-space:pre;padding:2px 12px;border-top:1px solid var(--line);border-bottom:1px solid var(--line)}
+.diff-hunk:first-child{border-top:0}
+.diff-file{display:flex;gap:12px;justify-content:space-between;align-items:baseline;background:#252930;color:#e6e7e9;padding:4px 12px;font-family:Manrope,Inter,-apple-system,"Segoe UI",sans-serif;font-size:12px;font-weight:600;border-top:1px solid var(--line)}
+.diff-file:first-child{border-top:0}
+.diff-file-meta{font-weight:400;color:var(--muted);white-space:nowrap}
+.diff-marker{display:block;padding:0 12px 0 calc(var(--diff-digits,3) * 2ch + 32px + 2ch + 4px);color:var(--faint);font-style:italic;white-space:pre}

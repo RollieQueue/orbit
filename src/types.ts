@@ -53,6 +53,26 @@ export type Handover = {
   note?: string
 }
 export type FileTouch = { path: string; readers: string[]; writers: string[] }
+// One edit of one file by one agent. `diff` is a git-style unified diff. Run lists (listRuns) carry `hasDiff` instead of the
+// text to stay light; live `change.added` events and getRunChanges(runId) carry the text.
+// source: exact = Orbit compared the file before and after; event = built from a provider's tool event (Claude Edit/Write, Codex
+// file_change); git = `git diff HEAD` of the file, which can include edits that are not this agent's.
+export type FileChange = {
+  id: string
+  agentId: string
+  path: string
+  kind: 'create' | 'modify' | 'delete' | 'unknown'
+  tool: string
+  time: string
+  added: number
+  removed: number
+  source: 'exact' | 'event' | 'git'
+  diff?: string
+  hasDiff?: boolean
+  truncated?: boolean
+  binary?: boolean
+}
+export type InspectorTab = 'activity' | 'communications' | 'files' | 'changes' | 'graph'
 export type Message = {
   id: string
   author: 'user' | 'orbit' | 'system'
@@ -145,6 +165,7 @@ export type RunSnapshot = {
   messages: Message[]
   communications: Communication[]
   files?: FileTouch[]
+  changes?: FileChange[]
   router?: { routed: number; notices: number; refused: number }
   startedAt: string
   updatedAt?: string

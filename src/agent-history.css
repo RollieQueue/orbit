@@ -1,0 +1,56 @@
+/* «Ход работы» under answers, «История запусков» in the agents panel, and the team strip's two targets. */
+.team-strip{cursor:default}
+/* styles.css loads after this file, so the selector needs the extra weight to cancel its hover on the container. */
+div.team-strip:hover{border-color:#2f3a33;background:#1b211d}
+.team-strip .team-strip-open{display:flex;align-items:center;flex-wrap:wrap;gap:6px;min-width:0;padding:0;border:0;background:none;color:inherit;font:inherit;text-align:left;cursor:pointer}
+.team-strip .team-strip-open:hover .team-strip-title{color:#e6f3ea}
+.team-strip button.team-files{margin-left:auto;padding:2px 8px;border:1px solid #33443a;border-radius:999px;background:#212b25;color:#b7cfbf;font:inherit;cursor:pointer}
+.team-strip button.team-files:hover{border-color:#4d6a58;color:#e6f3ea}
+
+.history-block{margin-top:10px;border:1px solid #2b332d;border-radius:8px;background:#181d1a;font-size:12px;max-width:100%}
+.history-block>summary{display:flex;align-items:center;flex-wrap:wrap;gap:4px 12px;padding:8px 10px;color:#93a89a;cursor:pointer;list-style:none}
+.history-block>summary::-webkit-details-marker{display:none}
+.history-block>summary::before{content:'▸';color:#6f8577;font-size:10px}
+.history-block[open]>summary::before{content:'▾'}
+.history-block>summary strong{color:#cfe3d6;font-weight:600}
+.history-block>summary:hover{color:#b7cfbf}
+.history-missing{margin:10px 0 0;font-size:11px;color:var(--faint)}
+.history-cards{display:flex;flex-direction:column;gap:6px;padding:0 8px 8px}
+.history-error{margin:0 2px 2px;padding:6px 8px;border-radius:6px;background:#2a1d1d;color:#e0a9a9;font-size:11px;white-space:pre-wrap;overflow-wrap:anywhere}
+.history-empty{margin:6px 10px 10px;font-size:11px;color:var(--faint)}
+
+.history-agent{border:1px solid #29312b;border-radius:7px;background:#1b211d}
+.history-agent>summary{display:flex;align-items:center;gap:8px;padding:7px 9px;cursor:pointer;list-style:none}
+.history-agent>summary::-webkit-details-marker{display:none}
+.history-agent>summary:hover{background:#202821}
+.history-agent-main{display:flex;flex-direction:column;gap:1px;min-width:0;flex:1}
+.history-agent-main strong{color:#d4e6da;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.history-agent[open]>summary .history-agent-main small{display:none}
+.history-agent-main small{color:#8ba092;font-size:11px;line-height:1.35;overflow:hidden;text-overflow:ellipsis;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}
+.history-agent-state{flex-shrink:0;font-size:11px;color:#8ba092}
+.history-agent-body{display:flex;flex-direction:column;gap:8px;padding:2px 10px 10px;border-top:1px solid #262e28;min-width:0}
+.history-agent-meta{display:flex;align-items:center;flex-wrap:wrap;gap:4px 12px;padding-top:8px;font-size:11px;color:#8ba092}
+.history-open{margin-left:auto;padding:3px 9px;border:1px solid #33443a;border-radius:6px;background:#212b25;color:#b7cfbf;font:inherit;cursor:pointer}
+.history-open:hover{border-color:#4d6a58;color:#e6f3ea}
+.history-task{padding:7px 9px;border-radius:6px;background:#161b18;color:#a9bbb0;font-size:12px}
+.history-entry{min-width:0;overflow-wrap:anywhere}
+.history-entry .eyebrow{margin-bottom:3px}
+.history-more{margin-top:4px;padding:0;border:0;background:none;color:#8fbca2;font:inherit;font-size:11px;cursor:pointer}
+.history-more:hover{text-decoration:underline}
+
+.history-runs{margin:0 14px 10px}
+.history-runs-title{display:flex;align-items:center;gap:6px;width:100%;min-width:0;margin-bottom:6px;padding:2px 0;border:0;background:none;font:inherit;font-size:10px;letter-spacing:.08em;color:var(--faint);text-align:left;cursor:pointer}
+.history-runs-title:hover .history-runs-label{color:var(--muted)}
+.history-runs-title>span{flex-shrink:0}
+.history-runs-title>.history-runs-count{padding:0 6px;border-radius:999px;background:#25292f;color:var(--muted)}
+.history-runs-title em{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-style:normal;letter-spacing:0;font-size:11px;color:var(--muted)}
+.history-runs-list{display:flex;flex-direction:column;gap:3px;max-height:min(184px,22vh);overflow-y:auto;padding-right:2px}
+.history-run{display:flex;align-items:flex-start;gap:8px;width:100%;padding:7px 9px;border:1px solid transparent;border-radius:7px;background:#1f2126;color:inherit;font:inherit;text-align:left;cursor:pointer}
+.history-run:hover{background:#25282e}
+.history-run.selected{border-color:#3d5a49;background:#1f2a24}
+.history-run .status-dot{margin-top:5px;flex-shrink:0}
+.history-run-main{display:flex;flex-direction:column;gap:1px;min-width:0}
+.history-run-main strong{font-size:12px;font-weight:600;color:#dcded9;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.history-run-main small{font-size:11px;color:var(--muted)}
+.history-follow{display:flex;align-items:center;justify-content:center;gap:8px;margin:0 14px 10px;padding:7px 10px;border:1px solid #3d5a49;border-radius:7px;background:#1f2a24;color:#cfe3d6;font:inherit;font-size:12px;cursor:pointer}
+.history-follow:hover{background:#26352d}

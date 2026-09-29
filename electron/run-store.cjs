@@ -4,6 +4,19 @@ const { readJSON, writeJSON, clone } = require('./storage.cjs')
 
 const activeStatuses = new Set(['running', 'working', 'waiting', 'queued', 'stopping'])
 
+// A copy of a run record whose file changes carry no diff text, only `hasDiff`, so lists stay small. The text is
+// served by RunStore.getChanges / the runtime on demand. The copy is shallow: everything but `changes` is shared.
+function stripDiffs(record) {
+  if (!record || !Array.isArray(record.changes)) return record
+  return {
+    ...record,
+    changes: record.changes.map(change => {
+      const { diff, ...rest } = change
+      return { ...rest, hasDiff: Boolean(diff) || change.hasDiff === true }
+    }),
+  }
+}
+
 class RunStore {
   constructor(userDataPath) {
     this.root = path.join(userDataPath, 'run-history')
@@ -67,14 +80,20 @@ class RunStore {
     return this.records.has(id) ? clone(this.records.get(id)) : readJSON(path.join(this.root, `${id}.json`), null)
   }
 
+  // The full file changes (with diff text) of one run, for the renderer to ask for on demand.
+  getChanges(id) {
+    const changes = this.get(id)?.changes
+    return Array.isArray(changes) ? changes : []
+  }
+
   // Only the runs of one chat are copied: the whole history can be many megabytes.
   forChat(projectId, chatId, limit = 8) {
     const matching = [...this.records.values()].filter(record => record.projectId === projectId && record.chatId === chatId)
-    return clone(matching.sort((a, b) => String(b.startedAt).localeCompare(String(a.startedAt))).slice(0, limit))
+    return clone(matching.sort((a, b) => String(b.startedAt).localeCompare(String(a.startedAt))).slice(0, limit).map(stripDiffs))
   }
 
   list() {
-    return clone([...this.records.values()].sort((a, b) => String(b.startedAt).localeCompare(String(a.startedAt))).slice(0, 200))
+    return clone([...this.records.values()].sort((a, b) => String(b.startedAt).localeCompare(String(a.startedAt))).slice(0, 200).map(stripDiffs))
   }
 }
 
@@ -89,4 +108,4 @@ class StateStore {
   }
 }
 
-module.exports = { RunStore, StateStore }
+module.exports = { RunStore, StateStore, stripDiffs }

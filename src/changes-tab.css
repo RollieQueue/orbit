@@ -1,0 +1,30 @@
+.changes-summary{font-size:12px;color:#b9cbc0;margin:0 0 14px}
+.changes-plus{color:#8fd0a2}
+.changes-minus{color:#e2928f}
+.changes-error{display:flex;align-items:center;justify-content:space-between;gap:10px;margin:0 0 14px;padding:9px 12px;border:1px solid #6b3e3c;border-radius:8px;background:#2a1d1d;color:#e6b9b7;font-size:11px;line-height:1.6}
+.changes-error button{flex-shrink:0;padding:4px 10px;border-radius:6px;background:#3a2626;color:#f0cfcd;font-size:11px}
+.changes-error button:disabled{opacity:.5}
+.changes-widen{margin-top:10px;padding:8px 12px;font-size:11px;border:1px solid #2f3238;border-radius:8px;color:var(--muted)}
+.changes-widen:hover{color:var(--accent);border-color:#3d4a42}
+.changes-file{border:1px solid #30383a;border-radius:8px;background:#1c2121;margin-bottom:10px;overflow:hidden}
+.changes-file.shared{border-color:#5a5233;background:#221f17}
+.changes-file-toggle{display:flex;align-items:center;gap:8px;width:100%;padding:10px 12px 4px;text-align:left;color:#d3ddd8}
+.changes-file-toggle:focus-visible{outline-offset:-2px}
+.changes-caret{flex-shrink:0;width:10px;color:#8b9d93;font-size:10px}
+.changes-path{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px;color:#d3ddd8;background:none;padding:0}
+.changes-kind{flex-shrink:0;padding:1px 7px;border-radius:999px;font-size:10px;background:#2a3a30;color:#cfe3d6}
+.changes-kind.create{background:#254232;color:#b6e6c6}
+.changes-kind.delete{background:#452a2a;color:#f0c3c1}
+.changes-stat{flex-shrink:0;font-size:11px;font-variant-numeric:tabular-nums}
+.changes-file-agents{display:flex;flex-wrap:wrap;align-items:center;gap:6px;padding:4px 12px 10px 30px}
+.changes-file-agents button{max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:10px;padding:3px 9px;border-radius:999px;background:#2a3a30;color:#cfe3d6}
+.changes-file-agents button:hover{filter:brightness(1.2)}
+.changes-shared{font-size:10px;color:#d8c98f}
+.changes-entries{border-top:1px solid #2a3234;padding:4px 12px 12px}
+.changes-entry{padding-top:10px}
+.changes-entry+.changes-entry{border-top:1px dashed #2a3234;margin-top:10px}
+.changes-entry-head{display:flex;flex-wrap:wrap;align-items:baseline;gap:8px;font-size:11px;color:#c3d5c9;margin-bottom:6px}
+.changes-entry-head strong{font-weight:600}
+.changes-entry-head time,.changes-tool{color:#8b9d93;font-size:10px}
+.changes-source{font-size:10px;line-height:1.6;color:#8b9d93;margin:0 0 8px}
+.changes-note{font-size:11px;line-height:1.7;color:#8b9d93;margin:0}

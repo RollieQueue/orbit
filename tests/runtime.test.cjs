@@ -150,6 +150,22 @@ test('explicit auto effort stays auto for children despite a saved provider defa
   assert.equal(snapshot.agents.length, 2)
 })
 
+test('an agent adopts the level its provider reports as the one that ran', async t => {
+  const workspace = folder(t), seen = []
+  let rootCalls = 0, childCalls = 0
+  const runtime = new OrbitRuntime({ runProvider: async options => {
+    const [, name] = identity(options.prompt)
+    seen.push({ name, providerId: options.providerId, effort: options.reasoningEffort })
+    if (name === 'Orbit') return ++rootCalls === 1 ? response(tool('spawn_agent', { name: 'Auto child', task: 'Check', reason: 'Independent check', providerId: 'cursor', model: 'auto' }), tool('wait_agent')) : { text: 'Done' }
+    // The saved level cannot apply to `auto`: the provider says so on the first answer, and the agent stops asking for it.
+    return ++childCalls === 1 ? { ...response(tool('list_files')), reasoningEffort: '' } : { text: 'Child done' }
+  } })
+  const { snapshot } = await finished(runtime, payload(workspace, { providerOptions: { cursor: { reasoningEffort: 'high' } } }))
+  assert.equal(snapshot.status, 'completed')
+  assert.deepEqual(seen.filter(item => item.name === 'Auto child').map(item => [item.providerId, item.effort]), [['cursor', 'high'], ['cursor', '']])
+  assert.equal(snapshot.agents.find(agent => agent.name === 'Auto child').reasoningEffort, '')
+})
+
 test('cancelling an approval does not write the proposed file', async t => {
   const workspace = folder(t)
   let runtime
