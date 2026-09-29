@@ -4,7 +4,7 @@
 
 Установка CLI и вход в аккаунты не входят в Windows-пакет Orbit. Подробности подключения и ограничения транспорта: [docs/providers.md](docs/providers.md).
 
-История изменений по версиям: [docs/CHANGELOG.md](docs/CHANGELOG.md).
+История изменений по версиям: [docs/CHANGELOG.md](docs/CHANGELOG.md). Что решено, но не сделано: [docs/TECH-DEBT.md](docs/TECH-DEBT.md).
 
 ## Как пользоваться
 
