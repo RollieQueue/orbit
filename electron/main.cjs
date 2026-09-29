@@ -6,6 +6,7 @@ const { OrbitRuntime } = require('./runtime.cjs')
 const { OrbitMemoryStore } = require('./memory.cjs')
 const { ProjectContextStore } = require('./project-context.cjs')
 const { CapabilityStore } = require('./capabilities.cjs')
+const { ProjectIndex } = require('./project-index.cjs')
 const { RunStore, StateStore } = require('./run-store.cjs')
 const { workspaceKey } = require('./storage.cjs')
 const { inspectProviders } = require('./providers.cjs')
@@ -58,6 +59,7 @@ const runtime = new OrbitRuntime({ requestApproval: request => {
 let memoryStore
 let projectContextStore
 let capabilityStore
+let projectIndex
 let runStore
 let stateStore
 
@@ -344,6 +346,13 @@ handle('runtime:get', (_event, runId) => runtime.getRun(runId) || runStore?.get(
 handle('state:load', () => stateStore.load())
 handle('state:save', (_event, state) => stateStore.save(state))
 handle('project-context:get', (_event, workspace) => projectContextStore?.getLatest(workspace) || null)
+// Building the index is the same scan a task starts with; asking for it first just makes the first task faster.
+handle('project-index:status', async (_event, workspace, rebuild) => {
+  const folder = validateWorkspace(workspace)
+  if (!projectIndex) return null
+  await projectIndex.refresh(folder, { force: rebuild === true })
+  return projectIndex.stats(folder)
+})
 handle('memory:list', (_event, workspace) => memoryStore.list(workspace))
 handle('memory:search', (_event, query, workspace) => memoryStore.search(query, workspace))
 handle('memory:save', (_event, entry) => memoryStore.upsert(entry))
@@ -371,6 +380,8 @@ app.whenReady().then(() => {
   projectContextStore = new ProjectContextStore(app.getPath('userData'))
   runtime.setContextStore(projectContextStore)
   capabilityStore = new CapabilityStore(app.getPath('userData'))
+  projectIndex = new ProjectIndex({ directory: path.join(app.getPath('userData'), 'project-index') })
+  runtime.setProjectIndex(projectIndex)
   runStore = new RunStore(app.getPath('userData'))
   stateStore = new StateStore(app.getPath('userData'))
   runtime.setMemoryStore(memoryStore)
@@ -394,6 +405,7 @@ app.on('before-quit', () => {
     if (['running', 'working', 'waiting', 'queued'].includes(run.status)) runtime.stop(run.runId)
   }
   runStore?.flush()
+  projectIndex?.flush()
 })
 
 app.on('window-all-closed', () => {

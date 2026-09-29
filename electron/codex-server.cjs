@@ -69,7 +69,7 @@ async function runCodexServer(options, helpers) {
         return
       }
       if (item.type === 'agentMessage' && message.method === 'item/completed' && item.phase !== 'commentary') text = item.text || text
-      if (['commandExecution', 'fileChange', 'mcpToolCall'].includes(item.type)) emit({ kind: 'tool', native: true, tool: item.type, toolId: item.id, text: item.command || JSON.stringify(item.changes || item), status: message.method === 'item/started' ? 'started' : item.status || 'completed' })
+      if (['commandExecution', 'fileChange', 'mcpToolCall'].includes(item.type)) emit({ kind: 'tool', native: true, tool: item.type, toolId: item.id, changes: item.changes, text: item.command || JSON.stringify(item.changes || item), status: message.method === 'item/started' ? 'started' : item.status || 'completed' })
     }
     if (message.method === 'turn/completed') {
       if (params.turn?.status !== 'completed') fail(new Error(params.turn?.error?.message || `Codex turn ${params.turn?.status || 'incomplete'}`))

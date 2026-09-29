@@ -123,7 +123,7 @@ test('a correction that fails the same way every time is stopped', async t => {
 
 test('re-running a command whose output only differs by timings is a repeat, not new information', async t => {
   const { workspace } = fixture(t)
-  const script = "console.log('# tests 5\n# pass 4\n# fail 1\n# duration_ms ' + (Math.random() * 1000) + '\nfinished in ' + Math.floor(Math.random() * 9000) + 'ms at ' + new Date().toISOString())"
+  const script = "console.log('# tests 5\\n# pass 4\\n# fail 1\\n# duration_ms ' + (Math.random() * 1000) + '\\nfinished in ' + Math.floor(Math.random() * 9000) + 'ms at ' + new Date().toISOString())"
   const runtime = new OrbitRuntime({ runProvider: async () => envelope(call('run_command', { command: process.execPath, args: ['-e', script] })) })
   const { run } = await finish(runtime, { workspace })
   assert.equal(run.status, 'completed')

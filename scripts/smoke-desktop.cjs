@@ -158,7 +158,13 @@ async function exercise(win) {
   assert.ok(await evaluate(`document.querySelector('.conversation').textContent.includes('контекст проекта Альфа сохранён')`))
   assert.ok(!await evaluate(`document.querySelector('.conversation').textContent.includes('tool_calls')`), 'broken and repaired envelopes must stay out of chat')
   await evaluate(`document.querySelector('.agents-toggle').click()`)
-  assert.equal(await evaluate(`document.querySelectorAll('.agent-tree .agent-row').length`), 2)
+  assert.equal(await evaluate(`document.querySelectorAll('.agent-tree .agent-row:not(.router-row)').length`), 2)
+  assert.equal(await evaluate(`document.querySelectorAll('.agent-tree .router-row').length`), 1, 'the router is listed as a participant')
+  assert.ok(await evaluate(`document.querySelector('.team-strip')?.textContent.includes('Команда · 1')`), 'the team of a finished turn stays visible under its answer')
+  await waitFor(() => evaluate(`/Индекс: [0-9]+/.test(document.querySelector('.project-index-row')?.textContent || '')`), 'project index status shown')
+  await evaluate(`document.querySelector('.agent-row.router-row').click()`)
+  assert.ok(await evaluate(`document.querySelector('.agent-inspector').textContent.includes('Все сообщения между агентами проходят здесь')`))
+  await evaluate(`document.querySelector('.agent-row:not(.router-row)').click()`)
   const tabsPosition = await evaluate(`(() => {
     document.querySelectorAll('.agent-inspector details').forEach(item => item.open = true);
     const body = document.querySelector('.agent-inspector');
@@ -182,7 +188,7 @@ async function exercise(win) {
   await switchProject('Альфа')
   await evaluate(`document.querySelector('.agents-toggle').click()`)
   await delay(500)
-  assert.equal(await evaluate(`document.querySelectorAll('.agent-tree .agent-row').length`), 2)
+  assert.equal(await evaluate(`document.querySelectorAll('.agent-tree .agent-row:not(.router-row)').length`), 2)
   const screenshotPath = path.resolve(__dirname, '../artifacts/desktop-smoke.png')
   fs.mkdirSync(path.dirname(screenshotPath), { recursive: true })
   fs.writeFileSync(screenshotPath, (await win.webContents.capturePage(undefined, { stayHidden: true, stayAwake: true })).toPNG())

@@ -7,7 +7,7 @@ const strings = { type: 'array', items: string }
 const optional = schema => ({ anyOf: [schema, { type: 'null' }] })
 const object = properties => ({ type: 'object', properties, required: Object.keys(properties), additionalProperties: false })
 const toolArguments = {
-  spawn_agent: { task: string, reason: string, name: optional(string), providerId: optional(string), model: optional(string), reasoningEffort: optional({ type: 'string', enum: ['', 'none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra', 'enabled'] }), memoryProfile: optional({ type: 'string', enum: ['project', 'project-global'] }) },
+  spawn_agent: { task: string, reason: string, name: optional(string), providerId: optional(string), model: optional(string), reasoningEffort: optional({ type: 'string', enum: ['', 'none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra', 'enabled'] }), memoryProfile: optional({ type: 'string', enum: ['project', 'project-global'] }), continueFrom: optional(string) },
   context_read: { key: optional(string) },
   context_save: { key: string, summary: string, files: optional(strings) },
   model_evaluate: { agentId: string, taskType: string, assessment: string, evidence: string },
@@ -15,6 +15,10 @@ const toolArguments = {
   wait_agent: { agentId: optional(string), timeout_ms: optional(number) },
   send_message: { agentId: string, message: string, replyTo: optional(string) },
   broadcast_message: { message: string, agentIds: optional(strings), replyTo: optional(string) },
+  ask_team: { message: string, topic: optional(string), files: optional(strings), agentIds: optional(strings), replyTo: optional(string) },
+  index_search: { query: string, limit: optional(number) },
+  index_outline: { path: string },
+  team_history: { agent: optional(string), runId: optional(string), limit: optional(number) },
   read_conversation: { afterId: optional(string), limit: optional(number) },
   read_messages: { unread_only: optional(boolean) },
   wait_message: { timeout_ms: optional(number) },

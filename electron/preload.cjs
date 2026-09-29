@@ -13,6 +13,7 @@ contextBridge.exposeInMainWorld('orbit', {
   saveState: (state) => ipcRenderer.invoke('state:save', state),
   spawnSubAgent: (payload) => ipcRenderer.invoke('runtime:spawn-subagent', payload),
   getProjectContext: (workspace) => ipcRenderer.invoke('project-context:get', workspace),
+  projectIndexStatus: (workspace, rebuild) => ipcRenderer.invoke('project-index:status', workspace, rebuild === true),
   listMemory: (workspace) => ipcRenderer.invoke('memory:list', workspace),
   searchMemory: (query, workspace) => ipcRenderer.invoke('memory:search', query, workspace),
   saveMemory: (entry) => ipcRenderer.invoke('memory:save', entry),

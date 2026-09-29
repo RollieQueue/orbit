@@ -67,6 +67,12 @@ class RunStore {
     return this.records.has(id) ? clone(this.records.get(id)) : readJSON(path.join(this.root, `${id}.json`), null)
   }
 
+  // Only the runs of one chat are copied: the whole history can be many megabytes.
+  forChat(projectId, chatId, limit = 8) {
+    const matching = [...this.records.values()].filter(record => record.projectId === projectId && record.chatId === chatId)
+    return clone(matching.sort((a, b) => String(b.startedAt).localeCompare(String(a.startedAt))).slice(0, limit))
+  }
+
   list() {
     return clone([...this.records.values()].sort((a, b) => String(b.startedAt).localeCompare(String(a.startedAt))).slice(0, 200))
   }

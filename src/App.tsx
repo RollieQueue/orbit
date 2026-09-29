@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from 'react'
-import type { Agent, AppState, Capability, ChatThread, MemoryEntry, Message, Project, RunSnapshot, RunStatus, Settings, Workspace } from './types'
+import type { Agent, AppState, Capability, ChatThread, Communication, FileTouch, MemoryEntry, Message, Project, RunSnapshot, RunStatus, Settings, Workspace } from './types'
 import { AgentGraph } from './AgentGraph'
 import { SwarmSettings } from './SwarmSettings'
 import { ReasoningPicker, reasoningLevels, effortLabels } from './ReasoningPicker'
@@ -20,6 +20,19 @@ const active = (status?: RunStatus) => status === 'working' || status === 'waiti
 const statusText = (status?: RunStatus) => ({ idle: 'Готов', waiting: 'В очереди', working: 'Работает', done: 'Завершён', completed: 'Завершён', error: 'Ошибка', failed: 'Ошибка', cancelled: 'Остановлен', interrupted: 'Прерван' }[status || 'idle'])
 const timeOf = (time?: string) => { if (!time) return ''; const date = new Date(time); return Number.isNaN(date.valueOf()) ? time : date.toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' }) }
 const errorText = (error: unknown) => error instanceof Error ? error.message : String(error)
+const plural = (n: number, forms: [string, string, string]) => `${n} ${forms[n % 10 === 1 && n % 100 !== 11 ? 0 : n % 10 >= 2 && n % 10 <= 4 && (n % 100 < 10 || n % 100 >= 20) ? 1 : 2]}`
+const routeLabel: Record<string, string> = { direct: 'напрямую', explicit: 'адресат указан отправителем', match: 'подобран по файлам и теме', reply: 'ответ автору сообщения', escalation: 'передано руководителю' }
+// Live events carry each agent's own file lists, so the team-wide view is derived from them.
+function fileMap(run: RunSnapshot): FileTouch[] {
+  const files = new Map<string, FileTouch>()
+  const entry = (path: string) => { let item = files.get(path); if (!item) { item = { path, readers: [], writers: [] }; files.set(path, item) } return item }
+  for (const agent of run.agents) {
+    for (const path of agent.files?.wrote || []) entry(path).writers.push(agent.id)
+    for (const path of agent.files?.read || []) entry(path).readers.push(agent.id)
+  }
+  return [...files.values()]
+}
+const changedFiles = (run?: RunSnapshot) => new Set((run?.agents || []).flatMap(agent => agent.files?.wrote || [])).size
 function stored<T>(key: string, fallback: T): T { try { return JSON.parse(localStorage.getItem(key) || 'null') ?? fallback } catch { return fallback } }
 function normalize(value: Partial<AppState>): AppState {
   const projects = (Array.isArray(value.projects) ? value.projects : []).filter(p => p?.id && p.workspace?.path).map(p => ({ ...p, chats: (Array.isArray(p.chats) ? p.chats : []).map(c => ({ ...c, messages: (Array.isArray(c.messages) ? c.messages : []).filter(m => m.id !== 'welcome') })) }))
@@ -86,6 +99,7 @@ function Icon({ name, size = 18 }: { name: string; size?: number }) {
     refresh: <><path d="M20 10a8 8 0 1 0-1 8M20 3v7h-7" /></>,
     trash: <><path d="M3 6h18M9 6V3h6v3M6 6l1 15h10l1-15M10 10v7M14 10v7" /></>,
     menu: <path d="M4 6h16M4 12h16M4 18h16" />, check: <path d="m5 12 4 4L19 6" />, terminal: <><path d="m4 6 6 6-6 6M13 18h7" /></>,
+    index: <><circle cx="11" cy="11" r="6" /><path d="m16 16 4 4" /></>,
   }
   return <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">{paths[name] || paths.chat}</svg>
 }
@@ -158,6 +172,8 @@ export default function App() {
   const [capabilities, setCapabilities] = useState<Capability[]>([])
   const [loadingLibrary, setLoadingLibrary] = useState(false)
   const [libraryRevision, setLibraryRevision] = useState(0)
+  const [indexInfo, setIndexInfo] = useState<ProjectIndexStatus | null>(null)
+  const [indexBusy, setIndexBusy] = useState(false)
   const bottom = useRef<HTMLDivElement>(null)
   const nearBottom = useRef(true)
   const project = state.projects.find(p => p.id === state.activeProjectId) || state.projects[0]
@@ -169,7 +185,10 @@ export default function App() {
   const workingRun = chatRuns.find(r => active(r.status))
   const running = !!workingRun || pending.has(chatKey)
   const otherActiveChats = Object.values(runs).filter(run => run.projectId === project?.id && run.chatId !== chat?.id && active(run.status)).length
-  const selected = currentRun?.agents.find(a => a.id === selectedAgent) || currentRun?.agents[0]
+  const routerAgent: Agent = { id: 'router', name: 'Маршрутизатор', role: 'Системный участник', status: active(currentRun?.status) ? 'working' : 'done' }
+  const selected = selectedAgent === 'router' && currentRun ? routerAgent : currentRun?.agents.find(a => a.id === selectedAgent) || currentRun?.agents[0]
+  const lastAnswerOfRun = new Map<string, string>()
+  for (const message of chat?.messages || []) if (message.author === 'orbit' && message.runId) lastAnswerOfRun.set(message.runId, message.id)
   const currentHealth = health.find(p => p.id === state.settings.providerId)
   const modelChoices = [...new Set([...(currentHealth?.models || []), ...(currentHealth?.model ? [currentHealth.model] : []), ...Object.values(runs).filter(run => run.providerId === state.settings.providerId && run.model).map(run => run.model!)])]
   const effortLevels = reasoningLevels(state.settings.providerId, state.settings.models[state.settings.providerId] || '', currentHealth)
@@ -199,6 +218,7 @@ export default function App() {
         if (event.improvements) run.improvements = event.improvements
         if (event.improvementStatus) run.improvementStatus = event.improvementStatus
         if (event.usage) run.usage = event.usage
+        if (event.router) run.router = event.router
         if (event.type === 'run.started') run.status = 'working'
         if (event.agent) { const exists = run.agents.some(a => a.id === event.agent!.id); run.agents = exists ? run.agents.map(a => a.id === event.agent!.id ? { ...a, ...event.agent } : a) : [...run.agents, event.agent] }
         if (event.trace) run.traces = (run.traces.some(t => t.id === event.trace!.id) ? run.traces.map(t => t.id === event.trace!.id ? event.trace! : t) : [...run.traces, event.trace]).slice(-1500)
@@ -298,6 +318,20 @@ export default function App() {
     return () => { clearTimeout(timer); document.removeEventListener('keydown', trap); before?.focus() }
   }, [panel])
 
+  useEffect(() => {
+    const api = window.orbit
+    if (!api || !project?.workspace.path) { setIndexInfo(null); return }
+    let mounted = true
+    void api.projectIndexStatus(project.workspace.path).then(info => { if (mounted) setIndexInfo(info) }).catch(() => { if (mounted) setIndexInfo(null) })
+    return () => { mounted = false }
+  }, [project?.workspace.path, libraryRevision])
+
+  async function rebuildIndex() {
+    if (!window.orbit || !project || indexBusy) return
+    setIndexBusy(true)
+    try { setIndexInfo(await window.orbit.projectIndexStatus(project.workspace.path, true)) } catch (error) { setNotice(errorText(error)) } finally { setIndexBusy(false) }
+  }
+  function openTeam(runId: string) { setSelection(previous => ({ ...previous, [chatKey]: runId })); setSelectedAgent('root'); setAgentsOpen(true) }
   function updateSettings(patch: Partial<Settings>) { setState(previous => ({ ...previous, settings: { ...previous.settings, ...patch } })) }
   function setGlobalMemory(enabled: boolean) {
     if (!project) return
@@ -373,7 +407,7 @@ export default function App() {
       const nextSeen = new Set(seen).add(agent.id)
       const providerId = agent.providerId || currentRun?.providerId
       const modelLabel = `${providers.find(provider => provider.id === providerId)?.name || providerId || 'Провайдер не указан'} · ${agent.model || 'Модель: авто (ещё не определена)'}`
-      return <div key={agent.id}><button className={`agent-row ${selected?.id === agent.id ? 'selected' : ''}`} style={{ paddingLeft: 14 + Math.min(depth, 8) * 16 }} onClick={() => setSelectedAgent(agent.id)}><span className={`status-dot ${agent.status}`} /><span className="agent-row-label"><strong>{agent.name || agent.id}</strong><small title={modelLabel}>{modelLabel}</small>{agent.role && <small>{agent.role}</small>}</span><span className="agent-state">{statusText(agent.status)}</span></button>{agentTree(items, agent.id, depth + 1, nextSeen)}</div>
+      return <div key={agent.id}><button className={`agent-row ${selected?.id === agent.id ? 'selected' : ''}`} style={{ paddingLeft: 14 + Math.min(depth, 8) * 16 }} onClick={() => setSelectedAgent(agent.id)}><span className={`status-dot ${agent.status}`} /><span className="agent-row-label"><strong>{agent.name || agent.id}</strong><small title={modelLabel}>{modelLabel}</small>{agent.role && <small>{agent.role}</small>}{!!agent.files && agent.files.wrote.length + agent.files.read.length > 0 && <small>Файлы: изменил {agent.files.wrote.length}, читал {agent.files.read.length}</small>}</span><span className="agent-state">{statusText(agent.status)}</span></button>{agentTree(items, agent.id, depth + 1, nextSeen)}</div>
     })
   }
 
@@ -386,6 +420,7 @@ export default function App() {
         {projectMenu && <><button className="dropdown-dismiss" aria-label="Закрыть список проектов" onClick={() => setProjectMenu(false)} /><div className="project-dropdown"><div className="eyebrow">ПРОЕКТЫ</div>{state.projects.map(p => <button key={p.id} onClick={() => { setState(previous => ({ ...previous, activeProjectId: p.id })); setProjectMenu(false) }}><Icon name="folder" /><span><strong>{p.workspace.name}</strong><small title={p.workspace.path}>{p.workspace.path}</small></span>{p.id === project?.id && <Icon name="check" size={14} />}</button>)}<button className="add-project-row" onClick={() => { setPanel('add'); setProjectMenu(false) }}><Icon name="plus" />Добавить проект</button></div></>}
       </div>
       {project && <button type="button" className={`project-memory-toggle memory-toggle ${globalMemoryEnabled ? 'enabled' : ''}`} aria-label="Использовать общую память" aria-pressed={globalMemoryEnabled} disabled={!ready} title="Общая память для этого проекта. Проектная память доступна всегда. Изменение применяется к новым задачам." onClick={() => setGlobalMemory(!globalMemoryEnabled)}><Icon name="memory" size={14} /><span>Общая память</span><strong>{globalMemoryEnabled ? 'Вкл' : 'Выкл'}</strong></button>}
+      {project && desktop && <button type="button" className="project-index-row" disabled={indexBusy} title="Локальный индекс проекта: пути, символы, импорты. Агенты ищут по нему командой index_search вместо чтения папок. Нажмите, чтобы переиндексировать." onClick={() => void rebuildIndex()}><Icon name="index" size={14} /><span>{indexBusy || indexInfo?.indexing ? 'Индексируем…' : indexInfo ? `Индекс: ${plural(indexInfo.files, ['файл', 'файла', 'файлов'])}` : 'Индекс проекта'}</span><Icon name="refresh" size={13} /></button>}
       <button className="new-chat" onClick={project ? createChat : () => setPanel('add')}><Icon name="plus" />{project ? 'Новый чат' : 'Добавить проект'}<kbd>＋</kbd></button>
       <div className="section-label">ЧАТЫ ПРОЕКТА <span>{project?.chats.length || ''}</span></div>
       <nav className="chat-list" aria-label="Чаты проекта">{project?.chats.map(c => {
@@ -401,7 +436,7 @@ export default function App() {
       {(storageError || runtimeStorageError) && <div className="error-banner" role="alert">{storageError || runtimeStorageError}</div>}
       {!!otherActiveChats && <div className="parallel-chat-notice" role="status">Других активных чатов в проекте: {otherActiveChats}. Файлы общие — поручайте изменения разных участков.</div>}
       <div className="conversation" onScroll={event => { const element = event.currentTarget; nearBottom.current = element.scrollHeight - element.scrollTop - element.clientHeight < 100 }}>
-        {!chat?.messages.length ? <div className="welcome"><div className="welcome-symbol"><span className="brand-mark"><span /></span></div><div className="eyebrow">{project ? 'ПРОСТРАНСТВО ДЛЯ ВАШИХ ИДЕЙ' : 'ОДИН АГЕНТ. ВАШИ ПРОЕКТЫ.'}</div><h1>{project ? 'Над чем поработаем?' : 'Начните с проекта.'}</h1><p>{project ? 'Обсудите идею, задайте вопрос или поручите задачу. Агент сам выберет подход и подключит помощников, когда это полезно.' : 'Подключите локальную папку или Git-репозиторий. Чаты, память и работа агентов останутся в контексте проекта.'}</p>{project ? <div className="prompt-suggestions">{['Помоги разобраться в проекте', 'Давай обсудим новую функцию', 'Найди, что можно улучшить'].map(text => <button key={text} disabled={!desktop} onClick={() => setDrafts(previous => ({ ...previous, [chatKey]: text }))}>{text}<Icon name="arrow" size={14} /></button>)}</div> : <button className="primary-button" onClick={() => setPanel('add')}><Icon name="plus" />Подключить проект</button>}<div className="welcome-footnote">Отдельные чаты · Общая и проектная память · Агенты по задаче</div></div> : <div className="message-list">{chat.messages.map(message => <article key={message.id} className={`message ${message.author}`}><div className="message-avatar">{message.author === 'user' ? 'В' : message.author === 'system' ? '!' : <span className="tiny-orbit" />}</div><div className="message-content"><div className="message-meta"><strong>{message.author === 'user' ? 'Вы' : message.author === 'system' ? 'Система' : 'Orbit'}</strong>{message.model && <span>{message.model}</span>}<time>{timeOf(message.time)}</time></div><Markdown text={message.text} /></div></article>)}{running && <div className="working-indicator"><span className="status-dot working" /><span>{pending.has(chatKey) && !workingRun ? 'Запускаем агента…' : 'Агент работает'}</span><button onClick={() => setAgentsOpen(true)}>Посмотреть действия <Icon name="agents" size={14} /></button></div>}{currentRun && !running && ['failed', 'error', 'cancelled', 'interrupted'].includes(currentRun.status) && <div className={`run-notice ${currentRun.status}`}><span className={`status-dot ${currentRun.status}`} /><span>{statusText(currentRun.status)}{currentRun.error ? `: ${currentRun.error}` : currentRun.status === 'interrupted' ? '. Приложение закрылось во время работы. Можно продолжить новым сообщением.' : ''}</span><button onClick={() => setAgentsOpen(true)}>Подробности</button></div>}</div>}
+        {!chat?.messages.length ? <div className="welcome"><div className="welcome-symbol"><span className="brand-mark"><span /></span></div><div className="eyebrow">{project ? 'ПРОСТРАНСТВО ДЛЯ ВАШИХ ИДЕЙ' : 'ОДИН АГЕНТ. ВАШИ ПРОЕКТЫ.'}</div><h1>{project ? 'Над чем поработаем?' : 'Начните с проекта.'}</h1><p>{project ? 'Обсудите идею, задайте вопрос или поручите задачу. Агент сам выберет подход и подключит помощников, когда это полезно.' : 'Подключите локальную папку или Git-репозиторий. Чаты, память и работа агентов останутся в контексте проекта.'}</p>{project ? <div className="prompt-suggestions">{['Помоги разобраться в проекте', 'Давай обсудим новую функцию', 'Найди, что можно улучшить'].map(text => <button key={text} disabled={!desktop} onClick={() => setDrafts(previous => ({ ...previous, [chatKey]: text }))}>{text}<Icon name="arrow" size={14} /></button>)}</div> : <button className="primary-button" onClick={() => setPanel('add')}><Icon name="plus" />Подключить проект</button>}<div className="welcome-footnote">Отдельные чаты · Общая и проектная память · Агенты по задаче</div></div> : <div className="message-list">{chat.messages.map(message => <article key={message.id} className={`message ${message.author}`}><div className="message-avatar">{message.author === 'user' ? 'В' : message.author === 'system' ? '!' : <span className="tiny-orbit" />}</div><div className="message-content"><div className="message-meta"><strong>{message.author === 'user' ? 'Вы' : message.author === 'system' ? 'Система' : 'Orbit'}</strong>{message.model && <span>{message.model}</span>}<time>{timeOf(message.time)}</time></div><Markdown text={message.text} />{message.runId && lastAnswerOfRun.get(message.runId) === message.id && <TeamStrip run={runs[message.runId]} onOpen={openTeam} />}</div></article>)}{running && <div className="working-indicator"><span className="status-dot working" /><span>{pending.has(chatKey) && !workingRun ? 'Запускаем агента…' : 'Агент работает'}</span><button onClick={() => setAgentsOpen(true)}>Посмотреть действия <Icon name="agents" size={14} /></button></div>}{currentRun && !running && ['failed', 'error', 'cancelled', 'interrupted'].includes(currentRun.status) && <div className={`run-notice ${currentRun.status}`}><span className={`status-dot ${currentRun.status}`} /><span>{statusText(currentRun.status)}{currentRun.error ? `: ${currentRun.error}` : currentRun.status === 'interrupted' ? '. Приложение закрылось во время работы. Можно продолжить новым сообщением.' : ''}</span><button onClick={() => setAgentsOpen(true)}>Подробности</button></div>}</div>}
         <div ref={bottom} />
       </div>
       <div className="composer-area"><label className="improvement-toggle"><input type="checkbox" checked={!!state.settings.improvementMode} onChange={event => updateSettings({ improvementMode: event.target.checked })} />Бесконечное улучшение{running && <small> · для следующей задачи</small>}</label><form className={`composer ${running ? 'is-running' : ''}`} onSubmit={send}><textarea aria-label="Сообщение агенту" placeholder={!project ? 'Сначала подключите проект' : running ? 'Можно подготовить следующее сообщение…' : 'Напишите агенту…'} value={draft} disabled={!desktop || !project || !chat || !ready} onChange={event => setDrafts(previous => ({ ...previous, [chatKey]: event.target.value }))} onKeyDown={event => { if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); if (!running) void send() } }} rows={2} /><div className="composer-toolbar"><div className="composer-options"><select aria-label="Провайдер" value={state.settings.providerId} onChange={event => updateSettings({ providerId: event.target.value })}>{providers.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}</select><ModelPicker key={state.settings.providerId} value={state.settings.models[state.settings.providerId] || ''} models={modelChoices} onChange={model => updateSettings({ models: { ...state.settings.models, [state.settings.providerId]: model } })} /><ReasoningPicker providerId={state.settings.providerId} model={state.settings.models[state.settings.providerId] || ''} health={currentHealth} value={selectedEffort} onChange={reasoningEffort => updateSettings({ providerOptions: { ...state.settings.providerOptions, [state.settings.providerId]: { ...state.settings.providerOptions?.[state.settings.providerId], reasoningEffort } } })} /><select aria-label="Уровень доступа" title="Доступ наследуется всеми агентами задачи" value={accessChoice} onChange={event => chooseAccess(event.target.value)}><option value="ask">Ask — спрашивать</option><option value="danger-full-access">Full access</option><option value="workspace-write">Только проект</option><option value="read-only">Только чтение</option></select></div>{running ? <button type="button" className="send-button stop-button" aria-label="Остановить агентов" disabled={!workingRun} onClick={() => void stop()}><Icon name="stop" /></button> : <button className="send-button" type="submit" aria-label="Отправить сообщение" disabled={!draft.trim() || !desktop || !project || !chat || !ready}><Icon name="arrow" /></button>}</div></form><div className="composer-caption"><span>{!ready ? 'Восстанавливаем историю…' : currentHealth && !currentHealth.available ? `${providers.find(p => p.id === currentHealth.id)?.name}: ${currentHealth.detail}` : state.settings.models[state.settings.providerId] || 'Модель по настройкам провайдера'}</span><span>Enter — отправить · Shift + Enter — новая строка</span></div></div>
@@ -412,7 +447,7 @@ export default function App() {
       {chatRuns.length > 1 && <select className="run-select" aria-label="Запуск" value={currentRun?.runId || ''} onChange={event => { setSelection(previous => ({ ...previous, [chatKey]: event.target.value })); setSelectedAgent('root') }}>{[...chatRuns].reverse().map((run, i) => <option key={run.runId} value={run.runId}>{i === 0 ? 'Последний' : timeOf(run.startedAt)} · {statusText(run.status)} · {run.prompt.slice(0, 28)}</option>)}</select>}
       {!currentRun?.agents.length ? <div className="panel-empty"><Icon name="agents" size={34} /><h3>Команда появится здесь</h3><p>После отправки сообщения здесь будут реальные агенты, их задачи и действия. Подагенты создаются по необходимости.</p></div> : <>
         <div className="run-summary"><span className={`status-dot ${currentRun.status}`} />{statusText(currentRun.status)}<span>{currentRun.agents.length} агентов</span></div>
-        <div className="agent-tree">{agentTree(currentRun.agents)}</div>
+        <div className="agent-tree">{agentTree(currentRun.agents)}{(currentRun.agents.length > 1 || !!currentRun.communications?.length) && <button className={`agent-row router-row ${selected?.id === 'router' ? 'selected' : ''}`} onClick={() => setSelectedAgent('router')}><span className={`status-dot ${routerAgent.status}`} /><span className="agent-row-label"><strong>{routerAgent.name}</strong><small>Адресует сообщения и следит за общими файлами</small></span><span className="agent-state">{(currentRun.router?.routed ?? 0) + (currentRun.router?.notices ?? 0)}</span></button>}</div>
         {selected && <AgentInspector key={currentRun.runId} run={currentRun} agent={selected} onSelect={setSelectedAgent} />}
       </>}
     </aside>}
@@ -427,26 +462,77 @@ export default function App() {
   </div>
 }
 
+function TeamStrip({ run, onOpen }: { run?: RunSnapshot; onOpen: (runId: string) => void }) {
+  const helpers = (run?.agents || []).filter(agent => agent.id !== 'root')
+  if (!run || !helpers.length) return null
+  const changed = changedFiles(run)
+  return <button type="button" className="team-strip" onClick={() => onOpen(run.runId)} title="Открыть команду этого запуска: действия, переписку и файлы">
+    <span className="team-strip-title"><Icon name="agents" size={13} />Команда · {helpers.length}</span>
+    {helpers.slice(0, 5).map(agent => <span key={agent.id} className="team-chip"><span className={`status-dot ${agent.status}`} />{agent.name}</span>)}
+    {helpers.length > 5 && <span className="team-chip more">+{helpers.length - 5}</span>}
+    {!!changed && <span className="team-files">{plural(changed, ['файл изменён', 'файла изменено', 'файлов изменено'])}</span>}
+  </button>
+}
+
+function FileChips({ label, files }: { label: string; files: string[] }) {
+  if (!files.length) return null
+  return <div className="file-group"><span className="file-group-label">{label}</span><div className="file-pills">{files.slice(0, 12).map(file => <code key={file} title={file}>{file}</code>)}{files.length > 12 && <span className="file-more">+{files.length - 12}</span>}</div></div>
+}
+
+function FilesTab({ run, agent, onSelect }: { run: RunSnapshot; agent: Agent; onSelect: (id: string) => void }) {
+  const [onlySelected, setOnlySelected] = useState(agent.id !== 'router')
+  const nameOfAgent = (id: string) => run.agents.find(member => member.id === id)?.name || id
+  const scoped = agent.id === 'router' ? false : onlySelected
+  const files = fileMap(run).filter(file => !scoped || file.readers.includes(agent.id) || file.writers.includes(agent.id))
+    .sort((a, b) => Number(b.writers.length > 0 && new Set([...b.writers, ...b.readers]).size > 1) - Number(a.writers.length > 0 && new Set([...a.writers, ...a.readers]).size > 1))
+  return <div className="agent-files">
+    <div className="communications-heading"><h3>{scoped ? agent.name : 'Файлы команды'}</h3><p>Кто читал и кто менял файлы в этом запуске. Данные берутся из инструментов Orbit и событий нативных инструментов провайдера. Изменения от команд учитываются, только если их мог сделать один агент.</p></div>
+    {agent.id !== 'router' && <label className="communications-filter"><input type="checkbox" checked={onlySelected} onChange={event => setOnlySelected(event.target.checked)} /><span>Только файлы {agent.name}</span></label>}
+    {!files.length ? <div className="communications-empty"><Icon name="folder" size={26} /><p>{scoped ? 'Этот агент пока не читал и не менял файлы.' : 'Агенты пока не читали и не меняли файлы.'}</p></div> : files.map(file => {
+      const shared = file.writers.length > 0 && new Set([...file.writers, ...file.readers]).size > 1
+      return <article key={file.path} className={`file-row ${shared ? 'shared' : ''}`}>
+        <code title={file.path}>{file.path}</code>
+        {shared && <span className="file-shared">общий файл</span>}
+        <div className="file-agents">{file.writers.map(id => <button key={`w-${id}`} onClick={() => onSelect(id)} title={`${nameOfAgent(id)} изменил файл`}>✎ {nameOfAgent(id)}</button>)}{file.readers.filter(id => !file.writers.includes(id)).map(id => <button key={`r-${id}`} className="reader" onClick={() => onSelect(id)} title={`${nameOfAgent(id)} прочитал файл`}>{nameOfAgent(id)}</button>)}</div>
+      </article>
+    })}
+  </div>
+}
+
 function AgentInspector({ run, agent, onSelect }: { run: RunSnapshot; agent: Agent; onSelect: (id: string) => void }) {
-  const [tab, setTab] = useState<'activity' | 'communications' | 'graph'>('activity')
+  const [tab, setTab] = useState<'activity' | 'communications' | 'files' | 'graph'>('activity')
   const [onlySelected, setOnlySelected] = useState(false)
+  const isRouter = agent.id === 'router'
   const allMessages = run.communications || []
-  const communications = onlySelected ? allMessages.filter(message => message.fromAgentId === agent.id || message.toAgentId === agent.id) : allMessages
+  const routed = (message: Communication) => message.kind === 'notice' || (message.via === 'router' && !!message.route && message.route.via !== 'direct')
+  const communications = onlySelected ? allMessages.filter(message => isRouter ? routed(message) : message.fromAgentId === agent.id || message.toAgentId === agent.id) : allMessages
   const traces = run.traces.filter(trace => (trace.agentId || 'root') === agent.id)
   const replies = run.messages.filter(message => (message.agentId || 'root') === agent.id)
+  const touched = fileMap(run).length
   return <div className="agent-inspector-shell">
     <nav className="inspector-tabs" aria-label="Сведения об агентах">
       <button className={tab === 'activity' ? 'active' : ''} aria-pressed={tab === 'activity'} onClick={() => setTab('activity')}>Действия</button>
       <button className={`communication-tab ${tab === 'communications' ? 'active' : ''}`} aria-label="Переписка" aria-pressed={tab === 'communications'} onClick={() => setTab('communications')}>Переписка{!!allMessages.length && <span>{allMessages.length}</span>}</button>
+      <button className={`communication-tab ${tab === 'files' ? 'active' : ''}`} aria-label="Файлы" aria-pressed={tab === 'files'} onClick={() => setTab('files')}>Файлы{!!touched && <span>{touched}</span>}</button>
       <button className={tab === 'graph' ? 'active' : ''} aria-label="Граф агентов" aria-pressed={tab === 'graph'} onClick={() => setTab('graph')}>Граф</button>
     </nav>
     <div className="agent-inspector">
-    {tab === 'activity' ? <>
+    {tab === 'activity' && isRouter ? <>
+      <div className="inspector-heading"><div className="eyebrow">СИСТЕМНЫЙ УЧАСТНИК</div><h3>{agent.name}</h3><span>Работает без модели: не тратит ходы и не может зациклиться</span></div>
+      <div className="agent-task">Все сообщения между агентами проходят здесь. Маршрутизатор находит адресата по файлам и теме, сообщает агентам, что кто-то изменил файл, который они читали, и закрывает обсуждение, в котором никто ничего не делает.</div>
+      <p className="agent-budget">Доставлено адресно: {run.router?.routed ?? 0} · Уведомлений об изменениях: {run.router?.notices ?? 0} · Остановлено повторов и споров: {run.router?.refused ?? 0}</p>
+      <div className="section-label">РЕШЕНИЯ МАРШРУТИЗАТОРА</div>
+      <div className="agent-events">
+        {traces.map(trace => <details className="trace-item" key={trace.id}><summary><span className="trace-kind message" /><span>{trace.text.slice(0, 120)}</span><time>{timeOf(trace.time)}</time></summary><pre>{trace.text}</pre></details>)}
+        {!traces.length && <p className="muted">Адресных обращений пока не было. Уведомления об изменённых файлах смотрите во вкладке «Переписка».</p>}
+      </div>
+    </> : tab === 'activity' ? <>
       <div className="inspector-heading"><div className="eyebrow">{agent.parentId ? 'ПОДАГЕНТ' : 'ОСНОВНОЙ АГЕНТ'}</div><h3>{agent.name}</h3><span>{providers.find(provider => provider.id === agent.providerId)?.name || agent.providerId || run.providerId}{agent.model ? ` · ${agent.model}` : ''}{agent.reasoningEffort ? ` · Рассуждения: ${effortLabels[agent.reasoningEffort] || agent.reasoningEffort}` : ''}{agent.generation ? ` · Продолжение ${agent.generation}` : ''}</span></div>
       {agent.task && <div className="agent-task">{agent.task}</div>}
       {agent.reason && <p className="agent-reason">{agent.reason}</p>}
       <p className="agent-budget">{agent.parentId ? `Ходы: ${agent.turns || 0} / ${run.limits?.maxTurns ?? '∞'}` : `Ходы: ${agent.turns || 0} · без ограничения`}{agent.budgetLimited && (agent.stalled ? ' · Остановлен: повторял одни и те же вызовы, результаты сохранены' : ' · Лимит достигнут, результаты сохранены')}</p>
       {run.usage && <p className="agent-budget">Работают: {run.agents.filter(member => member.status === 'working').length} · Ходы помощников: {run.usage.workerTurns ?? '—'} / {run.limits?.maxTotalTurns ?? '∞'}</p>}
+      {!!(agent.files?.wrote.length || agent.files?.read.length) && <div className="agent-files-summary"><FileChips label="Изменил" files={agent.files?.wrote || []} /><FileChips label="Читал" files={agent.files?.read || []} /></div>}
       {agent.id === 'root' && !!run.improvements?.length && <div className="improvement-progress"><strong>Улучшения: {run.improvements.filter(task => task.status === 'done').length} / {run.improvements.length}</strong>{run.improvements.map(task => <details key={task.id}><summary>{({ pending: '○', working: '◐', done: '✓', blocked: '!' })[task.status]} {task.title}</summary><p>{task.evidence || 'Ожидает выполнения'}</p></details>)}</div>}
       <div className="section-label">ДЕЙСТВИЯ И РЕЗУЛЬТАТЫ</div>
       <div className="agent-events">
@@ -456,13 +542,14 @@ function AgentInspector({ run, agent, onSelect }: { run: RunSnapshot; agent: Age
         {replies.map(message => <div className="agent-output" key={message.id}><div className="eyebrow">ОТВЕТ · {timeOf(message.time)}</div><Markdown text={message.text} /></div>)}
         {!traces.length && !replies.length && <p className="muted">{agent.detail || 'Событий пока нет.'}</p>}
       </div>
-    </> : tab === 'graph' ? <AgentGraph agents={run.agents} selectedId={agent.id} onSelect={onSelect} /> : <div className="agent-communications">
-      <div className="communications-heading"><h3>{onlySelected ? agent.name : 'Вся команда'}</h3><p>Сообщения между агентами этого запуска.</p></div>
-      <label className="communications-filter"><input type="checkbox" checked={onlySelected} onChange={event => setOnlySelected(event.target.checked)} /><span>Только с участием {agent.name}</span></label>
-      {!communications.length ? <div className="communications-empty"><Icon name="chat" size={26} /><p>{onlySelected ? 'У этого агента пока нет переписки.' : 'Агенты ещё не обменивались сообщениями.'}</p></div> : communications.map(message => <article className="communication-item" key={message.id}>
-        <div className="communication-kind">{message.kind === 'spawn' ? 'Создание агента · исходная задача' : message.kind === 'followup' ? 'Новая задача существующему агенту' : message.discussionId ? 'Сообщение группе' : message.replyTo ? 'Ответ в обсуждении' : 'Сообщение'}</div>
+    </> : tab === 'graph' ? <AgentGraph agents={run.agents} selectedId={agent.id} onSelect={onSelect} /> : tab === 'files' ? <FilesTab key={agent.id} run={run} agent={agent} onSelect={onSelect} /> : <div className="agent-communications">
+      <div className="communications-heading"><h3>{onlySelected ? agent.name : 'Вся команда'}</h3><p>Сообщения между агентами этого запуска. Каждое проходит через маршрутизатор; он же сообщает об изменениях общих файлов.</p></div>
+      <label className="communications-filter"><input type="checkbox" checked={onlySelected} onChange={event => setOnlySelected(event.target.checked)} /><span>{isRouter ? 'Только решения маршрутизатора: подбор адресата и уведомления' : `Только с участием ${agent.name}`}</span></label>
+      {!communications.length ? <div className="communications-empty"><Icon name="chat" size={26} /><p>{onlySelected ? 'У этого агента пока нет переписки.' : 'Агенты ещё не обменивались сообщениями.'}</p></div> : communications.map(message => <article className={`communication-item ${message.kind === 'notice' ? 'notice' : ''} ${message.conflict ? 'conflict' : ''}`} key={message.id}>
+        <div className="communication-kind">{message.kind === 'notice' ? (message.conflict ? 'Маршрутизатор · конфликт правок' : 'Маршрутизатор · файл изменён другим агентом') : message.kind === 'spawn' ? 'Создание агента · исходная задача' : message.kind === 'followup' ? 'Новая задача существующему агенту' : message.route && message.route.via !== 'direct' ? (message.replyTo ? 'Ответ в обсуждении · через маршрутизатор' : 'Адресовано маршрутизатором') : message.discussionId ? 'Сообщение группе' : message.replyTo ? 'Ответ в обсуждении' : 'Сообщение'}</div>
         <div className="communication-route"><strong title={message.fromAgentId}>{message.fromAgentName || message.fromAgentId}</strong><span aria-label="пишет">→</span><strong title={message.toAgentId}>{message.toAgentName || message.toAgentId}</strong></div>
         {message.reason && <p className="agent-reason">{message.reason}</p>}
+        {message.via === 'router' && message.route && message.route.via !== 'direct' && <p className="agent-reason route-reason">Маршрутизатор: {routeLabel[message.route.via] || message.route.via}{message.route.reasons.length ? ` · ${message.route.reasons.join('; ')}` : ''}</p>}
         {message.replyTo && <blockquote className="communication-reply">{allMessages.find(item => item.id === message.replyTo)?.text.slice(0, 160) || 'Ответ на более раннее сообщение'}</blockquote>}
         <Markdown text={message.text} />
         <div className="communication-meta"><time dateTime={message.time}>{timeOf(message.time)}</time><span className={`delivery-status ${message.status}`} title={message.readAt ? `Прочитано ${timeOf(message.readAt)}` : message.deliveredAt ? `Доставлено ${timeOf(message.deliveredAt)}` : 'Будет доступно агенту на следующем ходе'}>{{ queued: 'В очереди', delivered: 'Доставлено', read: 'Прочитано' }[message.status] || 'Отправлено'}</span></div>

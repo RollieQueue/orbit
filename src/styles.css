@@ -22,3 +22,34 @@
 .pool-row input, .pool-row select { min-width: 0; }
 .improvement-progress { font-size: 12px; line-height: 1.6; padding: 12px 0; }
 .improvement-progress details { margin: 6px 0; }
+/* Team visibility: index status, the team strip under an answer, files touched per agent, the router. */
+.project-index-row{display:flex;align-items:center;gap:8px;width:100%;padding:9px 12px;margin:0 0 12px;border:1px solid #2f3238;border-radius:8px;font-size:12px;color:var(--muted);text-align:left}
+.project-index-row>span{flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.project-index-row:hover:not(:disabled){color:var(--accent);border-color:#3d4a42}
+.project-index-row:disabled{opacity:.7;cursor:progress}
+.team-strip{display:flex;align-items:center;flex-wrap:wrap;gap:6px;margin-top:12px;padding:8px 10px;border:1px solid #2f3a33;border-radius:8px;background:#1b211d;color:#a9bbb0;font-size:11px;text-align:left;max-width:100%}
+.team-strip:hover{border-color:#43584a;background:#1f2822}
+.team-strip-title{display:inline-flex;align-items:center;gap:6px;font-weight:600;color:#cfe3d6;margin-right:4px}
+.team-chip{display:inline-flex;align-items:center;gap:6px;padding:2px 8px;border-radius:999px;background:#26312a;color:#c4d6ca;max-width:160px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.team-chip.more{color:#8fa596}
+.team-files{margin-left:auto;color:#8fa596}
+.agent-row.router-row{border-top:1px dashed #30363a;margin-top:6px}
+.agent-files-summary{margin:14px 0 4px}
+.file-group{display:flex;gap:10px;align-items:flex-start;margin:8px 0;font-size:11px}
+.file-group-label{flex:0 0 58px;color:var(--muted);padding-top:3px}
+.file-pills{display:flex;flex-wrap:wrap;gap:5px;min-width:0}
+.file-pills code,.file-row>code{font-size:10px;padding:2px 6px;border-radius:5px;background:#22282a;color:#bccbc3;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.file-more{color:var(--muted);padding-top:3px}
+.file-row{border:1px solid #30383a;border-radius:8px;background:#1c2121;padding:11px 12px;margin-bottom:10px}
+.file-row.shared{border-color:#5a5233;background:#221f17}
+.file-row>code{display:block;background:none;padding:0;font-size:11px;color:#d3ddd8;margin-bottom:8px}
+.file-shared{display:inline-block;font-size:10px;color:#d4bf82;margin:-2px 0 8px}
+.file-agents{display:flex;flex-wrap:wrap;gap:6px}
+.file-agents button{font-size:10px;padding:3px 9px;border-radius:999px;background:#2a3a30;color:#cfe3d6}
+.file-agents button.reader{background:#252a2d;color:#a4afb3}
+.file-agents button:hover{filter:brightness(1.2)}
+.communication-item.notice{border-color:#4b4a33;background:#23231a}
+.communication-item.notice .communication-kind{color:#cdbf7d}
+.communication-item.conflict{border-color:#7a4a44;background:#2a1e1d}
+.communication-item.conflict .communication-kind{color:#e0958c}
+.agent-reason.route-reason{margin:-4px 0 12px;color:#8fb4a0}

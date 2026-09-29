@@ -21,7 +21,10 @@ export type Agent = {
   turns?: number
   budgetLimited?: boolean
   stalled?: boolean
+  files?: AgentFiles
 }
+export type AgentFiles = { read: string[]; wrote: string[] }
+export type FileTouch = { path: string; readers: string[]; writers: string[] }
 export type Message = {
   id: string
   author: 'user' | 'orbit' | 'system'
@@ -71,10 +74,16 @@ export type Communication = {
   delivery: 'next-turn' | 'mailbox'
   deliveredAt?: string
   readAt?: string
-  kind?: 'spawn' | 'followup' | 'message'
+  kind?: 'spawn' | 'followup' | 'message' | 'notice'
   reason?: string
   replyTo?: string
   discussionId?: string
+  via?: 'router'
+  route?: { via: 'direct' | 'explicit' | 'match' | 'reply' | 'escalation'; reasons: string[] }
+  about?: string
+  aboutName?: string
+  paths?: string[]
+  conflict?: boolean
 }
 export type RunSnapshot = {
   runId: string
@@ -87,6 +96,8 @@ export type RunSnapshot = {
   traces: TraceItem[]
   messages: Message[]
   communications: Communication[]
+  files?: FileTouch[]
+  router?: { routed: number; notices: number; refused: number }
   startedAt: string
   updatedAt?: string
   finishedAt?: string

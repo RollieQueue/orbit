@@ -16,6 +16,7 @@ interface Window {
     startTask: (payload: { projectId: string; chatId: string; prompt: string; history: { role: 'user' | 'assistant'; content: string }[]; workspace: string; memoryEnabled: boolean; globalMemoryEnabled?: boolean; reasoningEffort?: string; providerId: string; model?: string; providerPool?: import('./types').PoolMember[]; providerOptions?: Record<string, import('./types').ProviderOption>; agentInstructions: string; accessMode: import('./types').AccessMode; approvalPolicy: import('./types').ApprovalPolicy; limits: import('./types').RunLimits }) => Promise<string>
     stopTask: (runId: string) => Promise<boolean>
     listRuns: () => Promise<import('./types').RunSnapshot[]>
+    projectIndexStatus: (workspace: string, rebuild?: boolean) => Promise<ProjectIndexStatus | null>
     getRun: (runId: string) => Promise<import('./types').RunSnapshot | null>
     loadState: () => Promise<import('./types').AppState | null>
     saveState: (state: import('./types').AppState) => Promise<unknown>
@@ -32,6 +33,14 @@ interface Window {
     openExternal: (target: string) => Promise<void>
     platform: string
   }
+}
+interface ProjectIndexStatus {
+  files: number
+  lines: number
+  languages: Record<string, number>
+  omitted: number
+  updatedAt: string | null
+  indexing: boolean
 }
 interface ProviderHealth {
   id: string
@@ -66,4 +75,5 @@ interface RuntimeEvent {
   improvements?: import('./types').ImprovementTask[]
   improvementStatus?: string
   usage?: { providerTurns: number; workerTurns?: number }
+  router?: { routed: number; notices: number; refused: number }
 }
