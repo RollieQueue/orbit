@@ -3,9 +3,9 @@ const assert = require('node:assert/strict')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
-const { FileActivity } = require('../electron/file-activity.cjs')
-const { TeamRouter, MAX_EXCHANGE } = require('../electron/router.cjs')
-const { OrbitRuntime } = require('../electron/runtime.cjs')
+const { FileActivity } = require('../electron/file-activity.mts')
+const { TeamRouter, MAX_EXCHANGE } = require('../electron/router.mts')
+const { OrbitRuntime } = require('../electron/runtime.mts')
 
 function folder(t) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'orbit-router-'))

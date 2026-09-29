@@ -5,12 +5,15 @@ It also supports Ollama and an explicitly configured OpenAI-compatible endpoint.
 Orbit 0.3 also supports Antigravity and Cursor subscription CLIs; see the setup
 section below. OpenCode remains unsupported.
 
-| Provider | Setup | Model selection | Live output |
-| --- | --- | --- | --- |
-| Codex | Install Codex CLI and run `codex login` | Chat setting, otherwise CLI default | JSONL assistant messages, command/file/MCP/search activity |
-| Claude Code | Install Claude Code and sign in there | Chat setting, otherwise CLI default | Text deltas, tool calls and tool results |
-| Ollama | Start Ollama with an already installed model | Chat setting, `ORBIT_OLLAMA_MODEL`, otherwise an unambiguous installed model | Generated text deltas |
-| Compatible endpoint | Set `ORBIT_OPENAI_BASE_URL` | Chat setting or `ORBIT_OPENAI_MODEL` required | Chat Completions SSE, with JSON response compatibility |
+| Provider | Setup | Model selection | Transport | Live output |
+| --- | --- | --- | --- | --- |
+| Codex | Install Codex CLI and run `codex login` | Chat setting, otherwise CLI default | `session` (exec thread resumed per turn; App Server in Ask mode) | JSONL assistant messages, command/file/MCP/search activity |
+| Claude Code | Install Claude Code and sign in there | Chat setting, otherwise CLI default | `session` (`--session-id` / `--resume`) | Text deltas, tool calls and tool results |
+| Ollama | Start Ollama with an already installed model | Chat setting, `ORBIT_OLLAMA_MODEL`, otherwise an unambiguous installed model | `envelope` | Generated text deltas |
+| Compatible endpoint | Set `ORBIT_OPENAI_BASE_URL` | Chat setting or `ORBIT_OPENAI_MODEL` required | `envelope` | Chat Completions SSE, with JSON response compatibility |
+
+Antigravity and Cursor use the `envelope` transport. `transportFor(providerId, options)` returns the transport;
+`ORBIT_LEGACY_ENVELOPE=1` forces the envelope for every provider. See "Session transport" below.
 
 For custom installations, `ORBIT_CODEX_COMMAND` and `ORBIT_CLAUDE_COMMAND` can name
 an executable. On Windows, native executables and ordinary npm Node shims work;
@@ -44,11 +47,101 @@ Prompts go through stdin, including on Windows. Commands use `shell: false`.
 The prompt, project path, and model name are never assembled into shell code.
 This also avoids Windows command-line length limits for conversation context.
 
-The default invocation deadline is 30 minutes. Set `ORBIT_PROVIDER_TIMEOUT_MS`
-or pass `timeoutMs` for a different positive millisecond deadline. Cancellation
-kills the CLI process tree on Windows and its process group on POSIX; HTTP
-requests are aborted. stdout and stderr are consumed incrementally and bounded
-to 32 MB per invocation, with only a small raw diagnostic tail retained.
+Two timers watch a CLI. The inactivity timer (`inactivityMs`, default 15 minutes,
+env `ORBIT_PROVIDER_INACTIVITY_MS`, `null` disables) kills a process that has
+written nothing to stdout or stderr for that long; in session mode an Orbit tool
+call in flight (`session.activity()` reports `pending > 0`) defers the verdict,
+because a CLI waiting on `wait_agent` is silent by design. The total deadline
+(`timeoutMs`) applies to a session run only when the caller passes one
+(`run.limits.timeoutMs`); envelope runs and direct `runProvider` calls without
+`timeoutMs` keep the 30-minute default, `ORBIT_PROVIDER_TIMEOUT_MS` overrides it.
+Cancellation kills the CLI process tree on Windows and its process group on
+POSIX; HTTP requests are aborted. stdout and stderr are consumed incrementally
+and bounded to 32 MB per invocation, with only a small raw diagnostic tail retained.
+
+## Session transport
+
+**Proxies.** A CLI started for a session inherits the user's environment, and `HTTP_PROXY`/`HTTPS_PROXY` (a VPN or a
+corporate proxy) would route its calls to Orbit's loopback MCP server through the proxy, which cannot reach
+`127.0.0.1` of this machine; Claude Code then reports the server as `failed` and the model never sees the Orbit tools.
+Orbit therefore adds `127.0.0.1`, `localhost` and `::1` to `NO_PROXY`/`no_proxy` of every session process
+(`providers.loopbackNoProxy`), keeping whatever the variable already listed. Verified live on 2026-09-29 with
+`HTTP_PROXY=http://127.0.0.1:12334` set: without the exclusion the server was `failed`, with it Claude Code connected in 137 ms.
+
+**Live check.** `node scripts/smoke-session-live.cjs [model] [effort]` (default `haiku low`) spends a little of the user's
+Claude quota to prove the session transport end to end: a restricted agent creates a file through `write_file` over MCP
+(one process, exact diff recorded), then a root agent spawns one helper, waits for it over MCP and is resumed with the
+result. Report: `artifacts/session-live.json`. Measured 2026-09-29: 9 s and 24 s.
+
+Session mode keeps one CLI conversation per agent instead of restarting the CLI
+with the whole transcript at every Orbit tool call. Orbit tools reach the CLI as
+an MCP server (`electron/mcp-server.mts`: streamable HTTP on `127.0.0.1`,
+ephemeral port, one bearer token per run and agent, `tools/list` from
+`electron/tool-registry.mts`, `tools/call` dispatched to the runtime). The
+registry is the single source of truth for every Orbit tool: name, prompt
+signature, description, JSON-Schema input, `rootOnly`, `waits`, `mutating`,
+`minAccess`; the envelope prompt text and the envelope response schema are both
+derived from it, so envelope providers still see exactly the text they saw before.
+The internal `approve` tool is listed only for tokens issued with `approve: true`
+and answers Claude Code's `--permission-prompt-tool` with the JSON string
+`{"behavior":"allow","updatedInput":…}` or `{"behavior":"deny","message":…}`.
+
+`runProvider({ …, session: { id, token, mcpUrl, systemAppend, resume, activity } })`
+runs one session turn and returns `{ providerId, client, transport: 'session',
+sessionId, text, model, access }`. `sessionId` is the id to pass back as
+`session.id` with `resume: true` on the next turn. Usage still arrives through
+the completion `observation` event, once. MCP tool calls appear in the stream as
+`kind: 'tool'` events with `tool: 'mcp__orbit__<name>'` (Claude) or
+`tool: 'mcp_tool_call'` (Codex), `orbitTool: '<name>'`, `mcp: true` and
+`native: false`; their results carry the same `orbitTool`.
+
+Claude Code (checked against 2.1.284, no prompt was run):
+
+```text
+claude --print --output-format stream-json --verbose --include-partial-messages
+       --session-id <uuid chosen by Orbit>            first turn
+       --resume <that uuid>                            follow-ups
+       --mcp-config '{"mcpServers":{"orbit":{"type":"http","url":"http://127.0.0.1:<port>/mcp","headers":{"Authorization":"Bearer <token>"}}}}'
+       --strict-mcp-config --allowedTools mcp__orbit__*
+       [--tools Read,Glob,Grep]                        every mode except Full access
+       [--append-system-prompt-file <temp file>]       the stable Orbit block, removed after the run
+       [--permission-prompt-tool mcp__orbit__approve]  Ask mode only
+       --permission-mode default|bypassPermissions [--model m] [--effort level]
+```
+
+The prompt goes through stdin. There is no `--no-session-persistence` (a resume
+needs the session file) and no `ORBIT_RESPONSE_SCHEMA`. The session id comes
+back in `system/init` and `result`. The child gets
+`CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT` (24 h unless already set): Claude Code drops
+an idle HTTP tool call after 5 minutes by default, and a `wait_agent` legitimately
+takes longer; the MCP server also sends `notifications/progress` every 15 s while
+a call runs. The `--mcp-config` JSON, token included, is visible on the command
+line of a loopback-only process; the token belongs to one agent and is revoked
+when it ends.
+
+Codex exec (checked against 0.155):
+
+```text
+codex exec --json --skip-git-repo-check -C <ws> --sandbox <mode> -c features.multi_agent=false
+     -c 'mcp_servers.orbit.url="http://127.0.0.1:<port>/mcp"' -c 'mcp_servers.orbit.bearer_token_env_var="ORBIT_MCP_TOKEN"'
+     [-c approval_policy="never" | --approve-for-me] [--model m] [-c model_reasoning_effort="x"] -
+codex exec resume --json --skip-git-repo-check -c sandbox_mode="<mode>" -c features.multi_agent=false
+     -c mcp_servers.orbit.* … <thread id> -
+```
+
+`ORBIT_MCP_TOKEN` is in the child environment, never on the command line. No
+`--ephemeral`: the thread must persist for `resume`. The thread id comes from the
+`thread.started` event. `codex exec resume` accepts neither `-C` nor `--sandbox`
+nor `--approve-for-me`, so the process cwd is the workspace, the sandbox travels as
+`sandbox_mode`, and an auto-review resume keeps the thread's own approval policy.
+
+Codex Ask mode keeps one App Server process and one thread alive for the agent
+(`thread/start` with `ephemeral: false`, then one `turn/start` per Orbit turn; a
+resume whose process is gone tries `thread/resume` and falls back to a new
+thread). The MCP server goes in as `-c mcp_servers.orbit.*` on the process.
+`providers.closeSession(sessionId)` ends the process; a session idle for
+`ORBIT_SESSION_IDLE_MS` (default 30 minutes) ends itself, and cancellation kills
+the process tree before the turn settles.
 
 Codex Ask mode uses the stdio App Server with `on-request` approvals and a
 `workspace-write` sandbox. Native command, file-change and permission requests
@@ -58,8 +151,10 @@ Other modes use `codex exec` with the selected sandbox and no interactive
 escalation. Full access uses `danger-full-access` and `approval_policy="never"`.
 
 Both Codex transports override `features.multi_agent=false` for the spawned
-process only. Delegation uses Orbit's tool envelopes, so child
+process only. Delegation uses Orbit's tools, so child
 agents, their messages and results are owned by Orbit and shown in its UI.
+The rest of this section describes the envelope transport (Antigravity, Cursor,
+Ollama, compatible endpoints, and the CLIs under `ORBIT_LEGACY_ENVELOPE=1`).
 The first completed assistant message containing a validated, nonempty tool
 envelope transfers control to Orbit, including commentary. Both transports stop
 the provider process tree before returning that envelope to the runtime. Later
@@ -144,9 +239,13 @@ model family appears. Doubtful models are placed low, which only makes a replace
 ```js
 await runProvider({
   providerId, prompt, workspace, mode, accessMode, approvalPolicy,
-  model, signal, onEvent, timeoutMs,
+  model, signal, onEvent, timeoutMs, inactivityMs,
+  session, // { id, token, mcpUrl, systemAppend, resume, activity } for the session transport
 })
-// -> { providerId, client, text, model, access }
+// -> { providerId, client, text, model, access }                       envelope
+// -> { providerId, client, transport: 'session', sessionId, text, model, access }  session
+transportFor(providerId, options) // 'session' | 'envelope'
+closeSession(sessionId)           // ends a Codex App Server session; false when nothing was alive
 ```
 
 `text` is the exact final assistant text, preserving whitespace and JSON tool
@@ -186,6 +285,14 @@ finished child are enforced and recorded by the runtime.
 `node --test tests/providers.test.cjs` runs fixture parsers, real local child
 processes, process-tree cancellation, stdin/Unicode transport, and local HTTP
 streaming/error tests. It makes no inference request to a paid provider.
+`tests/providers-session.test.cjs` drives fake Claude and Codex CLIs through the
+session transport (session flags, temp system file, session-id parsing, resume
+arguments, inactivity and deadline timers, Codex config overrides and token
+environment, App Server sessions across turns with approvals, close and
+cancellation). `tests/mcp-server.test.cjs` talks to the Orbit MCP server with the
+SDK client (tools/list, tools/call, unread suffix, errors, 401, approve round
+trip, progress, stop). `tests/tool-registry.test.cjs` pins the prompt text and
+the envelope schema to their pre-registry bytes.
 `node --test tests/providers-messaging.test.cjs` connects the actual compatible
 SSE and Ollama NDJSON adapters to a local fixture server. The root and child
 exchange three Unicode/multiline messages through one provider slot, preserve

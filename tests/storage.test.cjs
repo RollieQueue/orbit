@@ -3,10 +3,10 @@ const assert = require('node:assert/strict')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
-const { OrbitMemoryStore } = require('../electron/memory.cjs')
-const { CapabilityStore } = require('../electron/capabilities.cjs')
-const { RunStore, StateStore } = require('../electron/run-store.cjs')
-const { writeJSON } = require('../electron/storage.cjs')
+const { OrbitMemoryStore } = require('../electron/memory.mts')
+const { CapabilityStore } = require('../electron/capabilities.mts')
+const { RunStore, StateStore } = require('../electron/run-store.mts')
+const { writeJSON } = require('../electron/storage.mts')
 
 function fixture(t) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'orbit-store-test-'))
@@ -134,7 +134,7 @@ test('a previous background flush error cannot discard a later terminal run snap
 })
 
 test('a temporary directory a process still holds is retried, never throws, and other paths are refused', async () => {
-  const { removeTemporaryDirectory } = require('../electron/storage.cjs')
+  const { removeTemporaryDirectory } = require('../electron/storage.mts')
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'orbit-probe-'))
   const child = require('node:child_process').spawn(process.execPath, ['-e', 'setTimeout(() => {}, 700)'], { cwd: directory, stdio: 'ignore' })
   await new Promise(resolve => setTimeout(resolve, 250))

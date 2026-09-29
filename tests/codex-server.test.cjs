@@ -1,8 +1,8 @@
 const test = require('node:test')
 const assert = require('node:assert/strict')
-const { runCodexServer } = require('../electron/codex-server.cjs')
-const { _testing, terminateProcess } = require('../electron/providers.cjs')
-const { ORBIT_RESPONSE_SCHEMA } = require('../electron/tool-schema.cjs')
+const { runCodexServer } = require('../electron/codex-server.mts')
+const { _testing, terminateProcess } = require('../electron/providers.mts')
+const { ORBIT_RESPONSE_SCHEMA } = require('../electron/tool-schema.mts')
 
 const fixture = `
 const readline = require('node:readline');

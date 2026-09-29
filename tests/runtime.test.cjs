@@ -3,10 +3,10 @@ const assert = require('node:assert/strict')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
-const { OrbitRuntime, parseResponse } = require('../electron/runtime.cjs')
-const { executeWorkspaceTool, workspacePath } = require('../electron/runtime-tools.cjs')
-const { OrbitMemoryStore } = require('../electron/memory.cjs')
-const { CapabilityStore } = require('../electron/capabilities.cjs')
+const { OrbitRuntime, parseResponse } = require('../electron/runtime.mts')
+const { executeWorkspaceTool, workspacePath } = require('../electron/runtime-tools.mts')
+const { OrbitMemoryStore } = require('../electron/memory.mts')
+const { CapabilityStore } = require('../electron/capabilities.mts')
 
 function folder(t) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'orbit-runtime-test-'))
@@ -870,6 +870,106 @@ test('old protocol answers and malformed repair examples never enter model conve
   const { snapshot } = await finished(runtime, payload(folder(t), { history }))
   assert.equal(snapshot.status, 'completed')
   assert.equal(history[0].content, broken, 'Saved user history is not mutated')
+})
+
+test('six consecutive polling turns get one nudge to wait, and the agent is not stopped for it', async t => {
+  const prompts = []
+  let turn = 0
+  const runtime = new OrbitRuntime({ runProvider: async ({ prompt }) => {
+    prompts.push(prompt)
+    turn++
+    // Every poll differs (a new key each time), so the loop guard sees no repeats; only the poll budget can notice.
+    return turn <= 9 ? response(tool('context_read', { key: `note-${turn}` })) : { text: 'polled enough' }
+  } })
+  const { snapshot } = await finished(runtime, payload(folder(t)))
+  assert.equal(snapshot.status, 'completed')
+  assert.equal(snapshot.summary.text, 'polled enough')
+  assert.equal(snapshot.agents[0].turns, 10)
+  assert.doesNotMatch(prompts[5], /POLL BUDGET/)
+  assert.match(prompts[6], /POLL BUDGET: your last 6 turns only polled/)
+  assert.match(prompts[6], /wait_agent \{timeout_ms\}/)
+  assert.equal(prompts.filter(prompt => /POLL BUDGET/.test(prompt)).length, 4, 'one instruction, kept in the transcript window from then on')
+  assert.ok(snapshot.traces.some(trace => trace.kind === 'budget' && /Poll budget/.test(trace.text)))
+})
+
+test('the inspector keeps the newest 2000 traces', async t => {
+  const runtime = new OrbitRuntime({ runProvider: () => new Promise(() => {}) })
+  const runId = await runtime.start(payload(folder(t)))
+  const run = runtime.runs.get(runId)
+  for (let index = 0; index < 2100; index++) runtime.trace(run, 'root', 'note', `trace ${index}`)
+  // The run's own background work (index refresh diagnostics, transport notes) may add a trace of another kind at any
+  // moment, so the cap is checked on the whole list and the order on the notes alone.
+  const others = run.traces.filter(trace => trace.kind !== 'note').map(trace => `${trace.kind}: ${trace.text}`)
+  assert.equal(run.traces.length, 2000, `unrelated traces: ${JSON.stringify(others)}`)
+  const notes = run.traces.filter(trace => trace.kind === 'note')
+  assert.equal(notes.at(-1).text, 'trace 2099')
+  assert.ok(Number(notes[0].text.slice('trace '.length)) >= 100, `oldest kept note is ${notes[0].text}; unrelated traces: ${JSON.stringify(others)}`)
+  assert.equal(notes.length, 2000 - others.length)
+  runtime.stop(runId)
+})
+
+test('run files are written in coalesced batches, not once per agent update, and the terminal write is immediate', async t => {
+  const saves = []
+  let turn = 0
+  const runtime = new OrbitRuntime({ runStore: { save: snapshot => saves.push(snapshot.status) }, runProvider: async () => ++turn <= 20 ? response(tool('context_save', { key: `k${turn}`, summary: `s${turn}` })) : { text: 'done' } })
+  const { snapshot } = await finished(runtime, payload(folder(t)))
+  assert.equal(snapshot.status, 'completed')
+  assert.ok(saves.length <= 4, `${saves.length} writes for 21 turns`)
+  assert.equal(saves.at(-1), 'completed')
+})
+
+test('listeners get one detached copy of each event: mutating it changes neither the run nor other listeners', async t => {
+  const seen = []
+  const runtime = new OrbitRuntime({ runProvider: async () => ({ text: 'answer' }) })
+  runtime.onEvent(event => { if (event.agent) event.agent.name = 'mutated' })
+  runtime.onEvent(event => { if (event.agent) seen.push(event.agent.name) })
+  const { snapshot } = await finished(runtime, payload(folder(t)))
+  assert.equal(snapshot.agents[0].name, 'Orbit')
+  assert.ok(seen.length > 0 && seen.every(name => name === 'mutated'), 'the copy is shared by the listeners of one emit')
+})
+
+test('tracked transcript sizes stay equal to the serialised transcript through trimming', async t => {
+  const workspace = folder(t)
+  for (let index = 1; index <= 30; index++) fs.writeFileSync(path.join(workspace, `big-${index}.txt`), `${`BODY_${index} `.padEnd(100, '.')}\n`.repeat(100))
+  let turn = 0
+  const runtime = new OrbitRuntime({ runProvider: async () => ++turn <= 30 ? response(tool('read_file', { path: `big-${turn}.txt`, limit: 100 })) : { text: 'done' } })
+  const { snapshot, runId } = await finished(runtime, payload(workspace, { limits: { maxContextChars: 40000 } }))
+  assert.equal(snapshot.status, 'completed')
+  const root = runtime.runs.get(runId).agentNodes.get('root')
+  assert.ok(root.transcript.length < 60, 'old observations were trimmed')
+  assert.equal(root.transcriptChars, JSON.stringify(root.transcript).length - root.transcript.length - 1)
+  assert.ok(root.transcript.length <= 2 || JSON.stringify(root.transcript).length <= 40000 * 2)
+})
+
+test('the envelope prompt takes its tool guide from the tool registry when one is present', async t => {
+  const prompts = []
+  const runtime = new OrbitRuntime({ registry: { describeForPrompt: (agent, run) => `REGISTRY GUIDE for ${agent.name} in ${run.workspace}` }, runProvider: async ({ prompt }) => { prompts.push(prompt); return { text: 'ok' } } })
+  const workspace = folder(t)
+  await finished(runtime, payload(workspace))
+  assert.ok(prompts[0].startsWith(`REGISTRY GUIDE for Orbit in ${fs.realpathSync(workspace)}`))
+  assert.doesNotMatch(prompts[0], /Orbit tool protocol:/)
+  const plain = new OrbitRuntime({ registry: null, runProvider: async ({ prompt }) => { prompts.push(prompt); return { text: 'ok' } } })
+  await finished(plain, payload(workspace))
+  assert.ok(prompts[1].startsWith('Orbit tool protocol:'), 'without a registry the inline text is used unchanged')
+})
+
+test('in envelope mode a tool envelope being typed never streams to the chat, a plain answer does under the final message id', async t => {
+  let turn = 0
+  const runtime = new OrbitRuntime({ runProvider: async ({ onEvent }) => {
+    if (++turn === 1) { onEvent({ kind: 'output', text: '{"content":"x","tool_calls":[', messageId: 'a', partial: true }); return response(tool('list_agents')) }
+    onEvent({ kind: 'output', text: 'Final ', messageId: 'b', partial: true }); onEvent({ kind: 'output', text: 'answer', messageId: 'b', partial: false })
+    return { text: 'Final answer' }
+  } })
+  const { snapshot, events } = await finished(runtime, payload(folder(t)))
+  const streaming = events.filter(event => event.type === 'message.streaming')
+  assert.ok(streaming.length >= 1)
+  assert.ok(streaming.every(event => !event.content.startsWith('{')))
+  assert.equal(streaming.at(-1).content, 'Final answer')
+  assert.equal(events.find(event => event.type === 'message.added').message.id, streaming[0].messageId)
+  const timings = snapshot.agents[0].turnTimings
+  assert.equal(timings.length, 2)
+  assert.deepEqual([timings[0].transport, timings[0].orbitToolCalls, timings[1].orbitToolCalls, timings[0].sessionId], ['envelope', 1, 0, null])
+  assert.ok(timings.every(timing => timing.startedAt && timing.endedAt && timing.firstEventAt && timing.promptChars > 0))
 })
 
 test('nullable schema arguments retain optional tool semantics', () => {

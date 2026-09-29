@@ -3,8 +3,8 @@ const assert = require('node:assert/strict')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
-const { OrbitMemoryStore, renderRecall, TIERS } = require('../electron/memory.cjs')
-const { writeJSON } = require('../electron/storage.cjs')
+const { OrbitMemoryStore, renderRecall, TIERS } = require('../electron/memory.mts')
+const { writeJSON } = require('../electron/storage.mts')
 
 const DAY = 86400000
 function fixture(t) {
@@ -195,8 +195,8 @@ test('old memory files load with sane defaults, keep quarantined records on disk
 })
 
 test('automatic notes of a chat are budgeted per chat; a busy chat cannot push out another, old chats and old notes expire', t => {
-  const { saveNote, pruneAutomatic } = require('../electron/shared-context.cjs')
-  const { ProjectContextStore } = require('../electron/project-context.cjs')
+  const { saveNote, pruneAutomatic } = require('../electron/shared-context.mts')
+  const { ProjectContextStore } = require('../electron/project-context.mts')
   const { root, a } = fixture(t), store = new ProjectContextStore(root)
   saveNote(store, a, {}, { key: 'deliberate', summary: 'kept on purpose' })
   saveNote(store, a, {}, { key: 'agent:quiet:Scout', summary: 'result of a quiet chat' })

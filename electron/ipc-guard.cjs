@@ -1,5 +1,21 @@
+// @ts-check
 'use strict'
 
+/**
+ * What the guard reads from an IPC event. Electron's IpcMainInvokeEvent and IpcMainEvent satisfy it (sender is the
+ * WebContents, senderFrame the WebFrameMain or null); the tests pass plain objects of this shape.
+ * @typedef {object} IpcSenderEvent
+ * @property {{ isDestroyed?: () => boolean, getURL?: () => string } | null} [sender]
+ * @property {{ url?: string, parent?: unknown } | null} [senderFrame]
+ */
+/** @typedef {{ isDev?: boolean }} GuardOptions */
+
+/**
+ * Only Orbit's own renderer origins: the Vite dev server in development, file: URLs (dist/index.html, packaged or not).
+ * @param {unknown} url
+ * @param {GuardOptions} [options]
+ * @returns {boolean}
+ */
 function isTrustedOrbitUrl(url, { isDev = false } = {}) {
   if (!url || typeof url !== 'string') return false
   if (isDev && /^http:\/\/127\.0\.0\.1:5173(?:\/|\?|#|$)/.test(url)) return true
@@ -7,6 +23,12 @@ function isTrustedOrbitUrl(url, { isDev = false } = {}) {
   return false
 }
 
+/**
+ * Throws unless `event` comes from Orbit's own window: a live sender, the top frame, a trusted URL.
+ * @param {IpcSenderEvent} event
+ * @param {GuardOptions} [options]
+ * @returns {void}
+ */
 function assertOrbitIpcSender(event, { isDev = false } = {}) {
   const sender = event?.sender
   if (!sender || (typeof sender.isDestroyed === 'function' && sender.isDestroyed())) {
@@ -20,6 +42,15 @@ function assertOrbitIpcSender(event, { isDev = false } = {}) {
   }
 }
 
+/**
+ * Wraps an ipcMain handler so the sender check runs before it; the handler's signature is kept.
+ * @template {IpcSenderEvent} E
+ * @template {unknown[]} A
+ * @template R
+ * @param {(event: E, ...args: A) => R} handler
+ * @param {GuardOptions} [options]
+ * @returns {(event: E, ...args: A) => R}
+ */
 function guardIpc(handler, options = {}) {
   return (event, ...args) => {
     assertOrbitIpcSender(event, options)
@@ -27,6 +58,7 @@ function guardIpc(handler, options = {}) {
   }
 }
 
+/** @param {GuardOptions} [options] @returns {string} */
 function contentSecurityPolicy({ isDev = false } = {}) {
   if (isDev) {
     return [

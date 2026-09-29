@@ -3,9 +3,9 @@ const assert = require('node:assert/strict')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
-const quota = require('../electron/quota.cjs')
+const quota = require('../electron/quota.mts')
 const { QuotaMonitor, assess, classifyQuotaError, parseResetText, parseCodexLimits, parseClaudeUsage, parseAntigravityUsage, parseCursorAbout, claudeStreamLimit, codexUpdateLimit } = quota
-const { createClaudeParser } = require('../electron/providers.cjs')._testing
+const { createClaudeParser } = require('../electron/providers.mts')._testing
 
 // Shapes below were captured from the real CLIs on 2026-09-29 (account identifiers removed).
 const CODEX_RESULT = {

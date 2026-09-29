@@ -3,7 +3,7 @@ const assert = require('node:assert/strict')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
-const { CapabilityStore } = require('../electron/capabilities.cjs')
+const { CapabilityStore } = require('../electron/capabilities.mts')
 
 // Cases found by an independent review of the skills library: each one failed before it was fixed.
 function fixture(t) {

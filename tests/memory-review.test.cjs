@@ -3,8 +3,8 @@ const assert = require('node:assert/strict')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
-const { OrbitMemoryStore } = require('../electron/memory.cjs')
-const { writeJSON } = require('../electron/storage.cjs')
+const { OrbitMemoryStore } = require('../electron/memory.mts')
+const { writeJSON } = require('../electron/storage.mts')
 
 // Cases found by an independent review of the tiered memory: each one failed before it was fixed.
 function fixture(t) {

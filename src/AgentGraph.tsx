@@ -1,6 +1,13 @@
 import type { Agent } from './types'
 import { useEffect, useRef } from 'react'
 
+const statusLabel: Record<Agent['status'], string> = {
+  idle: 'Ожидает', waiting: 'Ожидает', working: 'Работает', done: 'Ответил', error: 'Ошибка', cancelled: 'Остановлен', interrupted: 'Прерван',
+}
+const nodeLabel = (agent: Agent) => agent.budgetLimited ? (agent.stalled ? 'Остановлен · повтор' : 'Лимит · результат сохранён') : statusLabel[agent.status]
+const nodeClass = (agent: Agent, selected: boolean) => `agent-graph-node ${agent.status} ${selected ? 'selected' : ''}`
+const isActivation = (key: string) => key === 'Enter' || key === ' '
+
 export function AgentGraph({ agents, selectedId, onSelect }: { agents: Agent[]; selectedId: string; onSelect: (id: string) => void }) {
   const nodes = new Map<string, { agent: Agent; x: number; y: number }>()
   const children = new Map<string, Agent[]>()
@@ -29,18 +36,32 @@ export function AgentGraph({ agents, selectedId, onSelect }: { agents: Agent[]; 
     if (viewport.current && selected) viewport.current.scrollLeft = Math.max(0, selected.x - viewport.current.clientWidth / 2)
   }, [selected?.x, selected?.y])
   return <div className="agent-graph-panel">
-    <div className="communications-heading"><h3>Кто кого создал</h3><p>Стрелка ведёт от инициатора к созданному агенту. Нажмите на участника, чтобы выбрать его.</p></div>
+    <div className="communications-heading">
+      <h3>Кто кого создал</h3>
+      <p>Стрелка ведёт от инициатора к созданному агенту. Нажмите на участника, чтобы выбрать его.</p>
+    </div>
     <div className="agent-graph-scroll" ref={viewport}>
       <svg className="agent-graph" width={width} height={height} viewBox={`0 0 ${width} ${height}`} role="group" aria-label="Граф создания агентов">
-        <defs><marker id="agent-parent-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor" /></marker></defs>
+        <defs>
+          <marker id="agent-parent-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+            <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor" />
+          </marker>
+        </defs>
         {[...nodes.values()].map(node => {
           const parent = node.agent.parentId && nodes.get(node.agent.parentId)
-          return parent ? <path key={`edge-${node.agent.id}`} className="agent-graph-edge" data-parent={parent.agent.id} data-child={node.agent.id} d={`M ${parent.x} ${parent.y + 28} C ${parent.x} ${parent.y + 64}, ${node.x} ${node.y - 64}, ${node.x} ${node.y - 31}`} markerEnd="url(#agent-parent-arrow)"><title>{parent.agent.name} создал {node.agent.name}</title></path> : null
+          if (!parent) return null
+          const d = `M ${parent.x} ${parent.y + 28} C ${parent.x} ${parent.y + 64}, ${node.x} ${node.y - 64}, ${node.x} ${node.y - 31}`
+          return <path key={`edge-${node.agent.id}`} className="agent-graph-edge" data-parent={parent.agent.id} data-child={node.agent.id} d={d}
+            markerEnd="url(#agent-parent-arrow)">
+            <title>{parent.agent.name} создал {node.agent.name}</title>
+          </path>
         })}
-        {[...nodes.values()].map(({ agent, x, y }) => <g key={agent.id} className={`agent-graph-node ${agent.status} ${agent.id === selectedId ? 'selected' : ''}`} transform={`translate(${x - 84},${y - 28})`} role="button" tabIndex={0} aria-label={`Выбрать агента ${agent.name}`} aria-pressed={agent.id === selectedId} onClick={() => onSelect(agent.id)} onKeyDown={event => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); onSelect(agent.id) } }}>
+        {[...nodes.values()].map(({ agent, x, y }) => <g key={agent.id} className={nodeClass(agent, agent.id === selectedId)} role="button" tabIndex={0}
+          transform={`translate(${x - 84},${y - 28})`} aria-label={`Выбрать агента ${agent.name}`} aria-pressed={agent.id === selectedId}
+          onClick={() => onSelect(agent.id)} onKeyDown={event => { if (isActivation(event.key)) { event.preventDefault(); onSelect(agent.id) } }}>
           <title>{agent.name}{agent.task ? `: ${agent.task}` : ''}</title><rect width="168" height="56" rx="9" /><circle cx="13" cy="19" r="3" />
           <text x="24" y="23">{agent.name.length > 20 ? `${agent.name.slice(0, 19)}…` : agent.name}</text>
-          <text className="agent-graph-status" x="12" y="43">{agent.budgetLimited ? (agent.stalled ? 'Остановлен · повтор' : 'Лимит · результат сохранён') : ({ idle: 'Ожидает', waiting: 'Ожидает', working: 'Работает', done: 'Ответил', error: 'Ошибка', cancelled: 'Остановлен', interrupted: 'Прерван' }[agent.status])}</text>
+          <text className="agent-graph-status" x="12" y="43">{nodeLabel(agent)}</text>
         </g>)}
       </svg>
     </div>

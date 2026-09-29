@@ -2,7 +2,7 @@ const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
 const { spawnSync } = require('node:child_process')
-const { removeTemporaryDirectory } = require('../electron/storage.cjs')
+const { removeTemporaryDirectory } = require('../electron/storage.mts')
 
 const root = path.resolve(__dirname, '..')
 const tag = `v${Date.now()}`
@@ -42,7 +42,7 @@ function main() {
   const archive = path.join(unpacked, 'resources', 'app.asar')
   // Verify inside the temporary output first: a bundle that fails verification must never appear
   // under a name that Orbit.cmd / standalone-resolve would pick as the newest valid bundle.
-  for (const file of fs.readdirSync(path.join(root, 'electron')).filter(file => file.endsWith('.cjs'))) {
+  for (const file of fs.readdirSync(path.join(root, 'electron')).filter(file => /\.(cjs|mts)$/.test(file))) {
     const source = fs.readFileSync(path.join(root, 'electron', file))
     if (!asar.extractFile(archive, `electron/${file}`).equals(source)) throw new Error(`Packaged runtime differs from source: ${file}`)
   }

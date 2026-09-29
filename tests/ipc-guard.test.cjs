@@ -71,8 +71,12 @@ test('CSP disables remote script sources in production', () => {
 })
 
 test('every main-process IPC channel is registered through the sender guard', () => {
-  const source = require('node:fs').readFileSync(require('node:path').join(__dirname, '..', 'electron', 'main.cjs'), 'utf8')
-  assert.equal(source.split('ipcMain.handle(').length - 1, 1, 'only the guarded helper may call ipcMain.handle directly')
-  assert.ok(source.includes('const handle = (channel, handler) => ipcMain.handle(channel, guard(handler))'))
-  assert.doesNotMatch(source, /providers:ask/, 'the unguarded direct provider channel must stay removed')
+  const read = (file) => require('node:fs').readFileSync(require('node:path').join(__dirname, '..', 'electron', file), 'utf8')
+  const handlers = read('ipc-handlers.cjs')
+  const main = read('main.cjs')
+  assert.equal(handlers.split('ipcMain.handle(').length - 1, 1, 'only registerIpcHandlers may call ipcMain.handle directly')
+  assert.ok(handlers.includes('ipcMain.handle(channel, guardIpc(handler, { isDev }))'), 'the one registration wraps every handler in the sender guard')
+  assert.equal(main.split('ipcMain.handle(').length - 1, 0, 'main.cjs registers channels only through electron/ipc-handlers.cjs')
+  assert.ok(main.includes('registerIpcHandlers(ipcMain, createIpcHandlers('), 'main.cjs wires the handler map through the guarded registration')
+  for (const source of [handlers, main]) assert.doesNotMatch(source, /providers:ask/, 'the unguarded direct provider channel must stay removed')
 })

@@ -5,13 +5,13 @@ const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
 const { once } = require('node:events')
-const { runProvider, _testing } = require('../electron/providers.cjs')
+const { runProvider, _testing } = require('../electron/providers.mts')
 const { createCodexParser, createClaudeParser, createLineReader, buildCodexArgs, buildClaudeArgs, runCli, resolveLaunch } = _testing
 
 const feed = (parser, events) => events.forEach((event) => parser.line(JSON.stringify(event)))
 
 test('Claude hands validated Orbit calls back only from a completed main assistant message', () => {
-  const { ORBIT_RESPONSE_SCHEMA, TOOL_HANDOFF } = require('../electron/tool-schema.cjs')
+  const { ORBIT_RESPONSE_SCHEMA, TOOL_HANDOFF } = require('../electron/tool-schema.mts')
   const text = JSON.stringify({ content: 'Reading context', tool_calls: [{ id: 'read', name: 'context_read', arguments: {} }] })
   const events = [], parser = createClaudeParser(event => events.push(event), 'sonnet', ORBIT_RESPONSE_SCHEMA)
   const send = event => parser.line(JSON.stringify(event))
@@ -48,7 +48,7 @@ test('Codex streams native tool activity and returns only the exact final respon
     { type: 'item.completed', item: { id: 'b', type: 'agent_message', text: final } },
     { type: 'turn.completed', usage: { input_tokens: 45, output_tokens: 10 } },
   ])
-  assert.deepEqual(parser.finish(), { text: final, model: 'chosen-model' })
+  assert.deepEqual(parser.finish(), { text: final, model: 'chosen-model', sessionId: 'thread-1' })
   assert.equal(events.filter((event) => event.messageId === 'b').map((event) => event.text).join(''), final)
   assert.equal(events.filter((event) => event.kind === 'tool').length, 2)
   assert.equal(events.find((event) => event.exitCode === 0).output, 'clean')
@@ -151,7 +151,7 @@ test('Native arguments use stdin, preserve chosen model, and never widen read-on
 })
 
 test('Codex receives the Orbit response schema as a real file and cleans it after success or failure', async t => {
-  const { ORBIT_RESPONSE_SCHEMA } = require('../electron/tool-schema.cjs')
+  const { ORBIT_RESPONSE_SCHEMA } = require('../electron/tool-schema.mts')
   const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'orbit-schema-fixture-'))
   const previous = process.env.ORBIT_CODEX_COMMAND
   t.after(() => {

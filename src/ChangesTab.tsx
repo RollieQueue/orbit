@@ -5,20 +5,39 @@ import { fileMap } from './file-map'
 import { plural, timeOf } from './format'
 import './changes-tab.css'
 
-type Group = { path: string; changes: FileChange[]; added: number; removed: number; agents: string[]; last: number; kind: 'create' | 'modify' | 'delete'; shared: boolean }
+// A change as the main process serves it: `reason` says why there is no diff text (codes from electron/change-log.cjs REASONS),
+// `base` names the commit a recovered `git` diff is relative to.
+type Change = FileChange & { reason?: string; base?: string }
+type Group = { path: string; changes: Change[]; added: number; removed: number; agents: string[]; last: number; kind: 'create' | 'modify' | 'delete'; shared: boolean }
 
 const KIND_LABEL = { create: 'создан', modify: 'изменён', delete: 'удалён' }
 const SOURCE_NOTE: Record<string, string> = {
   event: 'по событию инструмента',
   git: 'накопленные изменения файла относительно коммита — могут включать не только правки этого агента',
 }
+// Why a change has no line-by-line diff. Nothing is invented: when the starting text is unknown, the entry says so.
+const UNTRACKED = 'Правка не записана: запуск сохранён до того, как Orbit начал сохранять построчные изменения; известно только, что агент записал файл.'
+const REASON_NOTE: Record<string, string> = {
+  'later-write': 'Не первая запись этого файла в запуске: с какого текста начинал инструмент, неизвестно.',
+  'no-baseline': 'Старый текст файла неизвестен: событие инструмента его не содержит, а Git не хранит версию файла (папка не репозиторий или файл не отслеживается).',
+  'unreadable': 'Файл не удалось прочитать как текст: его нет, он больше 2 МБ, бинарный или лежит вне папки проекта.',
+  'no-git': 'Git не показал разницы для файла, изменённого командой: файл не отслеживается или совпадает с коммитом.',
+  'trimmed': 'Текст разницы вытеснен более новыми правками: на запуск хранится не больше 1,5 МБ.',
+  'untracked-run': UNTRACKED,
+  'no-repo': `${UNTRACKED} Git помочь не может: папка проекта не репозиторий или у неё нет истории.`,
+  'no-base-commit': `${UNTRACKED} В Git нет коммита, сделанного до начала запуска, — сравнивать не с чем.`,
+  'git-same': `${UNTRACKED} Git не видит разницы файла относительно коммита начала запуска: файл не отслеживается или совпадает с ним.`,
+  'too-many': `${UNTRACKED} Git спрашивают не больше чем о 120 файлах одного запуска.`,
+}
+const FINISHED = new Set(['completed', 'failed', 'cancelled', 'interrupted', 'error'])
 const stamp = (time: string) => { const value = new Date(time).valueOf(); return Number.isNaN(value) ? 0 : value }
+const pairOf = (change: { agentId: string; path: string }) => `${change.agentId}:${change.path}`
 
 // Diff texts are fetched once per run and kept for the session, so switching agents or tabs never asks the main process again.
 const RUNS_KEPT = 5
-const loadedTexts = new Map<string, Map<string, FileChange>>()
-const pendingTexts = new Map<string, Promise<Map<string, FileChange>>>()
-function loadTexts(runId: string): Promise<Map<string, FileChange>> {
+const loadedTexts = new Map<string, Map<string, Change>>()
+const pendingTexts = new Map<string, Promise<Map<string, Change>>>()
+function loadTexts(runId: string): Promise<Map<string, Change>> {
   const done = loadedTexts.get(runId)
   if (done) return Promise.resolve(done)
   const running = pendingTexts.get(runId)
@@ -26,7 +45,7 @@ function loadTexts(runId: string): Promise<Map<string, FileChange>> {
   const api = window.orbit
   if (!api?.getRunChanges) return Promise.reject(new Error('Тексты изменений доступны только в настольном Orbit'))
   const request = api.getRunChanges(runId).then(list => {
-    const texts = new Map((list || []).map(change => [change.id, change] as const))
+    const texts = new Map((list || []).map(change => [change.id, change as Change] as const))
     loadedTexts.set(runId, texts)
     for (const key of [...loadedTexts.keys()]) { if (loadedTexts.size <= RUNS_KEPT) break; loadedTexts.delete(key) }
     return texts
@@ -35,8 +54,24 @@ function loadTexts(runId: string): Promise<Map<string, FileChange>> {
   return request
 }
 
-function groupChanges(changes: FileChange[]): Group[] {
-  const byPath = new Map<string, FileChange[]>()
+// Files the agents reported writing that no change record covers: a run saved before changes were tracked (or a lost record).
+// They are listed as changes without a diff; the main process may replace each by a recovered `git` entry with the same id.
+function placeholdersOf(run: RunSnapshot, all: Change[]): Change[] {
+  if (!FINISHED.has(run.status)) return [] // a live run's records are still being made; a placeholder would only flash
+  const covered = new Set(all.map(pairOf))
+  const list: Change[] = []
+  for (const file of fileMap(run.agents)) {
+    for (const agentId of file.writers) {
+      if (covered.has(`${agentId}:${file.path}`)) continue
+      const agent = run.agents.find(member => member.id === agentId)
+      list.push({ id: `legacy:${agentId}:${file.path}`, agentId, path: file.path, kind: 'unknown', tool: '', time: agent?.finishedAt || run.finishedAt || run.startedAt, added: 0, removed: 0, source: 'git', hasDiff: false, reason: 'untracked-run' })
+    }
+  }
+  return list
+}
+
+function groupChanges(changes: Change[]): Group[] {
+  const byPath = new Map<string, Change[]>()
   for (const change of changes) { const list = byPath.get(change.path); if (list) list.push(change); else byPath.set(change.path, [change]) }
   const groups: Group[] = []
   for (const [path, list] of byPath) {
@@ -56,21 +91,33 @@ function groupChanges(changes: FileChange[]): Group[] {
 // `teamWide` opens on the whole team's changes (from the run's «файлов изменено» button) instead of the selected agent's own.
 export function ChangesTab({ run, agent, onSelect, focusPath, teamWide }: { run: RunSnapshot; agent: Agent; onSelect: (id: string) => void; focusPath?: string; teamWide?: boolean }) {
   const isRouter = agent.id === 'router'
-  const all = run.changes
-  const [onlySelected, setOnlySelected] = useState(() => !isRouter && !teamWide && !(focusPath && (all || []).some(change => change.path === focusPath) && !(all || []).some(change => change.path === focusPath && change.agentId === agent.id)))
+  const recorded = (run.changes || []) as Change[]
+  const placeholders = useMemo(() => placeholdersOf(run, recorded), [run.agents, run.status, recorded]) // eslint-disable-line react-hooks/exhaustive-deps
+  const all = useMemo(() => recorded.concat(placeholders), [recorded, placeholders])
+  const [onlySelected, setOnlySelected] = useState(() => !isRouter && !teamWide && !(focusPath && all.some(change => change.path === focusPath) && !all.some(change => change.path === focusPath && change.agentId === agent.id)))
   const [expanded, setExpanded] = useState<Set<string>>(() => new Set(focusPath ? [focusPath] : []))
-  const [texts, setTexts] = useState<Map<string, FileChange> | null>(() => loadedTexts.get(run.runId) || null)
+  const [texts, setTexts] = useState<Map<string, Change> | null>(() => loadedTexts.get(run.runId) || null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
   const list = useRef<HTMLDivElement>(null)
   const focused = useRef<string | undefined>(undefined)
   const nameOfAgent = (id: string) => run.agents.find(member => member.id === id)?.name || id
 
+  // A saved run lists its changes without their text; a placeholder may have a recovered entry waiting in the main process.
+  const needsTexts = all.some(change => (change.hasDiff && change.diff == null) || change.reason === 'untracked-run')
+  function resolve(change: Change): Change {
+    const text = texts?.get(change.id)
+    if (!text) return change
+    if (change.reason === 'untracked-run') return { ...change, ...text, reason: text.reason }
+    if (change.diff != null) return change
+    return { ...change, diff: text.diff, truncated: text.truncated ?? change.truncated, binary: text.binary ?? change.binary, reason: text.reason ?? change.reason }
+  }
   const scoped = !isRouter && onlySelected
-  const visible = useMemo(() => (all || []).filter(change => !scoped || change.agentId === agent.id), [all, scoped, agent.id])
+  const resolved = useMemo(() => all.map(resolve), [all, texts]) // eslint-disable-line react-hooks/exhaustive-deps
+  const visible = useMemo(() => resolved.filter(change => !scoped || change.agentId === agent.id), [resolved, scoped, agent.id])
   const groups = useMemo(() => groupChanges(visible), [visible])
-  const teamFiles = useMemo(() => new Set((all || []).map(change => change.path)).size, [all])
-  const needsTexts = !!all?.some(change => change.hasDiff && change.diff == null)
+  const teamFiles = useMemo(() => new Set(all.map(change => change.path)).size, [all])
+  const legacy = placeholders.length > 0
 
   function fetchTexts() {
     setLoading(true); setError('')
@@ -83,9 +130,9 @@ export function ChangesTab({ run, agent, onSelect, focusPath, teamWide }: { run:
   // A file opened from the Files tab is expanded and brought into view; widen the scope when it is not this agent's file.
   useEffect(() => {
     if (!focusPath || focused.current === focusPath) return
-    if (!(all || []).some(change => change.path === focusPath)) return
+    if (!all.some(change => change.path === focusPath)) return
     focused.current = focusPath
-    if (scoped && !(all || []).some(change => change.path === focusPath && change.agentId === agent.id)) setOnlySelected(false)
+    if (scoped && !all.some(change => change.path === focusPath && change.agentId === agent.id)) setOnlySelected(false)
     setExpanded(previous => new Set(previous).add(focusPath))
     requestAnimationFrame(() => list.current && [...list.current.querySelectorAll<HTMLElement>('[data-path]')].find(node => node.dataset.path === focusPath)?.scrollIntoView({ block: 'nearest' }))
   }, [focusPath, all]) // eslint-disable-line react-hooks/exhaustive-deps
@@ -93,22 +140,19 @@ export function ChangesTab({ run, agent, onSelect, focusPath, teamWide }: { run:
   function toggle(path: string) {
     setExpanded(previous => { const next = new Set(previous); if (next.has(path)) next.delete(path); else next.add(path); return next })
   }
-  function resolve(change: FileChange): FileChange {
-    if (change.diff != null) return change
-    const text = texts?.get(change.id)
-    return text ? { ...change, diff: text.diff, truncated: text.truncated ?? change.truncated, binary: text.binary ?? change.binary } : change
-  }
 
   const added = groups.reduce((sum, group) => sum + group.added, 0)
   const removed = groups.reduce((sum, group) => sum + group.removed, 0)
   const agentCount = new Set(groups.flatMap(group => group.agents)).size
-  // A run saved before changes were tracked (or whose provider reports none) still lists what the agents wrote in the Files tab.
-  const untracked = !all?.length && fileMap(run.agents).some(file => file.writers.length > 0)
-  const emptyText = untracked ? 'Для этого запуска изменения не записаны: смотрите список файлов во вкладке «Файлы»' : scoped ? 'Этот агент пока не менял файлы' : 'Агенты пока не меняли файлы'
+  const emptyText = scoped ? 'Этот агент пока не менял файлы' : 'Агенты пока не меняли файлы'
 
-  function body(change: FileChange) {
+  function sourceNote(change: Change) {
+    if (change.base) return `Разница по Git относительно коммита ${change.base} — последнего перед началом запуска. Она накоплена: может включать правки других агентов и более поздние.`
+    return SOURCE_NOTE[change.source]
+  }
+  function body(change: Change) {
     if (change.diff != null || change.binary) return <DiffView diff={change.diff || ''} truncated={change.truncated} binary={change.binary} />
-    if (!change.hasDiff) return <p className="changes-note">Построчная разница для этого изменения недоступна: файл не удалось сравнить или её текст не сохранён</p>
+    if (!change.hasDiff) return <p className="changes-note">{(change.reason && REASON_NOTE[change.reason]) || 'Построчная разница для этого изменения недоступна: файл не удалось сравнить или её текст не сохранён.'}</p>
     if (loading) return <p className="changes-note">Загружаем текст изменения…</p>
     if (error) return <p className="changes-note">Текст изменения не загружен.</p>
     return <p className="changes-note">Текст этого изменения не найден.</p>
@@ -116,6 +160,7 @@ export function ChangesTab({ run, agent, onSelect, focusPath, teamWide }: { run:
 
   return <div className="changes-tab">
     <div className="communications-heading"><h3>{scoped ? agent.name : 'Изменения команды'}</h3><p>Что именно агенты меняли в файлах этого запуска: у каждой правки — автор, время, инструмент и построчная разница.</p></div>
+    {legacy && <p className="changes-legacy" role="note">Запуск сохранён до того, как Orbit начал записывать правки: список файлов взят из отчётов агентов, а разница — из Git относительно коммита, с которого начинался запуск, если Git её ещё видит. Такие правки помечены «git».</p>}
     {!isRouter && <label className="communications-filter"><input type="checkbox" checked={onlySelected} onChange={event => setOnlySelected(event.target.checked)} /><span>Только изменения {agent.name}</span></label>}
     {error && <div className="changes-error" role="alert"><span>Не удалось загрузить тексты изменений: {error}</span><button type="button" onClick={fetchTexts} disabled={loading}>Повторить</button></div>}
     {!groups.length ? <div className="communications-empty changes-empty"><p>{emptyText}</p>{scoped && teamFiles > 0 && <button type="button" className="changes-widen" onClick={() => setOnlySelected(false)}>Показать изменения команды: {plural(teamFiles, ['файл', 'файла', 'файлов'])}</button>}</div> : <>
@@ -135,14 +180,11 @@ export function ChangesTab({ run, agent, onSelect, focusPath, teamWide }: { run:
               {group.shared && <span className="changes-shared">правили несколько агентов</span>}
             </div>
             {open && <div className="changes-entries">
-              {group.changes.map(raw => {
-                const change = resolve(raw)
-                return <section key={change.id} className="changes-entry">
-                  <div className="changes-entry-head"><strong>{nameOfAgent(change.agentId)}</strong><time dateTime={change.time}>{timeOf(change.time)}</time><span className="changes-tool">{change.tool}</span></div>
-                  {SOURCE_NOTE[change.source] && <p className="changes-source">{SOURCE_NOTE[change.source]}</p>}
-                  {body(change)}
-                </section>
-              })}
+              {group.changes.map(change => <section key={change.id} className="changes-entry">
+                <div className="changes-entry-head"><strong>{nameOfAgent(change.agentId)}</strong><time dateTime={change.time}>{timeOf(change.time)}</time>{change.tool ? <span className="changes-tool">{change.tool}</span> : <span className="changes-tool">инструмент не записан</span>}{change.hasDiff && change.source === 'git' && <span className="changes-badge">git</span>}</div>
+                {change.hasDiff && sourceNote(change) && <p className="changes-source">{sourceNote(change)}</p>}
+                {body(change)}
+              </section>)}
             </div>}
           </article>
         })}

@@ -4,8 +4,8 @@ const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
 const assert = require('node:assert/strict')
-const { OrbitRuntime } = require('../electron/runtime.cjs')
-const { runProvider } = require('../electron/providers.cjs')
+const { OrbitRuntime } = require('../electron/runtime.mts')
+const { runProvider } = require('../electron/providers.mts')
 
 async function main() {
   const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'orbit-protocol-live-'))

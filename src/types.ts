@@ -23,8 +23,30 @@ export type Agent = {
   stalled?: boolean
   files?: AgentFiles
   handovers?: Handover[]
+  error?: string
+  startedAt?: string
+  finishedAt?: string
+  // session = one CLI process resumed turn after turn; envelope = the JSON protocol with a fresh process per turn.
+  transport?: AgentTransport
+  sessionId?: string | null
+  turnTimings?: TurnTiming[]
 }
 export type AgentFiles = { read: string[]; wrote: string[] }
+export type AgentTransport = 'session' | 'envelope'
+// One provider turn of one agent. `endedAt` is missing while the turn is still running.
+export type TurnTiming = {
+  turn: number
+  transport: AgentTransport
+  startedAt: string
+  firstEventAt?: string | null
+  endedAt?: string | null
+  promptChars?: number
+  nativeToolCalls?: number
+  orbitToolCalls?: number
+  sessionId?: string | null
+}
+// The root agent's answer while it is still being written: kept in the live run only, never in the saved chat or run file.
+export type StreamingMessage = { messageId: string; agentId: string; content: string; startedAt: string; updatedAt: string }
 export type QuotaWindow = { kind: 'session' | 'week' | 'other'; usedPercent: number; resetsAt: number | null; scope: string; models?: string[] }
 export type QuotaState = 'ok' | 'warning' | 'exhausted' | 'unknown' | 'unlimited' | 'unavailable'
 export type QuotaSnapshot = {
@@ -71,6 +93,10 @@ export type FileChange = {
   hasDiff?: boolean
   truncated?: boolean
   binary?: boolean
+  // Why there is no diff text (a code from electron/change-log.cjs REASONS); only set when hasDiff is false.
+  reason?: string
+  // Short commit a recovered `git` diff is relative to (the last commit before the run started).
+  base?: string
 }
 export type InspectorTab = 'activity' | 'communications' | 'files' | 'changes' | 'graph'
 export type Message = {
@@ -103,7 +129,10 @@ export type MemoryEntry = {
   source?: string
 }
 export type TierStats = { count: number; limit: number; pinned?: number; chars?: number }
-export type LibraryStats = { memory: { chat: TierStats; project: TierStats; global: TierStats; stored: number }; skills: { project: TierStats; global: TierStats; used: number } }
+export type LibraryStats = {
+  memory: { chat: TierStats; project: TierStats; global: TierStats; stored: number }
+  skills: { project: TierStats; global: TierStats; used: number }
+}
 export type Capability = {
   id: string
   name: string
@@ -179,8 +208,13 @@ export type RunSnapshot = {
   improvementMode?: boolean
   limits?: RunLimits
   usage?: { providerTurns: number; workerTurns?: number }
+  streaming?: StreamingMessage
 }
-export type RunLimits = { maxAgents: number | null; maxDepth: number | null; maxConcurrent: number | null; maxTurns: number | null; maxTotalTurns: number | null; maxMessages?: number | null; maxToolCalls?: number | null; timeoutMs?: number | null; runTimeoutMs?: number | null; maxContextChars?: number; maxOutputChars?: number }
+export type RunLimits = {
+  maxAgents: number | null; maxDepth: number | null; maxConcurrent: number | null; maxTurns: number | null; maxTotalTurns: number | null
+  maxMessages?: number | null; maxToolCalls?: number | null; timeoutMs?: number | null; runTimeoutMs?: number | null
+  maxContextChars?: number; maxOutputChars?: number
+}
 export type ProviderOption = { command?: string; reasoningEffort?: string; proxyMode?: 'system' | 'inherit' | 'custom' | 'direct'; proxyUrl?: string }
 export type PoolMember = { providerId: string; model: string; purpose?: string; reasoningEffort?: string }
 export type ImprovementTask = { id: string; title: string; status: 'pending' | 'working' | 'done' | 'blocked'; evidence: string }

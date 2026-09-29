@@ -3,9 +3,9 @@ const assert = require('node:assert/strict')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
-const quota = require('../electron/quota.cjs')
-const { OrbitRuntime } = require('../electron/runtime.cjs')
-const { normalizeFailover, tierOf, baselineTier, replacements, handoverNote } = require('../electron/failover.cjs')
+const quota = require('../electron/quota.mts')
+const { OrbitRuntime } = require('../electron/runtime.mts')
+const { normalizeFailover, tierOf, baselineTier, replacements, handoverNote } = require('../electron/failover.mts')
 
 const w = (used, extra = {}) => ({ kind: 'session', scope: 'all', models: [], usedPercent: used, resetsAt: null, ...extra })
 const CATALOG = [
@@ -469,7 +469,7 @@ test('a stopped run is not treated as a quota problem', async t => {
   const events = []
   rt.onEvent(event => events.push(event))
   const runId = await rt.start(payload(workspace))
-  await new Promise(resolve => setTimeout(resolve, 100))
+  for (let waited = 0; !calls.length && waited < 5000; waited += 50) await new Promise(resolve => setTimeout(resolve, 50)) // the first provider call may take a while under a loaded machine
   rt.stop(runId)
   await new Promise(resolve => setTimeout(resolve, 100))
   assert.deepEqual(calls, ['codex'])

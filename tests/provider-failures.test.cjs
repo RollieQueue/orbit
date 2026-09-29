@@ -3,8 +3,8 @@ const assert = require('node:assert/strict')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
-const { runProvider, resolveLaunch, _testing } = require('../electron/providers.cjs')
-const { ORBIT_RESPONSE_SCHEMA, TOOL_HANDOFF } = require('../electron/tool-schema.cjs')
+const { runProvider, resolveLaunch, _testing } = require('../electron/providers.mts')
+const { ORBIT_RESPONSE_SCHEMA, TOOL_HANDOFF } = require('../electron/tool-schema.mts')
 const { runCli, createCodexParser } = _testing
 
 test('a CLI that fails before reading a large prompt reports its own error, not a stdin write error', async () => {

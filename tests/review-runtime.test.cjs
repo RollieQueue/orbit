@@ -3,10 +3,10 @@ const assert = require('node:assert/strict')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
-const { OrbitRuntime } = require('../electron/runtime.cjs')
-const { OrbitMemoryStore } = require('../electron/memory.cjs')
-const { CapabilityStore } = require('../electron/capabilities.cjs')
-const { workspaceKey } = require('../electron/storage.cjs')
+const { OrbitRuntime } = require('../electron/runtime.mts')
+const { OrbitMemoryStore } = require('../electron/memory.mts')
+const { CapabilityStore } = require('../electron/capabilities.mts')
+const { workspaceKey } = require('../electron/storage.mts')
 
 // Cases found by an independent review of the memory and skill integration: each one failed before it was fixed.
 function fixture(t) {

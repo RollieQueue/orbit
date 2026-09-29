@@ -1,10 +1,10 @@
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
-const { OrbitMemoryStore } = require('../electron/memory.cjs')
-const { inspectProviders } = require('../electron/providers.cjs')
-const { OrbitRuntime } = require('../electron/runtime.cjs')
-const { createWorktree, collectPatch, applyPatch, removeWorktree, verifyWorktree } = require('../electron/worktree.cjs')
+const { OrbitMemoryStore } = require('../electron/memory.mts')
+const { inspectProviders } = require('../electron/providers.mts')
+const { OrbitRuntime } = require('../electron/runtime.mts')
+const { createWorktree, collectPatch, applyPatch, removeWorktree, verifyWorktree } = require('../electron/worktree.mts')
 
 const run = (file, args, cwd) => new Promise((resolve, reject) => {
   require('node:child_process').execFile(file, args, { cwd, windowsHide: true }, (error, stdout, stderr) => {

@@ -1,0 +1,535 @@
+// Shared shapes of the main process: the run and agent records the runtime keeps, what a provider sends and returns,
+// the stores the runtime consumes, the tool registry's entries and the runtime's own surface as its modules see it.
+// Types only (every export is erased at load time), so any module can import from here at no cost. The shapes are
+// the ones the code has today, derived from use; the store interfaces list exactly the methods the runtime calls, and
+// the duck-typed alternatives the audit found (`recall` beside `list`/`search`, `save` beside `upsert`) are optional.
+import type { SWITCH_TRANSPORT } from './runtime/loops.mts'
+
+// ---- Enumerations -------------------------------------------------------------------------------------------------
+export type AccessMode = 'read-only' | 'workspace-write' | 'danger-full-access'
+export type ApprovalPolicy = 'never' | 'on-request' | 'auto-review'
+export type Transport = 'session' | 'envelope'
+export type RunStatus = 'working' | 'completed' | 'failed' | 'cancelled'
+export type AgentStatus = 'waiting' | 'working' | 'done' | 'error' | 'cancelled'
+export type MemoryScope = 'chat' | 'project' | 'global'
+export type MemoryProfile = 'project' | 'project-global'
+export type SkillScope = 'project' | 'global'
+export type ImprovementStatus = 'planning' | 'implementing' | 'completed' | 'blocked'
+export type TaskStatus = 'pending' | 'working' | 'done' | 'blocked'
+export type CommunicationKind = 'spawn' | 'followup' | 'message' | 'notice'
+export type CommunicationStatus = 'queued' | 'delivered' | 'read'
+export type CommunicationDelivery = 'next-turn' | 'mailbox'
+export type HandoverReason = 'exhausted' | 'approaching' | 'replacement-failed'
+export type FileAction = 'read' | 'write'
+
+// ---- Limits, usage, timings ---------------------------------------------------------------------------------------
+export interface RunLimits {
+  maxAgents: number | null; maxDepth: number | null; maxConcurrent: number | null; maxTurns: number | null; maxTotalTurns: number | null
+  maxMessages: number | null; maxToolCalls: number | null; maxOutputChars: number; maxContextChars: number; timeoutMs: number | null; runTimeoutMs: number | null
+}
+// What a start payload may say about the limits: raw values, normalised by `normalizeLimits`.
+export type LimitsInput = Partial<Record<keyof RunLimits | 'maxConcurrency', unknown>>
+export interface Usage { providerTurns: number; workerTurns: number; inputTokens: number | null; outputTokens: number | null; cachedInputTokens?: number; promptChars?: number }
+// Token figures as vendors report them (several spellings), read by `recordUsage`.
+export interface UsageFigures {
+  input_tokens?: number; prompt_tokens?: number; output_tokens?: number; completion_tokens?: number
+  cached_input_tokens?: number; cache_read_tokens?: number; cache_read_input_tokens?: number; prompt_tokens_details?: { cached_tokens?: number }
+  [extra: string]: unknown
+}
+export interface TurnTiming {
+  turn: number; transport: Transport; startedAt: string; firstEventAt: string | null; endedAt: string | null
+  promptChars: number; nativeToolCalls: number; orbitToolCalls: number; sessionId: string | null
+}
+
+// ---- Records a run publishes --------------------------------------------------------------------------------------
+export interface Trace { id: string; agentId: string; agentName: string; kind: string; text: string; time: string }
+export interface Message { id: string; agentId: string; generation: number; author: 'orbit'; text: string; kind: string; model: string; client: string; lane: string; time: string }
+export interface MessageRoute { via: string; reasons: string[] }
+export interface Communication {
+  id: string; fromAgentId: string; toAgentId: string; fromAgentName: string; toAgentName: string; text: string; time: string
+  status: CommunicationStatus; delivery: CommunicationDelivery; kind?: CommunicationKind; reason?: string; via?: string; route?: MessageRoute
+  replyTo?: string; discussionId?: string; deliveredAt?: string; readAt?: string
+  // Router notices: whose write it reports, which files, and whether the reader had changed them too.
+  about?: string; aboutName?: string; paths?: string[]; conflict?: boolean
+}
+export interface NoticeCommunication extends Communication { kind: 'notice'; about: string; paths: string[]; conflict: boolean }
+export interface RunSummary { text?: string; agentCount: number; providerTurns: number; limitedAgents: string[] }
+export interface RouterStats { routed: number; notices: number; refused: number }
+export interface ImprovementTask { id: string; title: string; status: TaskStatus; evidence: string }
+export interface ImprovementTaskInput { id?: string; title?: string; status?: string; evidence?: string }
+export interface HistoryEntry { role: 'user' | 'assistant'; content: string }
+// A chat message as the renderer sends it: old records carry `author`/`text` instead of `role`/`content`.
+export interface HistoryInput { role?: string; author?: string; content?: unknown; text?: unknown }
+
+// ---- Files and changes --------------------------------------------------------------------------------------------
+export interface AgentFiles { read: string[]; wrote: string[] }
+export interface FileTouch { path: string; action: FileAction; isNew: boolean }
+export interface FilePeer { agentId: string; how: string }
+export interface SharedFile { path: string; readers: Set<string>; writers: Set<string>; at?: string }
+export interface FileActivitySnapshot { path: string; readers: string[]; writers: string[] }
+export interface FileWrite { path: string; before: string; after: string }
+export interface FileChange {
+  id: string; agentId: string; path: string; kind: string; tool: string; time: string; added: number; removed: number
+  source?: string; hasDiff: boolean; diff?: string; truncated?: boolean; binary?: boolean; reason?: string
+}
+// What a change record is made from: a tool's exact texts, an event's diff, or Git's answer, plus the reason when none.
+export interface ChangeDescription {
+  kind?: string; source?: string; before?: string | null; after?: string | null; diff?: string
+  added?: number; removed?: number; truncated?: boolean; binary?: boolean; reason?: string
+}
+export interface ChangeInput extends ChangeDescription { path: string; tool?: string }
+// A vendor file change inside a native tool event (Codex `changes`).
+export interface NativeChange { path?: string; kind?: string; diff?: string; [extra: string]: unknown }
+// What a native tool call's events said about the edit so far (ChangeLog.remember).
+export interface NativeCallEntry { tool: string; input?: unknown; changes?: NativeChange[] }
+export interface IndexDiff { total?: number; added: string[]; changed: string[]; removed: string[]; fresh?: boolean }
+export interface IndexHit { path: string; [extra: string]: unknown }
+export interface IndexSearchResult { indexed?: number; results: IndexHit[] }
+export interface IndexOutline { path: string; [extra: string]: unknown }
+
+// ---- Tools: calls, arguments, observations ------------------------------------------------------------------------
+// The arguments of any Orbit tool, as the registry schema declares them. One bag for every tool: the same name means
+// the same thing everywhere (`limit`, `agentId`, `query`). MCP calls are validated by the registry before they get
+// here; the envelope path is not, so every callee keeps its coercions. `route` and `discussionId` are added by the
+// broadcast and ask_team paths; `__invalidArguments` marks a call whose arguments were not a JSON object.
+export interface ToolArgs {
+  task?: string; name?: string; reason?: string; providerId?: string; model?: string; reasoningEffort?: string; memoryProfile?: string; continueFrom?: string; id?: string
+  agentId?: string; agentIds?: string[]; timeout_ms?: number; message?: string; replyTo?: string; discussionId?: string; route?: MessageRoute
+  afterId?: string; limit?: number; unread_only?: boolean; topic?: string; files?: string[]; query?: string; path?: string; runId?: string; agent?: string
+  start_line?: number; recursive?: boolean; content?: string; old_text?: string; new_text?: string; command?: string; args?: string[]; cwd?: string
+  title?: string; scope?: string; type?: string; confidence?: number; outcome?: string; note?: string; description?: string; whenToUse?: string; instructions?: string; source?: string
+  key?: string; summary?: string; status?: string; tasks?: ImprovementTaskInput[]; taskType?: string; assessment?: string; evidence?: string
+  __invalidArguments?: boolean
+  [extra: string]: unknown
+}
+export interface ToolCall { id: string; name: string; arguments: ToolArgs }
+// A parsed envelope: the model's prose and the calls it made.
+export interface ParsedResponse { content: string; calls: ToolCall[] }
+// What a tool returned: JSON of a shape that depends on the tool, read only where the tool name is known.
+export type Observation = unknown
+// A tool result as the transcript keeps it (the observation, bounded, as text).
+export interface ToolResultEntry { type: 'tool_result'; tool_call_id: string; name: string; result: string; note?: string; via?: 'mcp' }
+export interface AssistantEntry { type: 'assistant'; content: string; tool_calls: ToolCall[]; via?: 'session' }
+export interface InstructionEntry { type: 'instruction'; content: string; via?: 'session' }
+export interface ChildResultEntry { type: 'child_result'; agentId: string; generation: number; status: AgentStatus; result: string; error: string | null; budgetLimited: boolean }
+export interface FollowupTaskEntry { type: 'followup_task'; generation: number; task: string; from: string }
+export interface AssistantFinalEntry { type: 'assistant_final'; generation: number; content: string; budgetLimited: boolean }
+export interface HandoverEntry { type: 'handover'; content: string }
+export type TranscriptEntry = ToolResultEntry | AssistantEntry | InstructionEntry | ChildResultEntry | FollowupTaskEntry | AssistantFinalEntry | HandoverEntry
+export interface LedgerEntry { name: string; text: string }
+export interface PreviousWork { generation: number; task: string; result: string; error: string | null; files?: AgentFiles }
+
+// ---- Agents -------------------------------------------------------------------------------------------------------
+// Whoever can send or receive a communication: an agent, the user, or the router.
+export interface AgentRef { id: string; name: string }
+export interface ModelTarget { providerId: string; model: string; reasoningEffort?: string }
+export interface PoolMember { providerId: string; model: string; reasoningEffort?: string }
+export interface HandoverRecord {
+  id: string; time: string; reason: HandoverReason; from: ModelTarget; to: ModelTarget; fresh: boolean
+  usedPercent: number | null; resetsAt: number | null; interrupted: boolean; note?: string
+}
+export interface InterruptedTurn { text: string; actions: string[] }
+export interface PartialTurn { messages: Map<string, string>; tools: Map<string, string> }
+export interface StreamState { messageId: string; parts: Map<string, string>; lastAt: number; timer: ReturnType<typeof setTimeout> | null; dirty: boolean }
+export interface TurnSlot { held: boolean }
+export interface ActiveTurn { slot: TurnSlot; timing: TurnTiming; changed: boolean; nativeSeen: Set<string>; stream: StreamState | null; delivered: Set<string> }
+export interface AgentRecord {
+  id: string; parentId: string | null; depth: number; name: string; role: string; task: string; reason: string
+  providerId: string; model: string; memoryProfile: MemoryProfile; reasoningEffort: string; requestedModel: string
+  status: AgentStatus; progress: number; detail: string; startedAt: string | null; finishedAt: string | null; result: string; error: string | null
+  turns: number; generation: number; inbox: unknown[]; seenChildren: Set<string>; transcript: TranscriptEntry[]; transcriptChars: number
+  previousWork: PreviousWork[]; ledger: LedgerEntry[]; ledgerDropped: Record<string, number>
+  files: AgentFiles; workDone: number
+  handovers: HandoverRecord[]; failedCandidates: Set<string>; trial: { key: string } | null; partialTurn: PartialTurn | null; quotaWarned: string
+  transport: Transport; sessionId: string | null; sessionToken: string | null; sessionCursor: number; turnTimings: TurnTiming[]; activeTurn: ActiveTurn | null; stream: StreamState | null
+  // Set later in an agent's life: the answer kept for an optional extra turn, the limit and loop-guard marks, prompt size.
+  draftAnswer?: string | null; budgetLimited?: boolean; stalled?: boolean; promptChars?: number
+}
+// The fields that stay inside the runtime; snapshots and events carry the rest (util.INTERNAL_AGENT_FIELDS).
+export type InternalAgentField = 'inbox' | 'seenChildren' | 'requestedModel' | 'transcript' | 'previousWork' | 'ledger' | 'ledgerDropped' | 'workDone' | 'failedCandidates' | 'trial' | 'partialTurn' | 'quotaWarned' | 'draftAnswer' | 'activeTurn' | 'stream' | 'sessionToken' | 'sessionCursor' | 'transcriptChars'
+export type PublicAgent = Omit<AgentRecord, InternalAgentField>
+// What an agent's execution resolves to (completeAgent), or the error a scheduled agent ended with.
+export interface AgentResult { agentId: string; generation: number; status: AgentStatus; result?: string; error?: string; budgetLimited?: boolean }
+export interface SpawnResult { ok: boolean; reason?: string; instruction?: string; reused?: boolean; agentId?: string; status?: AgentStatus; agent?: PublicAgent }
+export interface FollowupResult { ok: true; agentId: string; generation: number; status: AgentStatus }
+export interface TeamDigest { running: string[]; finished: string[] }
+export interface AgentDirectoryEntry {
+  id: string; name: string; parentId: string | null; status: AgentStatus; generation: number; providerId: string; model: string; task: string
+  result: string; resultTruncated?: boolean; fullResult?: string; error: string | null; budgetLimited: boolean
+}
+export interface AgentController { controller: AbortController; parentSignal: AbortSignal | null; abort: () => void }
+export interface TurnWaiter { resolve: () => void; reject: (error: Error) => void; signal: AbortSignal; abort: () => void }
+export interface ProviderBuffer { id: string; text: string; kind: string; agentId: string; timer: ReturnType<typeof setTimeout> | null; dirty: boolean }
+
+// ---- Runs ---------------------------------------------------------------------------------------------------------
+export interface FailoverConfig { enabled: boolean; switchAtPercent: number; allowWeaker: boolean }
+export interface ProviderOptions { reasoningEffort?: string; command?: string; transport?: string; legacyEnvelope?: boolean; [extra: string]: unknown }
+export interface SharedNote { key: string; summary: string; files?: Record<string, string>; updatedAt: string; stale?: boolean }
+export interface SharedContext { notes?: SharedNote[]; updatedAt?: string }
+export interface ProjectPacket { overview: unknown; notes: SharedNote[]; updatedAt?: string }
+export interface CatalogEntry { id: string; available?: boolean; models?: unknown; reasoningLevels?: Record<string, string[]>; [extra: string]: unknown }
+export interface RunRecord {
+  runId: string; projectId: string; chatId: string; prompt: string; workspace: string; providerId: string; model: string
+  memoryEnabled: boolean; globalMemoryEnabled: boolean; memoryContext: MemoryEntry[]
+  improvementMode: boolean; improvements: ImprovementTask[]; improvementStatus: ImprovementStatus
+  providerOptions: Record<string, ProviderOptions>; providerPool: PoolMember[]; sharedContext: SharedContext; evaluations: Set<string>
+  failover: FailoverConfig; models: Record<string, unknown>; catalogCache: { at: number; value: Promise<CatalogEntry[]> } | null; brokenProviders: Map<string, number>
+  history: HistoryEntry[]; agentInstructions: string; accessMode: AccessMode; reasoningEffort: string; approvalPolicy: ApprovalPolicy
+  status: RunStatus; startedAt: string; limits: RunLimits; contextExplicit: boolean; usage: Usage
+  agentNodes: Map<string, AgentRecord>; agentControllers: Map<string, AgentController>; agentOperations: Map<string, Set<Promise<unknown>>>
+  tasks: Map<string, Promise<AgentResult>>; traces: Trace[]; messages: Message[]; communications: Communication[]; messageWaiters: Map<string, Set<() => void>>; controller: AbortController
+  activeTurns: number; turnQueue: TurnWaiter[]; operations: Set<Promise<unknown>>; providerBuffers: Map<string, ProviderBuffer>; finishedAt: string | null; summary: RunSummary | null; error: string | null
+  fileActivity: FileActivityLike; changes: ChangeLogLike; changeQueue: Promise<void>; changePending: number; commands: { running: number; serial: number; writes: number }
+  priorRuns: ChatRunView[]; priorDigest: string | null
+  memoryTouched: Set<string>; skillUse: Map<string, { name: string; rated: boolean }>; skillLearning: boolean; skillReminded: boolean; skillSaved: boolean
+  router: TeamRouterLike
+  // Set after the record is made: the index scan, the run timer, the coalesced persistence timer and its failure mark.
+  indexReady?: Promise<unknown>; indexSettled?: boolean; timer?: ReturnType<typeof setTimeout>; persistTimer?: ReturnType<typeof setTimeout> | null; persistenceError?: boolean
+}
+// A run as others see it: the snapshot the UI, the run store and the chat memory get.
+export interface RunSnapshot {
+  runId: string; projectId: string; chatId: string; prompt: string; workspace: string; status: RunStatus; providerId: string; model: string
+  accessMode: AccessMode; approvalPolicy: ApprovalPolicy; reasoningEffort: string; memoryEnabled: boolean; improvementMode: boolean; improvements: ImprovementTask[]; improvementStatus: ImprovementStatus
+  startedAt: string; finishedAt: string | null; limits: RunLimits; usage: Usage; agents: PublicAgent[]
+  traces: Trace[]; messages: Message[]; communications: Communication[]; summary: RunSummary | null; error: string | null
+  files: FileActivitySnapshot[]; changes: FileChange[]; router: RouterStats
+}
+// An earlier turn of the chat as chat-memory presents it (a live run or a saved snapshot).
+export interface ChatRunView { runId: string; prompt: string; status: string; startedAt: string; answer: string; agents: PublicAgent[]; communications: Communication[] }
+export interface StartPayload {
+  prompt?: string; providerId?: string; workspace?: string; projectId?: string; chatId?: string; mode?: string; accessMode?: string; approvalPolicy?: string
+  reasoningEffort?: string; model?: string; providerOptions?: Record<string, ProviderOptions>; providerPool?: PoolMember[]
+  memoryEnabled?: boolean; globalMemoryEnabled?: boolean; memoryContext?: MemoryEntry[]; improvementMode?: boolean; quotaFailover?: unknown; models?: Record<string, unknown> | null
+  history?: HistoryInput[]; agentInstructions?: string; limits?: LimitsInput; skillLearning?: boolean
+}
+export type RuntimeEventData = Record<string, unknown>
+export interface RuntimeEvent { type: string; runId: string; projectId: string; chatId: string; [extra: string]: unknown }
+export type RuntimeListener = (event: RuntimeEvent) => void
+
+// ---- Providers ----------------------------------------------------------------------------------------------------
+export interface SessionInfo { id: string; token: string | null; mcpUrl: string | null; systemAppend: string; resume: boolean; activity: () => { pending: number; lastAt: number } | null }
+export interface ApprovalRequest { tool: string; arguments: unknown; toolUseId?: string }
+// What the user is asked, from an envelope tool or a Claude Code permission prompt.
+export interface ApprovalPrompt extends ApprovalRequest { runId: string; agentId: string; agentName: string; workspace: string; signal: AbortSignal }
+export type ApprovalHandler = (prompt: ApprovalPrompt) => boolean | Promise<boolean>
+export interface ProviderRunOptions {
+  providerId: string; model: string; prompt: string; workspace: string
+  mode: AccessMode; accessMode: AccessMode; approvalPolicy: ApprovalPolicy; reasoningEffort: string; providerOptions: ProviderOptions
+  session?: SessionInfo; responseSchema?: JsonSchema
+  onApproval: (request: ApprovalRequest) => Promise<boolean>; signal: AbortSignal; timeoutMs: number | null; inactivityMs?: number
+  onEvent: (event: ProviderEvent) => void
+}
+// One event of a provider's stream: streamed text and reasoning, native tool activity, observations, quota figures.
+// `kind` is always present (output, reasoning, tool, observation, quota, provider, …); everything else depends on it.
+export interface ProviderEvent {
+  kind: string; providerId?: string; text?: string; message?: string; messageId?: string; partial?: boolean; replace?: boolean; parentToolId?: string
+  native?: boolean; tool?: string; toolId?: string; status?: string; changes?: NativeChange[]; input?: unknown; output?: unknown; exitCode?: number
+  usage?: UsageFigures; quota?: QuotaUpdate; source?: string
+  [extra: string]: unknown
+}
+// What a provider turn returns. The envelope transport returns the text (an envelope JSON or a prose answer); the
+// session transport also names the session it kept (`sessionId`). `model` and `reasoningEffort` report what really ran.
+export interface ProviderResult {
+  text?: string; model?: string; sessionId?: string | null; usage?: UsageFigures; reasoningEffort?: string
+  providerId?: string; client?: string; transport?: Transport; access?: string
+}
+export type RunProvider = (options: ProviderRunOptions) => Promise<ProviderResult>
+export interface TransportOptions extends ProviderOptions { accessMode: AccessMode; approvalPolicy: ApprovalPolicy; model: string }
+export type TransportFor = (providerId: string, options: TransportOptions) => string
+export type CloseSession = (sessionId: string) => unknown
+
+// ---- Quota and failover -------------------------------------------------------------------------------------------
+export interface QuotaWindow { usedPercent: number; resetsAt?: number | null; models?: string[]; [extra: string]: unknown }
+export interface QuotaSnapshot { providerId?: string; windows?: QuotaWindow[]; checkedAt?: number | null; fetchedAt?: number | null; state?: string; blocked?: boolean; exhaustedUntil?: number; [extra: string]: unknown }
+// Live figures from a running turn (Claude stream, Codex notifications).
+export interface QuotaUpdate { windows?: QuotaWindow[]; blocked?: boolean; resetsAt?: number | null; source?: string }
+// How close an account is to a refusal (quota.assess).
+export interface QuotaLevel { usedPercent: number | null; window?: unknown; exhausted?: boolean; near?: boolean; resetsAt: number | null }
+export interface QuotaRefusal { providerId: string; resetsAt: number | null; message: string }
+export interface ReplacementChoice { providerId: string; model: string; reasoningEffort?: string; key: string }
+export interface HandoverRequest { reason: HandoverReason; level?: QuotaLevel | null; error?: unknown; interrupted?: InterruptedTurn | null }
+
+// ---- Memory and skills --------------------------------------------------------------------------------------------
+export interface MemoryEntry {
+  id: string; scope: MemoryScope; type: string; title: string; content: string; workspace?: string; chatId?: string; confidence?: number
+  created?: string; updated?: string; lastUsed?: string; uses?: number; pinned?: boolean; source?: string; dupOf?: string
+}
+export interface MemorySaveInput { id?: string; title: string; content: string; scope: MemoryScope; type?: string; confidence?: number; workspace?: string; chatId?: string; pinned?: boolean }
+export interface MemorySaveResult { entry: MemoryEntry; merged?: boolean; unchanged?: boolean; evicted?: number }
+export interface RecallQuery { query: string; workspace: string; chatId: string; includeGlobal: boolean; models: boolean }
+export interface RecallItem { entry: MemoryEntry; relevant: boolean; pinned: boolean }
+export interface RecallResult { tiers: Record<MemoryScope, RecallItem[]>; totals?: Partial<Record<MemoryScope, number>> }
+export interface SkillView {
+  id: string; name: string; description?: string; whenToUse?: string; scope: SkillScope; version?: number; uses?: number; reliability?: number
+  lessons?: string[]; successes?: number; failures?: number; workspace?: string; source?: string; relevant?: boolean
+}
+export interface SkillEntry extends SkillView { instructions: string }
+export interface SkillSuggestion { skills: SkillView[]; total: number }
+export interface SkillSaveInput { id?: string; name: string; description?: string; whenToUse?: string; instructions: string; scope: SkillScope; workspace?: string; source?: string }
+export interface SkillSaveResult { entry: SkillEntry; merged?: boolean; improved?: string; evicted?: number }
+export interface SkillFeedbackInput { outcome?: string; note?: string; includeGlobal?: boolean }
+export interface MaintainOptions { workspace: string; chatId?: string; crossProject: boolean; projects: string[] }
+
+// ---- Stores as the runtime consumes them ----------------------------------------------------------------------------
+export interface MemoryStoreLike {
+  list(workspace: string, includeGlobal?: boolean, chatId?: string): MemoryEntry[]
+  search(query: string, workspace: string, limit: number, includeGlobal: boolean, chatId?: string): MemoryEntry[]
+  remove(id: string, workspace: string, chatId: string, options: { origin: string; includeGlobal: boolean }): boolean
+  upsert(entry: MemorySaveInput, options?: { origin?: string }): MemoryEntry
+  // Optional: the tiered store has them, the fallback paths work without.
+  recall?(query: RecallQuery): RecallResult
+  find?(id: string, workspace: string, chatId: string, includeGlobal?: boolean): MemoryEntry | null
+  save?(input: MemorySaveInput, options?: { origin?: string }): MemorySaveResult
+  touch?(ids: string[]): void
+  maintain?(options: MaintainOptions): unknown
+  flush?(): void
+}
+export interface CapabilityStoreLike {
+  list(workspace: string, includeGlobal?: boolean): SkillView[]
+  search(query: string, workspace: string, limit: number, includeGlobal: boolean): SkillView[]
+  read(id: string, workspace: string, includeGlobal: boolean): SkillEntry
+  find(id: string, workspace: string, includeGlobal: boolean): SkillView | null
+  feedback(id: string, workspace: string, input: SkillFeedbackInput): SkillView & { lessonDropped?: boolean }
+  save(input: SkillSaveInput, options?: { origin?: string }): SkillSaveResult
+  suggest?(query: string, workspace: string, limit: number, includeGlobal: boolean): SkillSuggestion
+  recordUse?(id: string, workspace: string, includeGlobal: boolean): string | null
+  maintain?(options: Omit<MaintainOptions, 'chatId'>): unknown
+  flush?(): void
+}
+export interface RunStoreLike {
+  get?(id: string): RunSnapshot | null
+  save?(snapshot: RunSnapshot): void | Promise<unknown>
+  forChat?(projectId: string, chatId: string, limit: number): RunSnapshot[]
+  list?(): RunSnapshot[]
+}
+export interface ProjectIndexLike {
+  refresh(workspace: string, options?: { force?: boolean }): Promise<IndexDiff>
+  search(workspace: string, query: string, options: { limit: number }): IndexSearchResult
+  outline(workspace: string, requested: string | undefined): IndexOutline | null
+  overview(workspace: string): string
+  touch(workspace: string, relPaths: string[]): Promise<unknown>
+}
+export interface ContextStoreLike { getLatest(workspace: string): SharedContext | null | undefined; set(workspace: string, value: SharedContext): void }
+export interface QuotaMonitorLike {
+  peek(id: string): QuotaSnapshot | null
+  get(id: string, options: { maxAgeMs: number; waitMs: number; options: ProviderOptions }): Promise<QuotaSnapshot | null>
+  ingest?(id: string, partial: QuotaUpdate | null | undefined): void
+  markExhausted?(id: string, mark: { resetsAt: number | null; reason: string }): void
+}
+export type CatalogLike = (providerOptions: Record<string, ProviderOptions>) => Promise<CatalogEntry[] | null | undefined> | CatalogEntry[] | null | undefined
+export interface FileActivityLike {
+  record(agentId: string, target: string, action: FileAction): FileTouch | null
+  nativeEvent(agentId: string, event: ProviderEvent): FileTouch[]
+  forAgent(agentId: string): AgentFiles
+  peers(rel: string, exceptAgentId: string): FilePeer[]
+  owners(target: string): FilePeer[]
+  shared(): SharedFile[]
+  snapshot(): FileActivitySnapshot[]
+}
+export interface ChangeLogLike {
+  startedAt: number
+  claim(rel: string): boolean
+  remember(agentId: string, event: ProviderEvent): NativeCallEntry | null
+  add(input: ChangeInput & { agentId: string }): FileChange | null
+  snapshot(): FileChange[]
+}
+// The team router as the runtime uses it (electron/router.mts implements it).
+export interface RouterAudience { via: string; recipients: { agent: AgentRecord; reasons: string[] }[] }
+export interface RouterHost {
+  record(sender: AgentRef, target: AgentRef, text: string, extra?: Partial<Communication>): Communication
+  announce(communication: Communication, persist: boolean): void
+  changed?(stats: RouterStats): void
+}
+export interface TeamRouterLike {
+  stats: RouterStats
+  bump(key: keyof RouterStats, count?: number): void
+  audience(sender: AgentRecord, args: ToolArgs, resolveAgent: (reference: string) => AgentRecord): RouterAudience
+  pass(sender: AgentRecord, target: AgentRecord, text: string): void
+  notifyWrite(writer: AgentRecord, rel: string): { agent: string; how: string }[]
+}
+// The MCP server as the runtime drives it (electron/mcp-server.mts, or a test's fake).
+export interface McpServerLike {
+  start?(): Promise<unknown>
+  stop?(): Promise<unknown> | void
+  url: string | null | (() => string | null)
+  issueToken(info: { runId: string; agentId: string }): string
+  revoke?(token: string): unknown
+  activity?(token: string | null): { pending: number; lastAt: number } | null
+}
+export interface SessionRef { runId: string; agentId: string }
+export interface McpApproveRequest { tool_name?: string; tool?: string; input?: unknown; arguments?: unknown; tool_use_id?: string; [extra: string]: unknown }
+export interface McpDispatchResult { ok: boolean; error: string | null; observation?: Observation; text: string; unread: number }
+
+// ---- Tool registry ------------------------------------------------------------------------------------------------
+// JSON Schema as the registry writes it: enough for the envelope schema and the argument checks, nothing more.
+export interface JsonSchema {
+  type?: string; properties?: Record<string, JsonSchema>; required?: string[]; additionalProperties?: boolean
+  items?: JsonSchema; enum?: readonly unknown[]; anyOf?: JsonSchema[]; maxItems?: number
+}
+export interface ObjectSchema extends JsonSchema { type: 'object'; properties: Record<string, JsonSchema>; required: string[]; additionalProperties: boolean }
+export interface ToolSpec {
+  name: string; signature: string; blurb: string; description: string; inputSchema: ObjectSchema
+  rootOnly: boolean; waits: boolean; mutating: boolean; minAccess: AccessMode; internal: boolean
+}
+export type ValidationResult = { ok: true; args: ToolArgs } | { ok: false; error: string }
+export interface ToolAccessContext { root?: boolean; accessMode?: string }
+export interface ToolPromptOptions { section?: 'guide' | 'context'; transport?: Transport }
+// The registry as the runtime looks it up (the module, an injected one, or none).
+export interface ToolRegistryLike {
+  TOOLS?: ToolSpec[]
+  toolsFor?(context: ToolAccessContext): ToolSpec[]
+  validate?(name: string, args: unknown): ValidationResult
+  describeForPrompt?(agent: unknown, run: unknown, options?: ToolPromptOptions): string
+}
+
+// ---- Workspace tools ----------------------------------------------------------------------------------------------
+export interface WorkspaceContext { workspace: string; accessMode: string; signal?: AbortSignal | null; maxOutputChars: number; onFileChange?: (change: FileWrite) => void }
+export interface CommandResult { ok: boolean; exitCode?: number | null; signal?: NodeJS.Signals | null; stdout: string; stderr: string; truncated?: boolean; timedOut?: boolean; error?: string }
+
+// ---- Prompts and mail ---------------------------------------------------------------------------------------------
+export interface PromptBase { required: string; optional: string }
+export interface MailboxContext { text: string; deliveredIds: string[] }
+export interface ReadMessagesResult { messages: Communication[]; remainingUnread: number; timedOut?: boolean }
+export interface SendResult { ok: true; communicationId: string; agentId: string; status: CommunicationStatus; delivery: CommunicationDelivery }
+export interface AskTeamResult { ok: true; discussionId: string; via: string; routedTo: { agentId: string; name: string; reason?: string; status?: CommunicationStatus; error?: string }[] }
+export interface NoteSummary { key: string; summary: string; stale?: boolean; files: string[] }
+export interface NoteIndex { overview: unknown; notes: NoteSummary[]; otherNotes: string[] }
+
+// ---- The runtime as its modules see it -------------------------------------------------------------------------------
+export interface OrbitRuntimeOptions {
+  runProvider?: RunProvider; memoryStore?: MemoryStoreLike | null; capabilityStore?: CapabilityStoreLike | null; runStore?: RunStoreLike | null
+  requestApproval?: ApprovalHandler | null; clock?: () => number; projectIndex?: ProjectIndexLike | null; quota?: QuotaMonitorLike | null; catalog?: CatalogLike | null
+  mcp?: McpServerLike | null | false; transportFor?: TransportFor | null; closeSession?: CloseSession | null; registry?: ToolRegistryLike | null
+}
+// The facade's whole surface (electron/runtime.mts): state, the public methods main.cjs and the tests use, and the
+// methods the modules call back through. Every module function takes this as its first argument; a module never
+// imports the facade, so this interface is how they know it. `SWITCH_TRANSPORT` is the value a transport loop returns
+// when a handover moved the agent to a provider of the other transport.
+export interface OrbitRuntimeLike {
+  runProvider: RunProvider; memoryStore: MemoryStoreLike | null; capabilityStore: CapabilityStoreLike | null; runStore: RunStoreLike | null
+  requestApproval: ApprovalHandler | null; clock: () => number; projectIndex: ProjectIndexLike | null; quota: QuotaMonitorLike | null; catalog: CatalogLike | null
+  contextStore: ContextStoreLike | null; sharing: Map<string, boolean>; lastShare: number
+  mcp: McpServerLike | null | false; mcpStarted: Promise<McpServerLike | null> | null; mcpError: Error | null
+  transportFor: TransportFor | null; closeSession: CloseSession | null; toolRegistry: ToolRegistryLike | null | undefined; sessions: Map<string, SessionRef>
+  runs: Map<string, RunRecord>; listeners: Set<RuntimeListener>
+  setQuota(monitor: QuotaMonitorLike | null): void
+  setCatalog(catalog: CatalogLike | null): void
+  onEvent(listener: RuntimeListener): () => void
+  setProjectIndex(index: ProjectIndexLike | null): void
+  setMemoryStore(store: MemoryStoreLike | null): void
+  setCapabilityStore(store: CapabilityStoreLike | null): void
+  setRunStore(store: RunStoreLike | null): void
+  setContextStore(store: ContextStoreLike | null): void
+  routeMessage(): Promise<{ kind: string; reply: string }>
+  // store
+  getRun(id: string): RunSnapshot | null
+  getRuns(): RunSnapshot[]
+  snapshot(run: RunRecord): RunSnapshot
+  getRunChanges(runId: string): FileChange[]
+  persist(run: RunRecord): void
+  persistenceError(run: RunRecord, error: Error): void
+  schedulePersist(run: RunRecord, delay?: number): void
+  emit(run: RunRecord, type: string, data?: RuntimeEventData, persist?: boolean): void
+  trace(run: RunRecord, agentId: string, kind: string, text: string, id?: string): void
+  updateAgent(run: RunRecord, agent: AgentRecord, patch: Partial<AgentRecord>, persist?: boolean): void
+  message(run: RunRecord, agent: AgentRecord, text: string, kind?: string): void
+  pruneRuns(): void
+  // lifecycle
+  start(payload?: StartPayload): Promise<string>
+  previousRuns(run: RunRecord): ChatRunView[]
+  finishRun(run: RunRecord, result: AgentResult): void
+  setSharing(workspace: unknown, enabled: unknown): void
+  maintainKnowledge(run: RunRecord): void
+  failRun(run: RunRecord, error: Error): void
+  cancelAgents(run: RunRecord, detail: string): void
+  stop(runId: string): boolean
+  // agents
+  createAgent(run: RunRecord, parent: AgentRecord | null, spec: ToolArgs): AgentRecord
+  scheduleAgent(run: RunRecord, agent: AgentRecord): Promise<AgentResult>
+  spawnSubAgent(runId: string, parentId: string, spec?: ToolArgs): SpawnResult
+  resolveAgent(run: RunRecord, reference: unknown): AgentRecord
+  resultKey(agent: { id: string; generation: number }): string
+  followupAgent(run: RunRecord, sender: AgentRecord, args: ToolArgs): FollowupResult
+  acquireTurn(run: RunRecord, agent: AgentRecord): Promise<void>
+  releaseTurn(run: RunRecord): void
+  agentSignal(run: RunRecord, agent: { id: string }): AbortSignal
+  teamDigest(run: RunRecord, agent: AgentRecord): TeamDigest
+  agentDirectory(run: RunRecord): AgentDirectoryEntry[]
+  cancelDescendants(run: RunRecord, agent: AgentRecord, detail: string): void
+  completeAgent(run: RunRecord, agent: AgentRecord, content: string, budgetLimited?: boolean, detail?: string, extra?: Partial<AgentRecord>): AgentResult
+  budgetHandoff(run: RunRecord, agent: AgentRecord): AgentResult
+  stallHandoff(run: RunRecord, agent: AgentRecord, turns: number): AgentResult
+  // mailbox
+  communicationsFor(run: RunRecord, agent: { id: string }, unreadOnly?: boolean): Communication[]
+  pendingMail(run: RunRecord, agent: AgentRecord): Communication[]
+  markCommunications(run: RunRecord, ids: string[], status: CommunicationStatus, delivery: CommunicationDelivery): void
+  sendAgentMessage(run: RunRecord, sender: AgentRecord, args: ToolArgs): SendResult
+  recordCommunication(run: RunRecord, sender: AgentRef, target: AgentRef, text: string, extra?: Partial<Communication>): Communication
+  readAgentMessages(run: RunRecord, agent: AgentRecord, args?: ToolArgs): ReadMessagesResult
+  waitForTeam(run: RunRecord, agent: AgentRecord, participants: { id: string }[], timeout?: number): Promise<string>
+  waitAgentMessage(run: RunRecord, agent: AgentRecord, args: ToolArgs): Promise<ReadMessagesResult>
+  mailboxContext(run: RunRecord, agent: AgentRecord): MailboxContext
+  askTeam(run: RunRecord, sender: AgentRecord, args: ToolArgs): AskTeamResult
+  // prompts
+  teamContext(run: RunRecord, agent: AgentRecord): string
+  fileMapContext(run: RunRecord): string
+  context(run: RunRecord, agent: AgentRecord): Promise<PromptBase>
+  promptForTurn(base: PromptBase, transcript: TranscriptEntry[], run: RunRecord, mailboxText?: string, agent?: AgentRecord | null): string
+  resumePrompt(run: RunRecord, agent: AgentRecord, instruction: string, entries: TranscriptEntry[], mailboxText: string, lastWorkerTurn: boolean | undefined): string
+  toolGuide(run: RunRecord, agent: AgentRecord): string
+  // changes
+  awaitIndex(run: RunRecord, options?: { refresh?: boolean }): Promise<void>
+  publishFiles(run: RunRecord, agent: AgentRecord): void
+  touchFile(run: RunRecord, agent: AgentRecord, target: string, action: FileAction): { touch?: FileTouch; shared: { agent: string; how: string }[] }
+  trackNativeFiles(run: RunRecord, agent: AgentRecord, event: ProviderEvent): void
+  captureChange(run: RunRecord, agent: AgentRecord, target: string, tool: string | undefined, describe: (first: boolean) => Promise<ChangeDescription>): void
+  drainChanges(run: RunRecord, ms?: number): Promise<void>
+  recordChange(run: RunRecord, agent: AgentRecord, input: ChangeInput): void
+  reportWrite(run: RunRecord, agent: AgentRecord, tool: string, change: FileWrite): void
+  trackWorkspaceTool(run: RunRecord, agent: AgentRecord, name: string, args: ToolArgs, result: unknown): Promise<unknown>
+  runTrackedCommand(run: RunRecord, agent: AgentRecord, args: ToolArgs, context: WorkspaceContext): Promise<unknown>
+  // tools and knowledge
+  approve(run: RunRecord, agent: AgentRecord, request: ApprovalRequest, signal?: AbortSignal): Promise<boolean>
+  executeTool(run: RunRecord, agent: AgentRecord, name: string, args: ToolArgs): Promise<Observation>
+  markMemoryUse(run: RunRecord, entries: MemoryEntry[]): void
+  // ledger
+  recordLedger(agent: AgentRecord, name: string, text: string): void
+  workLog(agent: AgentRecord): string
+  collectChildren(run: RunRecord, agent: AgentRecord, transcript: TranscriptEntry[]): number
+  remember(agent: AgentRecord, entry: TranscriptEntry): void
+  trimTranscript(run: RunRecord, agent: AgentRecord): void
+  // turn
+  notePartialTurn(agent: AgentRecord, event: ProviderEvent): void
+  providerEvent(run: RunRecord, agent: AgentRecord, event: ProviderEvent): void
+  flushProviderBuffer(run: RunRecord, key: string): void
+  noteTurnEvent(agent: AgentRecord, event: ProviderEvent): void
+  streamOutput(run: RunRecord, agent: AgentRecord, event: ProviderEvent): void
+  flushStream(run: RunRecord, agent: AgentRecord, stream: StreamState): void
+  recordUsage(run: RunRecord, usage: UsageFigures): void
+  trackOperation<T>(run: RunRecord, operation: T | PromiseLike<T>, agent: { id: string }): Promise<Awaited<T>>
+  providerTurn(run: RunRecord, agent: AgentRecord, prompt: string | (() => string), sessionOptions?: SessionInfo | null): Promise<ProviderResult>
+  // handover
+  failoverActive(run: RunRecord): boolean
+  providerCatalog(run: RunRecord): Promise<CatalogEntry[]>
+  preflightQuota(run: RunRecord, agent: AgentRecord): Promise<void>
+  handover(run: RunRecord, agent: AgentRecord, request: HandoverRequest): Promise<boolean>
+  recoverProvider(run: RunRecord, agent: AgentRecord, error: unknown): Promise<boolean>
+  // loops
+  executeAgent(run: RunRecord, agent: AgentRecord): Promise<AgentResult>
+  envelopeLoop(run: RunRecord, agent: AgentRecord, signal: AbortSignal): Promise<AgentResult | typeof SWITCH_TRANSPORT>
+  sessionLoop(run: RunRecord, agent: AgentRecord, signal: AbortSignal): Promise<AgentResult | typeof SWITCH_TRANSPORT>
+  wakeInstruction(pending: TranscriptEntry[], mailboxText: string): string
+  // session
+  prepareSession(run: RunRecord, agent: AgentRecord): Promise<boolean>
+  releaseSession(run: RunRecord, agent: AgentRecord): void
+  closeSessions(run: RunRecord): void
+  decideTransport(run: RunRecord, providerId: string, model: string): Transport
+  ensureMcp(): Promise<McpServerLike | null>
+  mcpUrl(): string | null
+  sessionFor(token: string | SessionRef | null | undefined): { run: RunRecord; agent: AgentRecord } | null
+  registry(): ToolRegistryLike | null
+  listToolsMcp(token: string | SessionRef | null | undefined): ToolSpec[]
+  approveMcp(token: string | SessionRef | null | undefined, request?: McpApproveRequest): Promise<boolean>
+  dispatchMcp(token: string | SessionRef | null | undefined, name: string, args?: unknown): Promise<McpDispatchResult>
+  shutdown(): Promise<void>
+}

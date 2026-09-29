@@ -1,30 +1,34 @@
 // Actual Electron + renderer + preload + IPC + HTTP adapter integration.
 // All profiles and workspaces are temporary; no vendor model is called.
 const { app, BrowserWindow, dialog } = require('electron')
+const Module = require('node:module')
 const assert = require('node:assert/strict')
 const fs = require('node:fs')
 const http = require('node:http')
 const os = require('node:os')
 const path = require('node:path')
-const { StateStore } = require('../electron/run-store.cjs')
-const quota = require('../electron/quota.cjs')
-const providers = require('../electron/providers.cjs')
+const { StateStore } = require('../electron/run-store.mts')
+const quota = require('../electron/quota.mts')
+const providers = require('../electron/providers.mts')
 
 // Hermetic subscriptions: quota readings, provider health and two vendor CLIs are served by fixtures, so nothing here
-// touches a real account. Both hooks are installed before main.cjs loads, which binds them.
+// touches a real account. The quota readers are patched in place; providers.mts is an ES module whose namespace cannot be
+// patched, so its two fixtures replace what main.cjs and ipc-handlers.cjs get from require('./providers.mts') (main.cjs
+// passes that runProvider into the runtime). Both are installed before main.cjs loads.
 let codexUsed = 97, quotaReads = 0, codexRuns = 0, claudeRuns = 0
 const soon = hours => Date.now() + hours * 3600000
 quota.readers.codex = async () => { quotaReads++; return { windows: [{ kind: 'session', scope: 'all', models: [], usedPercent: codexUsed, resetsAt: soon(2) }, { kind: 'week', scope: 'all', models: [], usedPercent: 46, resetsAt: soon(100) }], plan: 'plus' } }
 quota.readers.claude = async () => ({ windows: [{ kind: 'session', scope: 'all', models: [], usedPercent: 12, resetsAt: soon(3) }, { kind: 'week', scope: 'all', models: [], usedPercent: 30, resetsAt: soon(90) }], plan: 'max' })
 quota.readers.antigravity = async () => ({ windows: [], state: 'unavailable', detail: 'fixture: CLI not installed' })
 quota.readers.cursor = async () => ({ windows: [], state: 'unknown', plan: 'Free', detail: 'fixture: no numbers' })
-providers.inspectProviders = async () => [
+const fixtures = {}
+fixtures.inspectProviders = async () => [
   { id: 'codex', supported: true, installed: true, available: true, authenticated: true, models: ['gpt-6-sol', 'gpt-6-luna'], reasoningLevels: {}, detail: 'fixture' },
   { id: 'claude', supported: true, installed: true, available: true, authenticated: true, models: ['sonnet', 'opus', 'haiku'], detail: 'fixture' },
   { id: 'custom', supported: true, available: true, authenticated: null, detail: 'fixture endpoint', model: 'fixture-model' },
 ]
 const realRunProvider = providers.runProvider
-providers.runProvider = async options => {
+fixtures.runProvider = async options => {
   if (options.providerId === 'codex') {
     codexRuns++
     if (options.prompt.includes('ORBIT_QUOTA_REFUSED')) throw new Error("You've hit your usage limit. Try again in 3 hours 22 minutes.")
@@ -33,6 +37,12 @@ providers.runProvider = async options => {
   if (options.providerId === 'claude') { claudeRuns++; return { text: 'Ответ Claude после замены подписки.', model: 'claude-opus-fixture' } }
   return realRunProvider(options)
 }
+const providersFile = require.resolve('../electron/providers.mts')
+const originalLoad = Module._load
+Module._load = function (request, parent, ...rest) {
+  const loaded = originalLoad.call(this, request, parent, ...rest)
+  return parent && request.endsWith('providers.mts') && Module._resolveFilename(request, parent) === providersFile ? { ...loaded, ...fixtures } : loaded
+}
 
 const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'orbit-desktop-test-'))
 const profile = path.join(temporary, 'profile')
@@ -40,6 +50,8 @@ const workspaces = [path.join(temporary, 'alpha'), path.join(temporary, 'beta')]
 workspaces.forEach(folder => fs.mkdirSync(folder))
 process.env.ORBIT_USER_DATA = profile
 process.env.ORBIT_DEV = '0'
+// The self-upgrade health report belongs to the real app; the smoke must not overwrite it or trip its crash hook.
+process.env.ORBIT_HEALTH_FILE = '0'
 process.env.ORBIT_OPENAI_MODEL = 'fixture-model'
 delete process.env.ORBIT_OPENAI_API_KEY
 const initial = {

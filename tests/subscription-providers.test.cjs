@@ -2,9 +2,9 @@ const test = require('node:test')
 const assert = require('node:assert/strict')
 const fs = require('node:fs')
 const path = require('node:path')
-const { buildArgs, createParser, parseModels, run, inspect, cursorEffortModel, cursorReasoningModels, cursorLaunch } = require('../electron/subscription-providers.cjs')
-const { ORBIT_RESPONSE_SCHEMA } = require('../electron/tool-schema.cjs')
-const { TOOL_HANDOFF } = require('../electron/tool-schema.cjs')
+const { buildArgs, createParser, parseModels, run, inspect, cursorEffortModel, cursorReasoningModels, cursorLaunch } = require('../electron/subscription-providers.mts')
+const { ORBIT_RESPONSE_SCHEMA } = require('../electron/tool-schema.mts')
+const { TOOL_HANDOFF } = require('../electron/tool-schema.mts')
 
 for (const calls of [[], [{ id: 'read', name: 'context_read', arguments: {} }]]) test(`Antigravity hands off the first completed schema response (${calls.length} calls)`, () => {
   const events = [], parser = createParser('antigravity', event => events.push(event), 'fixture', ORBIT_RESPONSE_SCHEMA)

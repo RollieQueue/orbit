@@ -1,96 +1,89 @@
 'use strict'
 
 /**
- * Orbit self-upgrade bootstrap:
- * verify (typecheck → test → smoke [→ smoke:desktop]) → package:win → relaunch newest Orbit-standalone-*.
+ * Orbit self-upgrade: the live loop for an app that runs from this repository (Orbit.cmd / npm start).
  *
- * On relaunch the child always receives:
- *   ORBIT_SELF_UPGRADE=1
- *   ORBIT_SELF_UPGRADE_BUNDLE=<Orbit-standalone-v… name>
- * When --loop / ORBIT_UPGRADE_LOOP=1 is set, the child also receives ORBIT_UPGRADE_LOOP=1.
- * Continuation of the improve→verify→package cycle is then the new process's job (handoff);
- * this script does not claim permanent success — it records nextAction and exits.
+ *   lock → typecheck (tsconfig.json and tsconfig.main.json) → node --experimental-strip-types --test tests/*.test.cjs
+ *   → runtime smoke → main-load test [→ smoke:desktop]
+ *   → dist/ saved to dist-prev/, the verified electron/ + src/ snapshotted as refs/orbit/self-upgrade/candidate
+ *   → vite build
+ *   → the running Orbit is asked to restart itself: `electron.exe <repo> --relaunch`, what `Orbit.cmd --relaunch`
+ *     runs (the second-instance handler in electron/main.cjs flushes state and relaunches; with no instance running
+ *     this simply starts one)
+ *   → wait ≤ 15 s for a fresh artifacts/self-upgrade-health.json, written by the new process after did-finish-load,
+ *     one IPC round trip and a mounted renderer; on success the candidate becomes refs/orbit/self-upgrade/last-good
+ *   → on failure: Orbit processes of this repository are stopped, the failed sources are kept as
+ *     refs/orbit/self-upgrade/failed + artifacts/self-upgrade-failed.patch, dist-prev/ and the last-good tree of
+ *     electron/ + src/ come back, Orbit is started again and the report says `rolled-back`.
+ *
+ * The relaunch phase runs in a watcher process detached from this one: when an agent runs the upgrade from inside
+ * Orbit, the restarting app stops that agent's command tree, and the health check and the rollback must outlive it.
+ * The foreground script waits for the watcher's report and prints it.
  *
  * Flags:
- *   --dry-run              print plan / current newest bundle; no commands (fails if the build
- *                          tools cannot be resolved)
- *   --no-relaunch          stop after successful package
- *   --skip-desktop         skip smoke:desktop (default: skip; pass --desktop to enable)
- *   --desktop              run smoke:desktop before package
- *   --skip-package         verify only
- *   --force                rebuild even when no source file changed since the newest bundle
- *   --loop                 handoff mode: after package+relaunch, document that the new
- *                          Orbit process continues the loop (same as ORBIT_UPGRADE_LOOP=1)
- *   --exit-after-relaunch  after a successful detached spawn of Orbit.exe, exit this
- *                          Node process with code 0 (same as ORBIT_SELF_UPGRADE_EXIT=1).
- *                          Only terminates the process running this script (typically
- *                          `node scripts/self-upgrade.cjs`). It does not close other
- *                          Electron windows unless this script is the main process.
- *                          Prefer with --loop when the parent should yield to the child.
+ *   --dry-run        print the plan and check the tools; nothing runs
+ *   --no-relaunch    verify and build only; the report says what to run next
+ *   --verify-only    stop after the checks (alias: --skip-package)
+ *   --force          verify, build and relaunch even when nothing changed since the last build
+ *   --desktop        also run smoke:desktop (default: skipped; --skip-desktop keeps it off)
+ *   --watch <plan>   internal: the detached relaunch phase
  *
- * Env (boolean when set to "1" / "true" / "yes", case-insensitive):
- *   ORBIT_UPGRADE_LOOP=1       same as --loop
- *   ORBIT_SELF_UPGRADE_EXIT=1  same as --exit-after-relaunch
- * Env (numbers):
- *   ORBIT_UPGRADE_MAX_CYCLES   most relaunch cycles a --loop chain may run (default 3)
- *   ORBIT_UPGRADE_CYCLE        set by this script for the relaunched process; do not set by hand
+ * Env: ORBIT_UPGRADE_MAX_CYCLES relaunches per ORBIT_UPGRADE_CYCLE_WINDOW_MIN minutes (default 3 per 30),
+ *      ORBIT_UPGRADE_HEALTH_TIMEOUT_MS (default 15000), ORBIT_USER_DATA (inherited by a freshly started Orbit).
  *
- * Nothing is rebuilt when the sources are not newer than the sources the newest bundle was built
- * from (recorded in <bundle>/orbit-build.json; a bundle without the record is rebuilt once). Only
- * one self-upgrade may run at a time (artifacts/self-upgrade.lock), a bundle whose sources changed
- * while it was being built is discarded instead of published, and a --loop chain stops after
- * ORBIT_UPGRADE_MAX_CYCLES cycles. Together these keep a chain from rebuilding code forever.
- *
- * Report: artifacts/self-upgrade-last.json
- *   bundle, timestamp, status, nextAction (+ ok, completed, relaunch, …)
+ * Reports: artifacts/self-upgrade-last.json (status, step timings, health, rollback), artifacts/self-upgrade-watch.log.
  */
 const fs = require('node:fs')
+const os = require('node:os')
 const path = require('node:path')
 const { spawn, spawnSync } = require('node:child_process')
-const { findNewestStandalone, listStandaloneBundles } = require('./standalone-resolve.cjs')
 
 const root = path.resolve(__dirname, '..')
-const args = new Set(process.argv.slice(2))
-const dryRun = args.has('--dry-run')
-const noRelaunch = args.has('--no-relaunch')
-const skipPackage = args.has('--skip-package')
-const force = args.has('--force')
-const runDesktop = args.has('--desktop') && !args.has('--skip-desktop')
+const ARTIFACTS = path.join(root, 'artifacts')
+const DIST = path.join(root, 'dist')
+const DIST_PREV = path.join(root, 'dist-prev')
+const HEALTH_FILE = path.join(ARTIFACTS, 'self-upgrade-health.json')
+const HEALTH_PREV_FILE = path.join(ARTIFACTS, 'self-upgrade-health-prev.json')
+const REPORT_FILE = path.join(ARTIFACTS, 'self-upgrade-last.json')
+const PLAN_FILE = path.join(ARTIFACTS, 'self-upgrade-plan.json')
+const CYCLES_FILE = path.join(ARTIFACTS, 'self-upgrade-cycles.json')
+const WATCH_LOG = path.join(ARTIFACTS, 'self-upgrade-watch.log')
+const FAILED_PATCH = path.join(ARTIFACTS, 'self-upgrade-failed.patch')
+const BUILD_MARKER = 'orbit-build.json'
+const RELAUNCH_FLAG = '--relaunch'
+const REF_PREFIX = 'refs/orbit/self-upgrade/'
+const SNAPSHOT_PATHS = ['electron', 'src']
+// Inputs the running application is made of.
+const SOURCE_ENTRIES = ['electron', 'src', 'package.json', 'index.html', 'vite.config.ts', 'tsconfig.json']
+const DEFAULT_HEALTH_TIMEOUT_MS = 15000
 
-function envFlag(name) {
-  const raw = process.env[name]
-  if (raw == null || raw === '') return false
-  return /^(1|true|yes)$/i.test(String(raw).trim())
-}
-
-const loopMode = args.has('--loop') || envFlag('ORBIT_UPGRADE_LOOP')
-const exitAfterRelaunch = args.has('--exit-after-relaunch') || envFlag('ORBIT_SELF_UPGRADE_EXIT')
-const cycle = Math.max(0, Math.floor(Number(process.env.ORBIT_UPGRADE_CYCLE) || 0))
+const argv = process.argv.slice(2)
+const flags = new Set(argv.filter((arg) => arg.startsWith('--')))
+const watchPlan = argv.includes('--watch') ? argv[argv.indexOf('--watch') + 1] : null
+const dryRun = flags.has('--dry-run')
+const noRelaunch = flags.has('--no-relaunch')
+const verifyOnly = flags.has('--verify-only') || flags.has('--skip-package')
+const force = flags.has('--force')
+const runDesktop = flags.has('--desktop') && !flags.has('--skip-desktop')
+const healthTimeoutMs = Math.max(1000, Number(process.env.ORBIT_UPGRADE_HEALTH_TIMEOUT_MS) || DEFAULT_HEALTH_TIMEOUT_MS)
 const maxCycles = Math.max(1, Math.floor(Number(process.env.ORBIT_UPGRADE_MAX_CYCLES) || 3))
+const cycleWindowMs = Math.max(1, Number(process.env.ORBIT_UPGRADE_CYCLE_WINDOW_MIN) || 30) * 60 * 1000
 
-function fail(message, code = 1) {
-  console.error(message)
-  process.exit(code)
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+function readJson(file) { try { return JSON.parse(fs.readFileSync(file, 'utf8')) } catch { return null } }
+function writeJson(file, value) {
+  fs.mkdirSync(path.dirname(file), { recursive: true })
+  fs.writeFileSync(file, JSON.stringify(value, null, 2), 'utf8')
+  return file
 }
+function indexMtime(dist = DIST) { try { return Math.round(fs.statSync(path.join(dist, 'index.html')).mtimeMs) } catch { return null } }
 
-function run(label, command, commandArgs) {
-  console.log(`\n==> ${label}`)
-  const result = spawnSync(command, commandArgs, {
-    cwd: root,
-    stdio: 'inherit',
-    shell: false,
-    windowsHide: true,
-    env: process.env,
-  })
-  if (result.error) throw result.error
-  if (result.status !== 0) throw new Error(`${label} exited with ${result.status}`)
-}
-
-const pause = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms)
+// ---------------------------------------------------------------------------------------------------------------
+// Tools
 
 /**
- * Entry file of a dependency's executable. Modern packages hide their bin files behind an `exports`
- * map, so `require.resolve('typescript/bin/tsc')` throws; the declared `bin` field is the supported route.
+ * Entry file of a dependency's executable. Modern packages hide their bin files behind an `exports` map, so
+ * `require.resolve('typescript/bin/tsc')` throws; the declared `bin` field is the supported route.
  */
 function toolPath(packageName, binName) {
   const manifest = require.resolve(`${packageName}/package.json`)
@@ -102,18 +95,32 @@ function toolPath(packageName, binName) {
   return file
 }
 
-function toolchain() {
-  return {
-    tsc: toolPath('typescript', 'tsc'),
-    vite: toolPath('vite', 'vite'),
-    electronBuilder: require.resolve('electron-builder/cli.js'),
-  }
+/** The electron package exports the path of its binary when loaded under Node; Orbit.cmd starts the same file. */
+function electronBinary() {
+  const file = require('electron')
+  if (typeof file !== 'string' || !fs.existsSync(file)) throw new Error(`Electron binary is missing (${file}); run npm install`)
+  return file
 }
 
-// Inputs that end up inside the packaged application.
-const SOURCE_ENTRIES = ['electron', 'src', 'package.json', 'index.html', 'vite.config.ts', 'tsconfig.json']
+function gitVersion() {
+  const result = spawnSync('git', ['--version'], { encoding: 'utf8', windowsHide: true })
+  return result.status === 0 ? result.stdout.trim() : null
+}
 
-/** Newest modification time among the files a bundle is built from. */
+function toolchain() {
+  return { tsc: toolPath('typescript', 'tsc'), vite: toolPath('vite', 'vite'), electron: electronBinary(), git: gitVersion() }
+}
+
+function testFiles(base = root) {
+  return fs.readdirSync(path.join(base, 'tests'))
+    .filter((name) => name.endsWith('.test.cjs'))
+    .map((name) => path.join('tests', name))
+    .sort()
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Sources and the build marker (dist/orbit-build.json: which sources the current dist/ was built and verified from)
+
 function newestSourceChange(base = root) {
   let newest = { time: 0, file: null }
   const visit = (target) => {
@@ -127,329 +134,529 @@ function newestSourceChange(base = root) {
   return newest
 }
 
-const BUILD_MARKER = 'orbit-build.json'
-
-/** The sources a bundle was built from. Missing for bundles made without this script (provenance unknown). */
-function readBuildMarker(bundle) {
-  try {
-    const marker = JSON.parse(fs.readFileSync(path.join(bundle.dir, BUILD_MARKER), 'utf8'))
-    return Number.isFinite(marker.sourceNewest) ? marker : null
-  } catch {
-    return null
-  }
+/** Missing for a dist/ made by `npm run build` alone: provenance unknown, so the next upgrade verifies and rebuilds. */
+function readBuildMarker(dist = DIST) {
+  const marker = readJson(path.join(dist, BUILD_MARKER))
+  return marker && Number.isFinite(marker.sourceNewest) ? marker : null
 }
 
-function writeBuildMarker(bundle, marker) {
-  fs.writeFileSync(path.join(bundle.dir, BUILD_MARKER), JSON.stringify(marker, null, 2), 'utf8')
+function writeBuildMarker(dist, marker) {
+  return writeJson(path.join(dist, BUILD_MARKER), marker)
 }
 
-/** Removes a bundle this run just built; never anything that is not one of our numbered bundles. */
-function discardBundle(bundle, base = root) {
-  if (path.dirname(bundle.dir) !== base || !/^Orbit-standalone-v\d+$/.test(bundle.name)) return false
-  try { fs.rmSync(bundle.dir, { recursive: true, force: true }); return true } catch { return false }
-}
+// ---------------------------------------------------------------------------------------------------------------
+// Lock: one upgrade at a time; the watcher takes it over for the relaunch phase.
 
-/** One self-upgrade at a time: two concurrent builds would both publish a bundle and relaunch. */
+let lockOwned = false
+function lockFile(base = root) { return path.join(base, 'artifacts', 'self-upgrade.lock') }
+function releaseLockOnExit(file) {
+  process.on('exit', () => {
+    if (!lockOwned) return
+    try { if (readJson(file)?.pid === process.pid) fs.unlinkSync(file) } catch { /* Already gone. */ }
+  })
+}
 function acquireLock(base = root) {
-  const file = path.join(base, 'artifacts', 'self-upgrade.lock')
+  const file = lockFile(base)
   fs.mkdirSync(path.dirname(file), { recursive: true })
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
-      fs.writeFileSync(file, JSON.stringify({ pid: process.pid, startedAt: Date.now() }), { flag: 'wx' })
-      process.on('exit', () => {
-        try { if (JSON.parse(fs.readFileSync(file, 'utf8')).pid === process.pid) fs.unlinkSync(file) } catch { /* Already gone. */ }
-      })
-      return
+      fs.writeFileSync(file, JSON.stringify({ pid: process.pid, startedAt: Date.now(), role: 'upgrade' }), { flag: 'wx' })
+      lockOwned = true
+      releaseLockOnExit(file)
+      return file
     } catch (error) {
       if (error.code !== 'EEXIST') throw error
-      let holder = null
-      try { holder = JSON.parse(fs.readFileSync(file, 'utf8')) } catch { /* Unreadable lock is stale. */ }
+      const holder = readJson(file)
       let alive = false
       // EPERM means the process exists but belongs to someone else (elevated, another user): still running.
       if (holder?.pid) { try { process.kill(holder.pid, 0); alive = true } catch (killError) { alive = killError.code === 'EPERM' } }
-      if (alive && Date.now() - holder.startedAt < 45 * 60 * 1000) fail(`Another self-upgrade is already running (pid ${holder.pid}). Wait for it to finish.`)
+      if (alive && Date.now() - holder.startedAt < 45 * 60 * 1000) throw new Error(`Another self-upgrade is already running (pid ${holder.pid}, ${holder.role || 'upgrade'}). Wait for it to finish.`)
       try { fs.unlinkSync(file) } catch { /* Lost the race to another cleanup. */ }
     }
   }
-  fail('Could not acquire the self-upgrade lock.')
+  throw new Error('Could not acquire the self-upgrade lock.')
+}
+function handOverLock() { lockOwned = false }
+function takeOverLock(base = root) {
+  const file = lockFile(base)
+  writeJson(file, { pid: process.pid, startedAt: Date.now(), role: 'watcher' })
+  lockOwned = true
+  releaseLockOnExit(file)
 }
 
-function testFiles() {
-  return fs.readdirSync(path.join(root, 'tests'))
-    .filter((name) => name.endsWith('.test.cjs'))
-    .map((name) => path.join('tests', name))
-    .sort()
-}
+// ---------------------------------------------------------------------------------------------------------------
+// Steps with timings
 
-function runVerifySteps(completed, tools) {
-  run('typecheck', process.execPath, [tools.tsc, '--noEmit'])
-  completed.push('typecheck')
-
-  run('test', process.execPath, ['--test', ...testFiles()])
-  completed.push('test')
-
-  run('smoke', process.execPath, [path.join('scripts', 'smoke-runtime.cjs')])
-  completed.push('smoke')
-
-  if (runDesktop) {
-    run('smoke:desktop', process.execPath, [path.join('scripts', 'run-electron.cjs'), path.join('scripts', 'smoke-desktop.cjs')])
-    completed.push('smoke:desktop')
+function createTimer(log = console.log) {
+  const timings = []
+  const step = async (name, action) => {
+    const began = Date.now()
+    log(`\n==> ${name}`)
+    try {
+      const result = await action()
+      timings.push({ step: name, ms: Date.now() - began, ok: true })
+      return result
+    } catch (error) {
+      timings.push({ step: name, ms: Date.now() - began, ok: false, error: error.message })
+      throw error
+    }
   }
+  return { timings, step }
 }
 
-function runPackage(completed, tools) {
-  run('build:typecheck', process.execPath, [tools.tsc, '--noEmit'])
-  run('build:vite', process.execPath, [tools.vite, 'build'])
-  run('package:win', process.execPath, [path.join('scripts', 'package-win.cjs')])
-  completed.push('package:win')
+function run(label, command, commandArgs) {
+  const result = spawnSync(command, commandArgs, { cwd: root, stdio: 'inherit', shell: false, windowsHide: true, env: process.env })
+  if (result.error) throw result.error
+  if (result.status !== 0) throw new Error(`${label} exited with ${result.status}`)
 }
 
-function writeReport(report) {
-  const dir = path.join(root, 'artifacts')
-  fs.mkdirSync(dir, { recursive: true })
-  const file = path.join(dir, 'self-upgrade-last.json')
-  fs.writeFileSync(file, JSON.stringify(report, null, 2), 'utf8')
-  return file
+// ---------------------------------------------------------------------------------------------------------------
+// Git snapshots of electron/ and src/ (the real index is never touched)
+
+const SNAPSHOT_IDENTITY = {
+  GIT_AUTHOR_NAME: 'orbit-self-upgrade', GIT_AUTHOR_EMAIL: 'self-upgrade@orbit.local',
+  GIT_COMMITTER_NAME: 'orbit-self-upgrade', GIT_COMMITTER_EMAIL: 'self-upgrade@orbit.local',
 }
 
-/** A failure the next reader of self-upgrade-last.json must be able to see, not only the console. */
-function failWithReport(message, details = {}) {
-  const reportPath = writeReport({
-    ok: false, timestamp: new Date().toISOString(), status: 'failed', nextAction: 'fix-and-retry',
-    error: message, loop: loopMode, relaunch: false, ...details,
-  })
-  fail(`${message}\nReport: ${reportPath}`)
+function git(args, { cwd = root, env = {}, allowFailure = false } = {}) {
+  const result = spawnSync('git', args, { cwd, encoding: 'utf8', windowsHide: true, env: { ...process.env, ...env } })
+  if (result.error) throw result.error
+  if (result.status !== 0 && !allowFailure) throw new Error(`git ${args.join(' ')} failed: ${(result.stderr || result.stdout || '').trim()}`)
+  return { ok: result.status === 0, out: (result.stdout || '').trim(), err: (result.stderr || '').trim() }
+}
+
+function readRef(label, cwd = root) {
+  const result = git(['rev-parse', '--verify', '--quiet', `${REF_PREFIX}${label}^{commit}`], { cwd, allowFailure: true })
+  return result.ok ? result.out : null
 }
 
 /**
- * Spawn newest Orbit.exe detached with self-upgrade handoff env.
- * Does not wait for the child; caller decides whether to exit this process.
+ * The working-tree state of electron/ and src/ (modified, new and deleted files alike; `git stash create` would miss
+ * new files) as a commit behind refs/orbit/self-upgrade/<label>. A temporary index keeps the real one untouched.
  */
-function relaunch(bundle, { loop } = {}) {
-  console.log(`\n==> relaunch ${bundle.exe}`)
-  const childEnv = {
-    ...process.env,
-    ORBIT_SELF_UPGRADE: '1',
-    ORBIT_SELF_UPGRADE_BUNDLE: bundle.name,
-    ORBIT_UPGRADE_CYCLE: String(cycle + 1),
+function snapshotTree({ cwd = root, label, paths = SNAPSHOT_PATHS } = {}) {
+  if (!label) throw new Error('snapshotTree needs a label')
+  const index = path.join(os.tmpdir(), `orbit-upgrade-index-${process.pid}-${Date.now()}`)
+  const env = { GIT_INDEX_FILE: index }
+  try {
+    const head = git(['rev-parse', '--verify', '--quiet', 'HEAD'], { cwd, allowFailure: true })
+    if (head.ok) git(['read-tree', 'HEAD'], { cwd, env })
+    else git(['read-tree', '--empty'], { cwd, env })
+    git(['add', '-A', '--', ...paths], { cwd, env })
+    const tree = git(['write-tree'], { cwd, env }).out
+    const message = `orbit self-upgrade ${label} ${new Date().toISOString()}`
+    const commit = git(['commit-tree', tree, ...(head.ok ? ['-p', head.out] : []), '-m', message], { cwd, env: { ...env, ...SNAPSHOT_IDENTITY } }).out
+    git(['update-ref', `${REF_PREFIX}${label}`, commit], { cwd })
+    return { label, ref: `${REF_PREFIX}${label}`, commit, tree, head: head.ok ? head.out : null }
+  } finally {
+    try { fs.unlinkSync(index) } catch { /* Never created. */ }
   }
-  // Started with this variable Orbit.exe behaves as plain Node: no window, silent exit. It leaks in from
-  // shells launched by Electron or a VS Code host, and from commands an agent runs inside Orbit.
+}
+
+/** Puts electron/ and src/ back to a snapshot: tracked files are rewritten or removed; files created after it stay. */
+function restoreTree({ cwd = root, commit, paths = SNAPSHOT_PATHS }) {
+  if (!commit) throw new Error('restoreTree needs a commit')
+  git(['restore', '--source', commit, '--worktree', '--no-overlay', '--', ...paths], { cwd })
+  return true
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// dist/ and dist-prev/
+
+/** Copy `source` over `target`. The old target is renamed first: a folder another process holds open cannot be deleted at once on Windows, but it can be renamed. */
+function replaceDirectory(source, target) {
+  const parked = `${target}.old-${Date.now()}`
+  if (fs.existsSync(target)) fs.renameSync(target, parked)
+  try {
+    fs.cpSync(source, target, { recursive: true })
+  } catch (error) {
+    if (!fs.existsSync(target) && fs.existsSync(parked)) fs.renameSync(parked, target)
+    throw error
+  }
+  try { fs.rmSync(parked, { recursive: true, force: true }) } catch { /* Swept on the next run. */ }
+}
+
+function sweepParked(base = root) {
+  for (const name of fs.readdirSync(base)) {
+    if (/^dist(-prev)?\.old-\d+$/.test(name)) { try { fs.rmSync(path.join(base, name), { recursive: true, force: true }) } catch { /* Still held open. */ } }
+  }
+}
+
+function saveDistPrev({ dist = DIST, prev = DIST_PREV } = {}) {
+  if (!fs.existsSync(path.join(dist, 'index.html'))) return false
+  replaceDirectory(dist, prev)
+  return true
+}
+
+function restoreDistPrev({ dist = DIST, prev = DIST_PREV } = {}) {
+  if (!fs.existsSync(path.join(prev, 'index.html'))) throw new Error('dist-prev/ has no build to restore')
+  replaceDirectory(prev, dist)
+  return true
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Orbit processes, relaunch signal, health
+
+/** Start Orbit the way Orbit.cmd does: electron.exe <repo> [args], without ELECTRON_RUN_AS_NODE. */
+function orbitLaunch({ electron, base = root, args = [], env = process.env } = {}) {
+  const childEnv = { ...env }
   delete childEnv.ELECTRON_RUN_AS_NODE
-  if (loop) childEnv.ORBIT_UPGRADE_LOOP = '1'
-  else delete childEnv.ORBIT_UPGRADE_LOOP
-  const child = spawn(bundle.exe, [], {
-    cwd: bundle.dir,
-    detached: true,
-    stdio: 'ignore',
-    windowsHide: false,
-    env: childEnv,
-  })
-  // A failed start is reported asynchronously; without a listener it would crash this script after its report.
-  child.on('error', (error) => console.error(`Could not start ${bundle.exe}: ${error.message}`))
+  return { file: electron, args: [base, ...args], env: childEnv, cwd: base }
+}
+
+function signalRelaunch(spec, log = console.log) {
+  log(`starting ${spec.file} ${spec.args.map((arg) => (/\s/.test(arg) ? `"${arg}"` : arg)).join(' ')}`)
+  const child = spawn(spec.file, spec.args, { cwd: spec.cwd, detached: true, stdio: 'ignore', windowsHide: false, env: spec.env })
+  child.on('error', (error) => log(`could not start Electron: ${error.message}`))
   child.unref()
-  return child
+  return child.pid
 }
 
-function stillRunning(child) {
-  try { process.kill(child.pid, 0); return true } catch (error) { return error.code === 'EPERM' }
+/** Whether a Win32_Process row is an Orbit main process started from this repository (not a helper, smoke, dev server or this script). */
+function matchesOrbitProcess(commandLine, base = root) {
+  const rest = String(commandLine || '').replace(/^\s*("[^"]*"|\S+)\s*/, '')
+  const needle = base.replace(/[\\/]+$/, '').toLowerCase()
+  if (!rest.toLowerCase().includes(needle)) return false
+  if (/--type=/.test(rest)) return false
+  if (/smoke-desktop\.cjs|self-upgrade\.cjs|electron[\\/]main\.cjs/i.test(rest)) return false
+  return true
 }
 
-function buildReportBase({ started, completed, before, after, error }) {
-  const timestamp = new Date().toISOString()
-  const bundle = after?.name || before?.name || null
-  return {
-    ok: !error,
-    bundle,
-    timestamp,
-    status: error ? 'failed' : null,
-    nextAction: error ? 'fix-and-retry' : null,
-    started,
-    finished: timestamp,
-    completed,
-    error: error || undefined,
-    newestBefore: before?.name || null,
-    newestAfter: after?.name || null,
-    loop: loopMode,
-    relaunch: false,
+function findOrbitProcesses(base = root) {
+  if (process.platform !== 'win32') return []
+  const command = "Get-CimInstance Win32_Process -Filter \"Name='electron.exe'\" | Select-Object ProcessId,ParentProcessId,CommandLine | ConvertTo-Json -Compress"
+  const result = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', command], { encoding: 'utf8', windowsHide: true, timeout: 30000 })
+  if (result.status !== 0 || !result.stdout || !result.stdout.trim()) return []
+  let rows
+  try { rows = JSON.parse(result.stdout) } catch { return [] }
+  if (!Array.isArray(rows)) rows = [rows]
+  return rows
+    .filter((row) => row && matchesOrbitProcess(row.CommandLine, base))
+    .map((row) => ({ pid: Number(row.ProcessId), parentPid: Number(row.ParentProcessId), commandLine: String(row.CommandLine || '') }))
+}
+
+function killProcess(pid) {
+  if (process.platform === 'win32') {
+    const result = spawnSync('taskkill.exe', ['/pid', String(pid), '/t', '/f'], { encoding: 'utf8', windowsHide: true, timeout: 10000 })
+    return result.status === 0
+  }
+  try { process.kill(pid, 'SIGKILL'); return true } catch { return false }
+}
+
+/** A report from a process that started after the signal, not the one the previous instance left behind. */
+function isFreshHealth(health, since) {
+  return !!health && Number.isFinite(Number(health.pid)) && Number(health.startedAt) >= since && Number(health.writtenAt) >= Number(health.startedAt)
+}
+
+async function waitForHealth({ file = HEALTH_FILE, since, timeoutMs = healthTimeoutMs, poll = 200 } = {}) {
+  const deadline = Date.now() + timeoutMs
+  for (;;) {
+    const health = readJson(file)
+    if (isFreshHealth(health, since)) return health
+    if (Date.now() >= deadline) return null
+    await sleep(poll)
   }
 }
 
-function main() {
-  const before = findNewestStandalone(root)
-  const sourceAtStart = newestSourceChange()
-  const marker = before ? readBuildMarker(before) : null
-  // A bundle built without this script has no marker: its provenance is unknown, so rebuild once to record it.
-  const upToDate = !!before && !!marker && sourceAtStart.time <= marker.sourceNewest
+function parkHealthFile() {
+  try {
+    if (!fs.existsSync(HEALTH_FILE)) return
+    fs.rmSync(HEALTH_PREV_FILE, { force: true })
+    fs.renameSync(HEALTH_FILE, HEALTH_PREV_FILE)
+  } catch { /* A stale file is ignored by the freshness check anyway. */ }
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Relaunch cap: a chain that keeps restarting the app stops here.
+
+function readCycles({ file = CYCLES_FILE, now = Date.now(), windowMs = cycleWindowMs } = {}) {
+  const list = readJson(file)?.relaunches
+  return (Array.isArray(list) ? list : []).filter((time) => Number.isFinite(time) && now - time < windowMs)
+}
+function recordCycle({ file = CYCLES_FILE, now = Date.now(), windowMs = cycleWindowMs } = {}) {
+  const list = readCycles({ file, now, windowMs })
+  list.push(now)
+  writeJson(file, { relaunches: list })
+  return list.length
+}
+function cycleLimitReached({ file = CYCLES_FILE, now = Date.now(), limit = maxCycles, windowMs = cycleWindowMs } = {}) {
+  return readCycles({ file, now, windowMs }).length >= limit
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Plan and report
+
+function planSteps({ verifyOnly: onlyVerify = false, noRelaunch: skipRelaunch = false, desktop = false } = {}) {
+  const steps = ['typecheck', 'test', 'smoke', 'main-load', ...(desktop ? ['smoke:desktop'] : [])]
+  if (onlyVerify) return steps
+  steps.push('save-previous', 'build')
+  if (!skipRelaunch) steps.push('relaunch', 'health')
+  return steps
+}
+
+function writeReport(report) { return writeJson(REPORT_FILE, report) }
+
+/** A failure the next reader of self-upgrade-last.json must be able to see, not only the console. */
+function failWithReport(message, details = {}) {
+  const file = writeReport({ ok: false, status: 'failed', nextAction: 'fix-and-retry', timestamp: new Date().toISOString(), error: message, phase: 'done', ...details })
+  console.error(`${message}\nReport: ${file}`)
+  process.exit(details.exitCode || 1)
+}
+
+function spawnWatcher(planFile) {
+  const nodeExe = process.execPath
+  const script = __filename
+  const env = { ...process.env }
+  const onError = (error) => console.error(`Could not start the relaunch watcher: ${error.message}`)
+  if (process.platform === 'win32') {
+    // `start /b` through cmd.exe breaks the parent chain: the watcher's parent exits at once, so the `taskkill /t`
+    // Orbit aims at an agent's command tree while restarting (this script, when an agent runs it) cannot reach it.
+    const command = `start "" /b "${nodeExe}" "${script}" --watch "${planFile}"`
+    const child = spawn('cmd.exe', ['/d', '/s', '/c', `"${command}"`], { cwd: root, detached: true, stdio: 'ignore', windowsHide: true, windowsVerbatimArguments: true, env })
+    child.on('error', onError)
+    child.unref()
+    return
+  }
+  const child = spawn(nodeExe, [script, '--watch', planFile], { cwd: root, detached: true, stdio: 'ignore', env })
+  child.on('error', onError)
+  child.unref()
+}
+
+async function awaitWatcher(runId, timeoutMs) {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    const report = readJson(REPORT_FILE)
+    if (report?.runId === runId && report.phase === 'done') return report
+    await sleep(300)
+  }
+  return null
+}
+
+function summarize(report) {
+  const lines = [`\nSelf-upgrade ${report.status}${report.ok ? '' : ` — ${report.error || 'see report'}`}`]
+  for (const timing of report.timings || []) lines.push(`  ${timing.ok ? 'ok  ' : 'FAIL'} ${timing.step.padEnd(14)} ${timing.ms} ms`)
+  if (report.relaunch) lines.push(`  relaunch: health ${report.relaunch.health ? (report.relaunch.health.ok ? 'ok' : 'failed') : 'missing'} after ${report.relaunch.waitedMs} ms${report.relaunch.startedFresh ? ' (started a new instance)' : ''}`)
+  if (report.rollback) lines.push(`  rollback: dist ${report.rollback.distRestored ? 'restored' : 'not restored'}, sources ${report.rollback.treeRestored ? 'restored' : 'left as they are'}, recovered: ${report.rollback.recovered}${report.rollback.patch ? `, failed change: ${report.rollback.patch}` : ''}`)
+  lines.push(`Report: ${REPORT_FILE}`)
+  lines.push(`nextAction: ${report.nextAction}`)
+  return lines.join('\n')
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// The detached relaunch phase
+
+async function relaunchAndWait({ spec, timeoutMs, log }) {
+  const runningBefore = findOrbitProcesses().map((process_) => process_.pid)
+  parkHealthFile()
+  const since = Date.now()
+  const signalPid = signalRelaunch(spec, log)
+  log(`relaunch signalled (helper pid ${signalPid}); Orbit running before: ${runningBefore.join(', ') || 'none'}`)
+  const health = await waitForHealth({ since, timeoutMs })
+  log(health ? `health ${health.ok ? 'ok' : 'failed'} from pid ${health.pid} after ${Date.now() - since} ms${health.error ? `: ${health.error}` : ''}` : `no health report within ${timeoutMs} ms`)
+  return { since, runningBefore, startedFresh: runningBefore.length === 0, waitedMs: Date.now() - since, health }
+}
+
+async function rollback({ plan, spec, log }) {
+  const result = { startedAt: new Date().toISOString(), killed: [], distRestored: false, treeRestored: false, failed: null, patch: null, health: null, recovered: false }
+  for (const process_ of findOrbitProcesses()) {
+    killProcess(process_.pid)
+    result.killed.push(process_.pid)
+    log(`stopped Orbit pid ${process_.pid}`)
+  }
+  if (plan.candidate) {
+    try {
+      const failed = snapshotTree({ label: 'failed' })
+      result.failed = failed
+      const base = plan.lastGood || failed.head
+      if (base) {
+        const diff = git(['diff', base, failed.commit, '--', ...SNAPSHOT_PATHS], { allowFailure: true })
+        fs.writeFileSync(FAILED_PATCH, `${diff.out}\n`, 'utf8')
+        result.patch = FAILED_PATCH
+      }
+      log(`failed sources kept as ${failed.ref} (${failed.commit})`)
+    } catch (error) {
+      result.snapshotError = error.message
+      log(`could not snapshot the failed sources: ${error.message}`)
+    }
+  }
+  if (plan.distPrevSaved) {
+    try { restoreDistPrev(); result.distRestored = true; log('dist/ restored from dist-prev/') } catch (error) { result.distError = error.message; log(`dist restore failed: ${error.message}`) }
+  }
+  if (plan.lastGood) {
+    try { restoreTree({ commit: plan.lastGood }); result.treeRestored = true; log(`electron/ and src/ restored from ${plan.lastGood}`) } catch (error) { result.treeError = error.message; log(`source restore failed: ${error.message}`) }
+  } else {
+    result.treeNote = 'no last-good snapshot yet: electron/ and src/ were left as they are (the first successful upgrade records the baseline)'
+    log(result.treeNote)
+  }
+  const attempt = await relaunchAndWait({ spec, timeoutMs: plan.healthTimeoutMs, log })
+  result.relaunch = attempt
+  result.health = attempt.health
+  result.recovered = !!attempt.health?.ok
+  return result
+}
+
+async function watch(planFile) {
+  const plan = readJson(planFile)
+  if (!plan) { console.error(`Plan file is missing or unreadable: ${planFile}`); process.exit(1) }
+  const log = (line) => { try { fs.appendFileSync(WATCH_LOG, `${new Date().toISOString()} ${line}\n`) } catch { /* Log only. */ } }
+  takeOverLock()
+  log(`watcher ${process.pid} started for run ${plan.runId}`)
+  const report = { ...plan.report, phase: 'relaunching', watcherPid: process.pid }
+  writeReport(report)
+  const spec = orbitLaunch({ electron: plan.electron, args: [RELAUNCH_FLAG] })
+  try {
+    const attempt = await relaunchAndWait({ spec, timeoutMs: plan.healthTimeoutMs, log })
+    report.relaunch = attempt
+    if (attempt.health?.ok) {
+      recordCycle()
+      if (plan.candidate?.commit) {
+        try {
+          git(['update-ref', `${REF_PREFIX}last-good`, plan.candidate.commit])
+          report.lastGood = { commit: plan.candidate.commit, ref: `${REF_PREFIX}last-good` }
+        } catch (error) { report.lastGoodError = error.message }
+      }
+      Object.assign(report, { ok: true, status: 'relaunched', nextAction: 'none', health: attempt.health })
+    } else {
+      const error = attempt.health ? `the new Orbit reported a failure: ${attempt.health.error || 'unknown'}` : `no health report within ${plan.healthTimeoutMs} ms`
+      log(`upgrade failed: ${error}`)
+      report.rollback = await rollback({ plan, spec, log })
+      recordCycle()
+      Object.assign(report, { ok: false, status: 'rolled-back', nextAction: report.rollback.failed ? 'inspect-failed-ref' : 'fix-and-retry', error, health: report.rollback.health })
+    }
+  } catch (error) {
+    log(`watcher error: ${error.stack || error.message}`)
+    Object.assign(report, { ok: false, status: 'failed', nextAction: 'fix-and-retry', error: error.message })
+  }
+  report.phase = 'done'
+  report.finished = new Date().toISOString()
+  writeReport(report)
+  log(`done: ${report.status}`)
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// The foreground run
+
+async function main() {
+  try { sweepParked() } catch { /* Housekeeping only. */ }
+  const started = new Date().toISOString()
+  const runId = `${Date.now().toString(36)}-${process.pid}`
   let tools = null
   let toolchainError = null
   try { tools = toolchain() } catch (error) { toolchainError = error.message }
+  const sourceAtStart = newestSourceChange()
+  const marker = readBuildMarker(DIST)
+  const distPresent = fs.existsSync(path.join(DIST, 'index.html'))
+  const upToDate = distPresent && !!marker && sourceAtStart.time <= marker.sourceNewest
+  const health = readJson(HEALTH_FILE)
+  const running = findOrbitProcesses()
+  const runningCurrent = !!health?.ok && running.some((process_) => process_.pid === health.pid) && health.distMtime === indexMtime(DIST)
+  const lastGood = tools?.git ? readRef('last-good') : null
+  const steps = planSteps({ verifyOnly, noRelaunch, desktop: runDesktop })
   const plan = {
-    root,
-    dryRun,
-    loop: loopMode,
-    cycle,
-    maxCycles,
-    exitAfterRelaunch,
-    steps: [
-      'typecheck',
-      'test',
-      'smoke',
-      ...(runDesktop ? ['smoke:desktop'] : []),
-      ...(skipPackage ? [] : ['package:win']),
-      ...(noRelaunch || skipPackage ? [] : ['relaunch']),
-    ],
-    newestBefore: before ? before.name : null,
-    upToDate,
-    newestSource: sourceAtStart.file,
-    standaloneCount: listStandaloneBundles(root).length,
-    tools,
-    toolchainError,
-    handoffEnv: noRelaunch || skipPackage
-      ? null
-      : {
-          ORBIT_SELF_UPGRADE: '1',
-          ORBIT_SELF_UPGRADE_BUNDLE: '<newest bundle name after package>',
-          ORBIT_UPGRADE_CYCLE: String(cycle + 1),
-          ...(loopMode ? { ORBIT_UPGRADE_LOOP: '1' } : {}),
-        },
+    runId, root, dryRun, force, steps, tools, toolchainError, distPresent, upToDate, newestSource: sourceAtStart.file, marker,
+    running: running.map((process_) => process_.pid),
+    health: health ? { ok: health.ok, pid: health.pid, startedAt: health.startedAt, distMtime: health.distMtime, error: health.error } : null,
+    runningCurrent, lastGood, healthTimeoutMs,
+    cycles: { used: readCycles().length, max: maxCycles, windowMinutes: cycleWindowMs / 60000 },
+    relaunchCommand: tools ? `"${tools.electron}" "${root}" ${RELAUNCH_FLAG}` : null,
   }
 
   if (dryRun) {
-    const timestamp = new Date().toISOString()
-    const reportPath = writeReport({
-      ok: !toolchainError,
-      bundle: before?.name || null,
-      timestamp,
-      status: toolchainError ? 'failed' : 'dry-run',
-      nextAction: toolchainError ? 'fix-build-tools' : 'run-without-dry-run',
-      ...plan,
-      mode: 'dry-run',
-    })
-    console.log(JSON.stringify({ ok: !toolchainError, mode: 'dry-run', report: reportPath, ...plan }, null, 2))
-    if (toolchainError) process.exitCode = 1
+    const ok = !toolchainError
+    writeReport({ ok, status: ok ? 'dry-run' : 'failed', nextAction: ok ? 'run-without-dry-run' : 'fix-build-tools', timestamp: started, mode: 'dry-run', phase: 'done', ...plan })
+    console.log(JSON.stringify({ ok, mode: 'dry-run', report: REPORT_FILE, ...plan }, null, 2))
+    if (!ok) process.exitCode = 1
     return
   }
+  if (!tools) failWithReport(`Build tools cannot be resolved: ${toolchainError}`, { runId, nextAction: 'fix-build-tools' })
+  if (!tools.git) console.warn('git is not available: the last-good snapshot and the source rollback are off; dist-prev/ still is restored.')
 
-  if (!tools) failWithReport(`Build tools cannot be resolved: ${toolchainError}`, { newestBefore: before?.name || null })
-
-  if (loopMode && cycle >= maxCycles) {
-    const reportPath = writeReport({
-      ok: true, bundle: before?.name || null, timestamp: new Date().toISOString(), status: 'cycle-limit',
-      nextAction: 'review-and-rerun-manually', newestBefore: before?.name || null, loop: true, cycle, maxCycles, relaunch: false,
-    })
-    console.log(`Loop stopped after ${cycle} cycle(s) (ORBIT_UPGRADE_MAX_CYCLES=${maxCycles}). Review the changes, then run self-upgrade again.`)
-    console.log(`Report: ${reportPath}`)
+  const skipBuild = !force && upToDate
+  if (skipBuild && (runningCurrent || noRelaunch || verifyOnly)) {
+    writeReport({ ok: true, status: 'up-to-date', nextAction: 'edit-source-then-rerun', runId, timestamp: started, phase: 'done', newestSource: sourceAtStart.file, marker, running: plan.running, runningCurrent })
+    console.log(`Nothing changed since dist/ was built and verified (${marker.builtAt})${runningCurrent ? ' and the running Orbit serves it' : ''}. Pass --force to run the checks and rebuild anyway.`)
+    console.log(`Report: ${REPORT_FILE}`)
     return
   }
-
-  if (!skipPackage && !force && upToDate) {
-    const reportPath = writeReport({
-      ok: true, bundle: before.name, timestamp: new Date().toISOString(), status: 'up-to-date',
-      nextAction: 'edit-source-then-rerun', newestBefore: before.name, newestAfter: before.name,
-      loop: loopMode, relaunch: false, newestSource: sourceAtStart.file,
-    })
-    console.log(`Nothing changed since ${before.name} was built; not rebuilding. Pass --force to rebuild anyway.`)
-    console.log(`Report: ${reportPath}`)
-    return
+  if (!verifyOnly && !noRelaunch && cycleLimitReached()) {
+    writeReport({ ok: false, status: 'cycle-limit', nextAction: 'review-and-rerun-later', runId, timestamp: started, phase: 'done', cycles: plan.cycles })
+    console.error(`Orbit was relaunched ${plan.cycles.used} times in the last ${plan.cycles.windowMinutes} minutes (ORBIT_UPGRADE_MAX_CYCLES=${maxCycles}). Review the changes; raise the limit or wait before the next relaunch.`)
+    process.exit(2)
   }
 
-  acquireLock()
-  const started = new Date().toISOString()
-  const completed = []
+  try { acquireLock() } catch (error) { failWithReport(error.message, { runId, status: 'locked', nextAction: 'wait-for-running-upgrade', exitCode: 2 }) }
+  const { timings, step } = createTimer()
+  let candidate = null
+  let distPrevSaved = false
+  let distDirty = false
+  const details = () => ({ runId, started, timings, lastGood, candidate, distPrevSaved })
 
   try {
-    runVerifySteps(completed, tools)
-    if (!skipPackage) runPackage(completed, tools)
+    if (skipBuild) {
+      console.log(`Nothing changed since dist/ was built and verified (${marker.builtAt}); skipping the checks and the build, relaunching only.`)
+      if (tools.git) candidate = snapshotTree({ label: 'candidate' })
+    } else {
+      await step('typecheck', () => { run('typecheck', process.execPath, [tools.tsc, '--noEmit']); run('typecheck:main', process.execPath, [tools.tsc, '-p', 'tsconfig.main.json']) })
+      await step('test', () => run('test', process.execPath, ['--experimental-strip-types', '--disable-warning=ExperimentalWarning', '--test', ...testFiles()]))
+      await step('smoke', () => run('smoke', process.execPath, ['--experimental-strip-types', '--disable-warning=ExperimentalWarning', path.join('scripts', 'smoke-runtime.cjs')]))
+      await step('main-load', () => run('main-load', process.execPath, ['--experimental-strip-types', '--disable-warning=ExperimentalWarning', '--test', path.join('tests', 'main-load.test.cjs')]))
+      if (runDesktop) await step('smoke:desktop', () => run('smoke:desktop', process.execPath, [path.join('scripts', 'run-electron.cjs'), path.join('scripts', 'smoke-desktop.cjs')]))
+      if (verifyOnly) {
+        writeReport({ ok: true, status: 'verify-only', nextAction: 'build-when-ready', phase: 'done', finished: new Date().toISOString(), ...details() })
+        console.log(summarize({ ok: true, status: 'verify-only', nextAction: 'build-when-ready', timings }))
+        return
+      }
+      await step('save-previous', () => {
+        distPrevSaved = saveDistPrev()
+        if (tools.git) candidate = snapshotTree({ label: 'candidate' })
+      })
+      distDirty = true
+      await step('build', () => run('build', process.execPath, [tools.vite, 'build']))
+      // A source edit that landed during the checks was never verified: this build must not run.
+      const sourceAtEnd = newestSourceChange()
+      if (sourceAtEnd.time > sourceAtStart.time) throw new Error(`${sourceAtEnd.file} changed while the checks were running; run self-upgrade again`)
+      writeBuildMarker(DIST, { builtAt: new Date().toISOString(), sourceNewest: sourceAtStart.time, sourceFile: sourceAtStart.file, commit: candidate?.head || null, candidate: candidate?.commit || null })
+      distDirty = false
+    }
   } catch (error) {
-    failWithReport(error.message, buildReportBase({
-      started,
-      completed,
-      before,
-      after: findNewestStandalone(root),
-      error: error.message,
-    }))
+    let distRestored = false
+    if (distDirty && distPrevSaved) { try { restoreDistPrev(); distRestored = true } catch { /* Reported below as not restored. */ } }
+    failWithReport(error.message, { ...details(), distRestored })
   }
 
-  const after = findNewestStandalone(root)
-  if (!skipPackage) {
-    const details = { started, completed, newestBefore: before?.name || null, newestAfter: after?.name || null }
-    if (!after) failWithReport('package:win finished but no Orbit-standalone-*/Orbit.exe was found', details)
-    if (before && after.name === before.name) failWithReport(`Expected a new Orbit-standalone-* bundle, still at ${after.name}`, details)
-    if (before && after.version <= before.version) failWithReport(`New bundle ${after.name} is not newer than ${before.name}`, details)
-    // The tests ran before the bundle was built. A source edit that landed in between was never verified,
-    // and Orbit.cmd would pick this bundle as the newest one, so it is discarded rather than published.
-    const sourceAtEnd = newestSourceChange()
-    if (sourceAtEnd.time > sourceAtStart.time) {
-      const removed = discardBundle(after)
-      failWithReport(`${sourceAtEnd.file} changed while the bundle was being built; ${removed ? 'the unverified bundle was discarded' : 'the bundle may not match the tested sources'}. Run self-upgrade again.`, details)
-    }
-    writeBuildMarker(after, { builtAt: new Date().toISOString(), sourceNewest: sourceAtStart.time, sourceFile: sourceAtStart.file })
+  const base = { ok: null, status: 'relaunching', nextAction: 'wait-for-health', runId, started, timings, built: !skipBuild, lastGood, candidate, distPrevSaved, healthTimeoutMs, phase: 'relaunching' }
+  if (noRelaunch) {
+    writeReport({ ...base, ok: true, status: 'built', nextAction: 'relaunch', phase: 'done', finished: new Date().toISOString(), relaunchCommand: plan.relaunchCommand })
+    console.log(summarize({ ...base, ok: true, status: 'built', nextAction: 'relaunch' }))
+    console.log(`Start or restart Orbit with: Orbit.cmd ${RELAUNCH_FLAG}`)
+    return
   }
 
-  const report = buildReportBase({ started, completed, before, after, error: null })
-
-  if (skipPackage) {
-    report.status = 'verify-only'
-    report.nextAction = 'package-when-ready'
-  } else if (noRelaunch) {
-    report.status = 'packaged'
-    report.nextAction = 'relaunch-or-run-orbit-cmd'
-  } else {
-    const child = relaunch(after, { loop: loopMode })
-    // Orbit quits at once when another instance already holds its single-instance lock (the normal case
-    // when this runs inside Orbit), so give it a moment and say what that outcome usually means.
-    pause(2500)
-    report.relaunch = true
-    report.relaunchTarget = after.exe
-    report.relaunchAlive = stillRunning(child)
-    report.ORBIT_SELF_UPGRADE = '1'
-    report.ORBIT_SELF_UPGRADE_BUNDLE = after.name
-    report.cycle = cycle + 1
-    if (!report.relaunchAlive) report.note = 'The new Orbit exited within 2.5 s. Usually another Orbit is still running: close it and start Orbit.cmd. Otherwise start the bundle by hand to see its error.'
-    if (loopMode) {
-      report.status = 'handoff'
-      report.nextAction = 'continue-improvement-in-new-process'
-      report.ORBIT_UPGRADE_LOOP = '1'
-      report.handoff = {
-        message:
-          `Parent packaged and relaunched (cycle ${cycle + 1} of at most ${maxCycles}); the verify→improve cycle continues in the new Orbit process (ORBIT_SELF_UPGRADE / ORBIT_UPGRADE_LOOP). This run is a handoff, not terminal success.`,
-      }
-    } else {
-      report.status = 'relaunched'
-      report.nextAction = exitAfterRelaunch ? 'parent-exiting' : 'close-previous-window'
-    }
+  const planFile = writeJson(PLAN_FILE, { runId, started, candidate, lastGood, distPrevSaved, built: !skipBuild, healthTimeoutMs, electron: tools.electron, report: base })
+  writeReport(base)
+  console.log('\n==> relaunch (detached watcher)')
+  spawnWatcher(planFile)
+  handOverLock()
+  const final = await awaitWatcher(runId, healthTimeoutMs * 2 + 60000)
+  if (!final) {
+    console.log(`The relaunch watcher has not reported yet; it continues on its own. Watch ${REPORT_FILE} and ${WATCH_LOG}.`)
+    process.exitCode = 2
+    return
   }
-
-  const reportPath = writeReport(report)
-  console.log(`\nSelf-upgrade ${report.status}. Bundle: ${after?.name || '(unchanged)'}`)
-  console.log(`Report: ${reportPath}`)
-  console.log(`nextAction: ${report.nextAction}`)
-  if (report.note) console.log(report.note)
-
-  if (report.relaunch) {
-    if (loopMode) {
-      console.log(
-        'Handoff: new Orbit started with ORBIT_SELF_UPGRADE=1 and ORBIT_UPGRADE_LOOP=1.',
-      )
-      console.log('Continuation of the upgrade loop is on the new process — not a permanent success of this parent.')
-    } else {
-      console.log('New Orbit instance started with ORBIT_SELF_UPGRADE=1.')
-      if (!exitAfterRelaunch) {
-        console.log('Close the previous window to finish the handoff (or pass --exit-after-relaunch).')
-      }
-    }
-  }
-
-  if (report.relaunch && exitAfterRelaunch) {
-    console.log(
-      'Exiting parent Node process after successful relaunch (--exit-after-relaunch / ORBIT_SELF_UPGRADE_EXIT).',
-    )
-    // Detached child already unref()'d; exit only this script process.
-    process.exit(0)
-  }
+  console.log(summarize(final))
+  process.exitCode = final.ok ? 0 : 1
 }
 
-if (require.main === module) main()
+if (require.main === module) {
+  (watchPlan ? watch(watchPlan) : main()).catch((error) => {
+    console.error(error.stack || error.message)
+    process.exit(1)
+  })
+}
 
-module.exports = { newestSourceChange, readBuildMarker, writeBuildMarker, discardBundle, acquireLock, toolPath, toolchain, SOURCE_ENTRIES }
+module.exports = {
+  SOURCE_ENTRIES, SNAPSHOT_PATHS, REF_PREFIX, RELAUNCH_FLAG, BUILD_MARKER,
+  newestSourceChange, readBuildMarker, writeBuildMarker, acquireLock, toolPath, toolchain, testFiles, planSteps,
+  createTimer, isFreshHealth, waitForHealth, snapshotTree, restoreTree, readRef, saveDistPrev, restoreDistPrev,
+  replaceDirectory, orbitLaunch, matchesOrbitProcess, findOrbitProcesses, readCycles, recordCycle, cycleLimitReached,
+}

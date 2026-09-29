@@ -98,3 +98,22 @@
 .library-entry .skill-when{margin-top:6px;color:#a9bbb0}
 .library-entry .skill-pitfalls{margin:10px 0 0;padding-left:18px;font-size:11px;line-height:1.7;color:#cfb98c}
 .library-entry .icon-button[aria-pressed="true"]{color:#bbdcca}
+/* Live chat: the answer being written, the working turn's elapsed time and the team's events while a run is active. */
+.message.streaming .markdown{color:#d2d6de}
+.message.streaming .markdown>p:last-child::after{content:"";display:inline-block;width:2px;height:1em;margin-left:3px;vertical-align:-2px;background:var(--accent);animation:caret 1s steps(2) infinite}
+@keyframes caret{50%{opacity:0}}
+.typing-label{display:inline-flex;align-items:center;gap:6px;color:#9db5a6!important}
+.chat-notices{margin:-6px 0 15px 45px;font-size:11px;color:#8ba092;max-width:100%}
+.chat-notices>summary{cursor:pointer;list-style:none;display:flex;align-items:center;gap:8px;min-width:0}
+.chat-notices>summary::-webkit-details-marker{display:none}
+.chat-notices>summary::before{content:'▸';color:#6f8577;font-size:10px;flex-shrink:0}
+.chat-notices[open]>summary::before{content:'▾'}
+.chat-notices>summary>span{flex-shrink:0}
+.chat-notices>summary>em{font-style:normal;color:#a9bbb0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
+.chat-notices>summary:hover{color:#b7cfbf}
+.chat-notices ul{list-style:none;margin:8px 0 0;padding:8px 10px;border:1px solid #2b332d;border-radius:8px;background:#181d1a;display:flex;flex-direction:column;gap:4px;max-height:180px;overflow:auto}
+.chat-notices li{display:flex;gap:10px;align-items:baseline;line-height:1.6;min-width:0}
+.chat-notices li>span{overflow-wrap:anywhere}
+.chat-notices li time{color:var(--faint);flex-shrink:0;font-variant-numeric:tabular-nums}
+.chat-notices .error{color:#e0a9a9}.chat-notices .done{color:#b1d6bc}.chat-notices .handover{color:#bbdcca}.chat-notices .cancelled,.chat-notices .interrupted{color:#cfb98c}
+@media(max-width:700px){.chat-notices{margin-left:38px}}

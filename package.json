@@ -1,6 +1,6 @@
 {
   "name": "orbit-ide",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "type": "module",
   "private": true,
   "author": "Orbit",
@@ -9,31 +9,37 @@
   "scripts": {
     "dev": "concurrently -k \"vite --host 127.0.0.1\" \"wait-on http://127.0.0.1:5173 && cross-env ORBIT_DEV=1 node scripts/run-electron.cjs electron/main.cjs\"",
     "build": "tsc --noEmit && vite build",
-    "start": "node scripts/run-electron.cjs electron/main.cjs",
-    "typecheck": "tsc --noEmit",
-    "test": "node --test tests/*.test.cjs",
-    "smoke": "node scripts/smoke-runtime.cjs",
+    "start": "node scripts/run-electron.cjs",
+    "typecheck": "tsc --noEmit && npm run typecheck:main",
+    "typecheck:main": "tsc -p tsconfig.main.json",
+    "test": "node --experimental-strip-types --disable-warning=ExperimentalWarning --test tests/*.test.cjs",
+    "smoke": "node --experimental-strip-types --disable-warning=ExperimentalWarning scripts/smoke-runtime.cjs",
     "smoke:desktop": "node scripts/run-electron.cjs scripts/smoke-desktop.cjs",
-    "package:win": "npm run build && node scripts/package-win.cjs",
+    "package:win": "npm run build && node --experimental-strip-types --disable-warning=ExperimentalWarning scripts/package-win.cjs",
     "verify": "npm run typecheck && npm test && npm run smoke",
     "self-upgrade": "node scripts/self-upgrade.cjs",
-    "self-upgrade:check": "node scripts/self-upgrade.cjs --dry-run"
+    "self-upgrade:check": "node scripts/self-upgrade.cjs --dry-run",
+    "clean:bundles": "node scripts/clean-bundles.cjs",
+    "gen:ipc": "node scripts/gen-ipc-types.cjs"
   },
   "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.31.0",
     "react": "19.3.0",
-    "react-dom": "19.3.0"
+    "react-dom": "19.3.0",
+    "zod": "^4.6.5"
   },
   "devDependencies": {
-    "@vitejs/plugin-react": "6.1.1",
-    "concurrently": "10.0.5",
-    "typescript": "7.0.2",
-    "vite": "8.3.1",
-    "wait-on": "9.1.0",
+    "@types/node": "^22.20.4",
     "@types/react": "19.3.0",
     "@types/react-dom": "19.3.0",
+    "@vitejs/plugin-react": "6.1.1",
+    "concurrently": "10.0.5",
     "cross-env": "10.1.0",
+    "electron": "44.4.5",
     "electron-builder": "26.15.3",
-    "electron": "44.4.5"
+    "typescript": "7.0.2",
+    "vite": "8.3.1",
+    "wait-on": "9.1.0"
   },
   "build": {
     "appId": "ai.orbit.ide",

@@ -3,9 +3,9 @@ const assert = require('node:assert/strict')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
-const { OrbitRuntime } = require('../electron/runtime.cjs')
-const { RunStore } = require('../electron/run-store.cjs')
-const chatMemory = require('../electron/chat-memory.cjs')
+const { OrbitRuntime } = require('../electron/runtime.mts')
+const { RunStore } = require('../electron/run-store.mts')
+const chatMemory = require('../electron/chat-memory.mts')
 
 function folder(t) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'orbit-chat-memory-'))

@@ -16,7 +16,9 @@ jobs:
           cache: npm
       - name: Install
         run: npm ci
-      - name: Typecheck
+      # Both configs: tsconfig.json (renderer) and tsconfig.main.json (main process: electron/**/*.mts, strict, plus the
+      # CommonJS shell electron/**/*.cjs under checkJs with JSDoc types, the generated preload included).
+      - name: Typecheck (renderer and main process)
         run: npm run typecheck
       - name: Unit tests
         run: npm test
@@ -24,5 +26,9 @@ jobs:
         run: npm run build
       - name: Runtime smoke
         run: npm run smoke
+      # The app runs from the repository (electron.exe <repo>); the dry run resolves tsc, vite, the Electron binary
+      # and git, checks that dist/ was built and prints the plan of the live loop without relaunching anything.
       - name: Self-upgrade dry-run
         run: npm run self-upgrade:check
+      - name: Packaged copies (listing only)
+        run: npm run clean:bundles

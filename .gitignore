@@ -1,5 +1,8 @@
 node_modules/
 dist/
+dist-prev/
+dist.old-*/
+dist-prev.old-*/
 release/
 release-orbit/
 release-orbit-v2/

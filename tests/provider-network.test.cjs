@@ -1,7 +1,7 @@
 const test = require('node:test')
 const assert = require('node:assert/strict')
-const { proxyEnvironment } = require('../electron/provider-network.cjs')
-const { _testing: { runCli } } = require('../electron/providers.cjs')
+const { proxyEnvironment } = require('../electron/provider-network.mts')
+const { _testing: { runCli } } = require('../electron/providers.mts')
 
 test('proxy modes are process-scoped and explicit routes override inherited bypasses', async () => {
   const env = await proxyEnvironment({}, async () => 'http://127.0.0.1:12334')

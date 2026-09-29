@@ -2,7 +2,7 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { unifiedDiff, fragmentDiff, lineOf, MAX_EDIT_DISTANCE } = require('../electron/diff.cjs');
+const { unifiedDiff, fragmentDiff, lineOf, MAX_EDIT_DISTANCE } = require('../electron/diff.mts');
 
 const P = { path: 'f.txt' };
 const text = (...lines) => lines.map((line) => `${line}\n`).join('');

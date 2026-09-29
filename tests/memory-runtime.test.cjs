@@ -3,9 +3,9 @@ const assert = require('node:assert/strict')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
-const { OrbitRuntime } = require('../electron/runtime.cjs')
-const { OrbitMemoryStore } = require('../electron/memory.cjs')
-const { CapabilityStore } = require('../electron/capabilities.cjs')
+const { OrbitRuntime } = require('../electron/runtime.mts')
+const { OrbitMemoryStore } = require('../electron/memory.mts')
+const { CapabilityStore } = require('../electron/capabilities.mts')
 
 function fixture(t) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'orbit-memory-runtime-'))

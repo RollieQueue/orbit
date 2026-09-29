@@ -3,10 +3,10 @@ const assert = require('node:assert/strict')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
-const { runProvider, _testing, terminateProcess } = require('../electron/providers.cjs')
-const { runCodexServer } = require('../electron/codex-server.cjs')
-const { OrbitRuntime } = require('../electron/runtime.cjs')
-const { ORBIT_RESPONSE_SCHEMA } = require('../electron/tool-schema.cjs')
+const { runProvider, _testing, terminateProcess } = require('../electron/providers.mts')
+const { runCodexServer } = require('../electron/codex-server.mts')
+const { OrbitRuntime } = require('../electron/runtime.mts')
+const { ORBIT_RESPONSE_SCHEMA } = require('../electron/tool-schema.mts')
 
 const envelope = JSON.stringify({ content: 'Starting audits', tool_calls: Array.from({ length: 8 }, (_, i) => ({
   id: `spawn-${i}`, name: 'spawn_agent', arguments: { name: `Audit-${i}`, task: 'Return one finding', reason: 'Independent audit', providerId: null, model: null },
@@ -80,7 +80,7 @@ test('cancellation during CLI handoff cleanup remains cancellation', async () =>
 
 for (const provider of ['antigravity', 'claude']) test(`${provider} stops its CLI at the completed Orbit tool envelope`, async () => {
   const parser = provider === 'antigravity'
-    ? require('../electron/subscription-providers.cjs').createParser(provider, null, '', ORBIT_RESPONSE_SCHEMA)
+    ? require('../electron/subscription-providers.mts').createParser(provider, null, '', ORBIT_RESPONSE_SCHEMA)
     : _testing.createClaudeParser(null, '', ORBIT_RESPONSE_SCHEMA)
   const message = text => provider === 'antigravity'
     ? { event: 'step_update', step_update: { step_type: 'agent_response', step_index: 1, state: 'DONE', text_delta: text } }
@@ -127,7 +127,8 @@ test('real CLI transport creates all eight runtime nodes before the final answer
   const events = []
   let resolve
   const terminal = new Promise(done => { resolve = done })
-  runtime = new OrbitRuntime({ runProvider })
+  // The tool handoff is the envelope protocol's mechanism; the session transport (the default for a real Codex) never kills a process at a tool call.
+  runtime = new OrbitRuntime({ runProvider, transportFor: () => 'envelope' })
   runtime.onEvent(event => { events.push(event); if (['run.finished', 'run.failed', 'run.cancelled'].includes(event.type)) resolve(event) })
   runId = await runtime.start({ workspace, providerId: 'codex', prompt: 'Audit with eight participants', memoryEnabled: false,
     limits: { maxAgents: 9, maxConcurrent: 8, timeoutMs: 5000, runTimeoutMs: 15000 } })

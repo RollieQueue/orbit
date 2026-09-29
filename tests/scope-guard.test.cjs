@@ -3,8 +3,8 @@ const assert = require('node:assert/strict')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
-const { projectReferences, scrub } = require('../electron/scope-guard.cjs')
-const { TextIndex, terms, similarity, uniqueTerms } = require('../electron/text-index.cjs')
+const { projectReferences, scrub } = require('../electron/scope-guard.mts')
+const { TextIndex, terms, similarity, uniqueTerms } = require('../electron/text-index.mts')
 
 function workspace(t, name = 'orbit-guard-fixture') {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'orbit-guard-'))

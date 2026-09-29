@@ -3,7 +3,7 @@ const assert = require('node:assert/strict')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
-const { CapabilityStore, renderSkills, LIMITS } = require('../electron/capabilities.cjs')
+const { CapabilityStore, renderSkills, LIMITS } = require('../electron/capabilities.mts')
 
 const DAY = 86400000
 function fixture(t) {

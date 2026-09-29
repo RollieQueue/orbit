@@ -3,9 +3,9 @@ const assert = require('node:assert/strict')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
-const { OrbitRuntime } = require('../electron/runtime.cjs')
-const { ProjectContextStore } = require('../electron/project-context.cjs')
-const { saveNote } = require('../electron/shared-context.cjs')
+const { OrbitRuntime } = require('../electron/runtime.mts')
+const { ProjectContextStore } = require('../electron/project-context.mts')
+const { saveNote } = require('../electron/shared-context.mts')
 
 function fixture(t) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'orbit-loop-guard-'))

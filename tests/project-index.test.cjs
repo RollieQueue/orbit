@@ -4,7 +4,7 @@ const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
 const { execFileSync } = require('node:child_process')
-const { ProjectIndex, extractSymbols, extractImports } = require('../electron/project-index.cjs')
+const { ProjectIndex, extractSymbols, extractImports } = require('../electron/project-index.mts')
 
 function project(t, files) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'orbit-index-'))
@@ -143,4 +143,66 @@ test('files that usually hold secrets are listed by name and their words are nev
   for (const word of ['hunter2hunter2', 'topsecretvalue', 'MIICsecretmaterial', 'abcdef123456']) assert.equal(index.search(workspace, word).results.length, 0, word)
   index.flush()
   for (const name of fs.readdirSync(index.directory)) assert.doesNotMatch(fs.readFileSync(path.join(index.directory, name), 'utf8'), /hunter2|topsecretvalue|MIICsecret|abcdef123456/, 'nothing secret reaches the index file on disk')
+})
+
+test('a long module keeps every definition findable, and the defining symbol is listed first', async t => {
+  const body = Array.from({ length: 150 }, (_, index) => `function handler${index}() {\n  return ${index}\n}`).join('\n')
+  const workspace = project(t, { ...sample, 'src/big.ts': `${body}\nexport async function lateDefinition() {}\n` })
+  const index = new ProjectIndex()
+  await index.refresh(workspace)
+  const outline = index.outline(workspace, 'src/big.ts')
+  assert.equal(outline.symbols.length, 151)
+  const hit = index.search(workspace, 'lateDefinition')
+  assert.equal(hit.results[0].path, 'src/big.ts')
+  assert.deepEqual(hit.results[0].symbols[0], { name: 'lateDefinition', kind: 'function', line: 451 })
+})
+
+test('search ranks the module above its tests, matches what a file says about itself and forgives inflection', async t => {
+  const workspace = project(t, {
+    'src/retrieval.ts': "// Lexical retrieval over notes: a small inverted index with BM25 scoring\nexport function score(a: string) { return a }\n",
+    'tests/retrieval.test.ts': "import { score } from '../src/retrieval'\ntest('score', () => score('x'))\n",
+    'src/scan.ts': 'export function refreshIndex() { /* refresh the index incrementally */ }\n',
+    'src/App.tsx': Array.from({ length: 30 }, (_, index) => `export function refreshWidget${index}() {}`).join('\n'),
+  })
+  const index = new ProjectIndex()
+  await index.refresh(workspace)
+  const paths = query => index.search(workspace, query).results.map(hit => hit.path)
+  assert.deepEqual(paths('retrieval score').slice(0, 2), ['src/retrieval.ts', 'tests/retrieval.test.ts'], 'the module before its test')
+  assert.equal(paths('inverted index BM25')[0], 'src/retrieval.ts', 'words from the first comment count although they appear nowhere else')
+  assert.equal(paths('refreshing indexes')[0], 'src/scan.ts', 'stemmed terms and one symbol hit per query word beat thirty look-alike handlers')
+})
+
+test('a folder its parent repository ignores is indexed by the walk, not left empty by Git', async t => {
+  const workspace = project(t, { ...sample, '.gitignore': 'nested/\n', 'nested/app.ts': 'export function nestedEntry() {}\n', 'nested/lib/util.ts': 'export const util = () => 1\n' })
+  try { execFileSync('git', ['init', '-q'], { cwd: workspace, stdio: 'ignore' }) } catch { t.skip('git is not installed'); return }
+  const index = new ProjectIndex()
+  const scan = await index.refresh(path.join(workspace, 'nested'))
+  assert.equal(scan.total, 2)
+  assert.equal(index.search(path.join(workspace, 'nested'), 'nestedEntry').results[0].path, 'app.ts')
+})
+
+test('a touched path that differs only in case updates the entry Git listed instead of adding a twin', { skip: !['win32', 'darwin'].includes(process.platform) && 'case-sensitive file system' }, async t => {
+  const workspace = project(t, sample)
+  const index = new ProjectIndex()
+  await index.refresh(workspace)
+  fs.appendFileSync(path.join(workspace, 'src/types.ts'), 'export type Shouted = string\n')
+  assert.deepEqual(await index.touch(workspace, ['SRC/Types.ts']), ['src/types.ts'])
+  assert.equal(index.stats(workspace).files, 5)
+  assert.equal(index.search(workspace, 'Shouted').results[0].path, 'src/types.ts')
+  assert.equal(index.outline(workspace, 'SRC/TYPES.TS').path, 'src/types.ts')
+})
+
+test('the index file is compact and has no backup copy: it is a cache that a rescan replaces', async t => {
+  const workspace = project(t, sample)
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'orbit-index-compact-'))
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }))
+  const index = new ProjectIndex({ directory })
+  await index.refresh(workspace)
+  index.flush()
+  const names = fs.readdirSync(directory)
+  assert.equal(names.length, 1, names.join())
+  assert.doesNotMatch(names[0], /\.bak$|\.tmp$/)
+  const text = fs.readFileSync(path.join(directory, names[0]), 'utf8')
+  assert.ok(!text.includes('\n  '), 'no pretty-printing')
+  assert.equal(JSON.parse(text).files.length, 5)
 })
