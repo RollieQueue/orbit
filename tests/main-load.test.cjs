@@ -37,7 +37,7 @@ function loadMain() {
 
 test('the main process loads and registers its IPC channels', () => {
   const { handlers, appEvents } = loadMain()
-  for (const channel of ['runtime:start', 'runtime:stop', 'runtime:list', 'runtime:get', 'state:load', 'state:save', 'providers:health', 'workspace:pick', 'memory:list', 'capabilities:list']) {
+  for (const channel of ['runtime:start', 'runtime:stop', 'runtime:list', 'runtime:get', 'state:load', 'state:save', 'providers:health', 'quota:get', 'workspace:pick', 'memory:list', 'memory:pin', 'memory:stats', 'memory:forget-chat', 'memory:sharing', 'capabilities:list', 'capabilities:pin']) {
     assert.ok(handlers.has(channel), `${channel} is registered`)
   }
   assert.ok(!handlers.has('providers:ask'), 'the direct, unguarded provider channel stays removed')
@@ -64,12 +64,14 @@ test('every call the preload exposes has a main-process handler behind it', () =
     ipcRenderer: { invoke: (channel) => { invoked.push(channel); return Promise.resolve() }, on() {}, removeListener() {} },
   })
   assert.ok(exposed.orbit && typeof exposed.orbit.startTask === 'function')
+  // Event subscriptions listen instead of invoking; each is checked below for its unsubscribe function.
+  const subscriptions = ['onRuntimeEvent', 'onQuotaUpdate']
   for (const [name, member] of Object.entries(exposed.orbit)) {
-    if (typeof member !== 'function' || name === 'onRuntimeEvent') continue
+    if (typeof member !== 'function' || subscriptions.includes(name)) continue
     invoked.length = 0
     member('a', 'b', 'c')
     assert.equal(invoked.length, 1, `${name} performs one invoke`)
     assert.ok(handlers.has(invoked[0]), `${name} -> ${invoked[0]} has a handler`)
   }
-  assert.equal(typeof exposed.orbit.onRuntimeEvent(() => {}), 'function', 'the event subscription returns an unsubscribe function')
+  for (const name of subscriptions) assert.equal(typeof exposed.orbit[name](() => {}), 'function', `${name} returns an unsubscribe function`)
 })

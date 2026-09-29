@@ -7,6 +7,32 @@ const http = require('node:http')
 const os = require('node:os')
 const path = require('node:path')
 const { StateStore } = require('../electron/run-store.cjs')
+const quota = require('../electron/quota.cjs')
+const providers = require('../electron/providers.cjs')
+
+// Hermetic subscriptions: quota readings, provider health and two vendor CLIs are served by fixtures, so nothing here
+// touches a real account. Both hooks are installed before main.cjs loads, which binds them.
+let codexUsed = 97, quotaReads = 0, codexRuns = 0, claudeRuns = 0
+const soon = hours => Date.now() + hours * 3600000
+quota.readers.codex = async () => { quotaReads++; return { windows: [{ kind: 'session', scope: 'all', models: [], usedPercent: codexUsed, resetsAt: soon(2) }, { kind: 'week', scope: 'all', models: [], usedPercent: 46, resetsAt: soon(100) }], plan: 'plus' } }
+quota.readers.claude = async () => ({ windows: [{ kind: 'session', scope: 'all', models: [], usedPercent: 12, resetsAt: soon(3) }, { kind: 'week', scope: 'all', models: [], usedPercent: 30, resetsAt: soon(90) }], plan: 'max' })
+quota.readers.antigravity = async () => ({ windows: [], state: 'unavailable', detail: 'fixture: CLI not installed' })
+quota.readers.cursor = async () => ({ windows: [], state: 'unknown', plan: 'Free', detail: 'fixture: no numbers' })
+providers.inspectProviders = async () => [
+  { id: 'codex', supported: true, installed: true, available: true, authenticated: true, models: ['gpt-6-sol', 'gpt-6-luna'], reasoningLevels: {}, detail: 'fixture' },
+  { id: 'claude', supported: true, installed: true, available: true, authenticated: true, models: ['sonnet', 'opus', 'haiku'], detail: 'fixture' },
+  { id: 'custom', supported: true, available: true, authenticated: null, detail: 'fixture endpoint', model: 'fixture-model' },
+]
+const realRunProvider = providers.runProvider
+providers.runProvider = async options => {
+  if (options.providerId === 'codex') {
+    codexRuns++
+    if (options.prompt.includes('ORBIT_QUOTA_REFUSED')) throw new Error("You've hit your usage limit. Try again in 3 hours 22 minutes.")
+    return { text: 'Ответ Codex.', model: 'gpt-6-sol' }
+  }
+  if (options.providerId === 'claude') { claudeRuns++; return { text: 'Ответ Claude после замены подписки.', model: 'claude-opus-fixture' } }
+  return realRunProvider(options)
+}
 
 const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'orbit-desktop-test-'))
 const profile = path.join(temporary, 'profile')
@@ -191,6 +217,13 @@ async function exercise(win) {
   assert.equal(await evaluate(`document.querySelectorAll('.agent-tree .agent-row:not(.router-row)').length`), 2)
   const screenshotPath = path.resolve(__dirname, '../artifacts/desktop-smoke.png')
   fs.mkdirSync(path.dirname(screenshotPath), { recursive: true })
+  const openMemoryPanel = () => evaluate(`Array.from(document.querySelectorAll('.sidebar-bottom button')).find(button => button.textContent === 'Память').click()`)
+  const shot = async file => {
+    win.webContents.invalidate()
+    await win.webContents.capturePage(undefined, { stayHidden: true, stayAwake: true })
+    await delay(500)
+    fs.writeFileSync(path.join(path.dirname(screenshotPath), file), (await win.webContents.capturePage(undefined, { stayHidden: true, stayAwake: true })).toPNG())
+  }
   fs.writeFileSync(screenshotPath, (await win.webContents.capturePage(undefined, { stayHidden: true, stayAwake: true })).toPNG())
   await evaluate(`document.querySelector('button[aria-label="Переписка"]').click()`)
   await waitFor(() => evaluate(`document.querySelectorAll('.agent-communications .communication-item').length === 4`), 'team correspondence restored')
@@ -213,6 +246,8 @@ async function exercise(win) {
   fs.writeFileSync(path.join(path.dirname(screenshotPath), 'agent-graph.png'), (await win.webContents.capturePage(undefined, { stayHidden: true, stayAwake: true })).toPNG())
   await evaluate(`Array.from(document.querySelectorAll('.sidebar-bottom button')).find(button => button.textContent === 'Навыки').click()`)
   await waitFor(() => evaluate(`!!document.querySelector('.library-entry details')`), 'capability library loaded')
+  assert.match(await evaluate(`document.querySelector('.tier-stats').textContent`), /Проект[\s\S]*Общие[\s\S]*Применялись/)
+  await shot('skills-panel.png')
   await evaluate(`document.querySelector('.library-entry details').open = true`)
   await waitFor(() => evaluate(`document.querySelector('.library-entry')?.textContent.includes('Use the existing project checks')`), 'skill instructions loaded')
   await evaluate(`Array.from(document.querySelectorAll('.library-entry button')).find(button => button.textContent === 'Редактировать').click()`)
@@ -228,6 +263,31 @@ async function exercise(win) {
   await waitFor(() => evaluate(`document.querySelector('.library-entry .scope-label')?.textContent.includes('v3')`), 'skill revision restored')
   const skills = await evaluate(`window.orbit.listCapabilities(${JSON.stringify(workspaces[0])})`)
   assert.equal((await evaluate(`window.orbit.readCapability(${JSON.stringify(skills[0].id)}, ${JSON.stringify(workspaces[0])})`)).instructions, 'Use the existing project checks')
+  // ---- Memory tiers: chat / project / shared, a note of this chat, pinning ----
+  await evaluate(`document.querySelector('button[aria-label="Закрыть"]').click()`)
+  await openMemoryPanel()
+  await waitFor(() => evaluate(`!!document.querySelector('.tier-stats')`), 'memory tiers shown')
+  assert.match(await evaluate(`document.querySelector('.tier-stats').textContent`), /Чат[\s\S]*Проект[\s\S]*Общая/)
+  await evaluate(`Array.from(document.querySelectorAll('.library-form button')).find(button => button.textContent.includes('Добавить запись')).click()`)
+  await waitFor(() => evaluate(`!!document.querySelector('.library-form input')`), 'memory form open')
+  await evaluate(`(() => {
+    const set = (element, prototype, value) => { Object.getOwnPropertyDescriptor(prototype, 'value').set.call(element, value); element.dispatchEvent(new Event(prototype === HTMLSelectElement.prototype ? 'change' : 'input', { bubbles: true })) }
+    set(document.querySelector('.library-form input'), HTMLInputElement.prototype, 'Ограничение этого чата')
+    set(document.querySelector('.library-form textarea'), HTMLTextAreaElement.prototype, 'Не трогать модуль оплаты в этой задаче')
+    set(document.querySelector('.library-form select[aria-label="Область действия"]'), HTMLSelectElement.prototype, 'chat')
+  })()`)
+  await delay(50)
+  await evaluate(`document.querySelector('.library-form form').requestSubmit()`)
+  await waitFor(() => evaluate(`Array.from(document.querySelectorAll('.library-group .section-label')).some(label => label.textContent.startsWith('ЧАТ'))`), 'the note appears in the chat group')
+  assert.ok(await evaluate(`Array.from(document.querySelectorAll('.library-entry')).some(card => card.textContent.includes('Не трогать модуль оплаты'))`))
+  assert.equal((await evaluate(`window.orbit.listMemory(${JSON.stringify(workspaces[0])})`)).length, 1, 'without a chat id the note is invisible: chat notes belong to their chat')
+  assert.equal((await evaluate(`window.orbit.listMemory(${JSON.stringify(workspaces[1])})`)).length, 0)
+  await evaluate(`Array.from(document.querySelectorAll('.library-entry')).find(card => card.textContent.includes('Не трогать модуль оплаты')).querySelector('button[aria-label^="Закрепить"]').click()`)
+  await waitFor(() => evaluate(`!!document.querySelector('.library-entry.pinned')`), 'the note is pinned')
+  await shot('memory-panel.png')
+  await evaluate(`document.querySelector('button[aria-label="Закрыть"]').click()`)
+  await openMemoryPanel()
+  await waitFor(() => evaluate(`!!document.querySelector('.library-entry.pinned')`), 'the pin survives reopening')
   await evaluate(`document.querySelector('button[aria-label="Закрыть"]').click()`)
   win.setSize(900, 700)
   await delay(100)
@@ -249,8 +309,69 @@ async function exercise(win) {
   await waitFor(() => evaluate(`window.orbit.listRuns().then(runs => runs.filter(run => run.prompt.startsWith('ORBIT_PARALLEL_') && run.status === 'working').length === 2)`), 'two write chats active in the same project')
   await waitFor(() => evaluate(`window.orbit.listRuns().then(runs => runs.filter(run => run.prompt.startsWith('ORBIT_PARALLEL_') && run.status === 'completed').length === 2)`), 'parallel chats complete independently')
   assert.equal(await evaluate(`document.querySelectorAll('.message.orbit').length`), 1, 'parallel answers stay in their own chats')
+
+  // ---- Subscription quotas: the window shows what is left, and a running agent moves to another subscription ----
+  const setSelect = (label, value) => evaluate(`(() => { const field = document.querySelector('select[aria-label="${label}"]'); field.value = ${JSON.stringify(value)}; field.dispatchEvent(new Event('change', {bubbles:true})); })()`)
+  const openSidebar = name => evaluate(`Array.from(document.querySelectorAll('.sidebar-bottom button')).find(button => button.textContent.startsWith(${JSON.stringify(name)})).click()`)
+  const card = name => evaluate(`(() => { const card = document.querySelector('.quota-card[aria-label="Квота ${name}"]'); return card && { state: card.querySelector('.quota-state').textContent, meters: Array.from(card.querySelectorAll('[role=meter]')).map(meter => Number(meter.getAttribute('aria-valuenow'))), text: card.textContent } })()`)
+  await openSidebar('Квоты')
+  await waitFor(() => evaluate(`document.querySelectorAll('.quota-card').length === 6`), 'a quota card for every provider')
+  await waitFor(async () => (await card('Codex'))?.meters.length === 2, 'Codex windows shown')
+  const codex = await card('Codex'), claude = await card('Claude Code')
+  assert.deepEqual(codex.meters, [97, 46]); assert.equal(codex.state, 'Скоро закончится')
+  assert.ok(codex.text.includes('осталось 3%') && codex.text.includes('plus') && codex.text.includes('сброс через'), codex.text)
+  assert.deepEqual(claude.meters, [12, 30]); assert.equal(claude.state, 'В норме')
+  assert.ok((await card('Cursor')).text.includes('fixture: no numbers') && (await card('Cursor')).text.includes('Free'))
+  assert.equal((await card('Antigravity')).state, 'Не подключён')
+  assert.ok(await evaluate(`!!document.querySelector('.quota-failover input[aria-label="Порог автозамены, процентов"]')`), 'failover threshold control')
+  await shot('quota-panel.png')
+  await evaluate(`document.querySelector('button[aria-label="Закрыть"]').click()`)
+  await setSelect('Провайдер', 'codex')
+  await waitFor(() => evaluate(`document.querySelector('.composer-caption .quota-chip')?.textContent.includes('Codex: 5 ч 3% ост.')`), 'quota chip for the chosen provider')
+
+  // Ahead of the limit: Codex is at 97%, so the agent starts on Claude and Codex is never called.
+  await evaluate(`document.querySelector('.new-chat').click()`)
+  await send('ORBIT_QUOTA_SWITCH: проверь автозамену')
+  await waitFor(() => evaluate(`window.orbit.listRuns().then(runs => runs.some(run => run.prompt.startsWith('ORBIT_QUOTA_SWITCH') && run.status === 'completed'))`), 'proactive replacement run completes')
+  const proactive = (await evaluate(`window.orbit.listRuns()`)).find(run => run.prompt.startsWith('ORBIT_QUOTA_SWITCH'))
+  assert.deepEqual([proactive.agents[0].providerId, proactive.agents[0].handovers.length, proactive.agents[0].handovers[0].reason, proactive.agents[0].handovers[0].fresh], ['claude', 1, 'approaching', true])
+  assert.deepEqual([codexRuns, claudeRuns], [0, 1], 'the nearly empty subscription was not called')
+  await waitFor(() => evaluate(`document.querySelector('.conversation').textContent.includes('Замена агента «Orbit»') && document.querySelector('.conversation').textContent.includes('Ответ Claude после замены подписки.')`), 'replacement announced in the chat')
+
+  // After a refusal: Codex looks healthy (20%) but refuses the request; the agent moves on and Codex is marked.
+  codexUsed = 20
+  await evaluate(`window.orbit.getQuotas({}, true).then(() => true)`)
+  await waitFor(() => evaluate(`document.querySelector('.composer-caption .quota-chip')?.textContent.includes('Codex: 5 ч 80% ост.')`), 'chip follows the fresh reading')
+  await evaluate(`document.querySelector('.new-chat').click()`)
+  await send('ORBIT_QUOTA_REFUSED: проверь замену после отказа')
+  await waitFor(() => evaluate(`window.orbit.listRuns().then(runs => runs.some(run => run.prompt.startsWith('ORBIT_QUOTA_REFUSED') && run.status === 'completed'))`), 'reactive replacement run completes')
+  const reactive = (await evaluate(`window.orbit.listRuns()`)).find(run => run.prompt.startsWith('ORBIT_QUOTA_REFUSED'))
+  assert.deepEqual([reactive.agents[0].providerId, reactive.agents[0].handovers[0].reason, reactive.agents[0].turns, reactive.usage.providerTurns], ['claude', 'exhausted', 1, 1], 'the refused attempt is not a turn')
+  assert.deepEqual([codexRuns, claudeRuns], [1, 2])
+  await waitFor(() => evaluate(`document.querySelector('.conversation').textContent.includes('квота исчерпана') && document.querySelector('.conversation').textContent.includes('Ответ Claude после замены подписки.')`), 'refusal replacement announced in the chat')
+  await waitFor(() => evaluate(`document.querySelector('.composer-caption .quota-chip.exhausted') !== null`), 'chip shows the refused provider as exhausted')
+  await evaluate(`(() => { if (!document.querySelector('.agents-panel')) document.querySelector('.agents-toggle').click() })()`)
+  await waitFor(() => evaluate(`document.querySelector('.agent-row .handover-badge')?.textContent.includes('Сменил подписку: 1')`), 'agent row marks the change')
+  assert.ok(await evaluate(`document.querySelector('.agent-inspector').textContent.includes('СМЕНА ПОДПИСКИ')`), 'inspector lists the handover')
+  await evaluate(`document.querySelector('.agent-inspector details.trace-item')?.setAttribute('open', '')`)
+  await evaluate(`document.querySelector('.toast button')?.click()`)
+  await shot('failover-agents.png')
+  await openSidebar('Квоты')
+  await waitFor(async () => (await card('Codex'))?.state === 'Исчерпана', 'refused provider is shown as exhausted')
+  assert.ok((await card('Codex')).text.includes('Провайдер отказал в запросе'))
+  assert.ok((await card('Claude Code')).text.includes('Orbit'), 'the agent now listed under the subscription it runs on')
+  await shot('quota-panel-after-failover.png')
+  await evaluate(`(() => { const field = document.querySelector('.quota-failover input[type=range]'); Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(field, '75'); field.dispatchEvent(new Event('input', {bubbles:true})); })()`)
+  await evaluate(`Array.from(document.querySelectorAll('.quota-failover input[type=checkbox]')).at(-1).click()`)
+  await delay(700)
+  await new Promise(resolve => { win.webContents.once('did-finish-load', resolve); win.webContents.reload() })
+  await waitFor(() => evaluate(`!!document.querySelector('textarea[aria-label="Сообщение агенту"]:not(:disabled)')`), 'ready after reload')
+  await openSidebar('Квоты')
+  await waitFor(() => evaluate(`document.querySelector('.quota-failover input[type=range]')?.value === '75'`), 'failover threshold survives reload')
+  assert.ok(await evaluate(`Array.from(document.querySelectorAll('.quota-failover input[type=checkbox]')).at(-1).checked`), 'weaker-model permission survives reload')
+  assert.ok(quotaReads > 0)
   assert.deepEqual(errors, [])
-  console.log(JSON.stringify({ ok: true, projects: 2, runs: 5, agents: 6, communications: 4, agentGraph: true, alphaCalls, betaCalls, childCalls, reload: true, parallelChats: true, fixedInspectorTabs: true, scopeIsolation: true, skillVersions: 3, screenshotPath }))
+  console.log(JSON.stringify({ ok: true, projects: 2, runs: 7, agents: 8, communications: 4, agentGraph: true, alphaCalls, betaCalls, childCalls, reload: true, parallelChats: true, fixedInspectorTabs: true, scopeIsolation: true, skillVersions: 3, quotaPanel: true, failover: { proactive: true, refused: true, codexRuns, claudeRuns }, screenshotPath }))
 }
 
 const timeout = setTimeout(() => { console.error('Desktop verification exceeded 60 seconds'); app.exit(1) }, 60000)

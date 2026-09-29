@@ -5,6 +5,7 @@ const { execFile, spawn } = require('node:child_process')
 const { StringDecoder } = require('node:string_decoder')
 const { isOrbitToolEnvelope, TOOL_HANDOFF } = require('./tool-schema.cjs')
 const { removeTemporaryDirectory } = require('./storage.cjs')
+const { claudeStreamLimit } = require('./quota.cjs')
 
 const DEFAULT_TIMEOUT_MS = 30 * 60 * 1000
 const MAX_OUTPUT_BYTES = 32 * 1024 * 1024
@@ -316,16 +317,28 @@ function createClaudeParser(onEvent, requestedModel = '', responseSchema) {
   let failure = ''
   let lastAssistant = ''
   let handoffText
+  let lastLimit
   const messages = new Map()
   const streams = new Map()
   const toolIds = new Set()
   const dispatch = (event) => emit(onEvent, { providerId: 'claude', ...event })
+  // A refusal that the stream itself announced as a rejected rate limit is typed, so the runtime need not guess from prose.
+  const failed = (message) => {
+    const error = new Error(message)
+    if (lastLimit?.status === 'rejected') error.quota = { providerId: 'claude', resetsAt: Number.isFinite(Number(lastLimit.resetsAt)) ? Number(lastLimit.resetsAt) * 1000 : null }
+    return error
+  }
   return {
     line(line) {
       if (handoffText !== undefined) return TOOL_HANDOFF
       if (!line.trim()) return
       let event
       try { event = JSON.parse(line) } catch { dispatch({ kind: 'observation', text: line, source: 'diagnostic' }); return }
+      if (event.type === 'rate_limit_event') {
+        // Quota figures are shared account state, not part of this agent's conversation.
+        if (event.rate_limit_info) { lastLimit = event.rate_limit_info; dispatch({ kind: 'quota', quota: claudeStreamLimit(event.rate_limit_info) }) }
+        return
+      }
       model = event.model || event.message?.model || model
       const parentToolId = event.parent_tool_use_id || null
       const streamKey = parentToolId || 'main'
@@ -380,7 +393,7 @@ function createClaudeParser(onEvent, requestedModel = '', responseSchema) {
     },
     finish() {
       if (handoffText !== undefined) return { text: handoffText, model }
-      if (failure) throw new Error(failure)
+      if (failure) throw failed(failure)
       if (!result) throw new Error('Claude stream ended without a result')
       const text = result.structured_output ? JSON.stringify(result.structured_output) : typeof result.result === 'string' && result.result.trim() ? result.result : lastAssistant
       if (!text?.trim()) throw new Error('Claude completed without an assistant response')
@@ -724,6 +737,6 @@ async function runProvider(options) {
 }
 
 module.exports = {
-  inspectProviders, runProvider, resolveLaunch, terminateProcess,
+  inspectProviders, runProvider, resolveLaunch, terminateProcess, runCli, createLineReader,
   _testing: { createCodexParser, createClaudeParser, createLineReader, buildCodexArgs, buildClaudeArgs, runCli, resolveLaunch, requestSignal },
 }

@@ -1,0 +1,92 @@
+const test = require('node:test')
+const assert = require('node:assert/strict')
+const fs = require('node:fs')
+const os = require('node:os')
+const path = require('node:path')
+const { projectReferences, scrub } = require('../electron/scope-guard.cjs')
+const { TextIndex, terms, similarity, uniqueTerms } = require('../electron/text-index.cjs')
+
+function workspace(t, name = 'orbit-guard-fixture') {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'orbit-guard-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const folder = path.join(root, name)
+  fs.mkdirSync(path.join(folder, 'src'), { recursive: true })
+  fs.writeFileSync(path.join(folder, 'src', 'engine.js'), 'x')
+  return folder
+}
+
+test('text that ties a note to one workspace is recognised, general text is not', t => {
+  const folder = workspace(t)
+  assert.deepEqual(projectReferences('Spin up an isolated Linux container with docker run and copy the environment into it', folder), [])
+  assert.deepEqual(projectReferences('See package.json and run npm test', folder), [], 'a bare file name exists in every project')
+  assert.equal(projectReferences(`The build lives in ${folder}`, folder)[0].kind, 'path')
+  assert.equal(projectReferences(`cd ${folder.replace(/\\/g, '/')}/src`, folder)[0].kind, 'path', 'either slash direction')
+  assert.equal(projectReferences('Edit src/engine.js to change the loop', folder)[0].kind, 'file')
+  assert.deepEqual(projectReferences('Edit src/other.js to change the loop', folder), [], 'a path that does not exist here is not evidence')
+  assert.equal(projectReferences('The orbit-guard-fixture repo needs a token', folder)[0].kind, 'name')
+  assert.deepEqual(projectReferences('Use the workspace folder', workspace(t, 'workspace')), [], 'a generic folder name is no evidence')
+  assert.deepEqual(projectReferences('Read ../secrets/key and /etc/hosts and node_modules/.bin/tsc', folder), [])
+  fs.mkdirSync(path.join(folder, '.git'))
+  fs.writeFileSync(path.join(folder, '.git', 'config'), '[remote "origin"]\n\turl = git@github.com:someone/secret-project.git\n')
+  assert.equal(projectReferences('Clone github.com/someone/secret-project and build it', folder)[0].kind, 'remote')
+})
+
+test('scrub removes the workspace path from text that has to stay shared', t => {
+  const folder = workspace(t)
+  const text = scrub(`Checked ${folder}${path.sep}src${path.sep}engine.js and ${folder.replace(/\\/g, '/')}/x`, folder)
+  assert.ok(!text.includes('orbit-guard-fixture'), text)
+  assert.match(text, /<project>/)
+  assert.equal(scrub('nothing here', folder), 'nothing here')
+})
+
+test('terms stem inflections in English and Russian and split identifiers', () => {
+  assert.deepEqual(uniqueTerms('memories'), uniqueTerms('memory'))
+  assert.deepEqual(uniqueTerms('проекты'), uniqueTerms('проекте'))
+  assert.ok(uniqueTerms('capabilityStore').has('store'))
+  assert.ok(uniqueTerms('memory_save').has('save'))
+  assert.ok(!terms('the and для что').length, 'stop words carry no signal')
+  assert.equal(similarity(new Set(['a', 'b']), new Set(['a', 'b'])), 1)
+  assert.equal(similarity(new Set(['a']), new Set(['b'])), 0)
+})
+
+test('the index ranks by BM25, honours titles and never scores documents outside the allowed set', () => {
+  const index = new TextIndex()
+  index.set('one', [['Database migration', 3], ['Run the sqlite migration script before deploy', 1]])
+  index.set('two', [['Styling', 3], ['The database is mentioned once in passing here', 1]])
+  index.set('three', [['Other project database', 3], ['postgres database migration', 1]])
+  const all = index.search('database migration')
+  assert.ok(all.get('one').score > all.get('two').score)
+  assert.equal(all.get('one').matched, 2)
+  const limited = index.search('database migration', new Set(['two']))
+  assert.deepEqual([...limited.keys()], ['two'])
+  index.delete('one')
+  assert.ok(!index.search('sqlite').size)
+  assert.equal(index.search('').size, 0)
+})
+
+test('the usual ways of writing a project path, name or repository are all recognised', t => {
+  const folder = workspace(t, 'crm')
+  fs.mkdirSync(path.join(folder, 'lib'), { recursive: true }); fs.writeFileSync(path.join(folder, 'lib', 'core.js'), 'x')
+  fs.mkdirSync(path.join(folder, 'src', 'компоненты'), { recursive: true }); fs.writeFileSync(path.join(folder, 'src', 'компоненты', 'Кнопка.tsx'), 'x')
+  for (const text of ['Edit ./src/engine.js first', 'Edit .\\src\\engine.js first', 'see @/src/engine.js', 'the fix is in src/engine.js.', 'see lib/core.js', 'see src/компоненты/Кнопка.tsx', 'the crm needs a token']) {
+    assert.ok(projectReferences(text, folder).length, text)
+  }
+  const many = Array.from({ length: 120 }, (_, i) => `docs/none-${i}.md`).join(' ')
+  assert.ok(projectReferences(`${many} then src/engine.js`, folder).length, 'a path after many other paths is still checked')
+  assert.deepEqual(projectReferences('See the standard lib/ folder layout and usr/bin/env', folder), [], 'what does not exist here is no evidence')
+  // A workspace inside a repository, and a linked worktree: the remote is found through `.git` above or behind a pointer file.
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'orbit-guard-repo-'))
+  t.after(() => fs.rmSync(repo, { recursive: true, force: true }))
+  fs.mkdirSync(path.join(repo, '.git'))
+  fs.writeFileSync(path.join(repo, '.git', 'config'), '[remote "origin"]\n\turl = https://github.com/acme-corp/billing-engine.git\n')
+  const inner = path.join(repo, 'packages', 'web'); fs.mkdirSync(inner, { recursive: true })
+  assert.equal(projectReferences('Cloned from github.com/acme-corp/billing-engine', inner)[0].kind, 'remote')
+  assert.equal(projectReferences('the acme-corp/billing-engine repo', inner)[0].kind, 'remote', 'the bare owner/repo form')
+  assert.equal(scrub('Verified on the acme-corp/billing-engine repo (github.com/acme-corp/billing-engine)', inner), 'Verified on the <repo> repo (<repo>)')
+  const linked = path.join(repo, 'linked'); fs.mkdirSync(linked)
+  const gitdir = path.join(repo, '.git', 'worktrees', 'linked'); fs.mkdirSync(gitdir, { recursive: true })
+  fs.writeFileSync(path.join(gitdir, 'commondir'), '../..')
+  fs.writeFileSync(path.join(linked, '.git'), `gitdir: ${gitdir}\n`)
+  assert.equal(projectReferences('github.com/acme-corp/billing-engine', linked)[0].kind, 'remote')
+  assert.equal(scrub('Ran ./src/engine.js in crm', folder), 'Ran ./<file> in <project>')
+})

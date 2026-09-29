@@ -53,3 +53,48 @@
 .communication-item.conflict{border-color:#7a4a44;background:#2a1e1d}
 .communication-item.conflict .communication-kind{color:#e0958c}
 .agent-reason.route-reason{margin:-4px 0 12px;color:#8fb4a0}
+.quota-list{display:flex;flex-direction:column;gap:9px}
+.quota-card{border:1px solid #363c42;border-radius:9px;padding:14px 15px;background:#22262b}
+.quota-card.current{border-color:#607666;background:#252c28}
+.quota-card.disconnected{opacity:.62}
+.quota-card>header{display:flex;align-items:center;gap:9px;flex-wrap:wrap;margin-bottom:2px}
+.quota-card>header strong{font-size:13px;font-weight:650}
+.quota-plan{font-size:9px;letter-spacing:.6px;text-transform:uppercase;color:#9db5a6;border:1px solid #3f4d45;border-radius:5px;padding:2px 6px}
+.quota-current{font-size:9px;color:#7f9a89}
+.quota-state{margin-left:auto;font-size:10px;color:#8b959f}
+.quota-state.ok,.quota-state.unlimited{color:#b4d7bd}
+.quota-state.warning{color:#ceb889}
+.quota-state.exhausted{color:#e79d9d}
+.quota-row{margin-top:12px}
+.quota-row-head{display:flex;justify-content:space-between;gap:10px;font-size:11px;color:#b3bcc4}
+.quota-row-head strong{font-weight:600;color:#dbe6de}
+.quota-bar{height:6px;border-radius:4px;background:#171a1d;overflow:hidden;margin:7px 0 5px}
+.quota-bar>span{display:block;height:100%;border-radius:4px;background:#8fc0a4;transition:width .3s}
+.quota-bar.warn>span{background:#ceb889}
+.quota-bar.high>span{background:#e79d9d}
+.quota-row small{font-size:10px;color:#818d97}
+.quota-note{font-size:11px;line-height:1.7;color:#8f9aa3;margin-top:11px;overflow-wrap:anywhere}
+.quota-note.warn{color:#cfb98c}
+.quota-agents{display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin-top:12px;font-size:10px;color:#79858e}
+.quota-agent{display:inline-flex;align-items:center;gap:6px;border:1px solid #363c42;border-radius:12px;padding:3px 9px;color:#b3bec6}
+.quota-agent b{color:#bbdcca;font-weight:600}
+.quota-card>footer{margin-top:11px;font-size:9px;color:#68727b}
+.quota-failover{margin-top:8px}
+.quota-slider{display:block;margin:8px 0 12px;font-size:12px}
+.quota-slider.off{opacity:.5}
+.quota-slider input{padding:0;margin-top:9px;accent-color:#bad7c4;border:0;background:none}
+.quota-chip{display:inline;font-size:inherit;color:#9db5a6;text-decoration:underline;text-decoration-color:#48584f;text-underline-offset:3px;padding:0 0 0 4px}
+.quota-chip.warning{color:#ceb889}
+.quota-chip.exhausted{color:#e79d9d}
+.handover-badge{color:#bbdcca!important}
+.handover-list{margin-bottom:12px}
+.trace-kind.handover{background:#bbdcca}
+.trace-kind.quota{background:#ceb889}
+.tier-stats{display:flex;flex-wrap:wrap;gap:8px 16px;margin:0 0 18px;font-size:11px;color:#8f9aa3}
+.tier-stats strong{font-weight:600;color:#c3d3c8;margin-right:4px}
+.tier-stats .full,.tier-stats .full strong{color:#ceb889}
+.library-entry.pinned{border-color:#4a6357}
+.library-entry .entry-meta{display:block;margin-top:10px;font-size:10px;color:#73807a}
+.library-entry .skill-when{margin-top:6px;color:#a9bbb0}
+.library-entry .skill-pitfalls{margin:10px 0 0;padding-left:18px;font-size:11px;line-height:1.7;color:#cfb98c}
+.library-entry .icon-button[aria-pressed="true"]{color:#bbdcca}

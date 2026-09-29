@@ -30,10 +30,13 @@ const toolArguments = {
   edit_file: { path: string, old_text: string, new_text: string },
   run_command: { command: string, args: optional(strings), cwd: optional(string), timeout_ms: optional(number) },
   memory_search: { query: optional(string), limit: optional(number) },
-  memory_save: { title: string, content: string, scope: optional({ type: 'string', enum: ['project', 'global'] }), type: optional(string), id: optional(string) },
+  memory_save: { title: string, content: string, scope: optional({ type: 'string', enum: ['chat', 'project', 'global'] }), type: optional(string), id: optional(string), confidence: optional(number) },
+  memory_forget: { id: string },
   capability_list: {},
+  capability_search: { query: string, limit: optional(number) },
   capability_read: { id: string },
-  capability_install: { name: string, instructions: string, description: string, id: optional(string), scope: optional({ type: 'string', enum: ['project', 'global'] }), source: optional(string) },
+  capability_feedback: { id: string, outcome: { type: 'string', enum: ['worked', 'partial', 'failed'] }, note: optional(string) },
+  capability_install: { name: string, instructions: string, description: string, whenToUse: optional(string), id: optional(string), scope: optional({ type: 'string', enum: ['project', 'global'] }), source: optional(string) },
 }
 const ORBIT_RESPONSE_SCHEMA = object({
   content: string,

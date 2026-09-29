@@ -14,6 +14,8 @@ export function SwarmSettings({ settings, update, providers, health }: { setting
   return <>
     <label className="toggle-setting"><input type="checkbox" checked={!!settings.improvementMode} onChange={event => update({ improvementMode: event.target.checked })} />Бесконечное улучшение</label>
     <p className="field-hint">Включено: агент находит, реализует и проверяет улучшения до завершения вашего задания или остановки. Выключено: запрос «найдите улучшения» возвращает список. Число улучшений задайте в сообщении.</p>
+    <label className="toggle-setting"><input type="checkbox" checked={settings.skillLearning !== false} onChange={event => update({ skillLearning: event.target.checked })} />Учиться на задачах: сохранять навыки</label>
+    <p className="field-hint">После содержательной задачи (10 и более ходов) или применения навыка оркестратор один раз оценивает использованные навыки и сохраняет новый, если в работе появилась повторяемая процедура. Это добавляет один ход модели. Выключено: навыки создаются только по вашей просьбе или по собственной инициативе агента.</p>
     <h3>Ограничения по вашему выбору</h3>
     <p className="field-hint">Пустое поле — без ограничения. Верхних потолков для числа агентов, ходов и сообщений нет. Глубина 0 запрещает подагентов. Ограничения подписок провайдеров сохраняются.</p>
     <button type="button" className="text-button" onClick={() => update({ limits: { ...settings.limits, ...Object.fromEntries(limitFields.map(field => [field.key, null])) }, limitVersion: 2 })}>Убрать все ограничения</button>

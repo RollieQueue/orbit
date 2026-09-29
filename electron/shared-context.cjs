@@ -37,9 +37,27 @@ function projectPacket(store, workspace, fallback) {
     stale: JSON.stringify(signatures(workspace, Object.keys(note.files || {}))) !== JSON.stringify(note.files || {}) }))
   return { ...saved, overview: bootstrap(workspace), notes }
 }
-// Every finished agent leaves an `agent:<chat>:<name>` note. Without a cap they pile up for the
-// life of the project and end up dominating every context listing.
-const AUTO_NOTE_LIMIT = 30
+// Every finished agent leaves an `agent:<chat>:<name>` note, and an improvement plan leaves `progress:<chat>`. They are
+// working state of one chat that happens to live in the project's file, so they are budgeted per chat: a busy chat cannot
+// push another chat's notes out, only the most recent chats keep theirs, and they expire. Notes saved on purpose are never touched.
+const AUTO_KEY = /^(?:agent|progress):([^:]+)/
+const AUTO_NOTES_PER_CHAT = 30
+const AUTO_CHATS = 4
+const AUTO_NOTE_TTL_MS = 14 * 86400000
+function pruneAutomatic(notes, now = Date.now()) {
+  const chatOf = note => note.key.match(AUTO_KEY)?.[1]
+  const recent = []
+  for (let index = notes.length - 1; index >= 0; index--) { const chat = chatOf(notes[index]); if (chat && !recent.includes(chat)) recent.push(chat) }
+  const keptChats = new Set(recent.slice(0, AUTO_CHATS)), counts = new Map(), drop = new Set()
+  for (let index = notes.length - 1; index >= 0; index--) {
+    const chat = chatOf(notes[index])
+    if (!chat) continue
+    const rank = (counts.get(chat) || 0) + 1
+    counts.set(chat, rank)
+    if (!keptChats.has(chat) || rank > AUTO_NOTES_PER_CHAT || now - Date.parse(notes[index].updatedAt) > AUTO_NOTE_TTL_MS) drop.add(notes[index])
+  }
+  return notes.filter(note => !drop.has(note))
+}
 function saveNote(store, workspace, fallback, { key, summary, files = [] }) {
   if (!key?.trim() || !summary?.trim()) throw new Error('Context key and summary are required')
   const current = store?.getLatest(workspace) || fallback || {}
@@ -47,10 +65,8 @@ function saveNote(store, workspace, fallback, { key, summary, files = [] }) {
   for (const file of files) workspacePath(workspace, file)
   const note = { key: redact(key), summary: redact(summary).slice(0, 6000), files: signatures(workspace, files), updatedAt: new Date().toISOString() }
   const notes = [...(current.notes || []).filter(item => item.key !== key), note]
-  const automatic = notes.filter(item => item.key.startsWith('agent:'))
-  const expired = new Set(automatic.slice(0, Math.max(0, automatic.length - AUTO_NOTE_LIMIT)))
-  const next = { ...current, notes: notes.filter(item => !expired.has(item)) }
+  const next = { ...current, notes: pruneAutomatic(notes) }
   store?.set(workspace, next)
   return next
 }
-module.exports = { projectPacket, saveNote }
+module.exports = { projectPacket, saveNote, pruneAutomatic }

@@ -10,6 +10,7 @@ const { ProjectIndex } = require('./project-index.cjs')
 const { RunStore, StateStore } = require('./run-store.cjs')
 const { workspaceKey } = require('./storage.cjs')
 const { inspectProviders } = require('./providers.cjs')
+const { QuotaMonitor, PROVIDER_IDS } = require('./quota.cjs')
 const { applyPatch, removeWorktree } = require('./worktree.cjs')
 const { guardIpc } = require('./ipc-guard.cjs')
 
@@ -56,6 +57,10 @@ const runtime = new OrbitRuntime({ requestApproval: request => {
   approvalQueue = pending.catch(() => false)
   return pending
 } })
+// Subscription quotas belong to the account, not to a run: one monitor serves the window and every running agent.
+const quota = new QuotaMonitor()
+runtime.setQuota(quota)
+runtime.setCatalog(providerOptions => inspectProviders(providerOptions))
 let memoryStore
 let projectContextStore
 let capabilityStore
@@ -327,13 +332,13 @@ handle('runtime:start', (_event, payload) => {
   if (!payload?.projectId || !payload?.chatId) throw new Error('Project and chat are required')
   return runtime.start({
     ...payload, workspace,
-    memoryContext: payload.memoryEnabled ? memoryStore.search(payload.prompt, workspace, 6, payload.globalMemoryEnabled !== false) : [],
+    memoryContext: payload.memoryEnabled ? memoryStore.search(payload.prompt, workspace, 6, payload.globalMemoryEnabled !== false, payload.chatId) : [],
     artifactRoot: path.join(app.getPath('userData'), 'runs'),
   })
 })
 handle('runtime:route-message', (_event, payload) => runtime.routeMessage({
   ...payload,
-  memoryContext: payload.memoryEnabled ? memoryStore.search(payload.prompt, payload.workspace, 6, payload.globalMemoryEnabled !== false) : [],
+  memoryContext: payload.memoryEnabled ? memoryStore.search(payload.prompt, payload.workspace, 6, payload.globalMemoryEnabled !== false, payload.chatId) : [],
 }))
 handle('runtime:stop', (_event, runId) => runtime.stop(runId))
 handle('runtime:spawn-subagent', (_event, payload) => runtime.spawnSubAgent(payload.runId, payload.parentId, payload))
@@ -353,16 +358,24 @@ handle('project-index:status', async (_event, workspace, rebuild) => {
   await projectIndex.refresh(folder, { force: rebuild === true })
   return projectIndex.stats(folder)
 })
-handle('memory:list', (_event, workspace) => memoryStore.list(workspace))
-handle('memory:search', (_event, query, workspace) => memoryStore.search(query, workspace))
+handle('memory:list', (_event, workspace, chatId) => memoryStore.list(workspace, true, chatId))
+handle('memory:search', (_event, query, workspace, chatId) => memoryStore.search(query, workspace, 6, true, chatId))
 handle('memory:save', (_event, entry) => memoryStore.upsert(entry))
-handle('memory:remove', (_event, id, workspace) => memoryStore.remove(id, workspace))
+handle('memory:remove', (_event, id, workspace, chatId) => memoryStore.remove(id, workspace, chatId))
+handle('memory:pin', (_event, id, pinned, workspace, chatId) => memoryStore.pin(id, pinned === true, workspace, chatId))
+// The renderer owns the per-project switch for shared memory; the runtime needs it to know which projects may contribute.
+handle('memory:sharing', (_event, workspace, enabled) => { runtime.setSharing(workspace, enabled === true); return true })
+handle('memory:forget-chat', (_event, workspace, chatId) => memoryStore.forgetChat(workspace, chatId))
+// How full each tier of memory and each skill library is, for the panels.
+handle('memory:stats', (_event, workspace, chatId) => ({ memory: memoryStore.stats(workspace, chatId), skills: capabilityStore.stats(workspace) }))
 handle('capabilities:list', (_event, workspace) => capabilityStore.list(workspace))
+handle('capabilities:pin', (_event, id, pinned, workspace) => capabilityStore.pin(id, pinned === true, workspace))
 handle('capabilities:read', (_event, id, workspace) => capabilityStore.read(id, workspace))
 handle('capabilities:install', (_event, entry) => capabilityStore.install(entry))
 handle('capabilities:remove', (_event, id, workspace) => capabilityStore.remove(id, workspace))
 handle('capabilities:restore', (_event, id, version, workspace) => capabilityStore.restore(id, version, workspace))
 handle('providers:health', (_event, options) => inspectProviders(options))
+handle('quota:get', (_event, providerOptions, force) => quota.all(PROVIDER_IDS, { options: providerOptions && typeof providerOptions === 'object' ? providerOptions : {}, force: force === true }))
 handle('artifact:apply', async (_event, payload) => {
   const context = await getGitContext(payload.workspace)
   if (!context.connected) return { ok: false, reason: 'workspace_not_root', detail: 'Apply requires the exact Git repository root that produced this artifact.' }
@@ -373,6 +386,9 @@ handle('artifact:apply', async (_event, payload) => {
 
 runtime.onEvent((event) => {
   for (const win of BrowserWindow.getAllWindows()) win.webContents.send('runtime:event', event)
+})
+quota.onUpdate((update) => {
+  for (const win of BrowserWindow.getAllWindows()) if (!win.isDestroyed()) win.webContents.send('quota:update', update)
 })
 
 app.whenReady().then(() => {
@@ -387,6 +403,8 @@ app.whenReady().then(() => {
   runtime.setMemoryStore(memoryStore)
   runtime.setCapabilityStore(capabilityStore)
   runtime.setRunStore(runStore)
+  // Housekeeping on start (expiry, duplicates, caps). Nothing is shared between projects here: which projects allow it is known only once they run.
+  try { memoryStore.maintain({ crossProject: true, projects: [] }); capabilityStore.maintain({ crossProject: true, projects: [] }) } catch (error) { console.error(`Memory housekeeping failed: ${error.message}`) }
   createWindow()
 
   if (startupSelfUpgradeHandoff) {
@@ -406,6 +424,8 @@ app.on('before-quit', () => {
   }
   runStore?.flush()
   projectIndex?.flush()
+  memoryStore?.flush()
+  capabilityStore?.flush()
 })
 
 app.on('window-all-closed', () => {

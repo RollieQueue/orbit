@@ -57,6 +57,21 @@ function workspaceKey(value) {
   return process.platform === 'win32' ? resolved.toLowerCase() : resolved
 }
 
+// workspaceKey touches the disk (realpath); stores compare thousands of stored keys, so they resolve each path once.
+function keyCache(limit = 200) {
+  const keys = new Map()
+  return workspace => {
+    if (typeof workspace !== 'string' || !workspace.trim()) return ''
+    let key = keys.get(workspace)
+    if (key === undefined) {
+      key = workspaceKey(workspace)
+      if (keys.size >= limit) keys.clear()
+      keys.set(workspace, key)
+    }
+    return key
+  }
+}
+
 function redact(value) {
   return String(value ?? '')
     .replace(/\b(?:sk-|pk-|ghp_|github_pat_|xox[baprs]-|AKIA)[A-Za-z0-9_-]{8,}\b/g, '[redacted-token]')
@@ -65,4 +80,4 @@ function redact(value) {
 
 function clone(value) { return JSON.parse(JSON.stringify(value)) }
 
-module.exports = { readJSON, writeJSON, workspaceKey, redact, clone, removeTemporaryDirectory }
+module.exports = { readJSON, writeJSON, workspaceKey, keyCache, redact, clone, removeTemporaryDirectory }

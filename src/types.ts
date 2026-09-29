@@ -22,8 +22,36 @@ export type Agent = {
   budgetLimited?: boolean
   stalled?: boolean
   files?: AgentFiles
+  handovers?: Handover[]
 }
 export type AgentFiles = { read: string[]; wrote: string[] }
+export type QuotaWindow = { kind: 'session' | 'week' | 'other'; usedPercent: number; resetsAt: number | null; scope: string; models?: string[] }
+export type QuotaState = 'ok' | 'warning' | 'exhausted' | 'unknown' | 'unlimited' | 'unavailable'
+export type QuotaSnapshot = {
+  providerId: string
+  state: QuotaState
+  windows: QuotaWindow[]
+  plan?: string | null
+  credits?: { hasCredits: boolean; unlimited: boolean; balance: string | null } | null
+  detail?: string
+  stale?: boolean
+  fetchedAt?: number | null
+  exhaustedUntil?: number | null
+}
+export type QuotaFailover = { enabled: boolean; switchAtPercent: number; allowWeaker: boolean }
+export type HandoverTarget = { providerId: string; model: string; reasoningEffort?: string }
+export type Handover = {
+  id: string
+  time: string
+  reason: 'approaching' | 'exhausted' | 'replacement-failed'
+  from: HandoverTarget
+  to: HandoverTarget
+  fresh: boolean
+  interrupted: boolean
+  usedPercent: number | null
+  resetsAt: number | null
+  note?: string
+}
 export type FileTouch = { path: string; readers: string[]; writers: string[] }
 export type Message = {
   id: string
@@ -36,16 +64,26 @@ export type Message = {
   client?: string
   model?: string
 }
+// chat = working notes of one task thread, project = knowledge about one codebase, global = what holds in every project.
+export type MemoryScope = 'chat' | 'project' | 'global'
 export type MemoryEntry = {
   id: string
   title: string
   content: string
   type: 'decision' | 'pattern' | 'preference' | 'fact'
-  scope: 'project' | 'global'
+  scope: MemoryScope
   workspace?: string
+  chatId?: string
   updated: string
   confidence?: number
+  created?: string
+  lastUsed?: string
+  uses?: number
+  pinned?: boolean
+  source?: string
 }
+export type TierStats = { count: number; limit: number; pinned?: number; chars?: number }
+export type LibraryStats = { memory: { chat: TierStats; project: TierStats; global: TierStats; stored: number }; skills: { project: TierStats; global: TierStats; used: number } }
 export type Capability = {
   id: string
   name: string
@@ -53,9 +91,19 @@ export type Capability = {
   instructions: string
   scope: 'project' | 'global'
   workspace?: string
+  whenToUse?: string
   version?: number | string
   updatedAt?: string
   source?: string
+  uses?: number
+  successes?: number
+  failures?: number
+  reliability?: number
+  lessons?: string[]
+  usedIn?: string[]
+  pinned?: boolean
+  lastUsed?: string
+  editedBy?: string
   revisions?: { version: number; name: string; description: string; instructions: string; updatedAt: string }[]
 }
 export type Workspace = GitContext & { name: string; description?: string }
@@ -126,7 +174,9 @@ export type Settings = {
   limits: RunLimits
   limitVersion?: number
   improvementMode?: boolean
+  skillLearning?: boolean
   providerOptions?: Record<string, ProviderOption>
   providerPool?: PoolMember[]
+  quotaFailover?: QuotaFailover
 }
 export type AppState = { version: number; projects: Project[]; activeProjectId: string; settings: Settings; savedAt?: number }

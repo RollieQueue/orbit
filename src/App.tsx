@@ -1,8 +1,9 @@
 import { useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from 'react'
-import type { Agent, AppState, Capability, ChatThread, Communication, FileTouch, MemoryEntry, Message, Project, RunSnapshot, RunStatus, Settings, Workspace } from './types'
+import type { Agent, AppState, Capability, ChatThread, Communication, FileTouch, LibraryStats, MemoryEntry, MemoryScope, Message, Project, QuotaSnapshot, RunSnapshot, RunStatus, Settings, TierStats, Workspace } from './types'
 import { AgentGraph } from './AgentGraph'
 import { SwarmSettings } from './SwarmSettings'
 import { ReasoningPicker, reasoningLevels, effortLabels } from './ReasoningPicker'
+import { QuotaPanel, QuotaChip, handoverLabel, handoverReason, handoverText, windowsFor, usedNow, windowName } from './QuotaPanel'
 
 const providers = [
   { id: 'codex', name: 'Codex', description: 'CLI · подписка или API', help: 'Установите Codex CLI и выполните codex login в терминале.' },
@@ -12,7 +13,7 @@ const providers = [
   { id: 'ollama', name: 'Ollama', description: 'Локальные модели', help: 'Запустите Ollama. Модель можно указать в настройках; адрес сервера задаётся через ORBIT_OLLAMA_URL.' },
   { id: 'custom', name: 'OpenAI-compatible', description: 'Совместимый API', help: 'Задайте ORBIT_OPENAI_BASE_URL, ORBIT_OPENAI_API_KEY и ORBIT_OPENAI_MODEL в окружении приложения.' },
 ]
-const defaults: Settings = { providerId: 'codex', models: {}, limitVersion: 2, improvementMode: false, providerPool: [], providerOptions: {}, memoryEnabled: true, accessMode: 'workspace-write', approvalPolicy: 'on-request', reasoningEffort: '', agentInstructions: '', limits: { maxAgents: null, maxDepth: null, maxConcurrent: null, maxTurns: null, maxTotalTurns: null } }
+const defaults: Settings = { providerId: 'codex', models: {}, limitVersion: 2, improvementMode: false, skillLearning: true, providerPool: [], providerOptions: {}, quotaFailover: { enabled: true, switchAtPercent: 90, allowWeaker: false }, memoryEnabled: true, accessMode: 'workspace-write', approvalPolicy: 'on-request', reasoningEffort: '', agentInstructions: '', limits: { maxAgents: null, maxDepth: null, maxConcurrent: null, maxTurns: null, maxTotalTurns: null } }
 const uid = () => crypto.randomUUID()
 const now = () => new Date().toISOString()
 const nameOf = (path: string) => path.replace(/[\\/]+$/, '').split(/[\\/]/).pop() || 'Проект'
@@ -44,6 +45,8 @@ function normalize(value: Partial<AppState>): AppState {
   }
   if (!providers.some(p => p.id === settings.providerId)) settings.providerId = 'codex'
   if (!['never', 'on-request', 'auto-review'].includes(settings.approvalPolicy)) settings.approvalPolicy = 'on-request'
+  const savedFailover = value.settings?.quotaFailover, savedPercent = Number(savedFailover?.switchAtPercent)
+  settings.quotaFailover = { enabled: savedFailover?.enabled !== false, switchAtPercent: Number.isFinite(savedPercent) ? Math.max(50, Math.min(99, Math.round(savedPercent))) : 90, allowWeaker: savedFailover?.allowWeaker === true }
   settings.providerOptions = { ...settings.providerOptions }
   if (settings.reasoningEffort && settings.providerOptions[settings.providerId]?.reasoningEffort === undefined) {
     settings.providerOptions[settings.providerId] = { ...settings.providerOptions[settings.providerId], reasoningEffort: settings.reasoningEffort }
@@ -100,6 +103,8 @@ function Icon({ name, size = 18 }: { name: string; size?: number }) {
     trash: <><path d="M3 6h18M9 6V3h6v3M6 6l1 15h10l1-15M10 10v7M14 10v7" /></>,
     menu: <path d="M4 6h16M4 12h16M4 18h16" />, check: <path d="m5 12 4 4L19 6" />, terminal: <><path d="m4 6 6 6-6 6M13 18h7" /></>,
     index: <><circle cx="11" cy="11" r="6" /><path d="m16 16 4 4" /></>,
+    gauge: <><path d="M4 18a8 8 0 1 1 16 0" /><path d="m12 18 4-6" /></>,
+    pin: <><path d="M9 3h6l-1 6 3 3H7l3-3z" /><path d="M12 12v9" /></>,
   }
   return <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">{paths[name] || paths.chat}</svg>
 }
@@ -157,7 +162,7 @@ export default function App() {
   const [drafts, setDrafts] = useState<Record<string, string>>({})
   const [health, setHealth] = useState<ProviderHealth[]>([])
   const [checking, setChecking] = useState(false)
-  const [panel, setPanel] = useState<'settings' | 'memory' | 'capabilities' | 'add' | null>(null)
+  const [panel, setPanel] = useState<'settings' | 'memory' | 'capabilities' | 'add' | 'quota' | null>(null)
   const [agentsOpen, setAgentsOpen] = useState(false)
   const [sidebarOpen, setSidebarOpen] = useState(false)
   const [projectMenu, setProjectMenu] = useState(false)
@@ -170,10 +175,16 @@ export default function App() {
   const [remote, setRemote] = useState('')
   const [memory, setMemory] = useState<MemoryEntry[]>([])
   const [capabilities, setCapabilities] = useState<Capability[]>([])
+  const [libraryStats, setLibraryStats] = useState<LibraryStats | null>(null)
   const [loadingLibrary, setLoadingLibrary] = useState(false)
   const [libraryRevision, setLibraryRevision] = useState(0)
   const [indexInfo, setIndexInfo] = useState<ProjectIndexStatus | null>(null)
   const [indexBusy, setIndexBusy] = useState(false)
+  const [quotas, setQuotas] = useState<Record<string, QuotaSnapshot>>({})
+  const [quotaBusy, setQuotaBusy] = useState(false)
+  const providerOptionsRef = useRef(state.settings.providerOptions)
+  providerOptionsRef.current = state.settings.providerOptions
+  const quotaRefresh = useRef<number | undefined>(undefined)
   const bottom = useRef<HTMLDivElement>(null)
   const nearBottom = useRef(true)
   const project = state.projects.find(p => p.id === state.activeProjectId) || state.projects[0]
@@ -190,6 +201,10 @@ export default function App() {
   const lastAnswerOfRun = new Map<string, string>()
   for (const message of chat?.messages || []) if (message.author === 'orbit' && message.runId) lastAnswerOfRun.set(message.runId, message.id)
   const currentHealth = health.find(p => p.id === state.settings.providerId)
+  const connected = Object.fromEntries(health.map(p => [p.id, p.available]))
+  // The sidebar dot summarises the connected subscriptions: any exhausted, any close to the limit, otherwise fine.
+  const quotaStates = providers.filter(p => connected[p.id]).map(p => quotas[p.id]?.state)
+  const quotaDot = quotaStates.includes('exhausted') ? 'error' : quotaStates.includes('warning') ? 'waiting' : quotaStates.some(s => s === 'ok') ? 'done' : 'idle'
   const modelChoices = [...new Set([...(currentHealth?.models || []), ...(currentHealth?.model ? [currentHealth.model] : []), ...Object.values(runs).filter(run => run.providerId === state.settings.providerId && run.model).map(run => run.model!)])]
   const effortLevels = reasoningLevels(state.settings.providerId, state.settings.models[state.settings.providerId] || '', currentHealth)
   const savedEffort = state.settings.providerOptions?.[state.settings.providerId]?.reasoningEffort || ''
@@ -198,6 +213,27 @@ export default function App() {
   function chooseAccess(value: string) { updateSettings({ accessMode: value === 'ask' ? 'workspace-write' : value as Settings['accessMode'], approvalPolicy: value === 'ask' ? 'on-request' : 'never' }) }
   const draft = drafts[chatKey] || ''
   const desktop = !!window.orbit
+
+  async function refreshQuotas(force = false) {
+    const api = window.orbit
+    if (!api) return
+    setQuotaBusy(true)
+    try { setQuotas(await api.getQuotas(providerOptionsRef.current, force)) } catch (error) { setNotice(`Не удалось получить квоты: ${errorText(error)}`) } finally { setQuotaBusy(false) }
+  }
+  useEffect(() => {
+    const api = window.orbit
+    if (!api) return
+    const off = api.onQuotaUpdate(update => { if (update.snapshot) setQuotas(previous => ({ ...previous, [update.providerId]: update.snapshot! })) })
+    void refreshQuotas()
+    return () => { off(); window.clearTimeout(quotaRefresh.current) }
+  }, [])
+  // The open quota window keeps itself current; the shared cache makes this cheap.
+  useEffect(() => {
+    if (panel !== 'quota') return
+    void refreshQuotas()
+    const timer = window.setInterval(() => void refreshQuotas(), 60000)
+    return () => window.clearInterval(timer)
+  }, [panel])
 
   useEffect(() => {
     const api = window.orbit
@@ -238,7 +274,17 @@ export default function App() {
         if (restoring) restoredDuringLoad.push({ projectId: event.projectId, chatId: event.chatId, message })
         setState(previous => addChatMessage(previous, event.projectId, event.chatId, message))
       }
-      if (event.type === 'run.finished' || event.type === 'run.failed' || event.type === 'run.cancelled') setLibraryRevision(n => n + 1)
+      if (event.type === 'agent.handover' && event.handover) {
+        const text = handoverText(providers, event.agent?.name || 'Агент', event.handover)
+        setNotice(text)
+        if (!event.agentId || event.agentId === 'root') setState(previous => addChatMessage(previous, event.projectId, event.chatId, { id: `handover-${event.handover!.id}`, author: 'system', text, time: event.handover!.time, runId: event.runId, kind: 'handover' }))
+      }
+      if (event.type === 'run.finished' || event.type === 'run.failed' || event.type === 'run.cancelled') {
+        setLibraryRevision(n => n + 1)
+        // A run has just spent quota: read it again once the burst of finishing runs has settled.
+        window.clearTimeout(quotaRefresh.current)
+        quotaRefresh.current = window.setTimeout(() => void refreshQuotas(true), 2500)
+      }
     })
     void api.checkProviders(state.settings.providerOptions).then(result => { if (mounted) setHealth(result) }).catch(error => { if (mounted) setNotice(`Не удалось проверить провайдеры: ${errorText(error)}`) })
     void Promise.allSettled([api.loadState(), api.listRuns()]).then(results => {
@@ -283,6 +329,16 @@ export default function App() {
     return () => clearTimeout(timer)
   }, [state, ready])
 
+  // The runtime decides which projects may feed the shared memory; it learns each project's switch from here.
+  const sharingState = state.projects.map(p => `${p.workspace.path}\u0000${p.globalMemoryEnabled ?? state.settings.memoryEnabled ? 1 : 0}`).join('\u0001')
+  useEffect(() => {
+    if (!ready || !window.orbit) return
+    for (const entry of sharingState ? sharingState.split('\u0001') : []) {
+      const [workspace, flag] = entry.split('\u0000')
+      if (workspace) void window.orbit.setMemorySharing(workspace, flag === '1').catch(() => undefined)
+    }
+  }, [ready, sharingState])
+
   useEffect(() => { nearBottom.current = true; bottom.current?.scrollIntoView({ behavior: 'instant' }); setSelectedAgent('root') }, [chatKey])
   useEffect(() => { if (nearBottom.current) bottom.current?.scrollIntoView({ behavior: 'smooth' }) }, [chat?.messages.length, running])
   useEffect(() => { if (!notice) return; const timer = setTimeout(() => setNotice(''), 7500); return () => clearTimeout(timer) }, [notice])
@@ -292,10 +348,11 @@ export default function App() {
     if (!api) return
     let mounted = true
     setLoadingLibrary(true)
-    setMemory([]); setCapabilities([])
-    void Promise.all([api.listMemory(project?.workspace.path || ''), api.listCapabilities(project?.workspace.path || '')]).then(([entries, skills]) => { if (mounted) { setMemory(entries); setCapabilities(skills) } }).catch(error => { if (mounted) setNotice(errorText(error)) }).finally(() => { if (mounted) setLoadingLibrary(false) })
+    setMemory([]); setCapabilities([]); setLibraryStats(null)
+    const workspace = project?.workspace.path || ''
+    void Promise.all([api.listMemory(workspace, chat?.id), api.listCapabilities(workspace), api.memoryStats(workspace, chat?.id)]).then(([entries, skills, stats]) => { if (mounted) { setMemory(entries); setCapabilities(skills); setLibraryStats(stats) } }).catch(error => { if (mounted) setNotice(errorText(error)) }).finally(() => { if (mounted) setLoadingLibrary(false) })
     return () => { mounted = false }
-  }, [panel, project?.workspace.path, libraryRevision])
+  }, [panel, project?.workspace.path, chat?.id, libraryRevision])
   useEffect(() => {
     const listener = (event: KeyboardEvent) => { if (event.key === 'Escape') { setPanel(null); setProjectMenu(false); setSidebarOpen(false) } }
     window.addEventListener('keydown', listener)
@@ -346,6 +403,8 @@ export default function App() {
       return { ...p, chats, activeChatId: chats.some(c => c.id === p.activeChatId) ? p.activeChatId : chats[0].id, deletedChatIds: [...new Set([...(p.deletedChatIds || []), chatId])] }
     }) }))
     setDrafts(previous => { const next = { ...previous }; delete next[`${project.id}/${chatId}`]; return next })
+    // A deleted chat takes its working notes with it (what proved durable was already moved to the project).
+    if (window.orbit && project.workspace.path) void window.orbit.forgetChatMemory(project.workspace.path, chatId).catch(() => undefined)
   }
   function createChat() {
     if (!project) return
@@ -407,7 +466,7 @@ export default function App() {
       const nextSeen = new Set(seen).add(agent.id)
       const providerId = agent.providerId || currentRun?.providerId
       const modelLabel = `${providers.find(provider => provider.id === providerId)?.name || providerId || 'Провайдер не указан'} · ${agent.model || 'Модель: авто (ещё не определена)'}`
-      return <div key={agent.id}><button className={`agent-row ${selected?.id === agent.id ? 'selected' : ''}`} style={{ paddingLeft: 14 + Math.min(depth, 8) * 16 }} onClick={() => setSelectedAgent(agent.id)}><span className={`status-dot ${agent.status}`} /><span className="agent-row-label"><strong>{agent.name || agent.id}</strong><small title={modelLabel}>{modelLabel}</small>{agent.role && <small>{agent.role}</small>}{!!agent.files && agent.files.wrote.length + agent.files.read.length > 0 && <small>Файлы: изменил {agent.files.wrote.length}, читал {agent.files.read.length}</small>}</span><span className="agent-state">{statusText(agent.status)}</span></button>{agentTree(items, agent.id, depth + 1, nextSeen)}</div>
+      return <div key={agent.id}><button className={`agent-row ${selected?.id === agent.id ? 'selected' : ''}`} style={{ paddingLeft: 14 + Math.min(depth, 8) * 16 }} onClick={() => setSelectedAgent(agent.id)}><span className={`status-dot ${agent.status}`} /><span className="agent-row-label"><strong>{agent.name || agent.id}</strong><small title={modelLabel}>{modelLabel}</small>{agent.role && <small>{agent.role}</small>}{!!agent.files && agent.files.wrote.length + agent.files.read.length > 0 && <small>Файлы: изменил {agent.files.wrote.length}, читал {agent.files.read.length}</small>}{!!agent.handovers?.length && <small className="handover-badge" title={agent.handovers.map(item => `${handoverLabel(providers, item.from)} → ${handoverLabel(providers, item.to)}`).join('\n')}>⇄ Сменил подписку: {agent.handovers.length}</small>}</span><span className="agent-state">{statusText(agent.status)}</span></button>{agentTree(items, agent.id, depth + 1, nextSeen)}</div>
     })
   }
 
@@ -427,7 +486,7 @@ export default function App() {
         const isRunning = Object.values(runs).some(r => r.projectId === project.id && r.chatId === c.id && active(r.status)) || pending.has(`${project.id}/${c.id}`)
         return <div key={c.id} className="chat-row"><button className={`chat-item ${c.id === chat?.id ? 'active' : ''}`} onClick={() => { setState(previous => ({ ...previous, projects: previous.projects.map(p => p.id === project.id ? { ...p, activeChatId: c.id } : p) })); setSidebarOpen(false) }}><Icon name="chat" size={16} /><span>{c.title}</span>{isRunning && <span className="status-dot working" />}</button><button className="chat-delete" aria-label={`Удалить чат «${c.title}»`} title={isRunning ? 'Сначала остановите агентов' : 'Удалить чат'} disabled={isRunning || !ready} onClick={() => deleteChat(c.id)}><Icon name="trash" size={14} /></button></div>
       })}{!project && <p className="sidebar-empty">Подключите папку или репозиторий, чтобы начать.</p>}</nav>
-      <div className="sidebar-bottom"><button onClick={() => setPanel('memory')}><Icon name="memory" />Память</button><button onClick={() => setPanel('capabilities')}><Icon name="skill" />Навыки</button><button onClick={() => setPanel('settings')}><Icon name="settings" />Настройки<span className={`status-dot ${currentHealth?.available ? 'done' : 'idle'}`} /></button><div className="local-label"><span className="status-dot idle" />{desktop ? 'История хранится на устройстве' : 'Предпросмотр интерфейса'}</div></div>
+      <div className="sidebar-bottom"><button onClick={() => setPanel('memory')}><Icon name="memory" />Память</button><button onClick={() => setPanel('capabilities')}><Icon name="skill" />Навыки</button><button onClick={() => setPanel('quota')} title="Остаток квот всех подписок и автозамена агентов"><Icon name="gauge" />Квоты<span className={`status-dot ${quotaDot}`} /></button><button onClick={() => setPanel('settings')}><Icon name="settings" />Настройки<span className={`status-dot ${currentHealth?.available ? 'done' : 'idle'}`} /></button><div className="local-label"><span className="status-dot idle" />{desktop ? 'История хранится на устройстве' : 'Предпросмотр интерфейса'}</div></div>
     </aside>
 
     <main className="main-pane">
@@ -439,7 +498,7 @@ export default function App() {
         {!chat?.messages.length ? <div className="welcome"><div className="welcome-symbol"><span className="brand-mark"><span /></span></div><div className="eyebrow">{project ? 'ПРОСТРАНСТВО ДЛЯ ВАШИХ ИДЕЙ' : 'ОДИН АГЕНТ. ВАШИ ПРОЕКТЫ.'}</div><h1>{project ? 'Над чем поработаем?' : 'Начните с проекта.'}</h1><p>{project ? 'Обсудите идею, задайте вопрос или поручите задачу. Агент сам выберет подход и подключит помощников, когда это полезно.' : 'Подключите локальную папку или Git-репозиторий. Чаты, память и работа агентов останутся в контексте проекта.'}</p>{project ? <div className="prompt-suggestions">{['Помоги разобраться в проекте', 'Давай обсудим новую функцию', 'Найди, что можно улучшить'].map(text => <button key={text} disabled={!desktop} onClick={() => setDrafts(previous => ({ ...previous, [chatKey]: text }))}>{text}<Icon name="arrow" size={14} /></button>)}</div> : <button className="primary-button" onClick={() => setPanel('add')}><Icon name="plus" />Подключить проект</button>}<div className="welcome-footnote">Отдельные чаты · Общая и проектная память · Агенты по задаче</div></div> : <div className="message-list">{chat.messages.map(message => <article key={message.id} className={`message ${message.author}`}><div className="message-avatar">{message.author === 'user' ? 'В' : message.author === 'system' ? '!' : <span className="tiny-orbit" />}</div><div className="message-content"><div className="message-meta"><strong>{message.author === 'user' ? 'Вы' : message.author === 'system' ? 'Система' : 'Orbit'}</strong>{message.model && <span>{message.model}</span>}<time>{timeOf(message.time)}</time></div><Markdown text={message.text} />{message.runId && lastAnswerOfRun.get(message.runId) === message.id && <TeamStrip run={runs[message.runId]} onOpen={openTeam} />}</div></article>)}{running && <div className="working-indicator"><span className="status-dot working" /><span>{pending.has(chatKey) && !workingRun ? 'Запускаем агента…' : 'Агент работает'}</span><button onClick={() => setAgentsOpen(true)}>Посмотреть действия <Icon name="agents" size={14} /></button></div>}{currentRun && !running && ['failed', 'error', 'cancelled', 'interrupted'].includes(currentRun.status) && <div className={`run-notice ${currentRun.status}`}><span className={`status-dot ${currentRun.status}`} /><span>{statusText(currentRun.status)}{currentRun.error ? `: ${currentRun.error}` : currentRun.status === 'interrupted' ? '. Приложение закрылось во время работы. Можно продолжить новым сообщением.' : ''}</span><button onClick={() => setAgentsOpen(true)}>Подробности</button></div>}</div>}
         <div ref={bottom} />
       </div>
-      <div className="composer-area"><label className="improvement-toggle"><input type="checkbox" checked={!!state.settings.improvementMode} onChange={event => updateSettings({ improvementMode: event.target.checked })} />Бесконечное улучшение{running && <small> · для следующей задачи</small>}</label><form className={`composer ${running ? 'is-running' : ''}`} onSubmit={send}><textarea aria-label="Сообщение агенту" placeholder={!project ? 'Сначала подключите проект' : running ? 'Можно подготовить следующее сообщение…' : 'Напишите агенту…'} value={draft} disabled={!desktop || !project || !chat || !ready} onChange={event => setDrafts(previous => ({ ...previous, [chatKey]: event.target.value }))} onKeyDown={event => { if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); if (!running) void send() } }} rows={2} /><div className="composer-toolbar"><div className="composer-options"><select aria-label="Провайдер" value={state.settings.providerId} onChange={event => updateSettings({ providerId: event.target.value })}>{providers.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}</select><ModelPicker key={state.settings.providerId} value={state.settings.models[state.settings.providerId] || ''} models={modelChoices} onChange={model => updateSettings({ models: { ...state.settings.models, [state.settings.providerId]: model } })} /><ReasoningPicker providerId={state.settings.providerId} model={state.settings.models[state.settings.providerId] || ''} health={currentHealth} value={selectedEffort} onChange={reasoningEffort => updateSettings({ providerOptions: { ...state.settings.providerOptions, [state.settings.providerId]: { ...state.settings.providerOptions?.[state.settings.providerId], reasoningEffort } } })} /><select aria-label="Уровень доступа" title="Доступ наследуется всеми агентами задачи" value={accessChoice} onChange={event => chooseAccess(event.target.value)}><option value="ask">Ask — спрашивать</option><option value="danger-full-access">Full access</option><option value="workspace-write">Только проект</option><option value="read-only">Только чтение</option></select></div>{running ? <button type="button" className="send-button stop-button" aria-label="Остановить агентов" disabled={!workingRun} onClick={() => void stop()}><Icon name="stop" /></button> : <button className="send-button" type="submit" aria-label="Отправить сообщение" disabled={!draft.trim() || !desktop || !project || !chat || !ready}><Icon name="arrow" /></button>}</div></form><div className="composer-caption"><span>{!ready ? 'Восстанавливаем историю…' : currentHealth && !currentHealth.available ? `${providers.find(p => p.id === currentHealth.id)?.name}: ${currentHealth.detail}` : state.settings.models[state.settings.providerId] || 'Модель по настройкам провайдера'}</span><span>Enter — отправить · Shift + Enter — новая строка</span></div></div>
+      <div className="composer-area"><label className="improvement-toggle"><input type="checkbox" checked={!!state.settings.improvementMode} onChange={event => updateSettings({ improvementMode: event.target.checked })} />Бесконечное улучшение{running && <small> · для следующей задачи</small>}</label><form className={`composer ${running ? 'is-running' : ''}`} onSubmit={send}><textarea aria-label="Сообщение агенту" placeholder={!project ? 'Сначала подключите проект' : running ? 'Можно подготовить следующее сообщение…' : 'Напишите агенту…'} value={draft} disabled={!desktop || !project || !chat || !ready} onChange={event => setDrafts(previous => ({ ...previous, [chatKey]: event.target.value }))} onKeyDown={event => { if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); if (!running) void send() } }} rows={2} /><div className="composer-toolbar"><div className="composer-options"><select aria-label="Провайдер" value={state.settings.providerId} onChange={event => updateSettings({ providerId: event.target.value })}>{providers.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}</select><ModelPicker key={state.settings.providerId} value={state.settings.models[state.settings.providerId] || ''} models={modelChoices} onChange={model => updateSettings({ models: { ...state.settings.models, [state.settings.providerId]: model } })} /><ReasoningPicker providerId={state.settings.providerId} model={state.settings.models[state.settings.providerId] || ''} health={currentHealth} value={selectedEffort} onChange={reasoningEffort => updateSettings({ providerOptions: { ...state.settings.providerOptions, [state.settings.providerId]: { ...state.settings.providerOptions?.[state.settings.providerId], reasoningEffort } } })} /><select aria-label="Уровень доступа" title="Доступ наследуется всеми агентами задачи" value={accessChoice} onChange={event => chooseAccess(event.target.value)}><option value="ask">Ask — спрашивать</option><option value="danger-full-access">Full access</option><option value="workspace-write">Только проект</option><option value="read-only">Только чтение</option></select></div>{running ? <button type="button" className="send-button stop-button" aria-label="Остановить агентов" disabled={!workingRun} onClick={() => void stop()}><Icon name="stop" /></button> : <button className="send-button" type="submit" aria-label="Отправить сообщение" disabled={!draft.trim() || !desktop || !project || !chat || !ready}><Icon name="arrow" /></button>}</div></form><div className="composer-caption"><span>{!ready ? 'Восстанавливаем историю…' : currentHealth && !currentHealth.available ? `${providers.find(p => p.id === currentHealth.id)?.name}: ${currentHealth.detail}` : state.settings.models[state.settings.providerId] || 'Модель по настройкам провайдера'} <QuotaChip name={providers.find(p => p.id === state.settings.providerId)?.name || ''} snapshot={quotas[state.settings.providerId]} model={state.settings.models[state.settings.providerId] || ''} onOpen={() => setPanel('quota')} /></span><span>Enter — отправить · Shift + Enter — новая строка</span></div></div>
     </main>
 
     {agentsOpen && <aside className="agents-panel">
@@ -448,15 +507,16 @@ export default function App() {
       {!currentRun?.agents.length ? <div className="panel-empty"><Icon name="agents" size={34} /><h3>Команда появится здесь</h3><p>После отправки сообщения здесь будут реальные агенты, их задачи и действия. Подагенты создаются по необходимости.</p></div> : <>
         <div className="run-summary"><span className={`status-dot ${currentRun.status}`} />{statusText(currentRun.status)}<span>{currentRun.agents.length} агентов</span></div>
         <div className="agent-tree">{agentTree(currentRun.agents)}{(currentRun.agents.length > 1 || !!currentRun.communications?.length) && <button className={`agent-row router-row ${selected?.id === 'router' ? 'selected' : ''}`} onClick={() => setSelectedAgent('router')}><span className={`status-dot ${routerAgent.status}`} /><span className="agent-row-label"><strong>{routerAgent.name}</strong><small>Адресует сообщения и следит за общими файлами</small></span><span className="agent-state">{(currentRun.router?.routed ?? 0) + (currentRun.router?.notices ?? 0)}</span></button>}</div>
-        {selected && <AgentInspector key={currentRun.runId} run={currentRun} agent={selected} onSelect={setSelectedAgent} />}
+        {selected && <AgentInspector key={currentRun.runId} run={currentRun} agent={selected} onSelect={setSelectedAgent} quotas={quotas} />}
       </>}
     </aside>}
 
-    {panel && <div className="modal-backdrop" onMouseDown={event => { if (event.target === event.currentTarget) setPanel(null) }}><section className={`modal ${panel === 'add' ? 'compact-modal' : ''}`} role="dialog" aria-modal="true" aria-label={{ settings: 'Настройки', memory: 'Память', capabilities: 'Навыки', add: 'Добавить проект' }[panel]}><header className="modal-header"><div><div className="eyebrow">ORBIT WORKSPACE</div><h2>{{ settings: 'Настройки', memory: 'Память', capabilities: 'Навыки', add: 'Добавить проект' }[panel]}</h2></div><button className="icon-button" aria-label="Закрыть" onClick={() => setPanel(null)}><Icon name="close" /></button></header><div className="modal-content">
+    {panel && <div className="modal-backdrop" onMouseDown={event => { if (event.target === event.currentTarget) setPanel(null) }}><section className={`modal ${panel === 'add' ? 'compact-modal' : ''}`} role="dialog" aria-modal="true" aria-label={{ settings: 'Настройки', memory: 'Память', capabilities: 'Навыки', add: 'Добавить проект', quota: 'Квоты' }[panel]}><header className="modal-header"><div><div className="eyebrow">ORBIT WORKSPACE</div><h2>{{ settings: 'Настройки', memory: 'Память', capabilities: 'Навыки', add: 'Добавить проект', quota: 'Квоты' }[panel]}</h2></div><button className="icon-button" aria-label="Закрыть" onClick={() => setPanel(null)}><Icon name="close" /></button></header><div className="modal-content">
+      {panel === 'quota' && (desktop ? <QuotaPanel providers={providers} connected={connected} quotas={quotas} busy={quotaBusy} onRefresh={() => void refreshQuotas(true)} failover={state.settings.quotaFailover!} onFailover={patch => updateSettings({ quotaFailover: { ...state.settings.quotaFailover!, ...patch } })} agents={currentRun?.agents || []} currentProviderId={state.settings.providerId} /> : <p className="inline-notice">Квоты подписок доступны в настольном приложении.</p>)}
       {panel === 'add' && <><p className="modal-intro">Каждый проект — отдельное пространство для чатов и памяти.</p>{!desktop && <p className="inline-notice">Откройте настольное приложение Orbit, чтобы подключить проект.</p>}<button className="local-project-option" disabled={!desktop || projectBusy} onClick={() => void addProject('local')}><span className="option-icon"><Icon name="folder" size={25} /></span><span><strong>Открыть локальную папку</strong><small>Работает и без Git</small></span><Icon name="plus" /></button><div className="divider-label">или клонировать репозиторий</div><form onSubmit={event => { event.preventDefault(); if (remote.trim()) void addProject('git') }}><label>URL репозитория<input autoFocus placeholder="https://github.com/owner/project.git" value={remote} onChange={event => setRemote(event.target.value)} disabled={!desktop || projectBusy} /></label><button className="primary-button full-width" disabled={!desktop || projectBusy || !remote.trim()}><Icon name="git" />{projectBusy ? 'Подключаем проект…' : 'Клонировать и открыть'}</button><p className="field-hint">Orbit предложит выбрать папку для клонирования.</p></form></>}
       {panel === 'settings' && <><p className="modal-intro">Агент использует выбранный провайдер. Подключения и авторизация CLI берутся из вашего окружения.</p><div className="settings-section-heading"><h3>Провайдеры</h3><button className="text-button" disabled={!desktop || checking} onClick={() => void refreshProviders()}><Icon name="refresh" size={14} />{checking ? 'Проверяем…' : 'Проверить'}</button></div><div className="provider-list">{providers.map(provider => { const status = health.find(p => p.id === provider.id); return <button key={provider.id} className={`provider-card ${state.settings.providerId === provider.id ? 'selected' : ''}`} onClick={() => updateSettings({ providerId: provider.id })}><div className="provider-monogram">{provider.name[0]}</div><span><strong>{provider.name}</strong><small>{status?.detail || provider.description}</small></span><span className={`provider-badge ${status?.available ? 'available' : ''}`}>{status ? status.available ? 'Доступен' : 'Не подключён' : 'Не проверен'}</span></button> })}</div><p className="field-hint">{providers.find(p => p.id === state.settings.providerId)?.help}</p><div className="settings-model"><span>Модель</span><ModelPicker key={state.settings.providerId} label="Модель в настройках" value={state.settings.models[state.settings.providerId] || ''} models={modelChoices} onChange={model => updateSettings({ models: { ...state.settings.models, [state.settings.providerId]: model } })} /><p className="field-hint">Выбор сохраняется отдельно для каждого провайдера и применяется к следующим сообщениям. Если модели нет в списке, укажите её идентификатор.</p></div><label>Ваши инструкции агенту<textarea rows={4} placeholder="Предпочтения в работе, языке и проверке результатов…" value={state.settings.agentInstructions} onChange={event => updateSettings({ agentInstructions: event.target.value })} /></label><details className="advanced-settings"><summary>Доступ и ограничения роя</summary><label>Доступ для всех агентов<select value={accessChoice} onChange={event => chooseAccess(event.target.value)}><option value="ask">Ask — спрашивать разрешение</option><option value="danger-full-access">Full access — полный доступ</option><option value="workspace-write">Только проект</option><option value="read-only">Только чтение</option></select></label><p className="field-hint">Выбранный доступ и уровень мышления применяются к новым задачам и наследуются подагентами. В режиме Ask запросы разрешения показываются в отдельном окне.</p><SwarmSettings settings={state.settings} update={updateSettings} providers={providers} health={health} /></details><p className="autosave-label"><Icon name="check" size={14} />Настройки сохраняются автоматически</p></>}
-      {panel === 'memory' && <><p className="modal-intro">Общая память доступна во всех проектах. Память проекта привязана к его папке и сохраняется между чатами.</p>{!desktop ? <p className="inline-notice">Память доступна в настольном приложении.</p> : <><LibraryForm kind="memory" workspace={project?.workspace.path || ''} onSaved={() => setLibraryRevision(n => n + 1)} onError={setNotice} />{loadingLibrary ? <p className="muted">Загружаем записи…</p> : memory.length ? (['project', 'global'] as const).map(scope => <div key={scope} className="library-group"><div className="section-label">{scope === 'project' ? `ПРОЕКТ · ${project?.workspace.name || 'НЕ ВЫБРАН'}` : 'ОБЩАЯ ПАМЯТЬ'}<span>{memory.filter(entry => entry.scope === scope).length}</span></div>{memory.filter(entry => entry.scope === scope).map(entry => <article className="library-entry" key={entry.id}><div><strong>{entry.title}</strong><button className="icon-button" aria-label={`Удалить запись ${entry.title}`} onClick={() => { void window.orbit!.removeMemory(entry.id, project?.workspace.path || '').then(() => setLibraryRevision(n => n + 1)).catch(error => setNotice(errorText(error))) }}><Icon name="trash" size={15} /></button></div><p>{entry.content}</p></article>)}</div>) : <div className="empty-library"><Icon name="memory" size={28} /><p>Память пока пуста. Добавьте важный контекст или попросите агента его запомнить.</p></div>}</>}</>}
-      {panel === 'capabilities' && <><p className="modal-intro">Навык — сохранённые инструкции и способы работы, которые агент может использовать и улучшать в следующих задачах.</p>{!desktop ? <p className="inline-notice">Навыки доступны в настольном приложении.</p> : <><LibraryForm kind="capability" workspace={project?.workspace.path || ''} onSaved={() => setLibraryRevision(n => n + 1)} onError={setNotice} />{loadingLibrary ? <p className="muted">Загружаем навыки…</p> : capabilities.length ? capabilities.map(entry => <CapabilityCard key={`${entry.id}-${entry.version}`} entry={entry} workspace={project?.workspace.path || ''} onSaved={() => setLibraryRevision(n => n + 1)} onError={setNotice} />) : <div className="empty-library"><Icon name="skill" size={28} /><p>Навыков пока нет. Агент может создавать их по мере работы над проектом; вы также можете добавить свой.</p></div>}</>}</>}
+      {panel === 'memory' && <MemoryPanel desktop={desktop} project={project} chat={chat} entries={memory} stats={libraryStats} loading={loadingLibrary} onChanged={() => setLibraryRevision(n => n + 1)} onError={setNotice} />}
+      {panel === 'capabilities' && <SkillsPanel desktop={desktop} workspace={project?.workspace.path || ''} skills={capabilities} stats={libraryStats} loading={loadingLibrary} onChanged={() => setLibraryRevision(n => n + 1)} onError={setNotice} />}
     </div></section></div>}
     {notice && <div className="toast" role="status"><span>{notice}</span><button className="icon-button" aria-label="Закрыть уведомление" onClick={() => setNotice('')}><Icon name="close" size={15} /></button></div>}
   </div>
@@ -499,7 +559,7 @@ function FilesTab({ run, agent, onSelect }: { run: RunSnapshot; agent: Agent; on
   </div>
 }
 
-function AgentInspector({ run, agent, onSelect }: { run: RunSnapshot; agent: Agent; onSelect: (id: string) => void }) {
+function AgentInspector({ run, agent, onSelect, quotas }: { run: RunSnapshot; agent: Agent; onSelect: (id: string) => void; quotas: Record<string, QuotaSnapshot> }) {
   const [tab, setTab] = useState<'activity' | 'communications' | 'files' | 'graph'>('activity')
   const [onlySelected, setOnlySelected] = useState(false)
   const isRouter = agent.id === 'router'
@@ -532,6 +592,11 @@ function AgentInspector({ run, agent, onSelect }: { run: RunSnapshot; agent: Age
       {agent.reason && <p className="agent-reason">{agent.reason}</p>}
       <p className="agent-budget">{agent.parentId ? `Ходы: ${agent.turns || 0} / ${run.limits?.maxTurns ?? '∞'}` : `Ходы: ${agent.turns || 0} · без ограничения`}{agent.budgetLimited && (agent.stalled ? ' · Остановлен: повторял одни и те же вызовы, результаты сохранены' : ' · Лимит достигнут, результаты сохранены')}</p>
       {run.usage && <p className="agent-budget">Работают: {run.agents.filter(member => member.status === 'working').length} · Ходы помощников: {run.usage.workerTurns ?? '—'} / {run.limits?.maxTotalTurns ?? '∞'}</p>}
+      {(() => {
+        const windows = windowsFor(quotas[agent.providerId || run.providerId || ''], agent.model || '')
+        return !!windows.length && <p className="agent-budget">Квота {providers.find(provider => provider.id === (agent.providerId || run.providerId))?.name}: {windows.map(window => `${windowName(window)} — осталось ${Math.max(0, 100 - usedNow(window, Date.now()))}%`).join(' · ')}</p>
+      })()}
+      {!!agent.handovers?.length && <div className="handover-list"><div className="section-label">СМЕНА ПОДПИСКИ</div>{agent.handovers.map(item => <details className="trace-item" key={item.id}><summary><span className="trace-kind handover" /><span>{handoverLabel(providers, item.from)} → {handoverLabel(providers, item.to)}</span><time>{timeOf(item.time)}</time></summary><pre>{`Причина: ${handoverReason(item)}${item.resetsAt ? `\nЛимит снимется: ${new Date(item.resetsAt).toLocaleString('ru-RU')}` : ''}${item.fresh && !item.interrupted ? '\nАгент ещё ничего не сделал: работа началась на новой подписке.' : `\n\nЧто получила новая модель:\n${item.note || ''}`}`}</pre></details>)}</div>}
       {!!(agent.files?.wrote.length || agent.files?.read.length) && <div className="agent-files-summary"><FileChips label="Изменил" files={agent.files?.wrote || []} /><FileChips label="Читал" files={agent.files?.read || []} /></div>}
       {agent.id === 'root' && !!run.improvements?.length && <div className="improvement-progress"><strong>Улучшения: {run.improvements.filter(task => task.status === 'done').length} / {run.improvements.length}</strong>{run.improvements.map(task => <details key={task.id}><summary>{({ pending: '○', working: '◐', done: '✓', blocked: '!' })[task.status]} {task.title}</summary><p>{task.evidence || 'Ожидает выполнения'}</p></details>)}</div>}
       <div className="section-label">ДЕЙСТВИЯ И РЕЗУЛЬТАТЫ</div>
@@ -559,23 +624,23 @@ function AgentInspector({ run, agent, onSelect }: { run: RunSnapshot; agent: Age
   </div>
 }
 
-function LibraryForm({ kind, workspace, onSaved, onError }: { kind: 'memory' | 'capability'; workspace: string; onSaved: () => void; onError: (message: string) => void }) {
+function LibraryForm({ kind, workspace, chatId, onSaved, onError }: { kind: 'memory' | 'capability'; workspace: string; chatId?: string; onSaved: () => void; onError: (message: string) => void }) {
   const [expanded, setExpanded] = useState(false)
   const [title, setTitle] = useState('')
   const [content, setContent] = useState('')
-  const [scope, setScope] = useState<'project' | 'global'>(workspace ? 'project' : 'global')
+  const [scope, setScope] = useState<MemoryScope>(workspace ? 'project' : 'global')
   const [busy, setBusy] = useState(false)
   async function submit(event: FormEvent) {
     event.preventDefault()
     if (!title.trim() || !content.trim() || !window.orbit) return
     setBusy(true)
     try {
-      if (kind === 'memory') await window.orbit.saveMemory({ id: uid(), title: title.trim(), content: content.trim(), type: 'fact', scope, workspace: scope === 'project' ? workspace : undefined, updated: now(), confidence: 100 })
-      else await window.orbit.installCapability({ name: title.trim(), description: content.trim().split('\n')[0].slice(0, 200), instructions: content.trim(), scope, workspace: scope === 'project' ? workspace : undefined, source: 'user' })
+      if (kind === 'memory') await window.orbit.saveMemory({ id: uid(), title: title.trim(), content: content.trim(), type: 'fact', scope, workspace: scope === 'global' ? undefined : workspace, chatId: scope === 'chat' ? chatId : undefined, updated: now(), confidence: 100 })
+      else await window.orbit.installCapability({ name: title.trim(), description: content.trim().split('\n')[0].slice(0, 200), instructions: content.trim(), scope: scope === 'global' ? 'global' : 'project', workspace: scope === 'global' ? undefined : workspace, source: 'user' })
       setTitle(''); setContent(''); setExpanded(false); onSaved()
     } catch (error) { onError(errorText(error)) } finally { setBusy(false) }
   }
-  return <div className="library-form">{!expanded ? <button className="secondary-button" onClick={() => setExpanded(true)}><Icon name="plus" size={16} />{kind === 'memory' ? 'Добавить запись' : 'Добавить навык'}</button> : <form onSubmit={submit}><label>Название<input autoFocus value={title} onChange={event => setTitle(event.target.value)} required maxLength={160} /></label><label>{kind === 'memory' ? 'Что нужно запомнить' : 'Инструкции навыка'}<textarea rows={4} value={content} onChange={event => setContent(event.target.value)} required /></label><div className="form-actions"><select aria-label="Область действия" value={scope} onChange={event => setScope(event.target.value as 'project' | 'global')}><option value="project" disabled={!workspace}>Только этот проект</option><option value="global">Все проекты</option></select><button type="button" className="text-button" onClick={() => setExpanded(false)}>Отмена</button><button className="primary-button" disabled={busy || !title.trim() || !content.trim()}>{busy ? 'Сохраняем…' : 'Сохранить'}</button></div></form>}</div>
+  return <div className="library-form">{!expanded ? <button className="secondary-button" onClick={() => setExpanded(true)}><Icon name="plus" size={16} />{kind === 'memory' ? 'Добавить запись' : 'Добавить навык'}</button> : <form onSubmit={submit}><label>Название<input autoFocus value={title} onChange={event => setTitle(event.target.value)} required maxLength={160} /></label><label>{kind === 'memory' ? 'Что нужно запомнить' : 'Инструкции навыка'}<textarea rows={4} value={content} onChange={event => setContent(event.target.value)} required /></label><div className="form-actions"><select aria-label="Область действия" value={scope} onChange={event => setScope(event.target.value as MemoryScope)}>{kind === 'memory' && <option value="chat" disabled={!workspace || !chatId}>Только этот чат</option>}<option value="project" disabled={!workspace}>Только этот проект</option><option value="global">Все проекты</option></select><button type="button" className="text-button" onClick={() => setExpanded(false)}>Отмена</button><button className="primary-button" disabled={busy || !title.trim() || !content.trim()}>{busy ? 'Сохраняем…' : 'Сохранить'}</button></div></form>}</div>
 }
 
 function CapabilityCard({ entry, workspace, onSaved, onError }: { entry: Capability; workspace: string; onSaved: () => void; onError: (message: string) => void }) {
@@ -602,5 +667,54 @@ function CapabilityCard({ entry, workspace, onSaved, onError }: { entry: Capabil
     } catch (error) { onError(errorText(error)) }
     finally { setBusy(false) }
   }
-  return <article className="library-entry"><div><strong>{entry.name}</strong><span className="scope-label">{entry.scope === 'global' ? 'Общий' : 'Проект'}{entry.version ? ` · v${entry.version}` : ''}</span><button className="icon-button" disabled={busy} aria-label={`Удалить навык ${entry.name}`} onClick={() => void mutate('remove')}><Icon name="trash" size={15} /></button></div><p>{entry.description}</p><details onToggle={event => { if (event.currentTarget.open) void load() }}><summary>Инструкции и версии</summary>{busy && !detail ? <p className="muted">Загружаем…</p> : detail && <><div className="capability-provenance">{detail.source === 'user' ? 'Добавлен пользователем' : `Источник: ${detail.source || 'агент'}`}{detail.updatedAt ? ` · ${new Date(detail.updatedAt).toLocaleString('ru-RU')}` : ''}</div>{editing ? <><textarea aria-label="Инструкции навыка" rows={8} value={instructions} onChange={event => setInstructions(event.target.value)} /><div className="capability-actions"><button className="text-button" onClick={() => { setEditing(false); setInstructions(detail.instructions) }}>Отмена</button><button className="secondary-button" disabled={busy || !instructions.trim()} onClick={() => void mutate('save')}>Сохранить новую версию</button></div></> : <><Markdown text={detail.instructions} /><button className="text-button" onClick={() => setEditing(true)}>Редактировать</button></>}{!!detail.revisions?.length && <div className="revision-controls"><select aria-label="Предыдущая версия навыка" value={revision} onChange={event => setRevision(event.target.value)}><option value="">Предыдущие версии</option>{[...detail.revisions].reverse().map(item => <option key={item.version} value={item.version}>v{item.version} · {new Date(item.updatedAt).toLocaleDateString('ru-RU')}</option>)}</select><button className="text-button" disabled={busy || !revision} onClick={() => void mutate('restore')}>Восстановить</button></div>}</>}{!busy && !detail && <button className="text-button" onClick={() => void load()}>Повторить загрузку</button>}</details></article>
+  return <article className={`library-entry ${entry.pinned ? 'pinned' : ''}`}><div><strong>{entry.name}</strong><span className="scope-label">{entry.pinned ? 'закреплён · ' : ''}{entry.scope === 'global' ? 'Общий' : 'Проект'}{entry.version ? ` · v${entry.version}` : ''}</span><button className="icon-button" disabled={busy} aria-pressed={!!entry.pinned} aria-label={`${entry.pinned ? 'Открепить' : 'Закрепить'} навык ${entry.name}`} onClick={() => { setBusy(true); window.orbit?.pinCapability(entry.id, !entry.pinned, workspace).then(onSaved).catch(error => onError(errorText(error))).finally(() => setBusy(false)) }}><Icon name="pin" size={14} /></button><button className="icon-button" disabled={busy} aria-label={`Удалить навык ${entry.name}`} onClick={() => void mutate('remove')}><Icon name="trash" size={15} /></button></div><p>{entry.description}</p>{entry.whenToUse && <p className="skill-when">Когда применять: {entry.whenToUse}</p>}<small className="entry-meta">{entry.uses ? `Применялся: ${entry.uses} · успешно ${Math.round((entry.reliability ?? 0.5) * 100)}%` : 'Ещё не применялся'}{entry.scope === 'global' && entry.usedIn?.length ? ` · проектов: ${entry.usedIn.length}` : ''}</small>{!!entry.lessons?.length && <ul className="skill-pitfalls" aria-label="Подводные камни">{entry.lessons.slice(0, 3).map(lesson => <li key={lesson}>{lesson}</li>)}</ul>}<details onToggle={event => { if (event.currentTarget.open) void load() }}><summary>Инструкции и версии</summary>{busy && !detail ? <p className="muted">Загружаем…</p> : detail && <><div className="capability-provenance">{detail.source === 'user' ? 'Добавлен пользователем' : `Источник: ${detail.source || 'агент'}`}{detail.editedBy ? ' · улучшен агентом' : ''}{detail.updatedAt ? ` · ${new Date(detail.updatedAt).toLocaleString('ru-RU')}` : ''}</div>{editing ? <><textarea aria-label="Инструкции навыка" rows={8} value={instructions} onChange={event => setInstructions(event.target.value)} /><div className="capability-actions"><button className="text-button" onClick={() => { setEditing(false); setInstructions(detail.instructions) }}>Отмена</button><button className="secondary-button" disabled={busy || !instructions.trim()} onClick={() => void mutate('save')}>Сохранить новую версию</button></div></> : <><Markdown text={detail.instructions} /><button className="text-button" onClick={() => setEditing(true)}>Редактировать</button></>}{!!detail.revisions?.length && <div className="revision-controls"><select aria-label="Предыдущая версия навыка" value={revision} onChange={event => setRevision(event.target.value)}><option value="">Предыдущие версии</option>{[...detail.revisions].reverse().map(item => <option key={item.version} value={item.version}>v{item.version} · {new Date(item.updatedAt).toLocaleDateString('ru-RU')}</option>)}</select><button className="text-button" disabled={busy || !revision} onClick={() => void mutate('restore')}>Восстановить</button></div>}</>}{!busy && !detail && <button className="text-button" onClick={() => void load()}>Повторить загрузку</button>}</details></article>
+}
+
+const TIER_NAMES: Record<MemoryScope, string> = { chat: 'Чат', project: 'Проект', global: 'Общая' }
+function TierBar({ items }: { items: { name: string; stat?: TierStats; text?: string }[] }) {
+  return <div className="tier-stats" role="status">{items.map(item => <span key={item.name} className={item.stat && item.stat.count >= item.stat.limit ? 'full' : ''}><strong>{item.name}</strong> {item.text ?? `${item.stat?.count ?? 0}/${item.stat?.limit ?? 0}`}</span>)}</div>
+}
+function sourceLabel(source?: string) { return source === 'user' ? 'вы' : source === 'promoted' ? 'поднято автоматически' : source === 'system' ? 'система' : 'агент' }
+
+function MemoryCard({ entry, workspace, chatId, onChanged, onError }: { entry: MemoryEntry; workspace: string; chatId?: string; onChanged: () => void; onError: (message: string) => void }) {
+  const [busy, setBusy] = useState(false)
+  async function act(action: () => Promise<unknown>) {
+    if (busy || !window.orbit) return
+    setBusy(true)
+    try { await action(); onChanged() } catch (error) { onError(errorText(error)) } finally { setBusy(false) }
+  }
+  return <article className={`library-entry ${entry.pinned ? 'pinned' : ''}`}>
+    <div><strong>{entry.title}</strong><span className="scope-label">{entry.pinned ? 'закреплено · ' : ''}{sourceLabel(entry.source)}</span>
+      <button className="icon-button" disabled={busy} aria-pressed={!!entry.pinned} aria-label={`${entry.pinned ? 'Открепить' : 'Закрепить'} запись ${entry.title}`} onClick={() => void act(() => window.orbit!.pinMemory(entry.id, !entry.pinned, workspace, chatId))}><Icon name="pin" size={14} /></button>
+      <button className="icon-button" disabled={busy} aria-label={`Удалить запись ${entry.title}`} onClick={() => void act(() => window.orbit!.removeMemory(entry.id, workspace, chatId))}><Icon name="trash" size={15} /></button></div>
+    <p>{entry.content}</p>
+    <small className="entry-meta">{entry.uses ? `Использована: ${entry.uses}` : 'Ещё не использовалась'} · {new Date(entry.updated).toLocaleDateString('ru-RU')}</small>
+  </article>
+}
+
+function MemoryPanel({ desktop, project, chat, entries, stats, loading, onChanged, onError }: { desktop: boolean; project?: Project; chat?: ChatThread; entries: MemoryEntry[]; stats: LibraryStats | null; loading: boolean; onChanged: () => void; onError: (message: string) => void }) {
+  const workspace = project?.workspace.path || ''
+  if (!desktop) return <p className="inline-notice">Память доступна в настольном приложении.</p>
+  const groupTitle: Record<MemoryScope, string> = { chat: `ЧАТ · ${chat?.title || 'НЕ ВЫБРАН'}`, project: `ПРОЕКТ · ${project?.workspace.name || 'НЕ ВЫБРАН'}`, global: 'ОБЩАЯ ПАМЯТЬ' }
+  return <>
+    <p className="modal-intro">Три уровня. <b>Чат</b> — рабочие заметки этой задачи. <b>Проект</b> — знания о коде, общие для всех его чатов. <b>Общая</b> — то, что верно во всех проектах. Записи, к которым агенты не возвращаются, устаревают и вытесняются сами; то, что чат использовал снова и снова, поднимается в проект. Детали проекта в общую память не попадают.</p>
+    {stats && <TierBar items={(['chat', 'project', 'global'] as const).map(scope => ({ name: TIER_NAMES[scope], stat: stats.memory[scope] }))} />}
+    <LibraryForm kind="memory" workspace={workspace} chatId={chat?.id} onSaved={onChanged} onError={onError} />
+    {loading ? <p className="muted">Загружаем записи…</p> : entries.length ? (['chat', 'project', 'global'] as const).map(scope => {
+      const group = entries.filter(entry => entry.scope === scope)
+      if (!group.length && scope === 'chat') return null
+      return <div key={scope} className="library-group"><div className="section-label">{groupTitle[scope]}<span>{group.length}</span></div>{group.map(entry => <MemoryCard key={entry.id} entry={entry} workspace={workspace} chatId={chat?.id} onChanged={onChanged} onError={onError} />)}</div>
+    }) : <div className="empty-library"><Icon name="memory" size={28} /><p>Память пока пуста. Добавьте важный контекст или попросите агента его запомнить.</p></div>}
+  </>
+}
+
+function SkillsPanel({ desktop, workspace, skills, stats, loading, onChanged, onError }: { desktop: boolean; workspace: string; skills: Capability[]; stats: LibraryStats | null; loading: boolean; onChanged: () => void; onError: (message: string) => void }) {
+  if (!desktop) return <p className="inline-notice">Навыки доступны в настольном приложении.</p>
+  const ordered = [...skills].sort((a, b) => Number(!!b.pinned) - Number(!!a.pinned) || (b.uses ?? 0) - (a.uses ?? 0))
+  return <>
+    <p className="modal-intro">Навык — проверенная процедура, которой агент научился в работе, например поднять изолированное окружение. Агент находит подходящий навык по задаче, применяет его, оценивает результат и дописывает подводные камни, так что набор растёт и улучшается сам. Общие навыки доступны во всех проектах, проектные остаются в своём.</p>
+    {stats && <TierBar items={[{ name: 'Проект', stat: stats.skills.project }, { name: 'Общие', stat: stats.skills.global }, { name: 'Применялись', text: String(stats.skills.used) }]} />}
+    <LibraryForm kind="capability" workspace={workspace} onSaved={onChanged} onError={onError} />
+    {loading ? <p className="muted">Загружаем навыки…</p> : ordered.length ? ordered.map(entry => <CapabilityCard key={`${entry.id}-${entry.version}-${entry.uses}-${entry.pinned}`} entry={entry} workspace={workspace} onSaved={onChanged} onError={onError} />) : <div className="empty-library"><Icon name="skill" size={28} /><p>Навыков пока нет. Агент создаёт их по мере работы, когда находит повторяемую процедуру; вы также можете добавить свой.</p></div>}
+  </>
 }

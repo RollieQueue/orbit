@@ -1,0 +1,15 @@
+{
+  "notes": [
+    "Quality tiers used to decide which model may replace another when a subscription runs out: 3 flagship, 2 strong, 1 light, 0 unknown.",
+    "Rules run top to bottom on the lowercase model id and the first match wins. A name fragment must be delimited by - _ / . or space, so 'mini' does not match 'gemini'.",
+    "Rules are by naming convention, not measured quality. When unsure, a model is placed LOWER: a replacement is then only rarely chosen, never wrongly trusted.",
+    "Unknown models (tier 0) are used as replacements only when the user listed them in the provider pool.",
+    "baseline is the tier assumed for the model that is being replaced when its name is not known yet (the CLI default). It is deliberately high: an unknown model is not swapped for a weaker one."
+  ],
+  "rules": [
+    { "tier": 1, "match": "(?:^|[-_/. ])(?:haiku|mini|nano|lite|flash|luna|small|tiny|instant)(?=$|[-_/. ])" },
+    { "tier": 3, "match": "(?:^|[-_/. ])(?:opus|fable|astra|sol|pro)(?=$|[-_/. ])" },
+    { "tier": 2, "match": "(?:^|[-_/. ])(?:sonnet|terra|codex|composer|grok|oss|gemini|claude|gpt|deepseek|qwen|llama|mistral)" }
+  ],
+  "baseline": { "codex": 3, "claude": 3, "antigravity": 3, "cursor": 2, "ollama": 2, "custom": 2 }
+}

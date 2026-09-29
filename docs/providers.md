@@ -111,6 +111,31 @@ children launched through Orbit's own delegation tools; native CLI subagents
 are not independent Orbit tasks. Claude events retain `parentToolId` for tracing
 native subagent activity when the CLI emits it.
 
+## Quota
+
+Orbit shows what is left of each subscription and moves a running agent to another one when a quota runs out (see
+`docs/ARCHITECTURE.md`, "Subscription quotas and failover"). The figures come from the CLIs themselves and were
+checked against the real CLIs on 2026-09-29; none of the calls below runs a model or spends quota.
+
+| Provider | Source | Windows | Notes |
+| --- | --- | --- | --- |
+| Codex | app-server request `account/rateLimits/read`, live `account/rateLimits/updated` | 5 hours, week; plan; credits | Needs a ChatGPT login; an API key is billed by usage and has no window. |
+| Claude Code | `claude -p "/usage"` (text), `claude auth status` (plan name only), stream `rate_limit_event` | session (5 h), week (all models), week per model | `/usage` answers locally in about 3 s (`num_turns: 0`). Reset times are wall-clock text with an IANA zone and are converted. A key-based login has no windows. |
+| Antigravity | `agy -p "/usage" --output-format json` | 5 hours and week for the Gemini group and for the Claude/GPT group | Uses the configured Google CLI proxy. Reading the quota does not prove that generation is allowed in the account's region. |
+| Cursor | `agent about` | none | Only the plan (for example Free) is published. A refusal is noticed when it happens. |
+| Ollama | none | none | Local, unmetered. |
+| Compatible endpoint | none | none | Limits are the server's business. |
+
+`ORBIT_CODEX_COMMAND`, `ORBIT_CLAUDE_COMMAND`, `ORBIT_ANTIGRAVITY_COMMAND`, `ORBIT_CURSOR_COMMAND` and the per-provider
+command in the settings apply to these calls too. Account identifiers printed by `auth status` and `agent about` are
+discarded; only the plan name is kept. The CLIs' output formats are not a published API: when one changes, the reader
+reports the provider as "unavailable" or "no data" instead of inventing numbers, and the reactive path (recognising
+a refusal) still works.
+
+Which model may replace which is decided by `electron/model-tiers.json`: ordered patterns on the lowercase model id that
+give a tier (3 flagship, 2 strong, 1 light). It follows naming conventions, not measured quality; edit it when a new
+model family appears. Doubtful models are placed low, which only makes a replacement rarer, never worse.
+
 ## Runtime contract
 
 ```js

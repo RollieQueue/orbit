@@ -1,5 +1,10 @@
 const { spawn } = require('node:child_process')
 const { isOrbitToolEnvelope } = require('./tool-schema.cjs')
+const { codexUpdateLimit } = require('./quota.cjs')
+
+// The server names a refused request by type; Orbit's failover relies on that rather than on the wording.
+const LIMIT_REFUSALS = new Set(['usageLimitExceeded', 'rateLimitExceeded', 'sessionBudgetExceeded'])
+const refusal = (info, error) => { if (typeof info === 'string' && LIMIT_REFUSALS.has(info)) error.quota = { providerId: 'codex' }; return error }
 
 // Codex exec cannot answer native approval requests; Ask uses the stdio App Server.
 async function runCodexServer(options, helpers) {
@@ -54,6 +59,8 @@ async function runCodexServer(options, helpers) {
       return
     }
     const params = message.params || {}
+    // Rolling account figures belong to the subscription, not to this thread.
+    if (message.method === 'account/rateLimits/updated' && params.rateLimits) emit({ kind: 'quota', quota: codexUpdateLimit(params.rateLimits) })
     if (handedOff) return
     if (threadId && params.threadId && params.threadId !== threadId) return
     if (message.method === 'item/agentMessage/delta') emit({ kind: 'output', text: params.delta || '', messageId: params.itemId, partial: true })
@@ -72,11 +79,11 @@ async function runCodexServer(options, helpers) {
       if (['commandExecution', 'fileChange', 'mcpToolCall'].includes(item.type)) emit({ kind: 'tool', native: true, tool: item.type, toolId: item.id, changes: item.changes, text: item.command || JSON.stringify(item.changes || item), status: message.method === 'item/started' ? 'started' : item.status || 'completed' })
     }
     if (message.method === 'turn/completed') {
-      if (params.turn?.status !== 'completed') fail(new Error(params.turn?.error?.message || `Codex turn ${params.turn?.status || 'incomplete'}`))
+      if (params.turn?.status !== 'completed') fail(refusal(params.turn?.error?.codexErrorInfo, new Error(params.turn?.error?.message || `Codex turn ${params.turn?.status || 'incomplete'}`)))
       else if (!text.trim()) fail(new Error('Codex completed without a final response'))
       else resolveDone({ providerId: 'codex', client: 'Codex App Server', text, model: actualModel, access: options.accessMode })
     }
-    if (message.method === 'error' && !params.willRetry) fail(new Error(params.error?.message || 'Codex server error'))
+    if (message.method === 'error' && !params.willRetry) fail(refusal(params.error?.codexErrorInfo, new Error(params.error?.message || 'Codex server error')))
   }
   const reader = createLineReader(line => {
     if (!line.trim()) return
