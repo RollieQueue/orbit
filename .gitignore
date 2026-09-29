@@ -1,0 +1,18 @@
+node_modules/
+dist/
+release/
+release-orbit/
+release-orbit-v2/
+release-orbit-final/
+Orbit-standalone-*/
+.orbit-partial-*/
+orbit-packaged.log
+.env
+.env.*
+!.env.example
+*.log
+artifacts/
+
+# Local state, not source: CLI profile data and stray test output
+.ouroboros/
+artifacts-test-output.txt

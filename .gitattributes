@@ -1,0 +1,6 @@
+# The repository stores LF; Windows working copies get CRLF through core.autocrlf / core.eol.
+* text=auto
+
+# Batch files must be CRLF on every platform.
+*.cmd text eol=crlf
+*.bat text eol=crlf

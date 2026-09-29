@@ -1,0 +1,67 @@
+{
+  "name": "orbit-ide",
+  "version": "0.3.1",
+  "type": "module",
+  "private": true,
+  "author": "Orbit",
+  "description": "Orbit — local-first multi-agent development environment",
+  "main": "electron/main.cjs",
+  "scripts": {
+    "dev": "concurrently -k \"vite --host 127.0.0.1\" \"wait-on http://127.0.0.1:5173 && cross-env ORBIT_DEV=1 node scripts/run-electron.cjs electron/main.cjs\"",
+    "build": "tsc --noEmit && vite build",
+    "start": "node scripts/run-electron.cjs electron/main.cjs",
+    "typecheck": "tsc --noEmit",
+    "test": "node --test tests/*.test.cjs",
+    "smoke": "node scripts/smoke-runtime.cjs",
+    "smoke:desktop": "node scripts/run-electron.cjs scripts/smoke-desktop.cjs",
+    "package:win": "npm run build && node scripts/package-win.cjs",
+    "verify": "npm run typecheck && npm test && npm run smoke",
+    "self-upgrade": "node scripts/self-upgrade.cjs",
+    "self-upgrade:check": "node scripts/self-upgrade.cjs --dry-run"
+  },
+  "dependencies": {
+    "react": "19.3.0",
+    "react-dom": "19.3.0"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "6.1.1",
+    "concurrently": "10.0.5",
+    "typescript": "7.0.2",
+    "vite": "8.3.1",
+    "wait-on": "9.1.0",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "cross-env": "10.1.0",
+    "electron-builder": "26.15.3",
+    "electron": "44.4.5"
+  },
+  "build": {
+    "appId": "ai.orbit.ide",
+    "productName": "Orbit",
+    "asar": true,
+    "directories": {
+      "output": "release-orbit-v2"
+    },
+    "files": [
+      "dist/**/*",
+      "electron/**/*",
+      "package.json"
+    ],
+    "extraFiles": [
+      {
+        "from": "Orbit.cmd",
+        "to": "Orbit.cmd"
+      }
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "dir",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "codex": ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"],
+  "claude": ["low", "medium", "high", "xhigh", "max"],
+  "antigravity": [],
+  "cursor": [],
+  "ollama": [],
+  "custom": ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]
+}

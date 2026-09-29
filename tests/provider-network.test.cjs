@@ -1,0 +1,17 @@
+const test = require('node:test')
+const assert = require('node:assert/strict')
+const { proxyEnvironment } = require('../electron/provider-network.cjs')
+const { _testing: { runCli } } = require('../electron/providers.cjs')
+
+test('proxy modes are process-scoped and explicit routes override inherited bypasses', async () => {
+  const env = await proxyEnvironment({}, async () => 'http://127.0.0.1:12334')
+  assert.equal(env.HTTPS_PROXY, 'http://127.0.0.1:12334')
+  assert.equal(env.NO_PROXY, 'localhost,127.0.0.1,::1')
+  assert.deepEqual(await proxyEnvironment({ proxyMode: 'inherit' }), {})
+  assert.deepEqual(await proxyEnvironment({}, async () => ''), {})
+  assert.equal((await proxyEnvironment({ proxyMode: 'direct' })).HTTPS_PROXY, '')
+  await assert.rejects(proxyEnvironment({ proxyMode: 'custom', proxyUrl: 'http://user:secret@localhost:1234' }), /HTTP/)
+  await assert.rejects(proxyEnvironment({ proxyMode: 'custom', proxyUrl: 'socks5://localhost:1234' }), /HTTP/)
+  const result = await runCli(process.execPath, ['-e', 'console.log(process.env.HTTPS_PROXY)'], { env, timeoutMs: 5000 })
+  assert.equal(result.stdout.trim(), env.HTTPS_PROXY)
+})
