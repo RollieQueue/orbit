@@ -3,7 +3,7 @@ import { isOrbitToolEnvelope } from './tool-schema.mts'
 import { codexUpdateLimit } from './quota.mts'
 import type { CodexRateLimitBucket, QuotaTaggedError } from './quota.mts'
 // providers.mts imports this file as well; both sides use the other only inside functions, so the ESM cycle is harmless.
-import { loopbackNoProxy } from './providers.mts'
+import { codexMcpArgs, loopbackNoProxy } from './providers.mts'
 import type { ApprovalHandler, CliHelpers, NormalizedSession, ParserEvent, ProviderEventListener, ProviderResult, ProviderRunOptions } from './providers.mts'
 
 // ---- App Server protocol (JSON-RPC over stdio) ------------------------------------------------------------------
@@ -159,9 +159,9 @@ async function runCodexServer(options: CodexServerOptions, helpers: CliHelpers):
 // command line, the bearer token through its environment. Nothing is killed at a tool call.
 const sessions = new Map<string, CodexSessionApi>()
 
+// The same overrides as `codex exec` gets (providers.codexMcpArgs), per-call tool timeout included.
 function mcpOverrides(session: Pick<NormalizedSession, 'mcpUrl' | 'token'> | null | undefined): string[] {
-  if (!session?.mcpUrl || !session?.token) return []
-  return ['-c', `mcp_servers.orbit.url=${JSON.stringify(session.mcpUrl)}`, '-c', 'mcp_servers.orbit.bearer_token_env_var="ORBIT_MCP_TOKEN"']
+  return codexMcpArgs(session)
 }
 
 async function openCodexSession(options: CodexServerOptions, session: NormalizedSession, helpers: CliHelpers): Promise<CodexSessionApi> {

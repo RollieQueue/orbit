@@ -1,23 +1,12 @@
 // @ts-check
 'use strict'
 
-const path = require('node:path')
-const { stripDiffs } = require('./run-store.mts')
-const providers = require('./providers.mts')
-const { PROVIDER_IDS } = require('./quota.mts')
-const { applyPatch, removeWorktree } = require('./worktree.mts')
 const { guardIpc } = require('./ipc-guard.cjs')
 const { CALLS } = require('./ipc-contract.cjs')
+const { RUNTIME_CHANNELS, SHELL_CHANNELS } = require('./runtime-protocol.mts')
 
 /** @typedef {import('./ipc-contract.cjs').IpcEntry} IpcEntry */
-/** @typedef {import('./runtime.mts').OrbitRuntime} OrbitRuntime */
-/** @typedef {import('./quota.mts').QuotaMonitor} QuotaMonitor */
-/** @typedef {import('./memory.mts').OrbitMemoryStore} OrbitMemoryStore */
-/** @typedef {import('./project-context.mts').ProjectContextStore} ProjectContextStore */
-/** @typedef {import('./capabilities.mts').CapabilityStore} CapabilityStore */
-/** @typedef {import('./project-index.mts').ProjectIndex} ProjectIndex */
-/** @typedef {import('./run-store.mts').RunStore} RunStore */
-/** @typedef {import('./run-store.mts').StateStore} StateStore */
+/** @typedef {import('./runtime-client.cjs').RuntimeStatus} RuntimeStatus */
 
 /**
  * What main.cjs tells the window about a project folder (the renderer's `GitContext` in src/vite-env.d.ts).
@@ -32,55 +21,62 @@ const { CALLS } = require('./ipc-contract.cjs')
  */
 
 /**
- * The stores main.cjs creates once Electron is ready (app.whenReady); null until then.
- * @typedef {object} Stores
- * @property {OrbitMemoryStore | null} memoryStore
- * @property {ProjectContextStore | null} projectContextStore
- * @property {CapabilityStore | null} capabilityStore
- * @property {ProjectIndex | null} projectIndex
- * @property {RunStore | null} runStore
- * @property {StateStore | null} stateStore
- */
-/**
- * The stores as a handler sees them: all created, because a window (and so a call) exists only after whenReady.
- * @typedef {{ [K in keyof Stores]: NonNullable<Stores[K]> }} ReadyStores
+ * What `runtime:restart` answers (RuntimeRestartResult of ipc-contract.cjs): the new runtime's pid and how long the
+ * restart took, or why it failed.
+ * @typedef {{ ok: boolean, ms: number, pid: number | null, error?: string }} RuntimeRestartResult
  */
 
 /**
- * What the handlers need from main.cjs: Electron's singletons, the runtime and the quota monitor, the stores, and the
- * workspace helpers and lifecycle hooks main.cjs implements.
+ * What the handlers need from main.cjs: Electron's dialog and shell, the workspace helpers, the lifecycle hooks, and
+ * the way to the runtime process.
  * @typedef {object} IpcContext
- * @property {import('electron').App} app
  * @property {import('electron').Dialog} dialog
  * @property {import('electron').Shell} shell
- * @property {OrbitRuntime} runtime
- * @property {QuotaMonitor} quota
- * @property {Stores} stores
- * @property {(workspace: unknown) => string} validateWorkspace Throws unless `workspace` is an existing absolute folder; returns its real path.
- * @property {(workspace: string) => Promise<GitContext>} getGitContext
- * @property {(remote: string) => Promise<GitContext | { error: string } | null>} cloneGitWorkspace
+ * @property {(workspace: unknown) => Promise<GitContext>} getGitContext Throws unless `workspace` is an existing absolute folder.
+ * @property {(remote: unknown) => Promise<GitContext | { error: string } | null>} cloneGitWorkspace
  * @property {(reason: string) => unknown} relaunchApp
+ * @property {(reason: string) => Promise<RuntimeRestartResult>} restartRuntime
+ * @property {() => Promise<unknown>} [whenStarted] settles once the start of this process has its health report; the
+ *   window's runtime restart waits for it, as the --restart-runtime signal does
+ * @property {() => RuntimeStatus} runtimeStatus
+ * @property {(channel: string, args: unknown[]) => Promise<unknown>} callRuntime Sends a call channel to the runtime (runtime-client.cjs), which answers it.
  * @property {number} startedAt
- * @property {() => boolean} isHealthy Whether this process has written a health report that says ok.
+ * @property {() => boolean} isHealthy Whether the last health report of this process says ok.
  */
+
+/** How long the window's runtime restart waits for the start of Orbit to be reported before it gives up. */
+const STARTING_WAIT_MS = 60000
+
+/**
+ * Whether `promise` settles within `ms`; the timer is cleared either way.
+ * @param {Promise<unknown>} promise
+ * @param {number} ms
+ * @returns {Promise<boolean>}
+ */
+function settlesWithin(promise, ms) {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(false), ms)
+    const done = () => { clearTimeout(timer); resolve(true) }
+    promise.then(done, done)
+  })
+}
 
 /**
  * One call channel's handler. The arguments are what the renderer sent, untyped: the contract's type strings describe
- * the renderer's view, the main process gets whatever crossed the IPC, so each handler validates what it relies on.
- * @typedef {(event: import('electron').IpcMainInvokeEvent, ...args: any[]) => unknown} IpcHandler
+ * the renderer's view, the main process gets whatever crossed the IPC, so each handler (or the runtime, for a
+ * forwarded channel) validates what it relies on.
+ * @typedef {(event: import('electron').IpcMainInvokeEvent, ...args: unknown[]) => unknown} IpcHandler
  */
 
 /**
- * The main-process side of electron/ipc-contract.cjs: one handler per call channel, keyed by channel.
- * `ctx` carries the app singletons and `stores`, which main.cjs fills once Electron is ready: the handlers read the
- * stores at call time, so they can be registered before the window exists (a call before then is a caller error).
+ * The main-process side of electron/ipc-contract.cjs: one handler per call channel, keyed by channel. Main answers
+ * SHELL_CHANNELS itself (dialogs, `shell`, health, restarts); every channel of RUNTIME_CHANNELS
+ * (electron/runtime-protocol.mts) goes to the runtime with its arguments as the window sent them. `ctx` is read at call
+ * time, so the handlers can be registered before the runtime exists.
  * @param {IpcContext} ctx
  * @returns {Map<string, IpcHandler>} keyed by channel
  */
 function createIpcHandlers(ctx) {
-  const { app, dialog, shell, runtime, quota, validateWorkspace, getGitContext, cloneGitWorkspace, relaunchApp, startedAt, isHealthy } = ctx
-  // The same object as ctx.stores, read at call time; typed as filled because no call can arrive before whenReady.
-  const stores = /** @type {ReadyStores} */ (ctx.stores)
   /** @type {Map<string, IpcHandler>} */
   const handlers = new Map()
   /** @param {string} channel @param {IpcHandler} handler */
@@ -90,78 +86,38 @@ function createIpcHandlers(ctx) {
   }
 
   handle('workspace:pick', async () => {
-    const result = await dialog.showOpenDialog({ properties: ['openDirectory', 'createDirectory'] })
+    const result = await ctx.dialog.showOpenDialog({ properties: ['openDirectory', 'createDirectory'] })
     if (result.canceled || !result.filePaths[0]) return null
-    return getGitContext(result.filePaths[0])
+    return ctx.getGitContext(result.filePaths[0])
   })
-  handle('workspace:inspect', (_event, workspace) => getGitContext(workspace))
-  handle('workspace:clone', (_event, remote) => cloneGitWorkspace(remote))
+  handle('workspace:inspect', (_event, workspace) => ctx.getGitContext(workspace))
+  handle('workspace:clone', (_event, remote) => ctx.cloneGitWorkspace(remote))
   handle('shell:open', (_event, target) => {
-    if (!/^https?:\/\//i.test(String(target || ''))) throw new Error('Only http(s) links can be opened externally')
-    return shell.openExternal(target)
+    if (typeof target !== 'string' || !/^https?:\/\//i.test(target)) throw new Error('Only http(s) links can be opened externally')
+    return ctx.shell.openExternal(target)
   })
   // Liveness for the self-upgrade health check (one round trip renderer → main → renderer) and the restart the upgrade
   // script or the window can ask for; the reply leaves before the process restarts.
-  handle('app:ping', () => ({ pid: process.pid, startedAt, healthy: isHealthy() }))
-  handle('app:relaunch', () => { setImmediate(() => relaunchApp('ipc')); return { ok: true, pid: process.pid } })
-  handle('runtime:start', (_event, payload) => {
-    const workspace = validateWorkspace(payload?.workspace)
-    if (!payload?.projectId || !payload?.chatId) throw new Error('Project and chat are required')
-    return runtime.start({
-      ...payload, workspace,
-      memoryContext: payload.memoryEnabled ? stores.memoryStore.search(payload.prompt, workspace, 6, payload.globalMemoryEnabled !== false, payload.chatId) : [],
-      artifactRoot: path.join(app.getPath('userData'), 'runs'),
-    })
+  handle('app:ping', () => ({ pid: process.pid, startedAt: ctx.startedAt, healthy: ctx.isHealthy() }))
+  handle('app:relaunch', () => { setImmediate(() => ctx.relaunchApp('ipc')); return { ok: true, pid: process.pid } })
+  // A new runtime process with the code on disk; the window stays. The reply comes once the new runtime is ready. While
+  // Orbit is still starting it waits for that start's report first: a restart on top of it would end a start that may
+  // be about to work, and its own report would come before the start's.
+  handle('runtime:restart', async () => {
+    if (ctx.whenStarted && !(await settlesWithin(Promise.resolve().then(ctx.whenStarted), STARTING_WAIT_MS))) {
+      /** @type {RuntimeRestartResult} */
+      const refused = { ok: false, ms: 0, pid: null, error: 'Orbit is still starting; restart the runtime once it has started' }
+      return refused
+    }
+    return ctx.restartRuntime('window')
   })
-  handle('runtime:stop', (_event, runId) => runtime.stop(runId))
-  handle('runtime:list', () => {
-    const records = new Map((stores.runStore?.list() || []).map(run => [run.runId, run]))
-    for (const run of runtime.getRuns()) records.set(run.runId, stripDiffs(/** @type {any} */ (run)))
-    return [...records.values()].sort((a, b) => String(b.startedAt).localeCompare(String(a.startedAt)))
-  })
-  handle('runtime:get', (_event, runId) => runtime.getRun(runId) || stores.runStore?.get(runId) || null)
-  // Diff texts are not part of run lists; the inspector asks for one run's changes when the user opens them.
-  handle('runtime:changes', async (_event, runId) => {
-    if (typeof runId !== 'string' || !/^[\w-]+$/.test(runId)) return []
-    const known = runtime.getRunChanges?.(runId) || stores.runStore?.getChanges(runId) || []
-    // Files written by agents that no record covers (runs saved before changes were tracked): Git may still show their diff.
-    const recovered = await (stores.runStore?.recoverChanges?.(runId, /** @type {any} */ (known)) || Promise.resolve([])).catch(() => [])
-    return recovered.length ? known.concat(recovered) : known
-  })
-  handle('state:load', () => stores.stateStore.load())
-  handle('state:save', (_event, state) => stores.stateStore.save(state))
-  // Building the index is the same scan a task starts with; asking for it first just makes the first task faster.
-  handle('project-index:status', async (_event, workspace, rebuild) => {
-    const folder = validateWorkspace(workspace)
-    if (!stores.projectIndex) return null
-    await stores.projectIndex.refresh(folder, { force: rebuild === true })
-    return stores.projectIndex.stats(folder)
-  })
-  handle('memory:list', (_event, workspace, chatId) => stores.memoryStore.list(workspace, true, chatId))
-  handle('memory:save', (_event, entry) => stores.memoryStore.upsert(entry))
-  handle('memory:remove', (_event, id, workspace, chatId) => stores.memoryStore.remove(id, workspace, chatId))
-  handle('memory:pin', (_event, id, pinned, workspace, chatId) => stores.memoryStore.pin(id, pinned === true, workspace, chatId))
-  // The renderer owns the per-project switch for shared memory; the runtime needs it to know which projects may contribute.
-  handle('memory:sharing', (_event, workspace, enabled) => { runtime.setSharing(workspace, enabled === true); return true })
-  handle('memory:forget-chat', (_event, workspace, chatId) => stores.memoryStore.forgetChat(workspace, chatId))
-  // How full each tier of memory and each skill library is, for the panels.
-  handle('memory:stats', (_event, workspace, chatId) => ({ memory: stores.memoryStore.stats(workspace, chatId), skills: stores.capabilityStore.stats(workspace) }))
-  handle('capabilities:list', (_event, workspace) => stores.capabilityStore.list(workspace))
-  handle('capabilities:pin', (_event, id, pinned, workspace) => stores.capabilityStore.pin(id, pinned === true, workspace))
-  handle('capabilities:read', (_event, id, workspace) => stores.capabilityStore.read(id, workspace))
-  handle('capabilities:install', (_event, entry) => stores.capabilityStore.install(entry))
-  handle('capabilities:remove', (_event, id, workspace) => stores.capabilityStore.remove(id, workspace))
-  handle('capabilities:restore', (_event, id, version, workspace) => stores.capabilityStore.restore(id, version, workspace))
-  // Read through the module so a fixture installed before start-up (smoke:desktop) is the one that answers.
-  handle('providers:health', (_event, options) => providers.inspectProviders(options))
-  handle('quota:get', (_event, providerOptions, force) => quota.all(PROVIDER_IDS, { options: providerOptions && typeof providerOptions === 'object' ? providerOptions : {}, force: force === true }))
-  handle('artifact:apply', async (_event, payload) => {
-    const context = await getGitContext(payload.workspace)
-    if (!context.connected) return { ok: false, reason: 'workspace_not_root', detail: 'Apply requires the exact Git repository root that produced this artifact.' }
-    const result = await applyPatch({ ...payload, artifactRoot: path.join(app.getPath('userData'), 'runs') })
-    if (result.ok && payload.worktreePath) await removeWorktree(payload.workspace, payload.worktreePath)
-    return result
-  })
+  handle('runtime:status', () => ctx.runtimeStatus())
+
+  const own = [...handlers.keys()]
+  if (own.length !== SHELL_CHANNELS.length || own.some(channel => !SHELL_CHANNELS.includes(channel))) {
+    throw new Error(`main's own IPC channels (${own.join(', ')}) differ from SHELL_CHANNELS of electron/runtime-protocol.mts`)
+  }
+  for (const channel of RUNTIME_CHANNELS) handle(channel, (_event, ...args) => ctx.callRuntime(channel, args))
   return handlers
 }
 

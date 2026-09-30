@@ -13,7 +13,8 @@ const env = { ...process.env }
 delete env.ELECTRON_RUN_AS_NODE
 
 // Without a script argument Orbit itself starts from the repository, the same command Orbit.cmd runs
-// (flags such as --relaunch pass through). A script argument runs that file inside Electron (smoke:desktop).
+// (flags such as --relaunch, --restart-runtime and --reload-renderer pass through, so `npm start -- --restart-runtime`
+// signals a running Orbit). A script argument runs that file inside Electron (smoke:desktop).
 const args = process.argv.slice(2)
 const runsApp = args.length === 0 || args[0].startsWith('--')
 if (runsApp) args.unshift(root)

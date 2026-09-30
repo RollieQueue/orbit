@@ -1,22 +1,24 @@
-// @ts-nocheck
 // Team correspondence: the durable mailbox of each agent (send, read, wait, delivery marks), waking finished agents,
 // the router-addressed ask_team, and the correspondence block a turn's prompt carries.
 import { randomUUID } from 'node:crypto'
 import { setMaxListeners } from 'node:events'
 import { ROUTER } from '../router.mts'
+import type { AgentRecord, AgentRef, AskTeamResult, Communication, CommunicationDelivery, CommunicationStatus, MailboxContext, OrbitRuntimeLike, ReadMessagesResult, RunRecord, SendResult, ToolArgs } from '../types.mts'
 import { ceiling, bounded, clip, abortError, abortable } from './util.mts'
 
-function communicationsFor(runtime, run, agent, unreadOnly = false) {
+type RoutedTo = AskTeamResult['routedTo'][number]
+
+function communicationsFor(runtime: OrbitRuntimeLike, run: RunRecord, agent: { id: string }, unreadOnly = false): Communication[] {
   return run.communications.filter((message) => message.toAgentId === agent.id && (!unreadOnly || !message.readAt))
 }
 // Router notices inform an agent at its next turn; unlike a request they never keep it from finishing or wake a wait.
 // Mail that the running turn's prompt already carried is not pending either: in session mode tools run inside the
 // turn, and the model has just read that mail (the envelope path marks it read before its tools run).
-function pendingMail(runtime, run, agent) {
+function pendingMail(runtime: OrbitRuntimeLike, run: RunRecord, agent: AgentRecord): Communication[] {
   const delivered = agent.activeTurn?.delivered
   return runtime.communicationsFor(run, agent, true).filter(message => message.kind !== 'notice' && !delivered?.has(message.id))
 }
-function markCommunications(runtime, run, ids, status, delivery) {
+function markCommunications(runtime: OrbitRuntimeLike, run: RunRecord, ids: string[], status: CommunicationStatus, delivery: CommunicationDelivery): void {
   let changed = false
   for (const message of run.communications) {
     if (!ids.includes(message.id) || message.status === 'read' || (message.status === status && message.delivery === delivery)) continue
@@ -28,7 +30,7 @@ function markCommunications(runtime, run, ids, status, delivery) {
   }
   if (changed) runtime.schedulePersist(run)
 }
-function sendAgentMessage(runtime, run, sender, args) {
+function sendAgentMessage(runtime: OrbitRuntimeLike, run: RunRecord, sender: AgentRecord, args: ToolArgs): SendResult {
   const target = runtime.resolveAgent(run, args.agentId)
   if (target.id === sender.id) throw new Error('Send messages to another agent, not yourself')
   if (['error', 'cancelled'].includes(target.status)) throw new Error('Agent is unavailable; failed agents can be retried with followup_agent')
@@ -55,15 +57,15 @@ function sendAgentMessage(runtime, run, sender, args) {
   for (const wake of run.messageWaiters.get(target.id) || []) wake()
   return { ok: true, communicationId: communication.id, agentId: target.id, status: communication.status, delivery: communication.delivery }
 }
-function recordCommunication(runtime, run, sender, target, text, extra = {}) {
-  const communication = { id: randomUUID(), fromAgentId: sender.id, toAgentId: target.id, fromAgentName: sender.name, toAgentName: target.name, text, time: new Date().toISOString(), status: 'queued', delivery: 'next-turn', ...extra }
+function recordCommunication(runtime: OrbitRuntimeLike, run: RunRecord, sender: AgentRef, target: AgentRef, text: string, extra: Partial<Communication> = {}): Communication {
+  const communication: Communication = { id: randomUUID(), fromAgentId: sender.id, toAgentId: target.id, fromAgentName: sender.name, toAgentName: target.name, text, time: new Date().toISOString(), status: 'queued', delivery: 'next-turn', ...extra }
   run.communications.push(communication)
   runtime.emit(run, 'communication.added', { communication })
   return communication
 }
-function readAgentMessages(runtime, run, agent, args = {}) {
+function readAgentMessages(runtime: OrbitRuntimeLike, run: RunRecord, agent: AgentRecord, args: ToolArgs = {}): ReadMessagesResult {
   const messages = runtime.communicationsFor(run, agent, args.unread_only !== false)
-  const selected = []
+  const selected: Communication[] = []
   let remaining = Math.max(1000, run.limits.maxOutputChars - 1000)
   for (const message of args.unread_only === false ? messages.slice(-24) : messages) {
     const length = JSON.stringify(message).length
@@ -73,16 +75,19 @@ function readAgentMessages(runtime, run, agent, args = {}) {
   runtime.markCommunications(run, selected.map((message) => message.id), 'read', 'mailbox')
   return { messages: structuredClone(selected), remainingUnread: runtime.communicationsFor(run, agent, true).length }
 }
-async function waitForTeam(runtime, run, agent, participants, timeout = 0) {
+async function waitForTeam(runtime: OrbitRuntimeLike, run: RunRecord, agent: AgentRecord, participants: { id: string }[], timeout = 0): Promise<string> {
   if (runtime.pendingMail(run, agent).length) return 'message'
-  let wake
-  const incoming = new Promise(resolve => { wake = () => resolve('message') })
+  // Assigned by the Promise executor, which runs synchronously.
+  let wake!: () => void
+  const incoming = new Promise<string>(resolve => { wake = () => resolve('message') })
   if (!run.messageWaiters.has(agent.id)) run.messageWaiters.set(agent.id, new Set())
-  run.messageWaiters.get(agent.id).add(wake)
+  // Created on the line above when missing.
+  run.messageWaiters.get(agent.id)!.add(wake)
   try {
     return await abortable(Promise.race([incoming, Promise.all(participants.map(member => run.tasks.get(member.id))).then(() => 'results')]), runtime.agentSignal(run, agent), timeout, 'wait_timeout')
   } catch (error) {
-    if (error.message === 'wait_timeout') return 'timeout'
+    // abortable rejects with Errors (a timeout, an abort, or a failed task).
+    if ((error as Error).message === 'wait_timeout') return 'timeout'
     throw error
   } finally {
     const waiters = run.messageWaiters.get(agent.id)
@@ -90,21 +95,24 @@ async function waitForTeam(runtime, run, agent, participants, timeout = 0) {
     if (!waiters?.size) run.messageWaiters.delete(agent.id)
   }
 }
-async function waitAgentMessage(runtime, run, agent, args) {
+async function waitAgentMessage(runtime: OrbitRuntimeLike, run: RunRecord, agent: AgentRecord, args: ToolArgs): Promise<ReadMessagesResult> {
   if (runtime.pendingMail(run, agent).length) return { ...runtime.readAgentMessages(run, agent), timedOut: false }
   const signal = runtime.agentSignal(run, agent)
   if (signal.aborted) throw abortError()
   const timeout = Math.max(10, Math.min(Number(args.timeout_ms) || 30000, 60000))
-  let wake
-  const incoming = new Promise((resolve) => { wake = resolve })
+  // Assigned by the Promise executor, which runs synchronously.
+  let wake!: () => void
+  const incoming = new Promise<void>((resolve) => { wake = resolve })
   if (!run.messageWaiters.has(agent.id)) run.messageWaiters.set(agent.id, new Set())
-  run.messageWaiters.get(agent.id).add(wake)
+  // Created on the line above when missing.
+  run.messageWaiters.get(agent.id)!.add(wake)
   runtime.updateAgent(run, agent, { status: 'waiting', detail: 'Waiting for a message' })
   try {
     await abortable(incoming, signal, timeout, 'mailbox_timeout')
     return { ...runtime.readAgentMessages(run, agent), timedOut: false }
   } catch (error) {
-    if (error.message === 'mailbox_timeout') return { messages: [], timedOut: true, remainingUnread: 0 }
+    // abortable rejects with Errors (a timeout or an abort).
+    if ((error as Error).message === 'mailbox_timeout') return { messages: [], timedOut: true, remainingUnread: 0 }
     throw error
   } finally {
     const waiters = run.messageWaiters.get(agent.id)
@@ -112,13 +120,14 @@ async function waitAgentMessage(runtime, run, agent, args) {
     if (!waiters?.size) run.messageWaiters.delete(agent.id)
   }
 }
-function mailboxContext(runtime, run, agent) {
+function mailboxContext(runtime: OrbitRuntimeLike, run: RunRecord, agent: AgentRecord): MailboxContext {
   const incoming = runtime.communicationsFor(run, agent).filter(message => !message.kind || message.kind === 'message' || message.kind === 'notice')
   const introductions = runtime.communicationsFor(run, agent, true).filter(message => message.kind === 'spawn' || message.kind === 'followup')
   const unread = incoming.filter((message) => !message.readAt)
   const ids = new Set(unread.map((message) => message.id))
   const recent = run.communications.filter((message) => (!message.kind || message.kind === 'message') && (message.toAgentId === agent.id || message.fromAgentId === agent.id) && !ids.has(message.id)).slice(-4)
-  const selected = [], delivered = []
+  // Excerpts of unread mail, then whole recent records: only serialised into the prompt.
+  const selected: object[] = [], delivered: string[] = []
   let remaining = 6000
   for (const message of unread) {
     const entry = { id: message.id, from: message.fromAgentName, text: bounded(message.text, 2000), excerpt: message.text.length > 2000, ...(message.kind === 'notice' ? { notice: true } : {}) }
@@ -133,18 +142,19 @@ function mailboxContext(runtime, run, agent) {
   }
   return { text: selected.length ? `TEAM CORRESPONDENCE (durable records; excerpts can be retrieved using read_messages unread_only=false):\n${JSON.stringify(selected)}` : '', deliveredIds: [...delivered, ...introductions.map(message => message.id)] }
 }
-function askTeam(runtime, run, sender, args) {
+function askTeam(runtime: OrbitRuntimeLike, run: RunRecord, sender: AgentRecord, args: ToolArgs): AskTeamResult {
   const text = String(args.message || '').trim()
   if (!text) throw new Error('A message is required')
   const { via, recipients } = run.router.audience(sender, args, reference => runtime.resolveAgent(run, reference))
   if (!recipients.length) throw new Error('No recipient: name agentIds, or give files or a topic that match a participant')
-  const original = args.replyTo && run.communications.find(message => message.id === args.replyTo)
+  const original = args.replyTo ? run.communications.find(message => message.id === args.replyTo) : undefined
   const discussionId = original?.discussionId || randomUUID()
-  const routedTo = recipients.map(({ agent, reasons }) => {
+  const routedTo = recipients.map(({ agent, reasons }): RoutedTo => {
     try {
       const sent = runtime.sendAgentMessage(run, sender, { agentId: agent.id, message: text, replyTo: args.replyTo, discussionId, route: { via, reasons } })
       return { agentId: agent.id, name: agent.name, reason: reasons.join('; '), status: sent.status }
-    } catch (error) { return { agentId: agent.id, name: agent.name, error: error.message } }
+    // sendAgentMessage and the router throw Errors.
+    } catch (error) { return { agentId: agent.id, name: agent.name, error: (error as Error).message } }
   })
   const delivered = routedTo.filter(item => !item.error)
   if (!delivered.length) throw new Error(routedTo.map(item => `${item.name}: ${item.error}`).join('; '))

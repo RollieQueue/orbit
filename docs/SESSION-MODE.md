@@ -39,11 +39,20 @@ Owner's invariants (do not trade these away):
 | claude | `session` | `--resume <id>` | MCP (HTTP, in-process) |
 | codex (exec) | `session` | `codex exec resume <id>` | MCP via `-c mcp_servers.orbit.*` |
 | codex (app-server, Ask mode) | `session` | same thread, `turn/start` per turn | MCP via config overrides |
-| cursor, antigravity | `envelope` (unchanged) | — | JSON envelope |
+| antigravity, Full access (added 2026-09-30) | `session` | `--conversation <id>` | MCP from a plugin in the conversation's folder |
+| cursor, Full access, opt-in (added 2026-09-30) | `session` | `--resume <chat id>` | MCP from a plugin folder per turn |
+| cursor, antigravity otherwise | `envelope` (unchanged) | — | JSON envelope |
 | ollama, custom endpoint | `envelope` (unchanged) | — | JSON envelope |
 
 `providers.transportFor(providerId, options)` returns `'session'` or `'envelope'`.
 `ORBIT_LEGACY_ENVELOPE=1` forces envelope mode for every provider (escape hatch).
+Cursor and Antigravity get the session only in Full access (`accessMode: 'danger-full-access'`,
+approval policy not `on-request`): headless, neither CLI can approve an MCP tool call
+except by approving everything (`--force`, `--dangerously-skip-permissions`). Antigravity
+has it by default there. Cursor's is opt-in until a live check passes (the Cursor account
+was out of quota): `transport: 'session'` in the Cursor provider options or
+`ORBIT_CURSOR_SESSION=1`. `transport: 'envelope'` in a provider's options forces the envelope
+for that provider.
 
 ### Claude session invocation
 
@@ -72,6 +81,92 @@ comes from the `thread.started` JSON event; follow-ups use `codex exec resume <i
 The App Server transport keeps its thread alive for the agent's life and sends one
 `turn/start` per Orbit turn. No process is killed at a tool call any more; the
 `TOOL_HANDOFF` path stays only for envelope providers.
+Both Codex transports also get `-c mcp_servers.orbit.tool_timeout_sec=3600` (added
+2026-09-30): Codex otherwise ends an MCP tool call after 60 s.
+
+### Cursor session invocation (2026-09-30, opt-in)
+
+```
+agent --print --output-format stream-json --trust
+      --approve-mcps --plugin-dir <temp folder>          Orbit's server, approved up front
+      --force --sandbox disabled [--resume <chat id>] [--model m]
+```
+
+Prompt on stdin, cwd = the workspace on every turn (Cursor keys its chats by folder). The
+plugin folder (`%TEMP%/orbit-cursor-mcp-<pid>-*`, created for every turn and removed after
+it) holds `.cursor-plugin/plugin.json` (`{"name":"orbit",…}`) and `mcp.json` with
+`Authorization: Bearer ${env:ORBIT_MCP_TOKEN}`: the token is only in the environment, and
+the server's id is `plugin-orbit-orbit`. `--approve-mcps` approves every MCP server Cursor
+has configured, the user's global and project ones included, not only Orbit's: acceptable
+only because this transport exists in Full access alone. The chat id comes from the stream
+(`session_id`, first in `system/init`). Cursor has no system-prompt option, so the stable
+Orbit block opens the conversation's first message. An empty final `result` falls back to
+the last text the turn streamed; an error event whose error is an object is described as
+JSON. "You've hit your usage limit" (stderr only) becomes a quota-tagged error, so failover
+recognises it.
+
+### Antigravity session invocation (2026-09-30)
+
+```
+agy --input-format stream-json --output-format stream-json [--model m]
+    --add-dir <workspace> --dangerously-skip-permissions [--conversation <id>]
+```
+
+cwd = a folder per conversation, `%TEMP%/orbit-agy-session-<pid>-*`, with
+`.agents/plugins/orbit/{plugin.json, mcp_config.json, rules/AGENTS.md}`: the server
+(`serverUrl`, a `Bearer` header with the token itself, since `agy` expands no variables;
+`timeoutSeconds: 3600`) and, as the plugin's always-on rule, the stable Orbit block plus
+the workspace path and how to call Orbit's tools. The files are rewritten before every
+turn (the port and the token may change). The prompt is one NDJSON line on stdin. Orbit
+tool calls arrive as `call_mcp_tool` with `ServerName` `orbit_orbit`; `denied_actions` is
+a diagnostic, not a failure; an empty `response` falls back to the streamed text. The
+conversation id comes from the stream. The folder stays until `closeSession` (the end of
+the run, or a handover) and goes when Orbit exits (the exit hook retries a folder still
+locked). The first session of a later process removes the folders an earlier one left (and
+Cursor plugin folders): at once when the process named in the folder is gone, else once
+their configuration is older than 6 h. A resume in a new Orbit process, which does not know
+the folder, runs in a new one.
+
+### Session ids (2026-09-30)
+
+Cursor, Antigravity and Codex name their sessions, and the id goes back to the CLI as an
+argument on resume (`--resume`, `--conversation`, `codex exec resume`). Only a plain token
+(`SESSION_ID`: a letter or digit, then letters, digits and `._:-`, at most 128 characters)
+is taken from a stream; anything else is ignored (the Cursor and Antigravity parsers report
+it once as a diagnostic). A provider that returns `sessionId: null` (its stream carried no
+id) starts fresh on the next turn instead of "resuming" the id Orbit proposed. A resume id that `normalizeSession`
+refuses (malformed, or not a UUID for Claude) throws with the code `ORBIT_SESSION_ID`; the
+session loop drops that id once, with a `transport` trace, and starts a fresh session. A
+handover closes the agent's old session first (an Antigravity folder holding the token, a
+Codex App Server) and stops its parked calls.
+
+### Per-call limits of MCP clients (2026-09-30)
+
+Some MCP clients end a tool call on their own clock: Cursor after 60 s (the MCP SDK
+default; it sends no progress token), Antigravity after the plugin's `timeoutSeconds`,
+Codex after `tool_timeout_sec`. `providers.mcpCallLimit(providerId)` gives Orbit's answer
+time: Cursor 50 s, Codex and Antigravity 59 min, 0 (no limit) for the others;
+`ORBIT_MCP_CALL_LIMIT_MS` can only lower it. For a session agent of such a provider
+`runtime/session.mts` (`dispatchMcp`):
+
+- cuts `wait_agent` and `wait_message` that would wait longer (`wait_agent` without
+  `timeout_ms` waits indefinitely, `wait_message` 30 s) at the limit and answers
+  "still running / still waiting, call again". The model slot the wait gave away is taken
+  back within what is left of the limit (at least a tenth of it, 5 s at most: about 55 s in
+  all for Cursor); if it is not free by then, the answer goes out and the slot comes back
+  in the background;
+- lets any other call (not `followup_agent`) that outlives the limit keep running and
+  answers `{ stillRunning: true, hint }`. The call is registered before anything is
+  awaited, so an identical call made meanwhile joins it; the agent's next identical call
+  (same tool and arguments, `timeout_ms` ignored) collects the result, marked
+  `collected: true` with the `startedAt` of the run it comes from, instead of starting the
+  tool again. A result is not handed out once files changed after the call started (an
+  Orbit `write_file`/`edit_file`, a native edit, changes attributed to another command) or
+  2 minutes after it finished: that call is stopped and started afresh. Each such call runs
+  under its own `AbortController` linked to the agent's signal and is stopped (a command
+  killed, `run.operations` emptied) when the agent's session is released, at a handover
+  and when the run ends. Known gap: a native edit made while the parked call still runs is
+  not noticed by a repeat that comes after the call finished (docs/TECH-DEBT.md).
 
 ### Timeouts
 
@@ -87,6 +182,12 @@ total deadline applies only when `run.limits.timeoutMs` is set explicitly.
 - One in-process streamable-HTTP MCP server per app, `127.0.0.1`, ephemeral port,
   started lazily on the first session. Built on `@modelcontextprotocol/sdk`
   (`server/index.js` low-level `Server` + `server/streamableHttp.js`).
+- Since 2026-09-30 the module itself (`electron/mcp-server.mts`, with the MCP SDK and zod)
+  is also loaded on the first session: `runtime/session.mts` `ensureMcp` imports it with
+  `await import()`, and a runtime that never opens a session never loads it. Measured on
+  Node 22: the runtime's module graph loads in about 0.26 s instead of 0.53 s (median).
+  "Per app" means per runtime process: the server goes down with the runtime and a new
+  runtime starts its own on the next session.
 - Auth: `Authorization: Bearer <token>`; the token identifies one (run, agent).
   `mcp.issueToken({ runId, agentId })` / `mcp.revoke(token)`; unknown token → 401.
 - `tools/list` comes from `electron/tool-registry.cjs` (new, see below), filtered by
@@ -143,6 +244,27 @@ the existing `executeAgent`. The session loop:
 4. Handover (quota/failure) works as today: the note is built from the ledger; the
    replacement provider starts a fresh session with the note in its user prompt.
 5. Cancellation kills the process tree as today.
+6. (2026-09-30) A continuation after an Orbit restart (`restart_orbit`, docs/ARCHITECTURE.md,
+   "Process model and restarts") starts its root with the restart note in the transcript.
+   When the old root was a session agent and the new root keeps its provider on the session
+   transport, the new root takes over the old session id (`run.resumeSession`): its first
+   turn is a resume carrying the continuation's message and the note. A root cut off in its
+   first session turn has no recorded `sessionId` yet; for Claude, whose session id Orbit
+   chooses, the id of its last `turnTimings` entry is used (unless a handover after that turn
+   began moved the root to Claude); Codex, Cursor and Antigravity name their own sessions, so
+   such a root starts fresh. A resume that fails
+   (a CLI killed mid-turn can leave the session unreadable) drops the id once, with a
+   `transport` trace, and a fresh session starts from the note (`runtime/loops.mts`).
+
+Every CLI process a provider turn starts, on both transports (Claude, Codex exec and App
+Server, Cursor, Antigravity), gets `ProviderRunOptions.extraEnv` in its environment. The
+runtime fills it with the restart variables (`ORBIT_RUN_ID`, `ORBIT_CHAT_ID`,
+`ORBIT_PROJECT_ID`, `ORBIT_AGENT_ID`, `ORBIT_RESUME_FILE`, `ORBIT_USER_DATA`) exactly where
+`restart_orbit` is offered: for the root agent of a writable run on Orbit's own repository,
+with a usable restart host, not under `ORBIT_DEV` (`runtime/restart.mts` `agentEnv`); a
+self-upgrade run from the CLI's own shell then names the run to continue and signals this
+Orbit's profile. For every other agent it is empty. Orbit's transport variables (the MCP
+token, `NO_PROXY`, proxy settings) win over it.
 
 Also in this wave (runtime): per-turn timing records
 `agent.turnTimings[] = { turn, transport, startedAt, firstEventAt, endedAt, promptChars, nativeToolCalls, orbitToolCalls, sessionId }`
@@ -171,11 +293,16 @@ No `--loop` handoff any more; the cycle cap is ORBIT_UPGRADE_MAX_CYCLES relaunch
 distribution step. `run_command` default timeout 600 s, clamp 20 ms–3 600 s.
 Old bundles are not deleted by code; `npm run clean:bundles` lists and removes them
 on request.
+Since 2026-09-30 the restart has three levels (window reload, runtime process, whole app),
+chosen from code fingerprints, and the root agent can run the loop itself with
+`restart_orbit`: README, "Самообновление", and docs/ARCHITECTURE.md, "Process model and
+restarts".
 
 ## IPC contract (`electron/ipc-contract.cjs`)
 
 One table of every renderer-callable method: `{ method, channel, args: [{ name, type, optional? }], returns, push? }`
-(`CALLS`), plus the two push events `runtime:event` and `quota:update` (`EVENTS`). Type strings are TypeScript as the
+(`CALLS`), plus the push events `runtime:event`, `quota:update` and, since 2026-09-30, `restart:notice` and
+`runtime:status-changed` (`EVENTS`). Type strings are TypeScript as the
 renderer sees it (`GitContext`, `RuntimeEvent`, … from `vite-env.d.ts`, or `import('./types').X`).
 
 - `electron/preload.cjs` and the block between the `BEGIN/END generated` markers of `src/vite-env.d.ts` (`OrbitBridge`,
@@ -185,7 +312,12 @@ renderer sees it (`GitContext`, `RuntimeEvent`, … from `vite-env.d.ts`, or `im
   and `RuntimeEvent` stay hand-written outside the markers.
 - `electron/ipc-handlers.cjs` implements the call channels as a `Map` keyed by channel; `registerIpcHandlers` throws at
   start-up when a contract channel has no handler or a handler has no contract entry. `main.cjs` is lifecycle + wiring.
-- To add a method: one entry in the contract, one `handle('…')` in `ipc-handlers.cjs`, run the generator, use it in `src/`.
+  Since 2026-09-30 main answers only `SHELL_CHANNELS` itself and forwards `RUNTIME_CHANNELS` (both lists in
+  `electron/runtime-protocol.mts`) to the runtime process, whose handlers are `electron/runtime-api.mts`
+  (`createRuntimeApi` throws the same way when they and `RUNTIME_CHANNELS` disagree).
+- To add a method: one entry in the contract, one `handle('…')` in `ipc-handlers.cjs` (a main channel) or in
+  `runtime-api.mts` (a runtime channel), the channel in `SHELL_CHANNELS` or `RUNTIME_CHANNELS`, run the generator, use
+  it in `src/`. The contract, the preload and `runtime-protocol.mts` are shell files: the change takes a full relaunch.
 - Removed in wave 2 as unused by the renderer: `routeMessage` (stub), `spawnSubAgent`, `getProjectContext`,
   `searchMemory`, `platform`. Kept although unused by `src/`: `inspectWorkspace`, `getRun` (typed), `applyArtifact`
   (only path into `worktree.cjs`), `ping`/`relaunch` (health check and self-upgrade).

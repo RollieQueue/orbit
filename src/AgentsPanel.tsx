@@ -6,7 +6,7 @@ import { Icon } from './Icon'
 import { handoverLabel } from './QuotaPanel'
 import { plural, statusText } from './format'
 import { providerName, providers } from './providers'
-import { isActiveStatus } from './run-events'
+import { isActiveStatus, resumeLinks, shortRunId } from './run-events'
 
 type TreeOptions = { run: RunSnapshot; selectedId?: string; onSelect: (id: string) => void }
 const handoverTitle = (agent: Agent) =>
@@ -54,6 +54,8 @@ export function AgentsPanel({ chatRuns, currentRun, selectedAgent, inspectorRequ
   const newerRun = chatRuns.length > 1 && currentRun && latest && latest.runId !== currentRun.runId && isActiveStatus(latest.status) ? latest : undefined
   const requested = inspectorRequest?.runId === currentRun?.runId ? inspectorRequest : null
   const routerRow = !!currentRun && (currentRun.agents.length > 1 || !!currentRun.communications?.length)
+  // Runs around an Orbit restart: the run this one continues, and the run that continued this one.
+  const resume = resumeLinks(chatRuns, currentRun)
   return <aside className="agents-panel">
     <header>
       <div><Icon name="agents" /><strong>Агенты</strong></div>
@@ -73,6 +75,16 @@ export function AgentsPanel({ chatRuns, currentRun, selectedAgent, inspectorRequ
         {statusText(currentRun.status)}
         <span>{plural(currentRun.agents.length, ['агент', 'агента', 'агентов'])}</span>
       </div>
+      {(resume.from || resume.next) && <div className="run-resume-links">
+        {resume.from && (resume.previous
+          ? <button type="button" onClick={() => onPick(resume.from!)} title="Открыть запуск, который завершился перезапуском Orbit">
+            Продолжение запуска {shortRunId(resume.from)}
+          </button>
+          : <span title="Этот запуск больше не хранится">Продолжение запуска {shortRunId(resume.from)}</span>)}
+        {resume.next && <button type="button" onClick={() => onPick(resume.next!.runId)} title="Открыть запуск, который продолжил эту задачу">
+          Продолжен в {shortRunId(resume.next.runId)}
+        </button>}
+      </div>}
       <div className="agent-tree">
         {agentTree(currentRun.agents, { run: currentRun, selectedId: selected?.id, onSelect: onSelectAgent })}
         {routerRow && <button className={`agent-row router-row ${selected?.id === 'router' ? 'selected' : ''}`} onClick={() => onSelectAgent('router')}>

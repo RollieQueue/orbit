@@ -1,30 +1,33 @@
-// @ts-nocheck
 // One provider turn: the call itself with its slot, budgets, timing record and cancellation plumbing, and the stream
 // of events it produces (buffered traces, the root's streamed answer, usage, native file events, the cut-off record).
 import { randomUUID } from 'node:crypto'
 import { ORBIT_RESPONSE_SCHEMA } from '../tool-schema.mts'
 import { classifyQuotaError } from '../quota.mts'
 import { TERMINAL, ceiling, MCP_TOOL_PREFIX, answerLimit, bounded, clip, TurnBudgetError, abortError, abortable, diagnostics } from './util.mts'
+import { agentEnv } from './restart.mts'
+import type { AgentRecord, OrbitRuntimeLike, ProviderEvent, ProviderResult, RunRecord, SessionInfo, StreamState, TurnTiming, UsageFigures } from '../types.mts'
 // The root agent's answer in progress is published at most four times a second.
 const STREAM_INTERVAL_MS = 250
 
 // What a turn had produced when the provider cut it off: the last streamed message and the native tool actions.
-function notePartialTurn(runtime, agent, event) {
+function notePartialTurn(runtime: OrbitRuntimeLike, agent: AgentRecord, event: ProviderEvent): void {
   const partial = agent.partialTurn
   if (!partial || event?.parentToolId) return
   if (event.kind === 'output') {
     const id = event.messageId || 'output'
     const text = event.replace ? String(event.text || '') : (partial.messages.get(id) || '') + String(event.text || '')
     partial.messages.delete(id); partial.messages.set(id, text)
-    if (partial.messages.size > 4) partial.messages.delete(partial.messages.keys().next().value)
+    // The map holds more than four entries here, so its first key exists.
+    if (partial.messages.size > 4) partial.messages.delete(partial.messages.keys().next().value!)
   } else if (event.native && event.kind === 'tool') {
-    const key = event.toolId || event.text
+    // A tool event without an id is keyed by its text (possibly undefined, as before: one shared slot).
+    const key = (event.toolId || event.text) as string
     partial.tools.delete(key)
     partial.tools.set(key, `${event.tool || 'tool'}: ${clip(event.text, 140)}${event.status ? ` [${event.status}]` : ''}`)
-    if (partial.tools.size > 12) partial.tools.delete(partial.tools.keys().next().value)
+    if (partial.tools.size > 12) partial.tools.delete(partial.tools.keys().next().value!)
   }
 }
-function providerEvent(runtime, run, agent, event) {
+function providerEvent(runtime: OrbitRuntimeLike, run: RunRecord, agent: AgentRecord, event: ProviderEvent): void {
   if (runtime.agentSignal(run, agent).aborted) return
   if (event?.kind === 'quota') {
     // Account figures from a live turn refine the shared monitor; they are not part of the agent's story.
@@ -54,16 +57,16 @@ function providerEvent(runtime, run, agent, event) {
   const text = [event?.text || event?.message || '', event?.output ? bounded(event.output, 4000) : '', event?.exitCode !== undefined ? `exitCode=${event.exitCode}` : '', event?.status ? `status=${event.status}` : ''].filter(Boolean).join('\n')
   runtime.trace(run, agent.id, event?.kind || 'provider', text || bounded(event, 4000))
 }
-function flushProviderBuffer(runtime, run, key) {
+function flushProviderBuffer(runtime: OrbitRuntimeLike, run: RunRecord, key: string): void {
   const buffer = run.providerBuffers.get(key)
   if (!buffer) return
-  clearTimeout(buffer.timer); buffer.timer = null
+  clearTimeout(buffer.timer ?? undefined); buffer.timer = null
   if (buffer.dirty && buffer.text) runtime.trace(run, buffer.agentId, buffer.kind, buffer.text, buffer.id)
   buffer.dirty = false
 }
 // Per-turn timing: when the provider first spoke, and how many native tool calls it made (Orbit's MCP tools are
 // counted where they are dispatched). A native call is counted once however many status events it produces.
-function noteTurnEvent(runtime, agent, event) {
+function noteTurnEvent(runtime: OrbitRuntimeLike, agent: AgentRecord, event: ProviderEvent): void {
   const turn = agent.activeTurn
   if (!turn) return
   if (!turn.timing.firstEventAt) turn.timing.firstEventAt = new Date().toISOString()
@@ -75,7 +78,7 @@ function noteTurnEvent(runtime, agent, event) {
 }
 // The root agent's answer as it is written: the whole text so far, at most four times a second, under one message id
 // that the final message.added reuses. A tool envelope being typed in envelope mode is not an answer and stays out.
-function streamOutput(runtime, run, agent, event) {
+function streamOutput(runtime: OrbitRuntimeLike, run: RunRecord, agent: AgentRecord, event: ProviderEvent): void {
   const turn = agent.activeTurn
   if (!turn) return
   if (!turn.stream) turn.stream = { messageId: randomUUID(), parts: new Map(), lastAt: 0, timer: null, dirty: false }
@@ -89,8 +92,8 @@ function streamOutput(runtime, run, agent, event) {
   if (elapsed >= STREAM_INTERVAL_MS) runtime.flushStream(run, agent, stream)
   else if (!stream.timer) { stream.timer = setTimeout(() => runtime.flushStream(run, agent, stream), STREAM_INTERVAL_MS - elapsed); stream.timer.unref?.() }
 }
-function flushStream(runtime, run, agent, stream) {
-  clearTimeout(stream.timer); stream.timer = null
+function flushStream(runtime: OrbitRuntimeLike, run: RunRecord, agent: AgentRecord, stream: StreamState): void {
+  clearTimeout(stream.timer ?? undefined); stream.timer = null
   if (!stream.dirty || TERMINAL.has(run.status)) return
   stream.dirty = false
   const content = [...stream.parts.values()].filter(Boolean).join('\n\n')
@@ -98,14 +101,14 @@ function flushStream(runtime, run, agent, stream) {
   stream.lastAt = Date.now()
   runtime.emit(run, 'message.streaming', { agentId: agent.id, messageId: stream.messageId, content: bounded(content, answerLimit(run, agent)) }, false)
 }
-function recordUsage(runtime, run, usage) {
+function recordUsage(runtime: OrbitRuntimeLike, run: RunRecord, usage: UsageFigures): void {
   const input = Number(usage.input_tokens ?? usage.prompt_tokens), output = Number(usage.output_tokens ?? usage.completion_tokens)
   if (Number.isFinite(input)) run.usage.inputTokens = (run.usage.inputTokens || 0) + input
   if (Number.isFinite(output)) run.usage.outputTokens = (run.usage.outputTokens || 0) + output
   const cached = Number(usage.cached_input_tokens ?? usage.cache_read_tokens ?? usage.cache_read_input_tokens ?? usage.prompt_tokens_details?.cached_tokens)
   if (Number.isFinite(cached)) run.usage.cachedInputTokens = (run.usage.cachedInputTokens || 0) + cached
 }
-function trackOperation(runtime, run, operation, agent) {
+function trackOperation<T>(runtime: OrbitRuntimeLike, run: RunRecord, operation: T | PromiseLike<T>, agent: { id: string }): Promise<Awaited<T>> {
   const pending = Promise.resolve(operation)
   run.operations.add(pending)
   run.agentOperations.get(agent?.id)?.add(pending)
@@ -115,12 +118,12 @@ function trackOperation(runtime, run, operation, agent) {
 }
 // One provider turn. `session` (session transport) is passed to the provider in place of the envelope schema; the
 // turn's slot object lets an MCP wait release the model slot and take it back (see dispatchMcp).
-async function providerTurn(runtime, run, agent, prompt, session = null) {
+async function providerTurn(runtime: OrbitRuntimeLike, run: RunRecord, agent: AgentRecord, prompt: string | (() => string), session: SessionInfo | null = null): Promise<ProviderResult> {
   await runtime.acquireTurn(run, agent)
   const signal = runtime.agentSignal(run, agent)
   const controller = new AbortController(), abort = () => controller.abort()
   const slot = { held: true }
-  let providerTask, counted = false, timing = null
+  let providerTask: Promise<ProviderResult> | undefined, counted = false, timing: TurnTiming | null = null
   signal.addEventListener('abort', abort, { once: true })
   try {
     if (signal.aborted) throw abortError()
@@ -138,17 +141,22 @@ async function providerTurn(runtime, run, agent, prompt, session = null) {
     run.usage.promptChars = (run.usage.promptChars || 0) + resolvedPrompt.length
     agent.promptChars = (agent.promptChars || 0) + resolvedPrompt.length
     timing.promptChars = resolvedPrompt.length
+    // The provider's CLI (and every shell it opens) learns which run it serves: a self-upgrade started there continues it.
+    const extraEnv = agentEnv(runtime, run, agent)
     providerTask = runtime.trackOperation(run, Promise.resolve().then(() => runtime.runProvider({
       providerId: agent.providerId, model: agent.requestedModel, prompt: resolvedPrompt, workspace: run.workspace,
       mode: run.accessMode, accessMode: run.accessMode, approvalPolicy: run.approvalPolicy,
       reasoningEffort: agent.reasoningEffort,
       providerOptions: run.providerOptions[agent.providerId] || {},
       ...(session ? { session } : { responseSchema: ORBIT_RESPONSE_SCHEMA }),
+      ...(Object.keys(extraEnv).length ? { extraEnv } : {}),
       onApproval: request => runtime.approve(run, agent, request, controller.signal),
       signal: controller.signal, timeoutMs: run.limits.timeoutMs,
       onEvent: (event) => { if (!controller.signal.aborted) runtime.providerEvent(run, agent, event) },
     })), agent)
     const result = await abortable(providerTask, signal, run.limits.timeoutMs, 'Provider turn time budget exhausted')
+    // A continuation's resume of the session from before the restart answered: from now on it is an ordinary session.
+    if (session && run.resumeSession === session.id) run.resumeSession = undefined
     if (result?.model) { runtime.updateAgent(run, agent, { model: result.model }); if (agent.id === 'root') run.model = result.model }
     // A provider that could not apply the requested level (Cursor `auto` has no variants) reports the one that really ran.
     if (typeof result?.reasoningEffort === 'string' && result.reasoningEffort !== agent.reasoningEffort) { runtime.updateAgent(run, agent, { reasoningEffort: result.reasoningEffort }); if (agent.id === 'root') run.reasoningEffort = result.reasoningEffort }

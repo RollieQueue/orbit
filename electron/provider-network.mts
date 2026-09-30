@@ -15,19 +15,45 @@ function proxyUrl(value: string): string {
   return url.origin
 }
 
-async function systemProxy(): Promise<string> {
-  // Electron resolves Windows proxy settings and PAC. The registry fallback is
-  // for CLI diagnostics outside Electron; never change the machine configuration.
+// What systemProxy asks about: the route to Antigravity's endpoint.
+const PROXY_PROBE_URL = 'https://daily-cloudcode-pa.googleapis.com'
+
+// Electron's route for a URL ("PROXY host:port; DIRECT", as session.resolveProxy answers), or null when it cannot tell.
+// The runtime child process installs one that asks main (runtime-child.cjs): Electron's session lives in main only.
+type ProxyResolver = (url: string) => Promise<string | null>
+let proxyResolver: ProxyResolver | null = null
+function setProxyResolver(resolver: ProxyResolver | null): void {
+  proxyResolver = resolver
+}
+
+// The first entry of a route as a proxy URL; '' for DIRECT (no proxy).
+function routeProxy(route: string): string {
+  const first = route.split(';')[0].trim()
+  const match = first.match(/^(PROXY|HTTPS) (.+)$/)
+  return match ? proxyUrl(`${match[1] === 'HTTPS' ? 'https' : 'http'}://${match[2]}`) : ''
+}
+
+// `readRegistry` is the last source; tests pass their own so the answer does not depend on this machine's settings.
+async function systemProxy(readRegistry: () => Promise<string> = registryProxy): Promise<string> {
+  // Electron resolves Windows proxy settings and PAC: through the resolver the runtime child installs, or directly in
+  // Electron's main process (the in-process runtime). The registry fallback is for CLI diagnostics outside Electron,
+  // or when neither answers; never change the machine configuration.
+  if (proxyResolver) {
+    try {
+      const route = await proxyResolver(PROXY_PROBE_URL)
+      if (typeof route === 'string') return routeProxy(route)
+    } catch { /* No answer from main: the next source. */ }
+  }
   try {
     // Loaded here, not at the top: outside Electron the package resolves to the binary's path and has no session.
     const { session } = (await import('electron')).default
-    if (session?.defaultSession) {
-      const route = await session.defaultSession.resolveProxy('https://daily-cloudcode-pa.googleapis.com')
-      const first = route.split(';')[0].trim()
-      const match = first.match(/^(PROXY|HTTPS) (.+)$/)
-      return match ? proxyUrl(`${match[1] === 'HTTPS' ? 'https' : 'http'}://${match[2]}`) : ''
-    }
-  } catch { /* Standalone Node does not have an Electron session. */ }
+    if (session?.defaultSession) return routeProxy(await session.defaultSession.resolveProxy(PROXY_PROBE_URL))
+  } catch { /* Standalone Node (and Electron's utility process) has no Electron session. */ }
+  return readRegistry()
+}
+
+// The static proxy of the Windows Internet settings (no PAC), '' when there is none or it cannot be read.
+async function registryProxy(): Promise<string> {
   if (process.platform !== 'win32') return ''
   try {
     const { stdout } = await promisify(execFile)('reg.exe', ['query', 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings'], { windowsHide: true, timeout: 3000 })
@@ -51,5 +77,5 @@ async function proxyEnvironment(options: ProxyOptions = {}, resolveSystem: () =>
     no_proxy: mode === 'direct' ? '*' : 'localhost,127.0.0.1,::1',
   }
 }
-export type { ProxyOptions, ProxyEnvironment }
-export { proxyEnvironment, proxyUrl, systemProxy }
+export type { ProxyOptions, ProxyEnvironment, ProxyResolver }
+export { proxyEnvironment, proxyUrl, systemProxy, setProxyResolver, PROXY_PROBE_URL }

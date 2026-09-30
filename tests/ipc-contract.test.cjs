@@ -23,11 +23,12 @@ function loadWithElectron(file, stub) {
   try { return require(resolved) } finally { Module._load = original; delete require.cache[resolved] }
 }
 
+// The IpcContext main.cjs passes: main's own helpers, and the runtime client behind callRuntime/restartRuntime/runtimeStatus.
 function fakeContext() {
   return {
-    app: { getPath: () => root }, dialog: {}, shell: {}, runtime: {}, quota: {}, stores: {},
-    validateWorkspace: (workspace) => workspace, getGitContext: async () => ({ connected: false }), cloneGitWorkspace: async () => null,
-    relaunchApp() {}, startedAt: Date.now(), isHealthy: () => false,
+    dialog: {}, shell: {}, getGitContext: async () => ({ connected: false }), cloneGitWorkspace: async () => null,
+    relaunchApp() {}, restartRuntime: async () => ({ ok: true, ms: 0, pid: 1 }), runtimeStatus: () => ({ state: 'ready' }),
+    callRuntime: async (channel, args) => ({ channel, args }), startedAt: Date.now(), isHealthy: () => false,
   }
 }
 
@@ -54,7 +55,21 @@ test('the contract is well-formed: unique methods and channels, typed arguments,
       assert.equal(entry.returns, '() => void', `${entry.method} returns the unsubscribe function`)
     }
   }
-  assert.deepEqual(contract.pushChannels().sort(), ['quota:update', 'runtime:event'])
+  assert.deepEqual(contract.pushChannels().sort(), ['quota:update', 'restart:notice', 'runtime:event', 'runtime:status-changed'])
+})
+
+test('the runtime restart and status rows: calls without arguments, events typed with the renderer types', () => {
+  const byMethod = new Map(contract.ENTRIES.map(entry => [entry.method, entry]))
+  assert.deepEqual([byMethod.get('restartRuntime')?.channel, byMethod.get('restartRuntime')?.args], ['runtime:restart', []])
+  assert.deepEqual([byMethod.get('getRuntimeStatus')?.channel, byMethod.get('getRuntimeStatus')?.args], ['runtime:status', []])
+  assert.equal(byMethod.get('getRuntimeStatus')?.returns, "import('./types').RuntimeStatus")
+  assert.match(contract.TYPES[byMethod.get('restartRuntime')?.returns] || '', /^\{ ok: boolean; ms: number; pid: number \| null; error\?: string \}$/)
+  assert.equal(byMethod.get('onRestartNotice')?.channel, 'restart:notice')
+  assert.match(byMethod.get('onRestartNotice')?.args[0].type || '', /RestartNotice\) => void$/)
+  assert.equal(byMethod.get('onRuntimeStatus')?.channel, 'runtime:status-changed')
+  assert.match(byMethod.get('onRuntimeStatus')?.args[0].type || '', /RuntimeStatus\) => void$/)
+  const types = read(path.join(root, 'src', 'types.ts'))
+  for (const name of ['RestartNotice', 'RuntimeStatus']) assert.match(types, new RegExp(`^export type ${name} = \\{`, 'm'), `src/types.ts declares ${name}`)
 })
 
 test('src/vite-env.d.ts carries the generated bridge block, byte for byte', () => {
@@ -141,9 +156,41 @@ test('the main-process handlers cover the contract exactly, and a mismatch is a 
   assert.deepEqual(registered.sort(), contract.callChannels().sort())
 })
 
+test('the window\'s runtime restart waits for the start of Orbit to be reported, as the --restart-runtime signal does', async () => {
+  let reportStart = () => {}
+  const started = new Promise((resolve) => { reportStart = resolve })
+  const restarts = []
+  const handlers = createIpcHandlers({
+    ...fakeContext(), whenStarted: () => started,
+    restartRuntime: async (reason) => { restarts.push(reason); return { ok: true, ms: 7, pid: 42 } },
+  })
+  const reply = handlers.get('runtime:restart')({})
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  assert.deepEqual(restarts, [], 'nothing restarts before the start is reported')
+  reportStart()
+  assert.deepEqual(await reply, { ok: true, ms: 7, pid: 42 })
+  assert.deepEqual(restarts, ['window'])
+  // Once started, at once; a main without the hook restarts at once too.
+  assert.deepEqual(await handlers.get('runtime:restart')({}), { ok: true, ms: 7, pid: 42 })
+  assert.deepEqual(await createIpcHandlers(fakeContext()).get('runtime:restart')({}), { ok: true, ms: 0, pid: 1 })
+})
+
 test('every push channel of the contract is sent by the main process', () => {
-  const source = fs.readFileSync(path.join(root, 'electron', 'main.cjs'), 'utf8')
-  for (const channel of contract.pushChannels()) assert.ok(source.includes(`webContents.send('${channel}'`), `main.cjs sends ${channel}`)
+  // Code only: a comment that merely names a channel does not count.
+  const code = (name) => {
+    let text = ''
+    try { text = fs.readFileSync(path.join(root, 'electron', name), 'utf8') } catch { return '' }
+    return text.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:'"`\\])\/\/.*$/gm, '$1')
+  }
+  const main = code('main.cjs')
+  // Main sends a channel itself (webContents.send('quota:update', …)), or forwards what the runtime emits with one
+  // generic webContents.send(channel, payload); then the channel is named by main or by the runtime code that emits it.
+  const forwards = /webContents\.send\(\s*[A-Za-z_$][\w$]*\s*,/.test(main)
+  const emitters = ['main.cjs', 'runtime-client.cjs', 'runtime-host.mts', 'runtime-child.cjs', 'runtime-protocol.mts'].map(code).join('\n')
+  for (const channel of contract.pushChannels()) {
+    const named = emitters.includes(`'${channel}'`) || emitters.includes(`"${channel}"`)
+    assert.ok(main.includes(`webContents.send('${channel}'`) || (forwards && named), `main.cjs sends ${channel}`)
+  }
 })
 
 test('channels the audit removed stay out of the surface', () => {

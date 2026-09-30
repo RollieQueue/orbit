@@ -1,20 +1,21 @@
-// @ts-nocheck
 // The knowledge tools: durable memory (search, save with the scope guard, forget), skills (list, search, read,
 // feedback, install) and model assessments, plus the usage marks that decide what the memory keeps.
 import { randomUUID, createHash } from 'node:crypto'
 import { reliability as skillReliability } from '../capabilities.mts'
 import { projectReferences, describe as describeReferences, scrub } from '../scope-guard.mts'
 import { bounded, clip, diagnostics } from './util.mts'
+import type { AgentRecord, CapabilityStoreLike, MemoryEntry, MemoryScope, MemorySaveInput, MemorySaveResult, Observation, OrbitRuntimeLike, RunRecord, SkillScope, SkillView, ToolArgs } from '../types.mts'
 
 // A note that matched the task, or was read on purpose, counts as used (once per run). Usage decides what the memory keeps.
-function markMemoryUse(runtime, run, entries) {
-  const fresh = []
+function markMemoryUse(runtime: OrbitRuntimeLike, run: RunRecord, entries: readonly (Pick<MemoryEntry, 'id'> | null | undefined)[]): void {
+  const fresh: string[] = []
   for (const entry of entries) if (entry?.id && !run.memoryTouched.has(entry.id)) { run.memoryTouched.add(entry.id); fresh.push(entry.id) }
   if (!fresh.length) return
-  try { runtime.memoryStore.touch?.(fresh) } catch (error) { diagnostics(runtime, run, 'memoryStore.touch', error) /* A usage counter never stops a turn. */ }
+  // A missing store throws here and is reported like any other failure.
+  try { runtime.memoryStore!.touch?.(fresh) } catch (error) { diagnostics(runtime, run, 'memoryStore.touch', error) /* A usage counter never stops a turn. */ }
 }
 // The knowledge tools, reached from executeTool; a capability_* name it does not know is unknown, as before.
-async function executeKnowledgeTool(runtime, run, agent, name, args) {
+async function executeKnowledgeTool(runtime: OrbitRuntimeLike, run: RunRecord, agent: AgentRecord, name: string, args: ToolArgs): Promise<Observation> {
   if (name === 'model_evaluate') {
     if (agent.id !== 'root') throw new Error('Only the orchestrator can evaluate model results')
     if (!run.memoryEnabled || !run.globalMemoryEnabled || !runtime.memoryStore) throw new Error('Global memory is disabled or unavailable')
@@ -26,7 +27,7 @@ async function executeKnowledgeTool(runtime, run, agent, name, args) {
     const previous = runtime.memoryStore.list(run.workspace).find(entry => entry.id === id)
     // An assessment is shared by every project, so it carries no path of this one, and it is a running record: newest first, twelve at most.
     const observation = { provider: target.providerId, model: target.model, taskType: clip(scrub(args.taskType, run.workspace), 120), assessment: clip(scrub(args.assessment, run.workspace), 400), evidence: clip(scrub(args.evidence, run.workspace), 400), runId: run.runId, agentId: target.id, turns: target.turns, status: target.status, date: new Date().toISOString() }
-    const record = { id, scope: 'global', type: 'fact', title: `Model: ${target.providerId}/${target.model} — ${observation.taskType}`, content: [JSON.stringify(observation), ...String(previous?.content || '').split('\n').filter(Boolean)].slice(0, 12).join('\n') }
+    const record: MemorySaveInput = { id, scope: 'global', type: 'fact', title: `Model: ${target.providerId}/${target.model} — ${observation.taskType}`, content: [JSON.stringify(observation), ...String(previous?.content || '').split('\n').filter(Boolean)].slice(0, 12).join('\n') }
     const entry = runtime.memoryStore.save ? runtime.memoryStore.save(record, { origin: 'system' }).entry : runtime.memoryStore.upsert(record)
     run.evaluations.add(runtime.resultKey(target))
     return entry
@@ -53,16 +54,16 @@ async function executeKnowledgeTool(runtime, run, agent, name, args) {
     const known = args.id ? (runtime.memoryStore.find ? runtime.memoryStore.find(String(args.id), run.workspace, run.chatId, true) : (await runtime.memoryStore.list(run.workspace)).find(entry => entry.id === args.id)) : null
     if (args.id && (!known || known.scope !== scope)) throw new Error('Memory id does not belong to the selected scope')
     // The model chooses the scope, the harness keeps a project's specifics out of the shared tier.
-    let target = scope
+    let target: MemoryScope = scope
     const pinnedTo = scope === 'global' ? describeReferences(projectReferences(`${args.title}\n${args.content}`, run.workspace)) : ''
     if (pinnedTo) {
       if (known) throw new Error(`A shared note cannot name this project (${pinnedTo}); save the project-specific part as a project note`)
       target = 'project'
     }
-    const payload = { id: known?.id, title: bounded(args.title, 200), content: bounded(args.content, 6000), type: args.type, confidence: Number.isFinite(args.confidence) ? args.confidence : undefined, scope: target, workspace: target === 'global' ? undefined : run.workspace, chatId: target === 'chat' ? run.chatId : undefined }
-    const saved = runtime.memoryStore.save ? runtime.memoryStore.save(payload, { origin: 'agent' }) : { entry: runtime.memoryStore.upsert({ ...payload, id: payload.id || randomUUID() }) }
+    const payload: MemorySaveInput = { id: known?.id, title: bounded(args.title, 200), content: bounded(args.content, 6000), type: args.type, confidence: Number.isFinite(args.confidence) ? args.confidence : undefined, scope: target, workspace: target === 'global' ? undefined : run.workspace, chatId: target === 'chat' ? run.chatId : undefined }
+    const saved: MemorySaveResult = runtime.memoryStore.save ? runtime.memoryStore.save(payload, { origin: 'agent' }) : { entry: runtime.memoryStore.upsert({ ...payload, id: payload.id || randomUUID() }) }
     run.memoryTouched.add(saved.entry.id)
-    const notes = []
+    const notes: string[] = []
     if (saved.merged) notes.push(saved.unchanged ? 'The user already wrote a note that says this; nothing changed.' : 'An existing note said the same and was updated.')
     if (pinnedTo) notes.push(`Saved to PROJECT memory instead of shared memory: it names ${pinnedTo}, and shared memory holds only what is true in every project.`)
     if (!saved.unchanged && String(args.content).trim().length > saved.entry.content.length) notes.push(`The content was cut to ${saved.entry.content.length} characters: keep notes short, or split them.`)
@@ -73,10 +74,11 @@ async function executeKnowledgeTool(runtime, run, agent, name, args) {
     }
   }
   if (name.startsWith('capability_')) {
-    const store = runtime.capabilityStore
+    // A missing store fails the call with a TypeError at first use, as it always did.
+    const store: CapabilityStoreLike = runtime.capabilityStore!
     // A project that switched shared memory off neither sees nor changes the shared library. Who may CREATE a shared skill is decided below.
     const shared = run.globalMemoryEnabled
-    const brief = ({ id, name, description, whenToUse, scope, uses, reliability, lessons }) => ({ id, name, description, whenToUse, scope, uses, reliability, ...(lessons?.length ? { pitfalls: lessons.slice(0, 3) } : {}) })
+    const brief = ({ id, name, description, whenToUse, scope, uses, reliability, lessons }: SkillView) => ({ id, name, description, whenToUse, scope, uses, reliability, ...(lessons?.length ? { pitfalls: lessons.slice(0, 3) } : {}) })
     if (name === 'capability_list') return (await store.list(run.workspace, shared)).slice(0, 60).map(brief)
     if (name === 'capability_search') {
       if (!String(args.query || '').trim()) throw new Error('A search query is required')
@@ -97,7 +99,7 @@ async function executeKnowledgeTool(runtime, run, agent, name, args) {
     }
     if (name === 'capability_install') {
       if (!String(args.name || '').trim() || !String(args.instructions || '').trim()) throw new Error('Capability name and instructions are required')
-      let scope = args.scope === 'global' ? 'global' : 'project', kept = ''
+      let scope: SkillScope = args.scope === 'global' ? 'global' : 'project', kept = ''
       if (scope === 'global') {
         // Sharing a skill is the agent's call, but a skill that only makes sense here stays here, and so does one from a project that opted out.
         const references = describeReferences(projectReferences([args.name, args.description, args.whenToUse, args.instructions].filter(Boolean).join('\n'), run.workspace))
@@ -110,7 +112,7 @@ async function executeKnowledgeTool(runtime, run, agent, name, args) {
       const source = /^(user|system|promoted)$/i.test(String(args.source || '').trim()) ? '' : args.source
       const saved = store.save({ id: known?.id ?? args.id, name: bounded(args.name, 160), description: bounded(args.description, 1000), whenToUse: bounded(args.whenToUse, 400), instructions: bounded(args.instructions, 20000), scope, workspace: run.workspace, source: bounded(source || `agent:${agent.id}`, 300) }, { origin: 'agent' })
       run.skillSaved = true
-      const notes = []
+      const notes: string[] = []
       if (saved.merged) notes.push(`A skill named "${saved.improved}" was very similar and was improved instead of duplicated (its previous version stays in the history). If yours is a different procedure, save it under a clearly different name.`)
       if (kept) notes.push(`Saved to this PROJECT's skills instead of the shared library: ${kept}.`)
       if (String(args.instructions).trim().length > saved.entry.instructions.length) notes.push(`The instructions were cut to ${saved.entry.instructions.length} characters: keep a skill short, or split it.`)

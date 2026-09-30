@@ -1,5 +1,5 @@
-import type { AccessMode, AppState, ChatThread, Message, Project, RunSnapshot, Settings, Workspace } from './types'
-import { mergeMessage } from './run-events'
+import type { AccessMode, AppState, ChatThread, Message, Project, RestartNotice, RestartNoticeKind, RunSnapshot, Settings, Workspace } from './types'
+import { mergeMessage, type RunMap } from './run-events'
 import { providers } from './providers'
 
 // The renderer's persistent state (projects, chats, settings) and everything that restores or transforms it.
@@ -93,7 +93,8 @@ export function reconcileSaved(local: AppState, durable: AppState | null): AppSt
 }
 
 // Runs the desktop kept for chats this state does not know (a chat deleted here stays deleted): each gets its project,
-// its chat, its prompt as the user's message and the root agent's replies. Messages end up in time order.
+// its chat, its prompt as the user's message and the root agent's replies. A continuation Orbit started after a restart
+// was not asked by the user: it gets the restart note instead of its prompt. Messages end up in time order.
 export function reconcileRuns(state: AppState, snapshots: RunSnapshot[]): AppState {
   let next = state
   for (const run of [...snapshots].sort((a, b) => String(a.startedAt || '').localeCompare(String(b.startedAt || '')))) {
@@ -107,7 +108,11 @@ export function reconcileRuns(state: AppState, snapshots: RunSnapshot[]): AppSta
       ...p, chats: [...p.chats, { id: run.chatId, title: run.prompt?.slice(0, 52) || 'Восстановленный чат', messages: [], updated: run.startedAt }],
     })
     const chat = next.projects.find(p => p.id === run.projectId)!.chats.find(c => c.id === run.chatId)!
-    if (run.prompt && !chat.messages.some(m => m.author === 'user' && m.runId === run.runId)) {
+    if (run.resumedFrom) {
+      // The live notice's note, when it came, is kept: it says more than what the saved runs remember.
+      const note = resumedNote(run, snapshots)
+      if (!chat.messages.some(m => m.id === note.id)) next = addChatMessage(next, run.projectId, run.chatId, note)
+    } else if (run.prompt && !chat.messages.some(m => m.author === 'user' && m.runId === run.runId)) {
       const legacyMessage = chat.messages.find(m => m.author === 'user' && !m.runId && m.text === run.prompt)
       const message: Message = legacyMessage ? { ...legacyMessage, runId: run.runId }
         : { id: `prompt-${run.runId}`, author: 'user', text: run.prompt, time: run.startedAt, runId: run.runId }
@@ -125,11 +130,88 @@ export function reconcileRuns(state: AppState, snapshots: RunSnapshot[]): AppSta
 }
 
 // What the start-up load does to the state, in one step: pick the newer copy, fold in the saved runs, then re-apply
-// the root messages that arrived as live events while the load was in flight.
-export function restoreState(local: AppState, saved: AppState | null, snapshots: RunSnapshot[], restoredDuringLoad: RestoredMessage[]): AppState {
+// the root messages and the restart notices that arrived as live events while the load was in flight.
+export function restoreState(
+  local: AppState, saved: AppState | null, snapshots: RunSnapshot[], restoredDuringLoad: RestoredMessage[], noticesDuringLoad: RestartNotice[] = [],
+): AppState {
   const durable = saved ? normalize(saved) : null
   const merged = reconcileRuns(reconcileSaved(local, durable), snapshots)
-  return restoredDuringLoad.reduce((result, item) => addChatMessage(result, item.projectId, item.chatId, item.message), merged)
+  const restored = restoredDuringLoad.reduce((result, item) => addChatMessage(result, item.projectId, item.chatId, item.message), merged)
+  return noticesDuringLoad.reduce(addRestartNote, restored)
+}
+
+// ---- Restart notices: a system note in the chat whose run restarted Orbit, saved with the chat ----
+
+const restartTexts: Record<RestartNoticeKind, string> = {
+  resumed: 'Orbit перезапущен по запросу агента, задача продолжена',
+  'rolled-back': 'Перезапуск не удался и откатился',
+  'loop-limit': 'Продолжение не запущено: слишком много перезапусков подряд (предел ORBIT_UPGRADE_MAX_CYCLES)',
+  expired: 'Намерение продолжить устарело (> 30 мин), продолжение не запущено',
+  failed: 'Продолжение после перезапуска не запущено',
+}
+// One entry per notice. A 'resumed' note is keyed by the continuation, so the note rebuilt from the saved runs and the
+// live notice are the same entry.
+const restartNoteId = (notice: Pick<RestartNotice, 'kind' | 'runId' | 'resumedRunId' | 'time'>) =>
+  `restart-${notice.kind}-${notice.kind === 'resumed' && notice.resumedRunId ? notice.resumedRunId : notice.runId || notice.time}`
+// A 'resumed' note carries the continuation's run id: the chat has no user message for that run, the note stands for it.
+export function restartNote(notice: RestartNotice): Message {
+  const note: Message = {
+    id: restartNoteId(notice), author: 'system', kind: 'restart', time: notice.time || now(),
+    text: notice.text?.trim() || restartTexts[notice.kind] || 'Orbit перезапущен',
+  }
+  if (notice.kind === 'resumed' && notice.resumedRunId) note.runId = notice.resumedRunId
+  return note
+}
+// The note a saved continuation gets when its live notice never reached this window (or before it does).
+function resumedNote(run: RunSnapshot, snapshots: RunSnapshot[]): Message {
+  const reason = snapshots.find(item => item.runId === run.resumedFrom)?.restart?.reason
+  return restartNote({
+    kind: 'resumed', projectId: run.projectId, chatId: run.chatId, runId: run.resumedFrom || null, resumedRunId: run.runId, time: run.startedAt,
+    text: `${restartTexts.resumed}${reason ? ` (причина: ${reason})` : ''}`,
+  })
+}
+// The chat a notice belongs to: its project and chat, or the project that holds its chat; null when this state has neither.
+function restartTarget(state: AppState, notice: RestartNotice): { projectId: string; chatId: string } | null {
+  if (!notice.chatId) return null
+  const holds = (project: Project) => project.chats.some(c => c.id === notice.chatId)
+  const project = state.projects.find(p => p.id === notice.projectId && holds(p)) || state.projects.find(holds)
+  return project ? { projectId: project.id, chatId: notice.chatId } : null
+}
+export function addRestartNote(state: AppState, notice: RestartNotice): AppState {
+  const target = restartTarget(state, notice)
+  return target ? addChatMessage(state, target.projectId, target.chatId, restartNote(notice)) : state
+}
+
+// ---- The pause between a restart_orbit restart and its continuation ----
+
+// The runtime restarts, then waits up to 30 s for the verdict on the new code before it starts the continuation
+// (electron/resume.mts); a full restart also relaunches the window. Two minutes cover that with room to spare.
+export const RESTART_WAIT_MS = 2 * 60 * 1000
+export const RESTART_WAIT_TEXT = 'Orbit перезапускается, задача продолжится автоматически'
+// Notices that start no continuation: their note, keyed by the run they are about, ends the wait for it.
+const settlingKinds: RestartNoticeKind[] = ['rolled-back', 'loop-limit', 'expired', 'failed']
+
+// Chats whose latest run ended 'restarting' (its agent restarted Orbit) and whose continuation has not come yet, as
+// `${projectId}/${chatId}` keys with the time (ms) the wait ends. Such a chat is busy, not idle: the runtime starts the
+// continuation in it and refuses to while another run of the chat is active (the user's message would win and the
+// continuation be lost), and a deleted chat would hide it. The wait is over once the chat has a later run (the
+// continuation), or the note of a restart notice that started none, and RESTART_WAIT_MS after the run ended at the latest
+// (either way: a clock that stepped back does not hold the chat longer).
+export function restartWaits(state: AppState, runs: RunMap, at = Date.now()): Map<string, number> {
+  const waits = new Map<string, number>()
+  const list = Object.values(runs)
+  for (const run of list) {
+    if (run.status !== 'restarting') continue
+    const ended = Date.parse(run.finishedAt || run.updatedAt || run.startedAt)
+    if (Number.isNaN(ended) || Math.abs(at - ended) >= RESTART_WAIT_MS) continue
+    const chat = state.projects.find(p => p.id === run.projectId)?.chats.find(c => c.id === run.chatId)
+    if (!chat) continue
+    const later = list.some(other => other.runId !== run.runId && other.projectId === run.projectId && other.chatId === run.chatId
+      && (other.resumedFrom === run.runId || String(other.startedAt) > String(run.startedAt)))
+    const settled = settlingKinds.some(kind => chat.messages.some(m => m.id === restartNoteId({ kind, runId: run.runId, time: '' })))
+    if (!later && !settled) waits.set(`${run.projectId}/${run.chatId}`, ended + RESTART_WAIT_MS)
+  }
+  return waits
 }
 
 // ---- Saving ----

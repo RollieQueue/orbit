@@ -541,8 +541,15 @@ test('a child provider failure cancels its descendants while its parent can hand
 test('harness command timeout waits for process termination', async (t) => {
   const workspace = folder(t)
   const marker = path.join(workspace, 'late-write.txt')
-  const result = await executeWorkspaceTool('run_command', { command: process.execPath, args: ['-e', 'setTimeout(() => require("node:fs").writeFileSync(process.argv[1], "late"), 300)', marker], timeout_ms: 40 }, { workspace, accessMode: 'workspace-write', maxOutputChars: 2000 })
+  const pidFile = path.join(workspace, 'pid.txt')
+  // The command records its pid at once and would write the marker 2 s later, so even a taskkill that starts slowly
+  // under the load of the whole suite ends it first.
+  const script = 'const fs = require("node:fs"); fs.writeFileSync(process.argv[2], String(process.pid)); setTimeout(() => fs.writeFileSync(process.argv[1], "late"), 2000)'
+  const result = await executeWorkspaceTool('run_command', { command: process.execPath, args: ['-e', script, marker, pidFile], timeout_ms: 40 }, { workspace, accessMode: 'workspace-write', maxOutputChars: 2000 })
   assert.equal(result.timedOut, true)
+  // The tool answers only after the process ended: if it got far enough to record its pid, that process is gone now.
+  const pid = fs.existsSync(pidFile) ? Number(fs.readFileSync(pidFile, 'utf8')) : 0
+  if (pid > 0) assert.throws(() => process.kill(pid, 0), /ESRCH/)
   await new Promise((resolve) => setTimeout(resolve, 350))
   assert.equal(fs.existsSync(marker), false)
 })

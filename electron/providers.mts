@@ -60,6 +60,9 @@ interface ProviderRunOptions extends LaunchOptions {
   providerOptions?: ProviderOptions
   transport?: string
   legacyEnvelope?: boolean
+  // Added to the environment of every CLI process the turn starts (the runtime's restart variables); Orbit's own
+  // transport variables (MCP token, NO_PROXY, proxy settings) win over it.
+  extraEnv?: Record<string, string> | null
 }
 // A native run always has a workspace (runProvider fills in the process cwd).
 interface NativeRunOptions extends ProviderRunOptions { workspace: string }
@@ -87,6 +90,8 @@ interface StreamParser { line(line: string): typeof TOOL_HANDOFF | undefined; fi
 // The process helpers codex-server.mts and subscription-providers.mts borrow from this module.
 interface CliHelpers { resolveLaunch: typeof resolveLaunch; terminateProcess: typeof terminateProcess; createLineReader: typeof createLineReader; busyCheck?: typeof busyCheck }
 type RunCli = typeof runCli
+// What subscription-providers.mts needs for a session turn (passed in: that module imports only types from this one).
+interface SessionHelpers { runCli: RunCli; busyCheck: typeof busyCheck; loopbackNoProxy: typeof loopbackNoProxy }
 
 // ---- CLI stream shapes (trusted after the JSON boundary; the guards only check that a line is an object) --------
 
@@ -159,6 +164,16 @@ const CLAUDE_MCP_IDLE_MS = 24 * 60 * 60 * 1000
 const SESSION_PROVIDERS = new Set(['claude', 'codex'])
 const SUBSCRIPTION_PROVIDERS = ['antigravity', 'cursor']
 const isSubscriptionId = (providerId: string): providerId is SubscriptionId => SUBSCRIPTION_PROVIDERS.includes(providerId)
+// Codex ends an MCP tool call after the server's `tool_timeout_sec` (60 s unless set); Orbit's tools legitimately take
+// longer (wait_agent, run_command, restart_orbit's checks), so Orbit's server gets an hour.
+const CODEX_MCP_TOOL_TIMEOUT_SEC = 3600
+// A provider whose MCP client ends a tool call on its own clock gets Orbit's answer before that: waits are cut at this
+// limit and a slower call answers "still running, call again" (runtime/session.mts). Cursor's client uses the MCP SDK's
+// 60 s default and sends no progress token; Antigravity's is the plugin's `timeoutSeconds`, Codex's `tool_timeout_sec`.
+const MCP_CALL_LIMITS: Record<string, number> = { cursor: 50_000, antigravity: 3_540_000, codex: CODEX_MCP_TOOL_TIMEOUT_SEC * 1000 - 60_000 }
+// A resumed Cursor chat, Antigravity conversation or Codex thread id goes to the CLI as an argument: never let it look
+// like a flag (the stream parsers accept nothing else; this rule lives with the subscription parsers).
+const SESSION_ID = subscriptions.SESSION_ID
 const ORBIT_MCP_PREFIX = 'mcp__orbit__'
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 const MAX_OUTPUT_BYTES = 32 * 1024 * 1024
@@ -416,6 +431,19 @@ function runCli(file: string, args: string[], { cwd, input = '', timeoutMs, inac
   })
 }
 
+// The caller's extra variables for a CLI child, string values only (the runtime's restart variables).
+function extraEnvOf(options: Pick<ProviderRunOptions, 'extraEnv'>): Record<string, string> {
+  const extra = options.extraEnv
+  if (!extra || typeof extra !== 'object') return {}
+  return Object.fromEntries(Object.entries(extra).filter((entry): entry is [string, string] => typeof entry[1] === 'string' && !!entry[0] && !entry[0].includes('=')))
+}
+// The same variables for a process codex-server.mts spawns itself: they ride on the launch it resolves.
+function launchHelpers(options: Pick<ProviderRunOptions, 'extraEnv'>, busy?: typeof busyCheck): CliHelpers {
+  const extra = extraEnvOf(options)
+  const resolve: typeof resolveLaunch = (command, args) => { const launch = resolveLaunch(command, args); return { ...launch, env: { ...launch.env, ...extra } } }
+  return { resolveLaunch: resolve, terminateProcess, createLineReader, ...(busy ? { busyCheck: busy } : {}) }
+}
+
 function emit(onEvent: ProviderEventListener | null | undefined, event: ProviderEvent): void {
   // A renderer disconnect must not crash the transport or orphan its process.
   try { onEvent?.(event) } catch (error) { report('providers: event observer threw (UI observers do not control the provider)', error) }
@@ -456,7 +484,7 @@ function createCodexParser(onEvent: ProviderEventListener | null | undefined, re
       try { event = JSON.parse(line) } catch { dispatch({ kind: 'observation', text: line, source: 'diagnostic' }); return }
       if (!isCodexEvent(event)) return
       model = event.model || event.thread?.model || event.metadata?.model || model
-      if (event.type === 'thread.started' && typeof event.thread_id === 'string' && event.thread_id) sessionId = event.thread_id
+      if (event.type === 'thread.started' && typeof event.thread_id === 'string' && SESSION_ID.test(event.thread_id)) sessionId = event.thread_id
       if (event.type === 'turn.failed') failure = errorText(event.error)
       if (event.type === 'error') { lastError = errorText(event.message || event.error); dispatch({ kind: 'observation', text: lastError, status: 'error' }) }
       if (event.type === 'turn.completed') { completed = true; dispatch({ kind: 'observation', text: 'Codex turn completed', usage: event.usage, status: 'completed' }) }
@@ -679,9 +707,11 @@ function buildClaudeSessionArgs(options: LaunchOptions, session: Pick<Normalized
   return args
 }
 
-function codexMcpArgs(session: Pick<NormalizedSession, 'mcpUrl' | 'token'>): string[] {
-  if (!session.mcpUrl || !session.token) return []
-  return ['-c', `mcp_servers.orbit.url=${JSON.stringify(session.mcpUrl)}`, '-c', 'mcp_servers.orbit.bearer_token_env_var="ORBIT_MCP_TOKEN"']
+// Orbit's MCP server as config overrides of one Codex process (exec and App Server alike); the token stays in the
+// environment. `tool_timeout_sec` checked against codex-cli 0.155 (`codex mcp get orbit --json` shows 3600.0).
+function codexMcpArgs(session: Pick<NormalizedSession, 'mcpUrl' | 'token'> | null | undefined): string[] {
+  if (!session?.mcpUrl || !session.token) return []
+  return ['-c', `mcp_servers.orbit.url=${JSON.stringify(session.mcpUrl)}`, '-c', 'mcp_servers.orbit.bearer_token_env_var="ORBIT_MCP_TOKEN"', '-c', `mcp_servers.orbit.tool_timeout_sec=${CODEX_MCP_TOOL_TIMEOUT_SEC}`]
 }
 
 // `codex exec resume` takes neither -C nor --sandbox nor --approve-for-me (checked against 0.155): the process cwd is
@@ -702,12 +732,15 @@ function buildCodexSessionArgs(options: LaunchOptions & { workspace: string }, s
   return args
 }
 
+// A session id refused below carries this code: the runtime drops it once and starts a fresh session (loops.mts).
+const refusedId = (message: string): Error => Object.assign(new Error(message), { code: 'ORBIT_SESSION_ID' })
 function normalizeSession(providerId: string, session: SessionOptions | null | undefined): NormalizedSession {
   if (!session || typeof session !== 'object') throw new Error('Session transport needs session options')
   const resume = session.resume === true
   const id = typeof session.id === 'string' && session.id.trim() ? session.id.trim() : null
   if (resume && !id) throw new Error('Resuming a session needs its id')
-  if (providerId === 'claude' && id && !UUID.test(id)) throw new Error('Claude session ids must be UUIDs')
+  if (providerId === 'claude' && id && !UUID.test(id)) throw refusedId('Claude session ids must be UUIDs')
+  if ((isSubscriptionId(providerId) || providerId === 'codex') && resume && id && !SESSION_ID.test(id)) throw refusedId(`Unexpected ${providerId} session id`)
   const mcpUrl = typeof session.mcpUrl === 'string' && session.mcpUrl ? session.mcpUrl : null
   const token = typeof session.token === 'string' && session.token ? session.token : null
   if ((mcpUrl && !token) || (token && !mcpUrl)) throw new Error('Session transport needs both the Orbit MCP url and its token')
@@ -742,7 +775,7 @@ async function runClaudeSession(options: NativeRunOptions, session: NormalizedSe
       fs.writeFileSync(appendFile, session.systemAppend, 'utf8')
     }
     const args = buildClaudeSessionArgs(options, session, { appendFile })
-    const env = { CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT: process.env.CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT || String(CLAUDE_MCP_IDLE_MS), ...(session.mcpUrl ? loopbackNoProxy() : {}) }
+    const env = { ...extraEnvOf(options), CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT: process.env.CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT || String(CLAUDE_MCP_IDLE_MS), ...(session.mcpUrl ? loopbackNoProxy() : {}) }
     try {
       await runCli(command, args, {
         cwd: options.workspace, input: options.prompt, signal: options.signal, env,
@@ -759,12 +792,12 @@ async function runClaudeSession(options: NativeRunOptions, session: NormalizedSe
 }
 
 async function runCodexSession(options: NativeRunOptions, session: NormalizedSession): Promise<ProviderResult> {
-  if (options.approvalPolicy === 'on-request') return codexServer.runCodexSessionTurn(options, session, { resolveLaunch, terminateProcess, createLineReader, busyCheck })
+  if (options.approvalPolicy === 'on-request') return codexServer.runCodexSessionTurn(options, session, launchHelpers(options, busyCheck))
   const parser = createCodexParser(options.onEvent, options.model)
   const command = options.providerOptions?.command || process.env.ORBIT_CODEX_COMMAND || 'codex'
   try {
     await runCli(command, buildCodexSessionArgs(options, session), {
-      cwd: options.workspace, input: options.prompt, signal: options.signal, env: session.token ? { ORBIT_MCP_TOKEN: session.token, ...loopbackNoProxy() } : undefined,
+      cwd: options.workspace, input: options.prompt, signal: options.signal, env: { ...extraEnvOf(options), ...(session.token ? { ORBIT_MCP_TOKEN: session.token, ...loopbackNoProxy() } : {}) },
       timeoutMs: options.timeoutMs ?? null, inactivityMs: options.inactivityMs, isBusy: busyCheck(session),
       onLine: parser.line,
       onDiagnostic: (text) => emit(options.onEvent, { providerId: 'codex', kind: 'observation', text, source: 'stderr' }),
@@ -780,20 +813,36 @@ function runSession(providerId: string, options: NativeRunOptions): Promise<Prov
 }
 
 // Which transport a provider uses: the CLIs keep a session (resume + MCP tools), everything else gets the JSON
-// envelope. ORBIT_LEGACY_ENVELOPE=1 forces the envelope everywhere.
-function transportFor(providerId: string, options: Pick<ProviderRunOptions, 'transport' | 'legacyEnvelope' | 'providerOptions'> = {}): Transport {
+// envelope. Cursor and Antigravity keep one only in Full access: headless, neither can approve an MCP tool call except
+// by approving everything (`--force`, `--dangerously-skip-permissions`). Cursor's session is opt-in until a live check
+// passes (its account was out of quota): `transport: 'session'` in the Cursor provider options, or ORBIT_CURSOR_SESSION=1.
+// ORBIT_LEGACY_ENVELOPE=1 forces the envelope everywhere; `transport: 'envelope'` does for one run or one provider.
+function transportFor(providerId: string, options: Pick<ProviderRunOptions, 'transport' | 'legacyEnvelope' | 'providerOptions' | 'accessMode' | 'approvalPolicy'> = {}): Transport {
   if (process.env.ORBIT_LEGACY_ENVELOPE === '1' || options.transport === 'envelope' || options.legacyEnvelope === true || options.providerOptions?.transport === 'envelope') return 'envelope'
-  return SESSION_PROVIDERS.has(providerId) ? 'session' : 'envelope'
+  if (SESSION_PROVIDERS.has(providerId)) return 'session'
+  if (!isSubscriptionId(providerId) || options.accessMode !== 'danger-full-access' || options.approvalPolicy === 'on-request') return 'envelope'
+  // decideTransport spreads the provider's options into `options`; runProvider passes them as `providerOptions`.
+  const optedIn = options.transport === 'session' || options.providerOptions?.transport === 'session' || process.env.ORBIT_CURSOR_SESSION === '1'
+  return providerId === 'cursor' && !optedIn ? 'envelope' : 'session'
+}
+// How long one Orbit tool call of this provider's session may take before Orbit answers "still running" (0: no limit).
+// ORBIT_MCP_CALL_LIMIT_MS may lower it, never raise it past the client's own limit.
+function mcpCallLimit(providerId: string): number {
+  const limit = MCP_CALL_LIMITS[providerId] || 0
+  const lower = Number(process.env.ORBIT_MCP_CALL_LIMIT_MS)
+  return limit && Number.isFinite(lower) && lower >= 10 && lower < limit ? lower : limit
 }
 
-// Ends whatever a session keeps alive between turns (today: a Codex App Server process); a no-op for other ids.
-function closeSession(sessionId: string): Promise<boolean> {
-  return codexServer.closeSession(sessionId)
+// Ends whatever a session keeps alive between turns: a Codex App Server process, an Antigravity conversation's
+// folder; false when nothing was alive.
+async function closeSession(sessionId: string): Promise<boolean> {
+  const codex = await codexServer.closeSession(sessionId)
+  return subscriptions.closeSession(sessionId) || codex
 }
 
 async function runNative(providerId: 'codex' | 'claude', options: NativeRunOptions): Promise<ProviderResult> {
   if (options.session && transportFor(providerId, options) === 'session') return runSession(providerId, options)
-  if (providerId === 'codex' && options.approvalPolicy === 'on-request') return codexServer.runCodexServer(options, { resolveLaunch, terminateProcess, createLineReader })
+  if (providerId === 'codex' && options.approvalPolicy === 'on-request') return codexServer.runCodexServer(options, launchHelpers(options))
   const parser = providerId === 'codex' ? createCodexParser(options.onEvent, options.model, options.responseSchema) : createClaudeParser(options.onEvent, options.model, options.responseSchema)
   const command = options.providerOptions?.command || process.env[providerId === 'codex' ? 'ORBIT_CODEX_COMMAND' : 'ORBIT_CLAUDE_COMMAND'] || providerId
   let schemaDirectory: string | undefined
@@ -808,7 +857,7 @@ async function runNative(providerId: 'codex' | 'claude', options: NativeRunOptio
     const args = providerId === 'codex' ? buildCodexArgs(options) : buildClaudeArgs(options)
     try {
       await runCli(command, args, {
-        cwd: options.workspace, input: options.prompt, signal: options.signal, timeoutMs: options.timeoutMs,
+        cwd: options.workspace, input: options.prompt, signal: options.signal, timeoutMs: options.timeoutMs, env: extraEnvOf(options),
         onLine: parser.line,
         onDiagnostic: (text) => emit(options.onEvent, { providerId, kind: 'observation', text, source: 'stderr' }),
       })
@@ -1078,7 +1127,10 @@ async function runProvider(options: ProviderRunOptions): Promise<ProviderResult>
   if (typeof options.prompt !== 'string' || !options.prompt.trim()) throw new Error('A non-empty provider prompt is required')
   if (options.signal?.aborted) throw cancelledError('Provider')
   const { providerId } = options
-  if (isSubscriptionId(providerId)) return subscriptions.run(providerId, options, { runCli })
+  if (isSubscriptionId(providerId)) {
+    if (options.session && transportFor(providerId, options) === 'session') return subscriptions.runSession(providerId, { ...options, workspace: options.workspace || process.cwd() }, normalizeSession(providerId, options.session), { runCli, busyCheck, loopbackNoProxy })
+    return subscriptions.run(providerId, options, { runCli })
+  }
   if (providerId === 'codex' || providerId === 'claude') return runNative(providerId, { ...options, workspace: options.workspace || process.cwd() })
   if (providerId === 'ollama') return runOllama(options)
   if (providerId === 'custom') return runCompatible(options)
@@ -1088,7 +1140,7 @@ async function runProvider(options: ProviderRunOptions): Promise<ProviderResult>
 export type {
   AccessMode, Transport, ProviderEvent, ProviderEventKind, OutputEvent, ReasoningEvent, ToolEvent, ObservationEvent, QuotaEvent, ParserEvent, ProviderEventListener,
   ApprovalRequest, ApprovalHandler, ProviderOptions, SessionActivity, SessionActivityCheck, SessionOptions, NormalizedSession, LaunchOptions, ProviderRunOptions, NativeRunOptions,
-  ProviderResult, ProviderHealth, InspectOptions, CliLaunch, CliResult, LineReader, RunCliOptions, RunCli, CliHelpers, ParsedTurn, StreamParser,
+  ProviderResult, ProviderHealth, InspectOptions, CliLaunch, CliResult, LineReader, RunCliOptions, RunCli, CliHelpers, SessionHelpers, ParsedTurn, StreamParser,
 }
 export const _testing = { createCodexParser, createClaudeParser, createLineReader, buildCodexArgs, buildClaudeArgs, buildClaudeSessionArgs, buildCodexSessionArgs, claudeMcpConfig, normalizeSession, inactivityValue, runCli, resolveLaunch, requestSignal }
-export { loopbackNoProxy, inspectProviders, runProvider, transportFor, closeSession, resolveLaunch, terminateProcess, runCli, createLineReader }
+export { loopbackNoProxy, codexMcpArgs, inspectProviders, runProvider, transportFor, mcpCallLimit, closeSession, resolveLaunch, terminateProcess, runCli, createLineReader }

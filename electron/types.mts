@@ -9,7 +9,8 @@ import type { SWITCH_TRANSPORT } from './runtime/loops.mts'
 export type AccessMode = 'read-only' | 'workspace-write' | 'danger-full-access'
 export type ApprovalPolicy = 'never' | 'on-request' | 'auto-review'
 export type Transport = 'session' | 'envelope'
-export type RunStatus = 'working' | 'completed' | 'failed' | 'cancelled'
+// `restarting`: the run ended because Orbit restarted with new code at an agent's request; a new run continues it.
+export type RunStatus = 'working' | 'completed' | 'failed' | 'cancelled' | 'restarting'
 export type AgentStatus = 'waiting' | 'working' | 'done' | 'error' | 'cancelled'
 export type MemoryScope = 'chat' | 'project' | 'global'
 export type MemoryProfile = 'project' | 'project-global'
@@ -34,7 +35,8 @@ export interface Usage { providerTurns: number; workerTurns: number; inputTokens
 export interface UsageFigures {
   input_tokens?: number; prompt_tokens?: number; output_tokens?: number; completion_tokens?: number
   cached_input_tokens?: number; cache_read_tokens?: number; cache_read_input_tokens?: number; prompt_tokens_details?: { cached_tokens?: number }
-  [extra: string]: unknown
+  // No index signature: a provider's `usage` is unknown, and recordUsage takes it once narrowed to an object (every
+  // field is optional and read through Number(), so any object is acceptable).
 }
 export interface TurnTiming {
   turn: number; transport: Transport; startedAt: string; firstEventAt: string | null; endedAt: string | null
@@ -67,25 +69,33 @@ export interface FileTouch { path: string; action: FileAction; isNew: boolean }
 export interface FilePeer { agentId: string; how: string }
 export interface SharedFile { path: string; readers: Set<string>; writers: Set<string>; at?: string }
 export interface FileActivitySnapshot { path: string; readers: string[]; writers: string[] }
-export interface FileWrite { path: string; before: string; after: string }
+// `before` is null when the write created the file.
+export interface FileWrite { path: string; before: string | null; after: string }
+export type ChangeKind = 'create' | 'modify' | 'delete' | 'unknown'
+// Where a diff came from: Orbit's own file tools ('exact'), a vendor tool's events ('event') or Git ('git').
+export type ChangeSource = 'exact' | 'event' | 'git'
+// One file change of a run, as the run snapshot persists it and the Changes tab shows it (change-log.mts makes them).
 export interface FileChange {
-  id: string; agentId: string; path: string; kind: string; tool: string; time: string; added: number; removed: number
-  source?: string; hasDiff: boolean; diff?: string; truncated?: boolean; binary?: boolean; reason?: string
+  id: string; agentId: string; path: string; kind: ChangeKind; tool: string; time: string; added: number; removed: number
+  source: ChangeSource; hasDiff: boolean; diff?: string; truncated?: boolean; binary?: boolean
+  // Why there is no diff text (a change-log REASONS value); for a recovered change, the short commit the diff is relative to.
+  reason?: string; base?: string
 }
 // What a change record is made from: a tool's exact texts, an event's diff, or Git's answer, plus the reason when none.
 export interface ChangeDescription {
-  kind?: string; source?: string; before?: string | null; after?: string | null; diff?: string
+  kind?: ChangeKind; source: ChangeSource; before?: string | null; after?: string | null; diff?: string
   added?: number; removed?: number; truncated?: boolean; binary?: boolean; reason?: string
 }
 export interface ChangeInput extends ChangeDescription { path: string; tool?: string }
 // A vendor file change inside a native tool event (Codex `changes`).
 export interface NativeChange { path?: string; kind?: string; diff?: string; [extra: string]: unknown }
-// What a native tool call's events said about the edit so far (ChangeLog.remember).
-export interface NativeCallEntry { tool: string; input?: unknown; changes?: NativeChange[] }
+// What a native tool call's events said about the edit so far (ChangeLog.remember returns change-log's CallRecord).
+export type NativeCallEntry = import('./change-log.mts').CallRecord
 export interface IndexDiff { total?: number; added: string[]; changed: string[]; removed: string[]; fresh?: boolean }
-export interface IndexHit { path: string; [extra: string]: unknown }
+// The index's own hit and outline (project-index.mts SearchHit, Outline): the runtime passes them on as they are.
+export type IndexHit = import('./project-index.mts').SearchHit
 export interface IndexSearchResult { indexed?: number; results: IndexHit[] }
-export interface IndexOutline { path: string; [extra: string]: unknown }
+export type IndexOutline = import('./project-index.mts').Outline
 
 // ---- Tools: calls, arguments, observations ------------------------------------------------------------------------
 // The arguments of any Orbit tool, as the registry schema declares them. One bag for every tool: the same name means
@@ -99,6 +109,7 @@ export interface ToolArgs {
   start_line?: number; recursive?: boolean; content?: string; old_text?: string; new_text?: string; command?: string; args?: string[]; cwd?: string
   title?: string; scope?: string; type?: string; confidence?: number; outcome?: string; note?: string; description?: string; whenToUse?: string; instructions?: string; source?: string
   key?: string; summary?: string; status?: string; tasks?: ImprovementTaskInput[]; taskType?: string; assessment?: string; evidence?: string
+  continueWith?: string; verify?: boolean
   __invalidArguments?: boolean
   [extra: string]: unknown
 }
@@ -164,10 +175,12 @@ export interface ProviderBuffer { id: string; text: string; kind: string; agentI
 // ---- Runs ---------------------------------------------------------------------------------------------------------
 export interface FailoverConfig { enabled: boolean; switchAtPercent: number; allowWeaker: boolean }
 export interface ProviderOptions { reasoningEffort?: string; command?: string; transport?: string; legacyEnvelope?: boolean; [extra: string]: unknown }
-export interface SharedNote { key: string; summary: string; files?: Record<string, string>; updatedAt: string; stale?: boolean }
+// A note as shared-context.mts writes it (project-context's ContextNote): `files` maps a path to its signature, null when missing.
+export interface SharedNote { key: string; summary: string; files: Record<string, string | null>; updatedAt: string; stale?: boolean }
 export interface SharedContext { notes?: SharedNote[]; updatedAt?: string }
 export interface ProjectPacket { overview: unknown; notes: SharedNote[]; updatedAt?: string }
-export interface CatalogEntry { id: string; available?: boolean; models?: unknown; reasoningLevels?: Record<string, string[]>; [extra: string]: unknown }
+// No index signature: providers.mts ProviderHealth (an interface, the catalog main.cjs passes) must fit it.
+export interface CatalogEntry { id: string; available?: boolean; models?: string[]; reasoningLevels?: Record<string, string[]> }
 export interface RunRecord {
   runId: string; projectId: string; chatId: string; prompt: string; workspace: string; providerId: string; model: string
   memoryEnabled: boolean; globalMemoryEnabled: boolean; memoryContext: MemoryEntry[]
@@ -185,7 +198,14 @@ export interface RunRecord {
   router: TeamRouterLike
   // Set after the record is made: the index scan, the run timer, the coalesced persistence timer and its failure mark.
   indexReady?: Promise<unknown>; indexSettled?: boolean; timer?: ReturnType<typeof setTimeout>; persistTimer?: ReturnType<typeof setTimeout> | null; persistenceError?: boolean
+  // Restarts (resume.mts): what a continuation starts again from, the run this one continues and how many restarts in a
+  // row led here, and for a run that ended `restarting`, why and when the restart was asked for. `resumeSession`: the
+  // old root's provider session a continuation is resuming, until its first turn answers (runtime/restart.mts).
+  startPayload?: StartPayload; resumedFrom?: string; resumeChain?: number; restart?: RestartMark; resumeSession?: string
 }
+// `note`: what the root of the continuation is told about the run the restart ended (work log, files, helpers, cut-off turn);
+// `intentId`: the id of the intent (pending-resume.json) that marked it, the only one that continues it (resume.mts).
+export interface RestartMark { reason: string; requestedAt: string; source: 'tool' | 'script'; note?: string; intentId?: string }
 // A run as others see it: the snapshot the UI, the run store and the chat memory get.
 export interface RunSnapshot {
   runId: string; projectId: string; chatId: string; prompt: string; workspace: string; status: RunStatus; providerId: string; model: string
@@ -193,14 +213,27 @@ export interface RunSnapshot {
   startedAt: string; finishedAt: string | null; limits: RunLimits; usage: Usage; agents: PublicAgent[]
   traces: Trace[]; messages: Message[]; communications: Communication[]; summary: RunSummary | null; error: string | null
   files: FileActivitySnapshot[]; changes: FileChange[]; router: RouterStats
+  startPayload?: StartPayload; resumedFrom?: string; resumeChain?: number; restart?: RestartMark
 }
-// An earlier turn of the chat as chat-memory presents it (a live run or a saved snapshot).
-export interface ChatRunView { runId: string; prompt: string; status: string; startedAt: string; answer: string; agents: PublicAgent[]; communications: Communication[] }
+// An earlier turn of the chat as chat-memory presents it (a live run or a saved snapshot): chat-memory's own RunView.
+export type ChatRunView = import('./chat-memory.mts').RunView
+// A run as the run store keeps it (run-store.mts): a snapshot saved by any version of Orbit. The store reads only
+// these fields; everything else is kept exactly as the runtime produced it. A live RunSnapshot is one.
+export interface StoredAgent { id: string; status?: string; detail?: string; finishedAt?: string | null; files?: { wrote?: string[]; read?: string[] } | null; [field: string]: unknown }
+export interface StoredRun {
+  runId: string; status?: string; projectId?: string; chatId?: string; workspace?: string
+  startedAt?: string; finishedAt?: string | null; updatedAt?: string; error?: string | null
+  agents?: StoredAgent[]; changes?: FileChange[]
+  startPayload?: StartPayload; resumedFrom?: string; resumeChain?: number; restart?: RestartMark
+}
 export interface StartPayload {
   prompt?: string; providerId?: string; workspace?: string; projectId?: string; chatId?: string; mode?: string; accessMode?: string; approvalPolicy?: string
   reasoningEffort?: string; model?: string; providerOptions?: Record<string, ProviderOptions>; providerPool?: PoolMember[]
   memoryEnabled?: boolean; globalMemoryEnabled?: boolean; memoryContext?: MemoryEntry[]; improvementMode?: boolean; quotaFailover?: unknown; models?: Record<string, unknown> | null
   history?: HistoryInput[]; agentInstructions?: string; limits?: LimitsInput; skillLearning?: boolean
+  // A continuation after a restart (resume.mts): the run it continues, how many restarts in a row led to it, the note its
+  // root starts with, and the old root's provider session to resume when the root keeps that provider.
+  resumedFrom?: string; resumeChain?: number; restartNote?: string; resumeSession?: { id: string; providerId: string }
 }
 export type RuntimeEventData = Record<string, unknown>
 export interface RuntimeEvent { type: string; runId: string; projectId: string; chatId: string; [extra: string]: unknown }
@@ -218,19 +251,24 @@ export interface ProviderRunOptions {
   session?: SessionInfo; responseSchema?: JsonSchema
   onApproval: (request: ApprovalRequest) => Promise<boolean>; signal: AbortSignal; timeoutMs: number | null; inactivityMs?: number
   onEvent: (event: ProviderEvent) => void
+  // Added to the environment of the provider's CLI process: the variables that name the agent's run (resume.mts restartEnv).
+  extraEnv?: Record<string, string>
 }
 // One event of a provider's stream: streamed text and reasoning, native tool activity, observations, quota figures.
 // `kind` is always present (output, reasoning, tool, observation, quota, provider, …); everything else depends on it.
 export interface ProviderEvent {
-  kind: string; providerId?: string; text?: string; message?: string; messageId?: string; partial?: boolean; replace?: boolean; parentToolId?: string
-  native?: boolean; tool?: string; toolId?: string; status?: string; changes?: NativeChange[]; input?: unknown; output?: unknown; exitCode?: number
-  usage?: UsageFigures; quota?: QuotaUpdate; source?: string
-  [extra: string]: unknown
+  kind: string; providerId?: string; text?: string; message?: string; messageId?: string; partial?: boolean; replace?: boolean; parentToolId?: string | null
+  native?: boolean; tool?: string; toolId?: string; status?: string; changes?: unknown; input?: unknown; output?: unknown; exitCode?: number | null
+  mcp?: boolean; server?: string; orbitTool?: string
+  // `usage` is the vendor's figures, unchecked (providers.mts types it unknown): read it as UsageFigures only defensively.
+  usage?: unknown; quota?: QuotaUpdate; source?: string
+  // No index signature: every member of providers.mts's ProviderEvent union (interfaces) must fit this shape, since
+  // providers call the runtime's listener with them. `changes` is the vendor's list (NativeChange items), unchecked.
 }
 // What a provider turn returns. The envelope transport returns the text (an envelope JSON or a prose answer); the
 // session transport also names the session it kept (`sessionId`). `model` and `reasoningEffort` report what really ran.
 export interface ProviderResult {
-  text?: string; model?: string; sessionId?: string | null; usage?: UsageFigures; reasoningEffort?: string
+  text?: string; model?: string; sessionId?: string | null; usage?: unknown; reasoningEffort?: string
   providerId?: string; client?: string; transport?: Transport; access?: string
 }
 export type RunProvider = (options: ProviderRunOptions) => Promise<ProviderResult>
@@ -239,15 +277,17 @@ export type TransportFor = (providerId: string, options: TransportOptions) => st
 export type CloseSession = (sessionId: string) => unknown
 
 // ---- Quota and failover -------------------------------------------------------------------------------------------
-export interface QuotaWindow { usedPercent: number; resetsAt?: number | null; models?: string[]; [extra: string]: unknown }
-export interface QuotaSnapshot { providerId?: string; windows?: QuotaWindow[]; checkedAt?: number | null; fetchedAt?: number | null; state?: string; blocked?: boolean; exhaustedUntil?: number; [extra: string]: unknown }
+// No index signatures: quota.mts's QuotaWindow/QuotaSnapshot (interfaces, what QuotaMonitor returns) must fit them.
+export interface QuotaWindow { usedPercent: number; resetsAt?: number | null; models?: string[] }
+export interface QuotaSnapshot { providerId?: string; windows?: QuotaWindow[]; checkedAt?: number | null; fetchedAt?: number | null; state?: string; blocked?: boolean; exhaustedUntil?: number }
 // Live figures from a running turn (Claude stream, Codex notifications).
 export interface QuotaUpdate { windows?: QuotaWindow[]; blocked?: boolean; resetsAt?: number | null; source?: string }
 // How close an account is to a refusal (quota.assess).
 export interface QuotaLevel { usedPercent: number | null; window?: unknown; exhausted?: boolean; near?: boolean; resetsAt: number | null }
 export interface QuotaRefusal { providerId: string; resetsAt: number | null; message: string }
 export interface ReplacementChoice { providerId: string; model: string; reasoningEffort?: string; key: string }
-export interface HandoverRequest { reason: HandoverReason; level?: QuotaLevel | null; error?: unknown; interrupted?: InterruptedTurn | null }
+// `level` is a quota assessment, or the synthetic `{ usedPercent: 100 }` after a refusal (failover.mts's HandoverLevel).
+export interface HandoverRequest { reason: HandoverReason; level?: import('./failover.mts').HandoverLevel | null; error?: unknown; interrupted?: InterruptedTurn | null }
 
 // ---- Memory and skills --------------------------------------------------------------------------------------------
 export interface MemoryEntry {
@@ -274,7 +314,7 @@ export interface MaintainOptions { workspace: string; chatId?: string; crossProj
 export interface MemoryStoreLike {
   list(workspace: string, includeGlobal?: boolean, chatId?: string): MemoryEntry[]
   search(query: string, workspace: string, limit: number, includeGlobal: boolean, chatId?: string): MemoryEntry[]
-  remove(id: string, workspace: string, chatId: string, options: { origin: string; includeGlobal: boolean }): boolean
+  remove(id: string, workspace: string, chatId: string, options: { origin: 'user' | 'agent' | 'system'; includeGlobal: boolean }): boolean
   upsert(entry: MemorySaveInput, options?: { origin?: string }): MemoryEntry
   // Optional: the tiered store has them, the fallback paths work without.
   recall?(query: RecallQuery): RecallResult
@@ -297,10 +337,10 @@ export interface CapabilityStoreLike {
   flush?(): void
 }
 export interface RunStoreLike {
-  get?(id: string): RunSnapshot | null
+  get?(id: string): StoredRun | null
   save?(snapshot: RunSnapshot): void | Promise<unknown>
-  forChat?(projectId: string, chatId: string, limit: number): RunSnapshot[]
-  list?(): RunSnapshot[]
+  forChat?(projectId: string, chatId: string, limit: number): StoredRun[]
+  list?(): StoredRun[]
 }
 export interface ProjectIndexLike {
   refresh(workspace: string, options?: { force?: boolean }): Promise<IndexDiff>
@@ -309,10 +349,11 @@ export interface ProjectIndexLike {
   overview(workspace: string): string
   touch(workspace: string, relPaths: string[]): Promise<unknown>
 }
-export interface ContextStoreLike { getLatest(workspace: string): SharedContext | null | undefined; set(workspace: string, value: SharedContext): void }
+export interface ContextStoreLike { getLatest(workspace: string): SharedContext | null; set(workspace: string, value: SharedContext): void }
 export interface QuotaMonitorLike {
-  peek(id: string): QuotaSnapshot | null
-  get(id: string, options: { maxAgeMs: number; waitMs: number; options: ProviderOptions }): Promise<QuotaSnapshot | null>
+  // Readings as quota.mts's QuotaMonitor keeps them: what `assess` and failover's `replacements` read.
+  peek(id: string): import('./quota.mts').QuotaSnapshot | null
+  get(id: string, options: { maxAgeMs: number; waitMs: number; options: ProviderOptions }): Promise<import('./quota.mts').QuotaSnapshot | null>
   ingest?(id: string, partial: QuotaUpdate | null | undefined): void
   markExhausted?(id: string, mark: { resetsAt: number | null; reason: string }): void
 }
@@ -383,7 +424,8 @@ export interface ToolRegistryLike {
 }
 
 // ---- Workspace tools ----------------------------------------------------------------------------------------------
-export interface WorkspaceContext { workspace: string; accessMode: string; signal?: AbortSignal | null; maxOutputChars: number; onFileChange?: (change: FileWrite) => void }
+// `env` is added to the environment of run_command (the variables that name the agent's run, resume.mts restartEnv).
+export interface WorkspaceContext { workspace: string; accessMode: string; signal?: AbortSignal | null; maxOutputChars: number; onFileChange?: (change: FileWrite) => void; env?: Record<string, string> }
 export interface CommandResult { ok: boolean; exitCode?: number | null; signal?: NodeJS.Signals | null; stdout: string; stderr: string; truncated?: boolean; timedOut?: boolean; error?: string }
 
 // ---- Prompts and mail ---------------------------------------------------------------------------------------------
@@ -400,6 +442,7 @@ export interface OrbitRuntimeOptions {
   runProvider?: RunProvider; memoryStore?: MemoryStoreLike | null; capabilityStore?: CapabilityStoreLike | null; runStore?: RunStoreLike | null
   requestApproval?: ApprovalHandler | null; clock?: () => number; projectIndex?: ProjectIndexLike | null; quota?: QuotaMonitorLike | null; catalog?: CatalogLike | null
   mcp?: McpServerLike | null | false; transportFor?: TransportFor | null; closeSession?: CloseSession | null; registry?: ToolRegistryLike | null
+  restartHost?: import('./resume.mts').RestartHost | null
 }
 // The facade's whole surface (electron/runtime.mts): state, the public methods main.cjs and the tests use, and the
 // methods the modules call back through. Every module function takes this as its first argument; a module never
@@ -412,6 +455,8 @@ export interface OrbitRuntimeLike {
   mcp: McpServerLike | null | false; mcpStarted: Promise<McpServerLike | null> | null; mcpError: Error | null
   transportFor: TransportFor | null; closeSession: CloseSession | null; toolRegistry: ToolRegistryLike | null | undefined; sessions: Map<string, SessionRef>
   runs: Map<string, RunRecord>; listeners: Set<RuntimeListener>
+  // Runs the self-upgrade script for restart_orbit (resume.mts createRestartHost); null when Orbit cannot restart itself.
+  restartHost: import('./resume.mts').RestartHost | null
   setQuota(monitor: QuotaMonitorLike | null): void
   setCatalog(catalog: CatalogLike | null): void
   onEvent(listener: RuntimeListener): () => void
@@ -422,7 +467,7 @@ export interface OrbitRuntimeLike {
   setContextStore(store: ContextStoreLike | null): void
   routeMessage(): Promise<{ kind: string; reply: string }>
   // store
-  getRun(id: string): RunSnapshot | null
+  getRun(id: string): RunSnapshot | StoredRun | null
   getRuns(): RunSnapshot[]
   snapshot(run: RunRecord): RunSnapshot
   getRunChanges(runId: string): FileChange[]
@@ -443,6 +488,9 @@ export interface OrbitRuntimeLike {
   failRun(run: RunRecord, error: Error): void
   cancelAgents(run: RunRecord, detail: string): void
   stop(runId: string): boolean
+  markRestarting(runId: string, mark?: RestartMark): boolean
+  // restart
+  setRestartHost(host: import('./resume.mts').RestartHost | null): void
   // agents
   createAgent(run: RunRecord, parent: AgentRecord | null, spec: ToolArgs): AgentRecord
   scheduleAgent(run: RunRecord, agent: AgentRecord): Promise<AgentResult>
@@ -490,7 +538,7 @@ export interface OrbitRuntimeLike {
   runTrackedCommand(run: RunRecord, agent: AgentRecord, args: ToolArgs, context: WorkspaceContext): Promise<unknown>
   // tools and knowledge
   approve(run: RunRecord, agent: AgentRecord, request: ApprovalRequest, signal?: AbortSignal): Promise<boolean>
-  executeTool(run: RunRecord, agent: AgentRecord, name: string, args: ToolArgs): Promise<Observation>
+  executeTool(run: RunRecord, agent: AgentRecord, name: string, args: ToolArgs, signal?: AbortSignal): Promise<Observation>
   markMemoryUse(run: RunRecord, entries: MemoryEntry[]): void
   // ledger
   recordLedger(agent: AgentRecord, name: string, text: string): void

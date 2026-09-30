@@ -5,22 +5,24 @@ import { ModelPicker } from './ModelPicker'
 import { QuotaChip } from './QuotaPanel'
 import { ReasoningPicker } from './ReasoningPicker'
 import { providerName, providers } from './providers'
-import { accessChoice, accessPatch, modelPatch, reasoningPatch } from './state-store'
+import { RESTART_WAIT_TEXT, accessChoice, accessPatch, modelPatch, reasoningPatch } from './state-store'
 
 export type ComposerProps = {
   settings: Settings; project?: Project; chat?: ChatThread; currentHealth?: ProviderHealth; modelChoices: string[]; selectedEffort: string
-  quotas: Record<string, QuotaSnapshot>; draft: string; running: boolean; workingRun?: RunSnapshot; ready: boolean; desktop: boolean
+  quotas: Record<string, QuotaSnapshot>; draft: string; running: boolean; restartWait: boolean; workingRun?: RunSnapshot; ready: boolean; desktop: boolean
   onDraft: (text: string) => void; onSend: () => boolean; onStop: () => void; onSettings: (patch: Partial<Settings>) => void; onOpenQuota: () => void
 }
 
-// The message field with the run options it sends with (provider, model, effort, access) and the stop/send button.
+// The message field with the run options it sends with (provider, model, effort, access) and the stop/send button. While
+// the chat waits for the continuation of a restart (restartWait) the draft can be written but not sent.
 export function Composer({
-  settings, project, chat, currentHealth, modelChoices, selectedEffort, quotas, draft, running, workingRun, ready, desktop,
+  settings, project, chat, currentHealth, modelChoices, selectedEffort, quotas, draft, running, restartWait, workingRun, ready, desktop,
   onDraft, onSend, onStop, onSettings, onOpenQuota,
 }: ComposerProps) {
   const model = settings.models[settings.providerId] || ''
   const enabled = desktop && !!project && !!chat && ready
-  const placeholder = !project ? 'Сначала подключите проект' : running ? 'Можно подготовить следующее сообщение…' : 'Напишите агенту…'
+  const placeholder = !project ? 'Сначала подключите проект' : running ? 'Можно подготовить следующее сообщение…'
+    : restartWait ? `${RESTART_WAIT_TEXT}…` : 'Напишите агенту…'
   const caption = !ready ? 'Восстанавливаем историю…'
     : currentHealth && !currentHealth.available ? `${providerName(currentHealth.id)}: ${currentHealth.detail}`
     : model || 'Модель по настройкам провайдера'
@@ -29,7 +31,7 @@ export function Composer({
   const onKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
     if (event.key !== 'Enter' || event.shiftKey || event.nativeEvent.isComposing) return
     event.preventDefault()
-    if (!running) onSend()
+    if (!running && !restartWait) onSend()
   }
   return <div className="composer-area">
     <label className="improvement-toggle">
@@ -59,7 +61,8 @@ export function Composer({
           ? <button type="button" className="send-button stop-button" aria-label="Остановить агентов" disabled={!workingRun} onClick={onStop}>
             <Icon name="stop" />
           </button>
-          : <button className="send-button" type="submit" aria-label="Отправить сообщение" disabled={!draft.trim() || !enabled}><Icon name="arrow" /></button>}
+          : <button className="send-button" type="submit" aria-label="Отправить сообщение" title={restartWait ? RESTART_WAIT_TEXT : undefined}
+            disabled={!draft.trim() || !enabled || restartWait}><Icon name="arrow" /></button>}
       </div>
     </form>
     <div className="composer-caption">

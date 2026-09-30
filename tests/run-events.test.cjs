@@ -5,13 +5,13 @@ const path = require('node:path')
 
 // Same loader as tests/diff-parse.test.cjs: vite's oxc transform, then an ES module from a data URL.
 // run-events.ts only has type imports, which the transform erases.
-let applyRunEvent, restoreRuns, snapshotBase, runNotices, openTurn, durationMs, formatDuration
+let applyRunEvent, restoreRuns, snapshotBase, runNotices, openTurn, durationMs, formatDuration, activeRunIds, interruptLost, isActiveStatus, LOST_RUN_ERROR
 test.before(async () => {
   const { transformWithOxc } = await import('vite')
   const file = path.join(__dirname, '..', 'src', 'run-events.ts')
   const out = await transformWithOxc(fs.readFileSync(file, 'utf8'), file, { lang: 'ts' })
   const mod = await import(`data:text/javascript;base64,${Buffer.from(out.code).toString('base64')}`)
-  ;({ applyRunEvent, restoreRuns, snapshotBase, runNotices, openTurn, durationMs, formatDuration } = mod)
+  ;({ applyRunEvent, restoreRuns, snapshotBase, runNotices, openTurn, durationMs, formatDuration, activeRunIds, interruptLost, isActiveStatus, LOST_RUN_ERROR } = mod)
 })
 
 const AT = '2026-09-29T10:00:00.000Z'
@@ -97,6 +97,8 @@ function eventsOf(snapshot) {
   if (snapshot.status === 'completed') events.push({ ...head, type: 'run.finished', status: 'completed', summary: snapshot.summary })
   if (snapshot.status === 'failed') events.push({ ...head, type: 'run.failed', status: 'failed', error: snapshot.error })
   if (snapshot.status === 'cancelled') events.push({ ...head, type: 'run.cancelled', status: 'cancelled' })
+  // A run its agent ended by restarting Orbit (restart_orbit): the terminal event carries the status.
+  if (snapshot.status === 'restarting') events.push({ ...head, type: 'run.finished', status: 'restarting' })
   return events
 }
 
@@ -216,6 +218,38 @@ test('restoreRuns matches the previous merge: saved terminal status is final, li
   const finishedMeanwhile = restoreRuns(fold(applyRunEvent, [ev('run.started'), ev('run.finished', { status: 'completed' })]), [saved])
   assert.equal(finishedMeanwhile['run-1'].status, 'completed', 'a run that ended while the list loaded stays ended')
   assert.equal(restoreRuns(fold(applyRunEvent, [ev('run.started')]), [{ ...saved, status: 'failed' }])['run-1'].status, 'failed', 'the saved terminal status wins over a stale live one')
+})
+
+test('a run the runtime process lost before its first save ends interrupted once the list read after the comeback lacks it', () => {
+  // The runtime crashed within about a second of the run's start: the window saw it start, the saved list never had it.
+  const LOST_AT = '2026-09-29T10:05:00.000Z'
+  let runs = fold(applyRunEvent, [ev('run.started', { prompt: 'p', workspace: 'w' }), ev('agent.created', { agent: agent('root', { status: 'working' }) }),
+    ev('agent.created', { agent: agent('agent-a') }), ev('agent.created', { agent: agent('agent-b', { status: 'done', finishedAt: AT }) }),
+    ev('message.streaming', { agentId: 'root', messageId: 'm1', content: 'Смотрю' })])
+  runs = applyRunEvent(runs, { type: 'run.started', runId: 'run-saved', projectId: 'project', chatId: 'chat-2' })
+  runs = applyRunEvent(runs, { type: 'run.started', runId: 'run-done', projectId: 'project', chatId: 'chat-3' })
+  runs = applyRunEvent(runs, { type: 'run.finished', runId: 'run-done', projectId: 'project', chatId: 'chat-3', status: 'completed' })
+  // Taken when the runtime went down: the active runs only.
+  const lost = activeRunIds(runs)
+  assert.deepEqual(lost, ['run-1', 'run-saved'])
+  // Before: the list alone left the run working for good (send blocked, the chat not deletable, Stop «уже завершён»).
+  assert.equal(restoreRuns(runs, [])['run-1'].status, 'working')
+  // After the comeback: a run of the new process starts before the list reply comes; the list has one of the lost runs.
+  runs = applyRunEvent(runs, { type: 'run.started', runId: 'run-new', projectId: 'project', chatId: 'chat-4' })
+  const snapshots = [{ ...syntheticRun(), runId: 'run-saved', chatId: 'chat-2', status: 'interrupted' }]
+  const restored = interruptLost(restoreRuns(runs, snapshots), lost, snapshots, LOST_AT)
+  const run = restored['run-1']
+  assert.deepEqual([run.status, run.finishedAt, run.error, run.streaming], ['interrupted', LOST_AT, LOST_RUN_ERROR, undefined])
+  assert.deepEqual(run.agents.map(item => [item.id, item.status, item.finishedAt]), [['root', 'cancelled', LOST_AT], ['agent-a', 'cancelled', LOST_AT], ['agent-b', 'done', AT]])
+  assert.equal(isActiveStatus(run.status), false, 'nothing holds its chat any more')
+  assert.equal(restored['run-saved'].status, 'interrupted', 'a lost run the list has follows the list')
+  assert.equal(restored['run-new'].status, 'working', "the new process's run is not touched")
+  assert.equal(restored['run-done'].status, 'completed')
+  // Nothing to end: the same map, so React keeps its state.
+  const settled = restoreRuns(runs, snapshots)
+  assert.equal(interruptLost(settled, [], snapshots), settled)
+  assert.equal(interruptLost(restored, lost, snapshots, AT), restored, 'a run already ended is left as it is')
+  assert.equal(interruptLost(settled, ['unknown'], snapshots), settled)
 })
 
 test('message.streaming keeps the root answer in progress on the run; message.added with the same id replaces it', () => {

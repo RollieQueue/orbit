@@ -1,4 +1,3 @@
-// @ts-nocheck
 // Orbit tool execution, one entry point for both transports: the user approval gate, shared project notes and the
 // improvement plan, workspace and index tools, and the team tools; memory, skills and model assessments are in
 // knowledge.mts. The registry (tool-registry.mts) validates MCP arguments before a call gets here.
@@ -6,11 +5,16 @@ import { randomUUID } from 'node:crypto'
 import { executeWorkspaceTool, WORKSPACE_TOOLS } from '../runtime-tools.mts'
 import { projectPacket, saveNote } from '../shared-context.mts'
 import * as chatMemory from '../chat-memory.mts'
-import { ceiling, bounded, clip, abortable } from './util.mts'
+import { ceiling, bounded, clip, abortable, oneOf } from './util.mts'
 import { noteIndex } from './prompts.mts'
 import * as knowledge from './knowledge.mts'
+import * as restart from './restart.mts'
+import type { AgentRecord, ApprovalRequest, Communication, ImprovementStatus, ImprovementTask, Observation, OrbitRuntimeLike, RunRecord, TaskStatus, ToolArgs, WorkspaceContext } from '../types.mts'
 
-async function approve(runtime, run, agent, request, signal = runtime.agentSignal(run, agent)) {
+const PLAN_STATUSES: readonly ImprovementStatus[] = ['planning', 'implementing', 'completed', 'blocked']
+const TASK_STATUSES: readonly TaskStatus[] = ['pending', 'working', 'done', 'blocked']
+
+async function approve(runtime: OrbitRuntimeLike, run: RunRecord, agent: AgentRecord, request: ApprovalRequest, signal: AbortSignal = runtime.agentSignal(run, agent)): Promise<boolean> {
   if (signal.aborted || !runtime.requestApproval) return false
   runtime.updateAgent(run, agent, { status: 'waiting', detail: 'Waiting for your permission' })
   try {
@@ -19,7 +23,7 @@ async function approve(runtime, run, agent, request, signal = runtime.agentSigna
     return approved === true
   } finally { if (!signal.aborted) runtime.updateAgent(run, agent, { status: 'working', detail: 'Resuming task' }) }
 }
-async function executeTool(runtime, run, agent, name, args) {
+async function executeTool(runtime: OrbitRuntimeLike, run: RunRecord, agent: AgentRecord, name: string, args: ToolArgs, signal: AbortSignal = runtime.agentSignal(run, agent)): Promise<Observation> {
   if (name === 'context_read') {
     const packet = projectPacket(runtime.contextStore, run.workspace, run.sharedContext)
     if (args.key === undefined) {
@@ -38,9 +42,9 @@ async function executeTool(runtime, run, agent, name, args) {
   if (name === 'improvement_plan') {
     if (agent.id !== 'root') throw new Error('Only the orchestrator can update the improvement plan')
     if (!run.improvementMode) throw new Error('Improvement mode is disabled')
-    if (!['planning', 'implementing', 'completed', 'blocked'].includes(args.status) || !Array.isArray(args.tasks)) throw new Error('Invalid improvement plan')
-    const tasks = args.tasks.map(item => {
-      if (!item.id || !item.title || !['pending', 'working', 'done', 'blocked'].includes(item.status)) throw new Error('Invalid improvement task')
+    if (!oneOf(PLAN_STATUSES, args.status) || !Array.isArray(args.tasks)) throw new Error('Invalid improvement plan')
+    const tasks = args.tasks.map((item): ImprovementTask => {
+      if (!item.id || !item.title || !oneOf(TASK_STATUSES, item.status)) throw new Error('Invalid improvement task')
       if (['done', 'blocked'].includes(item.status) && !String(item.evidence || '').trim()) throw new Error('Done/blocked tasks require evidence')
       return { id: String(item.id), title: String(item.title), status: item.status, evidence: String(item.evidence || '') }
     })
@@ -54,21 +58,23 @@ async function executeTool(runtime, run, agent, name, args) {
     return { ok: true, status: args.status, tasks }
   }
   if (name === 'model_evaluate' || name === 'memory_search' || name === 'memory_save' || name === 'memory_forget' || name.startsWith('capability_')) return knowledge.executeKnowledgeTool(runtime, run, agent, name, args)
+  if (name === 'restart_orbit') return restart.executeRestart(runtime, run, agent, args)
   if (run.approvalPolicy === 'on-request' && ['write_file', 'edit_file', 'run_command'].includes(name) && run.accessMode !== 'read-only') {
-    if (!await runtime.approve(run, agent, { tool: name, arguments: args })) throw new Error('User declined this operation')
+    if (!await runtime.approve(run, agent, { tool: name, arguments: args }, signal)) throw new Error('User declined this operation')
   }
   if (WORKSPACE_TOOLS.has(name)) {
-    const context = { workspace: run.workspace, accessMode: run.accessMode, signal: runtime.agentSignal(run, agent), maxOutputChars: run.limits.maxOutputChars, onFileChange: change => runtime.reportWrite(run, agent, name, change) }
+    const context: WorkspaceContext = { workspace: run.workspace, accessMode: run.accessMode, signal, maxOutputChars: run.limits.maxOutputChars, onFileChange: change => runtime.reportWrite(run, agent, name, change), env: restart.agentEnv(runtime, run, agent) }
     const result = name === 'run_command' ? await runtime.runTrackedCommand(run, agent, args, context) : await executeWorkspaceTool(name, args, context)
     return runtime.trackWorkspaceTool(run, agent, name, args, result)
   }
   if (name === 'index_search' || name === 'index_outline') {
     if (!runtime.projectIndex) throw new Error('The project index is unavailable')
     await runtime.awaitIndex(run, { refresh: true })
-    const touchedBy = file => run.fileActivity.peers(file, '').slice(0, 4).map(item => ({ agent: run.agentNodes.get(item.agentId)?.name || item.agentId, how: item.how }))
+    const touchedBy = (file: string) => run.fileActivity.peers(file, '').slice(0, 4).map(item => ({ agent: run.agentNodes.get(item.agentId)?.name || item.agentId, how: item.how }))
     if (name === 'index_search') {
       if (!String(args.query || '').trim()) throw new Error('A search query is required')
-      const found = runtime.projectIndex.search(run.workspace, args.query, { limit: Number(args.limit) || 10 })
+      // A nonempty query, checked just above.
+      const found = runtime.projectIndex.search(run.workspace, args.query as string, { limit: Number(args.limit) || 10 })
       return { ...found, results: found.results.map(hit => { const touched = touchedBy(hit.path); return touched.length ? { ...hit, touchedBy: touched } : hit }) }
     }
     const outline = runtime.projectIndex.outline(run.workspace, args.path)
@@ -87,7 +93,7 @@ async function executeTool(runtime, run, agent, name, args) {
     const discussionId = randomUUID()
     return { discussionId, deliveries: targets.map(agentId => {
       try { return runtime.sendAgentMessage(run, agent, { ...args, agentId, discussionId }) }
-      catch (error) { return { ok: false, agentId, error: error.message } }
+      catch (error) { return { ok: false, agentId, error: (error as Error).message } }
     }) }
   }
   if (name === 'read_conversation') {
@@ -95,7 +101,7 @@ async function executeTool(runtime, run, agent, name, args) {
     if (args.afterId && index < 0) throw new Error('Conversation cursor is no longer available; read recent history without afterId')
     const limit = Math.max(1, Math.min(Number(args.limit) || 30, 100))
     const records = args.afterId ? run.communications.slice(index + 1) : run.communications.slice(-limit)
-    const messages = []; let size = 0
+    const messages: Communication[] = []; let size = 0
     for (const message of records.slice(0, limit)) {
       const entry = { ...message, text: bounded(message.text, Math.max(200, run.limits.maxOutputChars - 1000)) }
       const length = JSON.stringify(entry).length

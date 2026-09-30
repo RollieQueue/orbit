@@ -1,10 +1,10 @@
-// @ts-nocheck
 // What happened to the workspace: file activity per agent (Orbit tools, native tool events, attributed commands),
 // change records with their diffs made in the background, and the project index's readiness for a prompt.
 import { executeWorkspaceTool } from '../runtime-tools.mts'
 import { normalizeRel } from '../file-activity.mts'
 import { nativeChange, commandChange } from '../change-log.mts'
 import { TERMINAL, overlappingWorkspaces, diagnostics } from './util.mts'
+import type { AgentRecord, ChangeDescription, ChangeInput, FileAction, FileTouch, FileWrite, OrbitRuntimeLike, ProviderEvent, RunRecord, ToolArgs, WorkspaceContext } from '../types.mts'
 // A command can change many files at once (a formatter, a generator); past this it is not attributed to anyone.
 const COMMAND_ATTRIBUTION_LIMIT = 40
 // How long a finishing run waits for file change records still being made (a Git call is bounded by 5 s on its own).
@@ -13,26 +13,26 @@ const CHANGE_DRAIN_MS = 1500
 const INDEX_WAIT_MS = 2500
 
 // The index scan starts with the run; a prompt waits for it only briefly and the run never depends on it.
-async function awaitIndex(runtime, run, { refresh = false } = {}) {
+async function awaitIndex(runtime: OrbitRuntimeLike, run: RunRecord, { refresh = false }: { refresh?: boolean } = {}): Promise<void> {
   if (!runtime.projectIndex || (run.indexSettled && !refresh)) return
   const pending = refresh && run.indexSettled ? runtime.projectIndex.refresh(run.workspace) : run.indexReady
-  let timer
+  let timer: ReturnType<typeof setTimeout> | undefined
   await Promise.race([pending, new Promise(resolve => { timer = setTimeout(resolve, INDEX_WAIT_MS); timer.unref?.() })]).catch(error => diagnostics(runtime, run, 'awaitIndex', error))
   clearTimeout(timer)
   run.indexSettled = true
 }
-function publishFiles(runtime, run, agent) { runtime.updateAgent(run, agent, { files: run.fileActivity.forAgent(agent.id) }, false) }
+function publishFiles(runtime: OrbitRuntimeLike, run: RunRecord, agent: AgentRecord): void { runtime.updateAgent(run, agent, { files: run.fileActivity.forAgent(agent.id) }, false) }
 // Records that `agent` read or changed a file. A change also tells the other agents who used that file.
-function touchFile(runtime, run, agent, target, action) {
+function touchFile(runtime: OrbitRuntimeLike, run: RunRecord, agent: AgentRecord, target: string, action: FileAction): { touch?: FileTouch; shared: { agent: string; how: string }[] } {
   const touch = run.fileActivity.record(agent.id, target, action)
   if (!touch) return { shared: [] }
   if (touch.isNew) runtime.publishFiles(run, agent)
   return { touch, shared: action === 'write' ? run.router.notifyWrite(agent, touch.path) : [] }
 }
 // Files touched by a vendor's own tools (Codex file changes, Claude Read/Edit/Write) arrive as provider events.
-function trackNativeFiles(runtime, run, agent, event) {
+function trackNativeFiles(runtime: OrbitRuntimeLike, run: RunRecord, agent: AgentRecord, event: ProviderEvent): void {
   const call = run.changes.remember(agent.id, event)
-  const changed = new Set() // one tool call names a file once, however often its event lists it
+  const changed = new Set<string>() // one tool call names a file once, however often its event lists it
   for (const touch of run.fileActivity.nativeEvent(agent.id, event)) {
     if (touch.isNew) runtime.publishFiles(run, agent)
     if (touch.action !== 'write') continue
@@ -45,7 +45,7 @@ function trackNativeFiles(runtime, run, agent, event) {
   }
 }
 // Change records are made one after another in the background: reading files and asking Git must not slow the provider stream.
-function captureChange(runtime, run, agent, target, tool, describe) {
+function captureChange(runtime: OrbitRuntimeLike, run: RunRecord, agent: AgentRecord, target: string, tool: string | undefined, describe: (first: boolean) => Promise<ChangeDescription>): void {
   const rel = normalizeRel(run.workspace, target)
   if (!rel) return
   const first = run.changes.claim(rel)
@@ -53,11 +53,11 @@ function captureChange(runtime, run, agent, target, tool, describe) {
   run.changeQueue = run.changeQueue.then(async () => runtime.recordChange(run, agent, { path: rel, tool, ...await describe(first) })).catch(error => diagnostics(runtime, run, `captureChange ${rel}`, error, agent.id)).then(() => { run.changePending-- })
 }
 // A run ends after the records still being made, but never waits long for them.
-async function drainChanges(runtime, run, ms = CHANGE_DRAIN_MS) {
-  let timer
+async function drainChanges(runtime: OrbitRuntimeLike, run: RunRecord, ms = CHANGE_DRAIN_MS): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined
   try { await Promise.race([run.changeQueue, new Promise(resolve => { timer = setTimeout(resolve, ms) })]) } finally { clearTimeout(timer) }
 }
-function recordChange(runtime, run, agent, input) {
+function recordChange(runtime: OrbitRuntimeLike, run: RunRecord, agent: AgentRecord, input: ChangeInput): void {
   const change = run.changes.add({ agentId: agent.id, ...input })
   if (!change) return
   runtime.emit(run, 'change.added', { change }, false)
@@ -65,25 +65,27 @@ function recordChange(runtime, run, agent, input) {
   if (!run.persistTimer) { run.persistTimer = setTimeout(() => runtime.persist(run), TERMINAL.has(run.status) ? 100 : 1000); run.persistTimer.unref?.() }
 }
 // Orbit's own file tools report the exact text before and after a write.
-function reportWrite(runtime, run, agent, tool, { path: target, before, after }) {
+function reportWrite(runtime: OrbitRuntimeLike, run: RunRecord, agent: AgentRecord, tool: string, { path: target, before, after }: FileWrite): void {
   const rel = normalizeRel(run.workspace, target)
   if (!rel) return
   run.changes.claim(rel)
   run.commands.writes++ // a command that overlapped this write cannot claim the file
   runtime.recordChange(run, agent, { path: rel, tool, source: 'exact', before, after })
 }
-async function trackWorkspaceTool(runtime, run, agent, name, args, result) {
-  if (name === 'read_file') runtime.touchFile(run, agent, args.path, 'read')
+// Runs only after executeWorkspaceTool succeeded: a file tool that read or wrote a file had a string `path` (without one it
+// resolves the workspace folder itself, which is not a file), and write_file/edit_file return an object.
+async function trackWorkspaceTool(runtime: OrbitRuntimeLike, run: RunRecord, agent: AgentRecord, name: string, args: ToolArgs, result: unknown): Promise<unknown> {
+  if (name === 'read_file') runtime.touchFile(run, agent, args.path as string, 'read')
   else if (name === 'write_file' || name === 'edit_file') {
-    const { shared } = runtime.touchFile(run, agent, args.path, 'write')
-    try { await runtime.projectIndex?.touch(run.workspace, [args.path]) } catch (error) { diagnostics(runtime, run, 'projectIndex.touch', error, agent.id) /* The index catches up on its next scan. */ }
-    if (shared.length) return { ...result, sharedWith: shared }
+    const { shared } = runtime.touchFile(run, agent, args.path as string, 'write')
+    try { await runtime.projectIndex?.touch(run.workspace, [args.path as string]) } catch (error) { diagnostics(runtime, run, 'projectIndex.touch', error, agent.id) /* The index catches up on its next scan. */ }
+    if (shared.length) return { ...(result as object), sharedWith: shared }
   }
   return result
 }
 // A command's file changes are attributed to its agent only when nothing else could have made them:
 // no other command overlapped it, no other agent had a provider turn (native tools) running and no other chat works in the folder.
-async function runTrackedCommand(runtime, run, agent, args, context) {
+async function runTrackedCommand(runtime: OrbitRuntimeLike, run: RunRecord, agent: AgentRecord, args: ToolArgs, context: WorkspaceContext): Promise<unknown> {
   if (!runtime.projectIndex) return executeWorkspaceTool('run_command', args, context)
   const commands = run.commands, serial = ++commands.serial
   try { await runtime.projectIndex.refresh(run.workspace) } catch (error) { diagnostics(runtime, run, 'runTrackedCommand refresh', error, agent.id) /* Attribution is best effort. */ }

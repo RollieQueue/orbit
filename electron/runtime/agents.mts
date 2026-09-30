@@ -1,11 +1,10 @@
-// @ts-nocheck — typing of this module was interrupted mid-way (see docs/TYPESCRIPT-MAIN.md, "Remaining work"); annotations already present are kept.
 // The agent tree: creating, scheduling and resolving agents, follow-ups, cancellation signals and model slots, the
 // directory, and the ways an agent ends (complete, budget reached, stopped by the loop guard, descendants cancelled).
 import { randomUUID } from 'node:crypto'
 import { setMaxListeners } from 'node:events'
 import { saveNote } from '../shared-context.mts'
 import * as chatMemory from '../chat-memory.mts'
-import type { AgentDirectoryEntry, AgentRecord, AgentResult, ChildResultEntry, FollowupResult, OrbitRuntimeLike, RunRecord, SpawnResult, TeamDigest, ToolArgs, TurnWaiter } from '../types.mts'
+import type { AgentDirectoryEntry, AgentRecord, AgentResult, ChildResultEntry, FollowupResult, OrbitRuntimeLike, PublicAgent, RunRecord, SpawnResult, TeamDigest, ToolArgs, TurnWaiter } from '../types.mts'
 import { TERMINAL, AGENT_TERMINAL, ceiling, withoutGoogleReasoning, answerLimit, publicAgent, bounded, clip, abortError } from './util.mts'
 
 function createAgent(runtime: OrbitRuntimeLike, run: RunRecord, parent: AgentRecord | null, spec: ToolArgs): AgentRecord {
@@ -58,9 +57,11 @@ function spawnSubAgent(runtime: OrbitRuntimeLike, runId: string, parentId: strin
   if (!parent || ['done', 'error', 'cancelled'].includes(parent.status)) return { ok: false, reason: 'parent_not_active' }
   if (!String(spec.task || '').trim() || !String(spec.reason || '').trim()) return { ok: false, reason: 'task_and_delegation_reason_required' }
   if (spec.reasoningEffort && !['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra', 'enabled'].includes(spec.reasoningEffort)) return { ok: false, reason: 'invalid_reasoning_effort' }
-  let prior = null
+  let prior: PublicAgent | null = null
   if (spec.continueFrom) {
-    prior = chatMemory.findAgent(run.priorRuns, spec.continueFrom)
+    // priorRuns are chatMemory.view() results over live AgentRecords and saved snapshots, so a found agent is a
+    // PublicAgent; chat-memory's AgentLike declares only the fields chat-memory itself reads (no `generation`).
+    prior = chatMemory.findAgent(run.priorRuns, spec.continueFrom) as PublicAgent | null
     if (!prior) return { ok: false, reason: 'continue_from_not_found', instruction: 'No agent with that name ran in earlier turns of this chat; team_history lists them.' }
     if (!spec.name) spec = { ...spec, name: prior.name }
   }

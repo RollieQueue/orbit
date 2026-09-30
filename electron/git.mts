@@ -1,4 +1,5 @@
 import os from 'node:os'
+import path from 'node:path'
 import { execFile } from 'node:child_process'
 import type { ExecFileException } from 'node:child_process'
 
@@ -7,7 +8,10 @@ import type { ExecFileException } from 'node:child_process'
 // locked, and that must never be a project the user wants to delete. What every call shares: paths are file names,
 // never patterns ("[id].tsx" is one file, not a character class), non-ASCII names come back unescaped, no fsmonitor
 // hook of the repository runs for Orbit, no optional index lock is taken, and no credential prompt can hang a hidden
-// process. The answer never throws: `ok` says whether Git ran and exited with 0.
+// process. The search for a repository stops at `ceiling` (the home folder by default, added to any
+// GIT_CEILING_DIRECTORIES already set): a plain folder under a home directory that is itself a repository is not
+// reported as inside it, while the ceiling folder itself and repositories below it are found as before.
+// The answer never throws: `ok` says whether Git ran and exited with 0.
 const DEFAULT_TIMEOUT_MS = 8000
 const DEFAULT_MAX_BUFFER = 8 * 1024 * 1024
 const CONFIG = ['-c', 'core.quotepath=off', '-c', 'core.fsmonitor=false']
@@ -23,6 +27,7 @@ interface GitOptions {
   maxBuffer?: number
   encoding?: GitEncoding
   env?: NodeJS.ProcessEnv | null
+  ceiling?: string | null
 }
 
 // { ok, code, signal, timedOut, stdout, stderr, value, error }. `stdout` is a string (a Buffer with
@@ -58,13 +63,16 @@ function outcome(error: RunFailure | null, stdout: string | Buffer, stderr: stri
 function runGit(workspace: string | null | undefined, args: readonly string[], options: GitOptions & { encoding: 'buffer' }): Promise<GitResult<Buffer>>
 function runGit(workspace: string | null | undefined, args: readonly string[], options?: GitOptions & { encoding?: BufferEncoding }): Promise<GitResult<string>>
 function runGit(workspace: string | null | undefined, args: readonly string[], options?: GitOptions): Promise<GitResult<string | Buffer>>
-function runGit(workspace: string | null | undefined, args: readonly string[], { timeoutMs = DEFAULT_TIMEOUT_MS, cwd = os.tmpdir(), literalPathspecs = true, maxBuffer = DEFAULT_MAX_BUFFER, encoding = 'utf8', env = null }: GitOptions = {}): Promise<GitResult<string | Buffer>> {
+function runGit(workspace: string | null | undefined, args: readonly string[], { timeoutMs = DEFAULT_TIMEOUT_MS, cwd = os.tmpdir(), literalPathspecs = true, maxBuffer = DEFAULT_MAX_BUFFER, encoding = 'utf8', env = null, ceiling = os.homedir() }: GitOptions = {}): Promise<GitResult<string | Buffer>> {
   if (!Array.isArray(args)) throw new TypeError('runGit: args must be an array')
   const argv = [...(workspace ? ['-C', String(workspace)] : []), ...(literalPathspecs ? ['--literal-pathspecs'] : []), ...CONFIG, ...args.map(String)]
   const settings = { encoding, timeoutMs }
+  const merged: NodeJS.ProcessEnv = { ...process.env, ...ENV, ...env }
+  const ceilings = [merged.GIT_CEILING_DIRECTORIES, ceiling].filter(Boolean).join(path.delimiter)
+  if (ceilings) merged.GIT_CEILING_DIRECTORIES = ceilings
   return new Promise<GitResult<string | Buffer>>(resolve => {
     try {
-      execFile('git', argv, { cwd, timeout: timeoutMs, maxBuffer, encoding, windowsHide: true, env: { ...process.env, ...ENV, ...env } },
+      execFile('git', argv, { cwd, timeout: timeoutMs, maxBuffer, encoding, windowsHide: true, env: merged },
         (error, stdout, stderr) => resolve(outcome(error, stdout, stderr, settings)))
     } catch (error) { resolve(outcome(error as RunFailure, '', '', settings)) }
   })

@@ -189,7 +189,8 @@ export function RunHistoryList({ runs, currentId, onPick }: { runs: RunSnapshot[
     const files = runChangedFiles(run)
     const agents = plural(run.agents.length, ['агент', 'агента', 'агентов'])
     const changed = files ? ` · ${plural(files, ['файл', 'файла', 'файлов'])}` : ''
-    return `${index === 0 ? 'Последний · ' : ''}${whenOf(run.startedAt)} · ${statusText(run.status)} · ${agents}${changed}`
+    const resumed = run.resumedFrom ? ' · продолжение после перезапуска' : ''
+    return `${index === 0 ? 'Последний · ' : ''}${whenOf(run.startedAt)} · ${statusText(run.status)}${resumed} · ${agents}${changed}`
   }
   return <section className="history-runs" aria-label="История запусков">
     <button type="button" className="history-runs-title" aria-expanded={open} onClick={() => setOpen(!open)}>

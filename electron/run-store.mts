@@ -2,20 +2,15 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { readJSON, writeJSON, clone } from './storage.mts'
 import { recoverChanges } from './change-log.mts'
-import type { FileChange, ReportedWrite } from './change-log.mts'
+import type { ReportedWrite } from './change-log.mts'
+import type { FileChange, StoredAgent, StoredRun } from './types.mts'
 
-// A record without a status is not active.
+// A record without a status is not active. `restarting` is terminal: a run Orbit ended to restart with new code is kept
+// as it is on load (never turned into `interrupted`), and the continuation after the restart links back to it.
 const activeStatuses = new Set<string | undefined>(['running', 'working', 'waiting', 'queued', 'stopping'])
 
-// The fields of a saved run this store reads. A snapshot carries much more (traces, messages, settings, timings);
-// all of it is kept exactly as the runtime produced it.
-interface StoredAgent { id: string; status?: string; detail?: string; finishedAt?: string; files?: { wrote?: string[]; read?: string[] } | null; [field: string]: unknown }
-interface StoredRun {
-  runId: string; status?: string; projectId?: string; chatId?: string; workspace?: string
-  startedAt?: string; finishedAt?: string; updatedAt?: string; error?: string
-  agents?: StoredAgent[]; changes?: FileChange[]
-  [field: string]: unknown
-}
+// The fields of a saved run this store reads (StoredRun, StoredAgent in types.mts). A snapshot carries much more
+// (traces, messages, settings, timings); all of it is kept exactly as the runtime produced it.
 // A saved run is any JSON object with a truthy `runId`, as every version of Orbit wrote them.
 const isStoredRun = (value: unknown): value is StoredRun => Boolean((value as { runId?: unknown } | null | undefined)?.runId)
 

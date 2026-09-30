@@ -12,7 +12,9 @@ section below. OpenCode remains unsupported.
 | Ollama | Start Ollama with an already installed model | Chat setting, `ORBIT_OLLAMA_MODEL`, otherwise an unambiguous installed model | `envelope` | Generated text deltas |
 | Compatible endpoint | Set `ORBIT_OPENAI_BASE_URL` | Chat setting or `ORBIT_OPENAI_MODEL` required | `envelope` | Chat Completions SSE, with JSON response compatibility |
 
-Antigravity and Cursor use the `envelope` transport. `transportFor(providerId, options)` returns the transport;
+Antigravity and Cursor use the `envelope` transport, except in Full access: there Antigravity keeps a session, and
+Cursor does when opted in (`transport: 'session'` in its provider options or `ORBIT_CURSOR_SESSION=1`); see "Cursor
+and Antigravity sessions" below. `transportFor(providerId, options)` returns the transport;
 `ORBIT_LEGACY_ENVELOPE=1` forces the envelope for every provider. See "Session transport" below.
 
 For custom installations, `ORBIT_CODEX_COMMAND` and `ORBIT_CLAUDE_COMMAND` can name
@@ -91,7 +93,7 @@ runs one session turn and returns `{ providerId, client, transport: 'session',
 sessionId, text, model, access }`. `sessionId` is the id to pass back as
 `session.id` with `resume: true` on the next turn. Usage still arrives through
 the completion `observation` event, once. MCP tool calls appear in the stream as
-`kind: 'tool'` events with `tool: 'mcp__orbit__<name>'` (Claude) or
+`kind: 'tool'` events with `tool: 'mcp__orbit__<name>'` (Claude; Cursor and Antigravity too) or
 `tool: 'mcp_tool_call'` (Codex), `orbitTool: '<name>'`, `mcp: true` and
 `native: false`; their results carry the same `orbitTool`.
 
@@ -124,6 +126,7 @@ Codex exec (checked against 0.155):
 ```text
 codex exec --json --skip-git-repo-check -C <ws> --sandbox <mode> -c features.multi_agent=false
      -c 'mcp_servers.orbit.url="http://127.0.0.1:<port>/mcp"' -c 'mcp_servers.orbit.bearer_token_env_var="ORBIT_MCP_TOKEN"'
+     -c mcp_servers.orbit.tool_timeout_sec=3600
      [-c approval_policy="never" | --approve-for-me] [--model m] [-c model_reasoning_effort="x"] -
 codex exec resume --json --skip-git-repo-check -c sandbox_mode="<mode>" -c features.multi_agent=false
      -c mcp_servers.orbit.* … <thread id> -
@@ -134,6 +137,10 @@ codex exec resume --json --skip-git-repo-check -c sandbox_mode="<mode>" -c featu
 `thread.started` event. `codex exec resume` accepts neither `-C` nor `--sandbox`
 nor `--approve-for-me`, so the process cwd is the workspace, the sandbox travels as
 `sandbox_mode`, and an auto-review resume keeps the thread's own approval policy.
+
+Codex ends an MCP tool call after the server's `tool_timeout_sec` (60 s unless set), and Orbit's tools legitimately
+take longer (`wait_agent`, `run_command`, the checks of `restart_orbit`), so both Codex transports set it to 3600
+(added 2026-09-30; with codex-cli 0.155, `codex mcp get orbit --json` shows 3600).
 
 Codex Ask mode keeps one App Server process and one thread alive for the agent
 (`thread/start` with `ephemeral: false`, then one `turn/start` per Orbit turn; a
@@ -153,8 +160,71 @@ escalation. Full access uses `danger-full-access` and `approval_policy="never"`.
 Both Codex transports override `features.multi_agent=false` for the spawned
 process only. Delegation uses Orbit's tools, so child
 agents, their messages and results are owned by Orbit and shown in its UI.
-The rest of this section describes the envelope transport (Antigravity, Cursor,
-Ollama, compatible endpoints, and the CLIs under `ORBIT_LEGACY_ENVELOPE=1`).
+
+**Cursor and Antigravity sessions** (2026-09-30). Only in Full access (`danger-full-access`, approval policy not
+`on-request`): headless, neither CLI can approve an MCP tool call except by approving everything (`--force`,
+`--dangerously-skip-permissions`). Antigravity uses the session there by default. Cursor uses it only when opted in
+(`transport: 'session'` in the Cursor provider options, a field the settings UI does not offer, or
+`ORBIT_CURSOR_SESSION=1`) until a live check passes: the Cursor account is out of quota, so the path from the model to
+an Orbit tool call over MCP is not verified; the arguments, the plugin and the stream parser are checked against a fake
+CLI only. In every other mode both stay on the envelope. The CLI process of a root agent working on Orbit's own
+repository also gets the runtime's restart variables (`extraEnv`, see "Runtime contract"). Both CLIs name their
+sessions: only a plain token (`SESSION_ID`: a letter or digit, then letters, digits and `._:-`, at most 128 characters)
+is taken from the stream, anything else is ignored and reported once as a diagnostic, and a resume id that is not such
+a token is refused with the code `ORBIT_SESSION_ID`, after which the runtime drops it once and starts a fresh session
+(the same rule holds for Codex thread ids). A handover to another subscription closes the old session first.
+
+Cursor:
+
+```text
+agent --print --output-format stream-json --trust --approve-mcps --plugin-dir <temp folder>
+      --force --sandbox disabled [--resume <chat id>] [--model m]
+```
+
+The prompt goes through stdin, and every turn, a resume included, runs in the workspace (Cursor keys its chats by
+folder). The plugin folder (`%TEMP%/orbit-cursor-mcp-<pid>-*`, created for every turn and removed after it) holds
+`.cursor-plugin/plugin.json` (`{"name":"orbit",…}`) and `mcp.json` with `Authorization: Bearer ${env:ORBIT_MCP_TOKEN}`:
+the token is only in the child's environment, and the server's id is `plugin-orbit-orbit`. `--approve-mcps` approves
+every MCP server Cursor has configured, the user's global and project ones included, not only Orbit's: acceptable only
+because this transport exists in Full access alone. A project `.cursor/mcp.json` is not used, because Cursor resolves
+the project root by the Git root, which on the owner's machine is the home folder. The chat id comes from
+`system/init`. Cursor has no system-prompt option, so the stable Orbit block opens the conversation's first message. An
+empty final `result` falls back to the last text the turn streamed, and an error event whose error is an object is
+described as JSON. "You've hit your usage limit", which Cursor prints on stderr only, becomes a quota-tagged error, so
+failover recognises it. The reasoning level picks a model variant as in the envelope mode.
+
+Antigravity (`agy` 1.2.13):
+
+```text
+agy --input-format stream-json --output-format stream-json [--model m]
+    --add-dir <workspace> --dangerously-skip-permissions [--conversation <id>]
+```
+
+Each conversation runs in its own folder, `%TEMP%/orbit-agy-session-<pid>-*`, with `.agents/plugins/orbit/plugin.json`,
+`mcp_config.json` (`serverUrl`, a `Bearer` header with the token itself, because `agy` expands no variables;
+`timeoutSeconds: 3600`) and `rules/AGENTS.md` (the stable Orbit block as an always-on rule, plus the workspace path and
+how to call Orbit's tools). The files are rewritten before every turn, since the port and the token may change; the
+prompt is one NDJSON line on stdin; the Google CLI proxy settings apply as in the envelope mode, with the loopback
+server excluded. Orbit tool calls arrive as `call_mcp_tool` with `ServerName` `orbit_orbit`; `denied_actions` is a
+diagnostic, not a failure; an empty `response` falls back to the streamed text. The folder goes with `closeSession`
+(the run's end, or a handover) or when Orbit exits (the exit hook retries a folder that is still locked); the first
+session of a later process removes such folders (and Cursor plugin folders) at once when the process named in the
+folder is gone, else when their configuration is older than 6 h. Verified live on 2026-09-30 through Orbit's own code
+path: two turns on `claude-sonnet-4-6` with an Orbit tool call over MCP in each, the rules file applied, and a resume
+of the same conversation from a new folder with a new port and token; about 10 s per turn; the CLI's global
+configuration files were unchanged (sha256 before and after). Gemini models are refused for this account by location.
+
+**Per-call limits.** Some MCP clients end a tool call on their own clock: Cursor after 60 s (the MCP SDK default; it
+sends no progress token), Antigravity after `timeoutSeconds`, Codex after `tool_timeout_sec`. `mcpCallLimit(providerId)`
+is the time Orbit answers within: Cursor 50 s, Codex and Antigravity 59 min, no limit for Claude (which gets progress
+notifications and the 24 h idle timeout above). `ORBIT_MCP_CALL_LIMIT_MS` can only lower it. A longer `wait_agent` or
+`wait_message` is cut at the limit and answers "still running, call again"; any other call keeps running past it, and
+the agent's identical next call collects the result instead of starting the tool again, unless files changed since it
+started or it finished more than 2 minutes ago; such a call is stopped with the agent's session, at a handover and at
+the end of the run (docs/SESSION-MODE.md).
+
+The rest of this section describes the envelope transport (Antigravity and Cursor
+outside a session, Ollama, compatible endpoints, and the CLIs under `ORBIT_LEGACY_ENVELOPE=1`).
 The first completed assistant message containing a validated, nonempty tool
 envelope transfers control to Orbit, including commentary. Both transports stop
 the provider process tree before returning that envelope to the runtime. Later
@@ -241,12 +311,21 @@ await runProvider({
   providerId, prompt, workspace, mode, accessMode, approvalPolicy,
   model, signal, onEvent, timeoutMs, inactivityMs,
   session, // { id, token, mcpUrl, systemAppend, resume, activity } for the session transport
+  extraEnv, // added to the environment of every CLI process of the turn (the runtime's restart variables)
 })
 // -> { providerId, client, text, model, access }                       envelope
 // -> { providerId, client, transport: 'session', sessionId, text, model, access }  session
 transportFor(providerId, options) // 'session' | 'envelope'
-closeSession(sessionId)           // ends a Codex App Server session; false when nothing was alive
+mcpCallLimit(providerId)          // ms within which Orbit answers one MCP tool call; 0 = no limit
+closeSession(sessionId)           // ends a Codex App Server session or an Antigravity conversation's folder; false when nothing was alive
 ```
+
+`extraEnv` reaches Claude, both Codex transports, Cursor and Antigravity on either transport; Orbit's own variables
+(the MCP token, `NO_PROXY`, the Google CLI proxy) win over it. The runtime passes `ORBIT_RUN_ID`, `ORBIT_CHAT_ID`,
+`ORBIT_PROJECT_ID`, `ORBIT_AGENT_ID`, `ORBIT_RESUME_FILE` and `ORBIT_USER_DATA` exactly where `restart_orbit` is offered
+(the root agent of a writable run on Orbit's own repository, when Orbit can restart itself and is not under the Vite dev
+server), so a self-upgrade run from that CLI's own shell names the run to continue and signals this Orbit's profile
+(README, "Самообновление"); every other agent gets none.
 
 `text` is the exact final assistant text, preserving whitespace and JSON tool
 envelopes. Intermediate commentary and tool output are separate events. Codex
@@ -289,7 +368,11 @@ streaming/error tests. It makes no inference request to a paid provider.
 session transport (session flags, temp system file, session-id parsing, resume
 arguments, inactivity and deadline timers, Codex config overrides and token
 environment, App Server sessions across turns with approvals, close and
-cancellation). `tests/mcp-server.test.cjs` talks to the Orbit MCP server with the
+cancellation) and, since 2026-09-30, fake Cursor and Antigravity CLIs (session flags, plugin
+folders and their removal, the token only by variable for Cursor, resume ids, the usage-limit
+refusal, `closeSession`); `tests/subscription-providers.test.cjs` covers their session parsers
+and plugin files, and `tests/session-mode.test.cjs` the call limits (cut waits, parked calls).
+`tests/mcp-server.test.cjs` talks to the Orbit MCP server with the
 SDK client (tools/list, tools/call, unread suffix, errors, 401, approve round
 trip, progress, stop). `tests/tool-registry.test.cjs` pins the prompt text and
 the envelope schema to their pre-registry bytes.
@@ -333,11 +416,13 @@ Google CLI по умолчанию получает системный HTTP-пр
 
 Путь к CLI настраивается в интерфейсе или через `ORBIT_ANTIGRAVITY_COMMAND` / `ORBIT_CURSOR_COMMAND`. Приложение запускает команду без shell, передаёт запрос через stdin и завершает дерево процессов при отмене. Для Cursor Windows поддерживаются native executable, стандартные npm-shim и официальный пакет с `versions/<version>/node.exe` + `index.js`.
 
-Cursor в Full access запускается в Agent (без `--mode ask`), с `--force --sandbox disabled`. В режимах Ask, чтения и доступа к проекту native-инструменты остаются read-only, а разрешённые записи выполняются через Orbit. Antigravity использует временный custom agent `tools: []`; все действия выполняет Orbit с выбранными правами. Политика и способ выполнения разрешённых записей явно указаны агентам в контексте. Завершённый шаг Antigravity (`agent_response`, `state: DONE`) с целым ответом по схеме Orbit сразу передаёт управление рантайму; дерево CLI останавливается до повторной генерации или исправления схемы. Частичные сообщения, текст инструментов и невалидный JSON этого не делают. Без такой передачи управления обязателен успешный terminal result.
+Cursor в Full access запускается в Agent (без `--mode ask`), с `--force --sandbox disabled`. В режимах Ask, чтения и доступа к проекту native-инструменты остаются read-only, а разрешённые записи выполняются через Orbit. Antigravity использует временный custom agent `tools: []`; все действия выполняет Orbit с выбранными правами. Политика и способ выполнения разрешённых записей явно указаны агентам в контексте. Завершённый шаг Antigravity (`agent_response`, `state: DONE`) с целым ответом по схеме Orbit сразу передаёт управление рантайму; дерево CLI останавливается до повторной генерации или исправления схемы. Частичные сообщения, текст инструментов и невалидный JSON этого не делают. Без такой передачи управления обязателен успешный terminal result. Всё это — режим конверта; в Full access Antigravity (и Cursor, если включён `ORBIT_CURSOR_SESSION=1`) работает в сессионном режиме с инструментами Orbit по MCP, см. «Cursor and Antigravity sessions» выше.
 
 Потоковые сообщения обновляют одну запись по идентификатору сообщения, участнику и ходу. Интервал обновления интерфейса больше не разрезает текст на отдельные записи, а длинные сообщения не обрезаются до 6000 символов. В панели агента показывается текст `content`, итоговый ответ публикуется в чате после обработки инструментов Orbit.
 
 **Claude Code по подписке:** установите официальный CLI по [инструкции Anthropic](https://code.claude.com/docs/en/setup), выполните `claude auth login` своим Claude-аккаунтом и нажмите «Проверить» в Orbit. API-ключ не требуется. Доступны стандартные CLI-псевдонимы `sonnet`, `opus`, `haiku`, ручной идентификатор или модель по умолчанию; конкретный доступ определяет аккаунт. Завершённое сообщение основного Claude-агента с валидными вызовами Orbit передаёт управление рантайму сразу, без ожидания дальнейших ответов CLI. Поток размышлений показывается отдельно. Источник: [CLI reference](https://code.claude.com/docs/en/cli-reference).
+
+Проверено 2026-09-30: генерация Antigravity на `claude-sonnet-4-6` проходит (проверялся сессионный режим, с вызовом инструмента Orbit по MCP); модели Gemini для этого аккаунта по-прежнему отклоняются по региону. Cursor CLI отвечает «You've hit your usage limit», поэтому его сессионный режим вживую не проверен.
 
 Проверено 2026-09-29: Claude Code 2.1.284 установлен, требуется вход пользователя. Локальные проверки транспорта проходят; живой вызов Antigravity из проверочного процесса получил `User location is not supported for the API use`, поэтому успешная облачная генерация после исправления не подтверждена.
 

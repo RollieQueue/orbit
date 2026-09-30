@@ -1,5 +1,5 @@
-// @ts-nocheck
 import { clip } from './text.mts'
+import type { AgentRecord, AgentRef, Communication, NoticeCommunication, RouterAudience, RouterHost, RouterStats, RunRecord, TeamRouterLike, ToolArgs } from './types.mts'
 
 // The router is the one place agent-to-agent traffic passes through. It is deliberately not a model call:
 // a deterministic dispatcher costs no provider turn, adds no latency and cannot start a conversation
@@ -17,23 +17,33 @@ const UNAVAILABLE = new Set(['error', 'cancelled'])
 const RUN_OVER = new Set(['completed', 'failed', 'cancelled'])
 const FILLER = new Set(('the and for with this that from have into about what when which where your their there would should could также этот эта это для что как при или его при над под без про').split(/\s+/))
 
-const normalized = text => String(text ?? '').toLowerCase().replace(/\s+/g, ' ').trim()
-const topicWords = text => [...new Set((String(text || '').toLowerCase().match(/[\p{L}\p{N}_-]{4,}/gu) || []).filter(word => !FILLER.has(word)))].slice(0, 12)
-const active = agent => agent.status === 'working' || agent.status === 'waiting'
+const normalized = (text: unknown): string => String(text ?? '').toLowerCase().replace(/\s+/g, ' ').trim()
+const topicWords = (text: unknown): string[] => [...new Set((String(text || '').toLowerCase().match(/[\p{L}\p{N}_-]{4,}/gu) || []).filter(word => !FILLER.has(word)))].slice(0, 12)
+const active = (agent: AgentRecord): boolean => agent.status === 'working' || agent.status === 'waiting'
 
-class TeamRouter {
+// How often two agents have written to each other since either of them last did work (workDone per agent).
+interface PairState { count: number; work: Record<string, number> }
+interface Candidate { agent: AgentRecord; score: number; reasons: string[] }
+
+class TeamRouter implements TeamRouterLike {
+  // Filled by Object.assign in the constructor and the assignments below it.
+  declare run: RunRecord
+  declare host: RouterHost
+  declare pairs: Map<string, PairState>
+  declare noticeMarks: Map<string, number>
+  declare stats: RouterStats
   // `host.record(sender, target, text, extra)` stores a communication; `host.announce(communication, persist)` publishes a change to one;
   // `host.changed(stats)` tells the UI that the counters moved.
-  constructor(run, host) {
+  constructor(run: RunRecord, host: RouterHost) {
     Object.assign(this, { run, host })
     this.pairs = new Map()
     this.noticeMarks = new Map()
     this.stats = { routed: 0, notices: 0, refused: 0 }
   }
-  bump(key, count = 1) { this.stats[key] += count; this.host.changed?.({ ...this.stats }) }
+  bump(key: keyof RouterStats, count = 1): void { this.stats[key] += count; this.host.changed?.({ ...this.stats }) }
 
   // Who should receive a message that names no exact recipient.
-  audience(sender, args, resolveAgent) {
+  audience(sender: AgentRecord, args: ToolArgs, resolveAgent: (reference: string) => AgentRecord): RouterAudience {
     const { run } = this
     const explicit = Array.isArray(args.agentIds) ? args.agentIds.filter(Boolean) : []
     if (explicit.length) {
@@ -48,12 +58,12 @@ class TeamRouter {
     }
     const files = (Array.isArray(args.files) ? args.files : []).map(String).filter(Boolean).slice(0, 12)
     const words = topicWords(args.topic)
-    const candidates = []
+    const candidates: Candidate[] = []
     if (files.length || words.length) {
       for (const agent of run.agentNodes.values()) {
         if (agent.id === sender.id || UNAVAILABLE.has(agent.status)) continue
         let score = 0
-        const reasons = []
+        const reasons: string[] = []
         for (const file of files) {
           const owner = run.fileActivity.owners(file).find(item => item.agentId === agent.id)
           if (owner) { score += owner.how === 'wrote' ? 10 : 4; reasons.push(`${owner.how === 'wrote' ? 'changed' : 'read'} ${clip(file, 80)}`) }
@@ -67,7 +77,7 @@ class TeamRouter {
         if (score >= MIN_SCORE) candidates.push({ agent, score, reasons })
       }
     }
-    candidates.sort((a, b) => (active(b.agent) - active(a.agent)) || b.score - a.score)
+    candidates.sort((a, b) => (+active(b.agent) - +active(a.agent)) || b.score - a.score)
     if (candidates.length) return { via: 'match', recipients: candidates.slice(0, MAX_AUDIENCE) }
     const parent = sender.parentId ? run.agentNodes.get(sender.parentId) : null
     if (parent && !UNAVAILABLE.has(parent.status)) return { via: 'escalation', recipients: [{ agent: parent, reasons: ['no teammate matched, so the question goes to the delegating agent'] }] }
@@ -75,7 +85,7 @@ class TeamRouter {
   }
 
   // Refuses a message that repeats an earlier one or continues a discussion in which nobody acted.
-  pass(sender, target, text) {
+  pass(sender: AgentRecord, target: AgentRecord, text: string): void {
     const { run } = this
     const key = [sender.id, target.id].sort().join('|')
     const recent = run.communications.slice(-DUPLICATE_WINDOW)
@@ -83,7 +93,7 @@ class TeamRouter {
       this.bump('refused')
       throw new Error(`You already sent «${target.name}» this exact message. Wait for the answer (wait_message) or say something new.`)
     }
-    const pair = this.pairs.get(key) || { count: 0, work: {} }
+    const pair: PairState = this.pairs.get(key) || { count: 0, work: {} }
     if (pair.work[sender.id] !== sender.workDone || pair.work[target.id] !== target.workDone) { pair.count = 0; pair.work = { [sender.id]: sender.workDone, [target.id]: target.workDone } }
     if (pair.count >= MAX_EXCHANGE) {
       this.bump('refused')
@@ -94,8 +104,8 @@ class TeamRouter {
   }
 
   // Called after `writer` changed `rel`. Everyone else who read or changed the file hears about it.
-  notifyWrite(writer, rel) {
-    const shared = []
+  notifyWrite(writer: AgentRecord, rel: string): { agent: string; how: string }[] {
+    const shared: { agent: string; how: string }[] = []
     for (const { agentId, how } of this.run.fileActivity.peers(rel, writer.id)) {
       const reader = this.run.agentNodes.get(agentId)
       if (!reader) continue
@@ -105,14 +115,14 @@ class TeamRouter {
     }
     return shared
   }
-  notice(writer, reader, rel, conflict) {
+  notice(writer: AgentRecord, reader: AgentRecord, rel: string, conflict: boolean): void {
     // Late events from a provider that is still unwinding must not add mail to a finished run.
     if (RUN_OVER.has(this.run.status)) return
     const mark = `${writer.id}|${reader.id}|${rel}`
     if (this.noticeMarks.get(mark) === reader.turns) return
     this.noticeMarks.set(mark, reader.turns)
-    if (this.noticeMarks.size > 2000) this.noticeMarks.delete(this.noticeMarks.keys().next().value)
-    const pending = this.run.communications.find(message => message.kind === 'notice' && message.toAgentId === reader.id && message.about === writer.id && !message.readAt && message.status !== 'read')
+    if (this.noticeMarks.size > 2000) this.noticeMarks.delete(this.noticeMarks.keys().next().value as string) // the map is not empty here
+    const pending = this.run.communications.find((message): message is NoticeCommunication => message.kind === 'notice' && message.toAgentId === reader.id && message.about === writer.id && !message.readAt && message.status !== 'read')
     if (pending) {
       if (!pending.paths.includes(rel) && pending.paths.length < NOTICE_PATHS) pending.paths.push(rel)
       pending.conflict = pending.conflict || conflict
@@ -124,7 +134,7 @@ class TeamRouter {
     this.bump('notices')
     this.host.record(ROUTER, reader, this.noticeText(writer, [rel], conflict), { kind: 'notice', via: 'router', about: writer.id, aboutName: writer.name, paths: [rel], conflict })
   }
-  noticeText(writer, paths, conflict) {
+  noticeText(writer: AgentRef, paths: string[], conflict: boolean): string {
     const list = paths.join(', ')
     return conflict
       ? `EDIT CONFLICT: «${writer.name}» and you both changed ${list}. Agree through ask_team who owns it before you edit it again, and re-read it first.`

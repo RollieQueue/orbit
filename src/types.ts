@@ -1,6 +1,7 @@
 export type AccessMode = 'read-only' | 'workspace-write' | 'danger-full-access'
 export type ApprovalPolicy = 'never' | 'on-request' | 'auto-review'
-export type AgentStatus = 'idle' | 'waiting' | 'working' | 'done' | 'error' | 'cancelled' | 'interrupted'
+// restarting = ended because Orbit restarts (restart_orbit); the task goes on in a new run whose resumedFrom points back.
+export type AgentStatus = 'idle' | 'waiting' | 'working' | 'done' | 'error' | 'cancelled' | 'interrupted' | 'restarting'
 export type RunStatus = AgentStatus | 'completed' | 'failed'
 export type Agent = {
   id: string
@@ -209,6 +210,44 @@ export type RunSnapshot = {
   limits?: RunLimits
   usage?: { providerTurns: number; workerTurns?: number }
   streaming?: StreamingMessage
+  // A continuation Orbit started itself after a restart: the run it continues and how many restarts in a row led here.
+  resumedFrom?: string
+  resumeChain?: number
+  // Set on a run that ended with status 'restarting': why and when its agent asked for the restart.
+  restart?: RunRestart
+}
+export type RunRestart = { reason: string; requestedAt: string; source: 'tool' | 'script' }
+// What the runtime reports after a restart_orbit restart (channel restart:notice): the continuation started, or why not.
+export type RestartNoticeKind = 'resumed' | 'rolled-back' | 'loop-limit' | 'expired' | 'failed'
+export type RestartNotice = {
+  kind: RestartNoticeKind
+  chatId: string | null
+  projectId: string | null
+  runId: string | null
+  resumedRunId?: string
+  text: string
+  reason?: string
+  level?: 'runtime' | 'full'
+  patch?: string
+  error?: string
+  time: string
+}
+// The runtime child process as main's client sees it (runtime:status, runtime:status-changed). since = when this state
+// began (ms), lastRestartMs = how long the last restart took. retrying: an automatic restart is scheduled (only after a
+// crash of a runtime that had been ready; a start that failed, another protocol, changed shell files or too many crashes
+// are not retried). lastError: the last error nothing caught in the running runtime process, which keeps running
+// (count = how many so far; at = when main heard of it); a new process starts without it.
+export type RuntimeState = 'starting' | 'ready' | 'restarting' | 'crashed' | 'stopped'
+export type RuntimeStatus = {
+  state: RuntimeState
+  mode: 'child' | 'inprocess'
+  pid: number | null
+  since: number
+  lastRestartMs: number | null
+  restarts: number
+  retrying: boolean
+  error?: string
+  lastError?: { message: string; at: number; count: number }
 }
 export type RunLimits = {
   maxAgents: number | null; maxDepth: number | null; maxConcurrent: number | null; maxTurns: number | null; maxTotalTurns: number | null

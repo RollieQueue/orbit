@@ -7,19 +7,23 @@ import { Icon } from './Icon'
 import { handoverLabel } from './QuotaPanel'
 import { Markdown, plural, statusText, timeOf } from './format'
 import { providers } from './providers'
-import { isActiveStatus, type RunMap } from './run-events'
+import { historyAnchors, isActiveStatus, resumeLinks, shortRunId, type RunMap } from './run-events'
+import { RESTART_WAIT_TEXT } from './state-store'
 
 type OpenTeam = (runId: string, tab?: InspectorTab, agentId?: string) => void
 const suggestions = ['Помоги разобраться в проекте', 'Давай обсудим новую функцию', 'Найди, что можно улучшить']
-const failedStatuses = ['failed', 'error', 'cancelled', 'interrupted']
+const failedStatuses = ['failed', 'error', 'cancelled', 'interrupted', 'restarting']
 const handoverName = (target: HandoverTarget) => handoverLabel(providers, target)
 const distanceToBottom = (element: HTMLElement) => element.scrollHeight - element.scrollTop - element.clientHeight
 const failureDetail = (run: RunSnapshot) =>
-  run.error ? `: ${run.error}` : run.status === 'interrupted' ? '. Приложение закрылось во время работы. Можно продолжить новым сообщением.' : ''
+  run.error ? `: ${run.error}`
+  : run.status === 'interrupted' ? '. Приложение закрылось во время работы. Можно продолжить новым сообщением.'
+  : run.status === 'restarting' ? `. Агент перезапустил Orbit${run.restart?.reason ? `: ${run.restart.reason}` : ''}.` : ''
 
 type ChatPaneProps = {
   project?: Project; chat?: ChatThread; chatKey: string; runs: RunMap; ready: boolean; desktop: boolean
-  running: boolean; starting: boolean; workingRun?: RunSnapshot; currentRun?: RunSnapshot; agentsOpen: boolean; storageError: string
+  // restartWait: the chat's agent restarted Orbit and the continuation has not started yet (state-store restartWaits).
+  running: boolean; restartWait: boolean; starting: boolean; workingRun?: RunSnapshot; currentRun?: RunSnapshot; agentsOpen: boolean; storageError: string
   composer: ComposerProps
   onOpenSidebar: () => void; onToggleAgents: () => void; onOpenAgents: () => void; onOpenTeam: OpenTeam
   onSuggest: (text: string) => void; onAddProject: () => void
@@ -27,7 +31,7 @@ type ChatPaneProps = {
 
 // Header, notices, the conversation (messages, the answer being written, the team's status) and the composer.
 export function ChatPane({
-  project, chat, chatKey, runs, ready, desktop, running, starting, workingRun, currentRun, agentsOpen, storageError, composer,
+  project, chat, chatKey, runs, ready, desktop, running, restartWait, starting, workingRun, currentRun, agentsOpen, storageError, composer,
   onOpenSidebar, onToggleAgents, onOpenAgents, onOpenTeam, onSuggest, onAddProject,
 }: ChatPaneProps) {
   const bottom = useRef<HTMLDivElement>(null)
@@ -41,13 +45,10 @@ export function ChatPane({
     }
     : undefined
   const otherActiveChats = Object.values(runs).filter(run => run.projectId === project?.id && run.chatId !== chat?.id && isActiveStatus(run.status)).length
-  // Each run's team strip and history hang under its answer. A finished run that never answered (failed, stopped) keeps them under the user's message.
-  const historyAnchor = new Map<string, string>()
-  for (const message of chat?.messages || []) if (message.author === 'orbit' && message.runId) historyAnchor.set(message.runId, message.id)
-  for (const message of chat?.messages || []) {
-    if (message.author !== 'user' || !message.runId || historyAnchor.has(message.runId)) continue
-    if (runs[message.runId] && !isActiveStatus(runs[message.runId].status)) historyAnchor.set(message.runId, message.id)
-  }
+  // Each run's team strip and history hang under its answer, or under the message that opened a run that never answered.
+  const historyAnchor = historyAnchors(chat?.messages || [], runs)
+  // A run that ended by restarting Orbit links to the run that continued it.
+  const continuation = currentRun?.status === 'restarting' ? resumeLinks(runs, currentRun).next : undefined
   useEffect(() => { nearBottom.current = true; bottom.current?.scrollIntoView({ behavior: 'instant' }) }, [chatKey])
   useEffect(() => { if (nearBottom.current) bottom.current?.scrollIntoView({ behavior: 'smooth' }) }, [chat?.messages.length, running])
   // A growing answer keeps the view pinned to the bottom, without the smooth scroll that would stutter several times a second.
@@ -83,8 +84,10 @@ export function ChatPane({
         {currentRun && !running && failedStatuses.includes(currentRun.status) && <div className={`run-notice ${currentRun.status}`}>
           <span className={`status-dot ${currentRun.status}`} />
           <span>{statusText(currentRun.status)}{failureDetail(currentRun)}</span>
+          {continuation && <button onClick={() => onOpenTeam(continuation.runId)}>Продолжен в {shortRunId(continuation.runId)}</button>}
           <button onClick={onOpenAgents}>Подробности</button>
         </div>}
+        {restartWait && !running && <div className="working-indicator" role="status"><span className="status-dot working" /><span>{RESTART_WAIT_TEXT}</span></div>}
       </div>}
       <div ref={bottom} />
     </div>

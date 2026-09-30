@@ -38,11 +38,15 @@ const CALLS = [
   ['openExternal', 'shell:open', 1],
   ['ping', 'app:ping', 0],
   ['relaunch', 'app:relaunch', 0],
+  ['restartRuntime', 'runtime:restart', 0],
+  ['getRuntimeStatus', 'runtime:status', 0],
 ]
 /** @type {[method: string, channel: string][]} */
 const EVENTS = [
   ['onQuotaUpdate', 'quota:update'],
   ['onRuntimeEvent', 'runtime:event'],
+  ['onRestartNotice', 'restart:notice'],
+  ['onRuntimeStatus', 'runtime:status-changed'],
 ]
 
 /** @type {Record<string, (...params: any[]) => unknown>} */

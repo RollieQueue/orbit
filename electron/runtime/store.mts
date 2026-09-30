@@ -1,16 +1,15 @@
-// @ts-nocheck — typing of this module was interrupted mid-way (see docs/TYPESCRIPT-MAIN.md, "Remaining work"); annotations already present are kept.
 // A run as others see it: snapshots, coalesced persistence, events to listeners, traces, agent updates and chat
 // messages. Nothing here decides what an agent does; it records and publishes what the other modules did.
 import { randomUUID } from 'node:crypto'
 import { ROUTER } from '../router.mts'
-import type { AgentRecord, FileChange, Message, OrbitRuntimeLike, RunRecord, RunSnapshot, RuntimeEvent, RuntimeEventData, Trace } from '../types.mts'
+import type { AgentRecord, FileChange, Message, OrbitRuntimeLike, RunRecord, RunSnapshot, RuntimeEvent, RuntimeEventData, StoredRun, Trace } from '../types.mts'
 import { TERMINAL, answerLimit, publicAgent, bounded } from './util.mts'
 
 // The inspector keeps this many traces per run; the run file is written at most this often while a run is active.
 const TRACE_LIMIT = 2000
 const PERSIST_DELAY_MS = 1000
 
-function getRun(runtime: OrbitRuntimeLike, id: string): RunSnapshot | null { const run = runtime.runs.get(id); return run ? runtime.snapshot(run) : (runtime.runStore?.get?.(id) || null) }
+function getRun(runtime: OrbitRuntimeLike, id: string): RunSnapshot | StoredRun | null { const run = runtime.runs.get(id); return run ? runtime.snapshot(run) : (runtime.runStore?.get?.(id) || null) }
 function getRuns(runtime: OrbitRuntimeLike): RunSnapshot[] { return [...runtime.runs.values()].map((run) => runtime.snapshot(run)) }
 function snapshot(runtime: OrbitRuntimeLike, run: RunRecord): RunSnapshot {
   return structuredClone({
@@ -21,6 +20,10 @@ function snapshot(runtime: OrbitRuntimeLike, run: RunRecord): RunSnapshot {
     agents: [...run.agentNodes.values()].map(publicAgent),
     traces: run.traces, messages: run.messages, communications: run.communications, summary: run.summary, error: run.error,
     files: run.fileActivity.snapshot(), changes: run.changes.snapshot(), router: { ...run.router.stats },
+    // Restarts: what a continuation starts again from, the link to the run a continuation continues, and the restart mark.
+    ...(run.startPayload ? { startPayload: run.startPayload } : {}),
+    ...(run.resumedFrom ? { resumedFrom: run.resumedFrom } : {}), ...(run.resumeChain !== undefined ? { resumeChain: run.resumeChain } : {}),
+    ...(run.restart ? { restart: run.restart } : {}),
   })
 }
 // A run's file changes with their diff text: the live run first, then the saved one.
@@ -58,7 +61,7 @@ function emit(runtime: OrbitRuntimeLike, run: RunRecord, type: string, data: Run
 }
 function trace(runtime: OrbitRuntimeLike, run: RunRecord, agentId: string, kind: string, text: string, id?: string): void {
   if (TERMINAL.has(run.status)) return
-  const previous = id && run.traces.find(trace => trace.id === id)
+  const previous: Trace | undefined = id ? run.traces.find(trace => trace.id === id) : undefined
   const trace: Trace = { id: id || randomUUID(), agentId, agentName: agentId === ROUTER.id ? ROUTER.name : run.agentNodes.get(agentId)?.name || 'Orbit', kind, text: bounded(text, ['output', 'reasoning', 'assistant_update'].includes(kind) ? 32 * 1024 * 1024 : 6000), time: previous?.time || new Date().toISOString() }
   if (previous) Object.assign(previous, trace)
   else run.traces.push(trace)

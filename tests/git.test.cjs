@@ -69,6 +69,22 @@ test('a failing command reports the exit code and what Git said, without throwin
   assert.equal(plain.stdout, '')
 })
 
+test('the repository search stops at the ceiling (the home folder by default)', { skip }, async t => {
+  // A fake home that is itself a repository, with a plain folder under it. Git ignores a ceiling in 8.3 short form,
+  // so the ceiling is the long path, as os.homedir() gives it.
+  const home = fs.realpathSync.native(folder(t, 'orbit-home-'))
+  git(home, 'init', '-q')
+  const plain = path.join(home, 'project')
+  fs.mkdirSync(plain)
+  const uncapped = await runGit(plain, ['rev-parse', '--show-toplevel'], { ceiling: null })
+  assert.ok(uncapped.ok && same(uncapped.value, home), 'without a ceiling Git finds the home repository')
+  const capped = await runGit(plain, ['rev-parse', '--show-toplevel'], { ceiling: home })
+  assert.equal(capped.ok, false)
+  assert.match(capped.stderr, /not a git repository/i)
+  const itself = await runGit(home, ['rev-parse', '--show-toplevel'], { ceiling: home })
+  assert.ok(itself.ok && same(itself.value, home), 'the ceiling folder itself is still a repository')
+})
+
 test('a workspace that does not exist is an ordinary failure', { skip }, async t => {
   const result = await runGit(path.join(folder(t), 'gone'), ['status', '--porcelain'])
   assert.equal(result.ok, false)

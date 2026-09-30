@@ -117,3 +117,15 @@
 .chat-notices li time{color:var(--faint);flex-shrink:0;font-variant-numeric:tabular-nums}
 .chat-notices .error{color:#e0a9a9}.chat-notices .done{color:#b1d6bc}.chat-notices .handover{color:#bbdcca}.chat-notices .cancelled,.chat-notices .interrupted{color:#cfb98c}
 @media(max-width:700px){.chat-notices{margin-left:38px}}
+/* Orbit restarts: a run that ended by restarting Orbit, its link to the continuation, and the runtime process line. */
+.status-dot.restarting{background:#9fc3d6}
+.run-notice.restarting{background:#232a30;border-color:#35434d;color:#b5cad8}
+.chat-notices .restarting{color:#a9c6d8}
+.run-resume-links{display:flex;flex-wrap:wrap;gap:6px 14px;padding:0 18px 14px;margin-top:-8px;font-size:10px;color:#8fa5b3}
+.run-resume-links button{font-size:10px;color:#a9c6d8;text-decoration:underline;text-underline-offset:3px}
+.runtime-label{font-size:10px;color:#9aa6a0;display:flex;align-items:flex-start;gap:7px;margin:8px 12px 0;line-height:1.5;overflow-wrap:anywhere}
+.runtime-label>.status-dot{margin-top:4.5px}.runtime-label>span:last-child{min-width:0}
+.runtime-label.error{color:#e0a9a9}
+.runtime-label.fading{animation:runtime-fade 6s ease-in forwards}
+@keyframes runtime-fade{0%,70%{opacity:1}100%{opacity:0}}
+.runtime-result.ok{color:#b1d6bc}.runtime-result.failed{color:#e0a9a9}

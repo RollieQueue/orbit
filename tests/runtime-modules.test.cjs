@@ -6,6 +6,7 @@ const assert = require('node:assert/strict')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
+const { stripTypeScriptTypes } = require('node:module')
 const { OrbitRuntime } = require('../electron/runtime.mts')
 const registry = require('../electron/tool-registry.mts')
 const { TOOL_GUIDE } = require('../electron/runtime/prompts.mts')
@@ -21,13 +22,16 @@ test('the envelope tool guide the runtime keeps inline matches the registry', ()
 })
 
 test('every facade method is one delegation to a module function of the same name', () => {
-  const source = fs.readFileSync(path.join(ROOT, 'runtime.mts'), 'utf8')
+  // The types are stripped the way Node strips them when it loads the facade (blanked in place, so the layout stays);
+  // what is compared is the code that runs: `getRun(id: string)` becomes `getRun(id        )`.
+  const source = stripTypeScriptTypes(fs.readFileSync(path.join(ROOT, 'runtime.mts'), 'utf8'), { mode: 'strip' })
   const aliases = Object.fromEntries([...source.matchAll(/^import \* as (\w+) from '\.\/runtime\/(\w+)\.mts'/gm)].map(match => [match[1], match[2]]))
-  const delegations = [...source.matchAll(/^  (\w+)\(([^)]*)\) \{ return (\w+)\.(\w+)\(this(?:, ([^)]*))?\) \}$/gm)]
+  const delegations = [...source.matchAll(/^  (\w+) *\(([^)]*)\) *\{ return (\w+)\.(\w+)\(this(?:, ([^)]*))?\) \}\r?$/gm)]
+  const names = params => params.split(',').map(param => param.trim()).filter(Boolean).join(', ')
   assert.ok(delegations.length >= 90, `${delegations.length} delegations found`)
   for (const [, method, params, alias, target, forwarded] of delegations) {
     assert.equal(target, method, `${method} delegates to ${alias}.${target}`)
-    assert.equal(forwarded || '', params, `${method} forwards its parameters unchanged`)
+    assert.equal(forwarded || '', names(params), `${method} forwards its parameters unchanged`)
     assert.ok(aliases[alias], `${alias} is a runtime module`)
     const mod = require(path.join(RUNTIME_DIR, `${aliases[alias]}.mts`))
     assert.equal(typeof mod[method], 'function', `${aliases[alias]}.mts exports ${method}`)

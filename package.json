@@ -1,6 +1,6 @@
 {
   "name": "orbit-ide",
-  "version": "0.4.0",
+  "version": "0.4.3",
   "type": "module",
   "private": true,
   "author": "Orbit",
@@ -8,7 +8,7 @@
   "main": "electron/main.cjs",
   "scripts": {
     "dev": "concurrently -k \"vite --host 127.0.0.1\" \"wait-on http://127.0.0.1:5173 && cross-env ORBIT_DEV=1 node scripts/run-electron.cjs electron/main.cjs\"",
-    "build": "tsc --noEmit && vite build",
+    "build": "tsc --noEmit && vite build && node scripts/self-upgrade.cjs --mark-build",
     "start": "node scripts/run-electron.cjs",
     "typecheck": "tsc --noEmit && npm run typecheck:main",
     "typecheck:main": "tsc -p tsconfig.main.json",

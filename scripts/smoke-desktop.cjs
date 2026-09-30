@@ -1,53 +1,44 @@
-// Actual Electron + renderer + preload + IPC + HTTP adapter integration.
+// Actual Electron + renderer + preload + IPC + runtime child process + HTTP adapter integration.
 // All profiles and workspaces are temporary; no vendor model is called.
 const { app, BrowserWindow, dialog } = require('electron')
-const Module = require('node:module')
 const assert = require('node:assert/strict')
 const fs = require('node:fs')
 const http = require('node:http')
 const os = require('node:os')
 const path = require('node:path')
 const { StateStore } = require('../electron/run-store.mts')
-const quota = require('../electron/quota.mts')
-const providers = require('../electron/providers.mts')
 
-// Hermetic subscriptions: quota readings, provider health and two vendor CLIs are served by fixtures, so nothing here
-// touches a real account. The quota readers are patched in place; providers.mts is an ES module whose namespace cannot be
-// patched, so its two fixtures replace what main.cjs and ipc-handlers.cjs get from require('./providers.mts') (main.cjs
-// passes that runProvider into the runtime). Both are installed before main.cjs loads.
-let codexUsed = 97, quotaReads = 0, codexRuns = 0, claudeRuns = 0
-const soon = hours => Date.now() + hours * 3600000
-quota.readers.codex = async () => { quotaReads++; return { windows: [{ kind: 'session', scope: 'all', models: [], usedPercent: codexUsed, resetsAt: soon(2) }, { kind: 'week', scope: 'all', models: [], usedPercent: 46, resetsAt: soon(100) }], plan: 'plus' } }
-quota.readers.claude = async () => ({ windows: [{ kind: 'session', scope: 'all', models: [], usedPercent: 12, resetsAt: soon(3) }, { kind: 'week', scope: 'all', models: [], usedPercent: 30, resetsAt: soon(90) }], plan: 'max' })
-quota.readers.antigravity = async () => ({ windows: [], state: 'unavailable', detail: 'fixture: CLI not installed' })
-quota.readers.cursor = async () => ({ windows: [], state: 'unknown', plan: 'Free', detail: 'fixture: no numbers' })
-const fixtures = {}
-fixtures.inspectProviders = async () => [
-  { id: 'codex', supported: true, installed: true, available: true, authenticated: true, models: ['gpt-6-sol', 'gpt-6-luna'], reasoningLevels: {}, detail: 'fixture' },
-  { id: 'claude', supported: true, installed: true, available: true, authenticated: true, models: ['sonnet', 'opus', 'haiku'], detail: 'fixture' },
-  { id: 'custom', supported: true, available: true, authenticated: null, detail: 'fixture endpoint', model: 'fixture-model' },
-]
-const realRunProvider = providers.runProvider
-fixtures.runProvider = async options => {
-  if (options.providerId === 'codex') {
-    codexRuns++
-    if (options.prompt.includes('ORBIT_QUOTA_REFUSED')) throw new Error("You've hit your usage limit. Try again in 3 hours 22 minutes.")
-    return { text: 'Ответ Codex.', model: 'gpt-6-sol' }
-  }
-  if (options.providerId === 'claude') { claudeRuns++; return { text: 'Ответ Claude после замены подписки.', model: 'claude-opus-fixture' } }
-  return realRunProvider(options)
-}
-const providersFile = require.resolve('../electron/providers.mts')
-const originalLoad = Module._load
-Module._load = function (request, parent, ...rest) {
-  const loaded = originalLoad.call(this, request, parent, ...rest)
-  return parent && request.endsWith('providers.mts') && Module._resolveFilename(request, parent) === providersFile ? { ...loaded, ...fixtures } : loaded
-}
+// The runtime runs as main runs it from the repository: its own process (ORBIT_RUNTIME_MODE=inprocess runs this smoke
+// with the runtime inside main instead; the runtime restart below is then skipped).
+const runtimeMode = process.env.ORBIT_RUNTIME_MODE === 'inprocess' ? 'inprocess' : 'child'
+process.env.ORBIT_RUNTIME_MODE = runtimeMode
 
 const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'orbit-desktop-test-'))
 const profile = path.join(temporary, 'profile')
 const workspaces = [path.join(temporary, 'alpha'), path.join(temporary, 'beta')]
 workspaces.forEach(folder => fs.mkdirSync(folder))
+
+// Hermetic subscriptions: quota readings, provider health and two vendor CLIs are served by scripts/smoke-fixtures.cjs,
+// which the runtime loads through ORBIT_RUNTIME_FIXTURES before it exists, so nothing here touches a real account. The
+// runtime is another process, so the smoke steers the fixtures (control.json) and reads what they did (counters.json)
+// through files in the temporary folder.
+process.env.ORBIT_RUNTIME_FIXTURES = path.join(__dirname, 'smoke-fixtures.cjs')
+process.env.ORBIT_SMOKE_FIXTURE_DIR = temporary
+// The runtime refuses to start without all three fixtures (runtime-host.mts), so a broken fixtures path fails loudly.
+process.env.ORBIT_SMOKE = '1'
+const setFixtures = (control) => fs.writeFileSync(path.join(temporary, 'control.json'), JSON.stringify(control))
+function fixtureCounters() {
+  const empty = { quotaReads: 0, codexRuns: 0, claudeRuns: 0 }
+  // The runtime rewrites the file after every count; a read that meets a half-written file simply reads again.
+  for (let attempt = 0; attempt < 5; attempt++) {
+    try { return { ...empty, ...JSON.parse(fs.readFileSync(path.join(temporary, 'counters.json'), 'utf8')) } } catch (error) {
+      if (error.code === 'ENOENT') return empty
+    }
+  }
+  throw new Error('counters.json of the smoke fixtures stays unreadable')
+}
+setFixtures({ codexUsed: 97 })
+
 process.env.ORBIT_USER_DATA = profile
 process.env.ORBIT_DEV = '0'
 // The self-upgrade health report belongs to the real app; the smoke must not overwrite it or trip its crash hook.
@@ -68,6 +59,7 @@ new StateStore(profile).save(initial)
 let alphaCalls = 0, betaCalls = 0, childCalls = 0
 const parallelResponses = []
 const approvalDialogs = []
+// Main shows the approval dialogs the runtime process asks for.
 dialog.showMessageBox = async (_window, options) => { approvalDialogs.push(options); return { response: 1 } }
 const errors = []
 const server = http.createServer(async (request, response) => {
@@ -127,6 +119,7 @@ async function waitFor(check, label, timeout = 15000) {
   throw new Error(`Timed out: ${label}`)
 }
 
+const timings = {}
 async function exercise(win) {
   win.webContents.setBackgroundThrottling(false)
   const evaluate = code => win.webContents.executeJavaScript(code, true)
@@ -137,6 +130,9 @@ async function exercise(win) {
   win.webContents.on('render-process-gone', (_event, detail) => errors.push(`Renderer exited: ${detail.reason}`))
   await waitFor(() => evaluate(`!!document.querySelector('textarea[aria-label="Сообщение агенту"]:not(:disabled)')`), 'renderer ready')
   assert.equal(await evaluate(`typeof window.orbit.startTask`), 'function')
+  const started = await evaluate(`window.orbit.getRuntimeStatus()`)
+  assert.deepEqual([started.state, started.mode], ['ready', runtimeMode], JSON.stringify(started))
+  if (runtimeMode === 'child') assert.notEqual(started.pid, process.pid, 'the runtime runs in its own process')
   await evaluate(`(() => { const field = document.querySelector('select[aria-label="Модель"]'); field.value = '__custom__'; field.dispatchEvent(new Event('change', {bubbles:true})); })()`)
   await waitFor(() => evaluate(`!!document.querySelector('input[aria-label="Модель: свой идентификатор"]')`), 'custom model field')
   await evaluate(`(() => { const field = document.querySelector('input[aria-label="Модель: свой идентификатор"]'); Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(field, 'fixture-selected'); field.dispatchEvent(new Event('input', {bubbles:true})); })()`)
@@ -347,11 +343,11 @@ async function exercise(win) {
   await waitFor(() => evaluate(`window.orbit.listRuns().then(runs => runs.some(run => run.prompt.startsWith('ORBIT_QUOTA_SWITCH') && run.status === 'completed'))`), 'proactive replacement run completes')
   const proactive = (await evaluate(`window.orbit.listRuns()`)).find(run => run.prompt.startsWith('ORBIT_QUOTA_SWITCH'))
   assert.deepEqual([proactive.agents[0].providerId, proactive.agents[0].handovers.length, proactive.agents[0].handovers[0].reason, proactive.agents[0].handovers[0].fresh], ['claude', 1, 'approaching', true])
-  assert.deepEqual([codexRuns, claudeRuns], [0, 1], 'the nearly empty subscription was not called')
+  assert.deepEqual([fixtureCounters().codexRuns, fixtureCounters().claudeRuns], [0, 1], 'the nearly empty subscription was not called')
   await waitFor(() => evaluate(`document.querySelector('.conversation').textContent.includes('Замена агента «Orbit»') && document.querySelector('.conversation').textContent.includes('Ответ Claude после замены подписки.')`), 'replacement announced in the chat')
 
   // After a refusal: Codex looks healthy (20%) but refuses the request; the agent moves on and Codex is marked.
-  codexUsed = 20
+  setFixtures({ codexUsed: 20 })
   await evaluate(`window.orbit.getQuotas({}, true).then(() => true)`)
   await waitFor(() => evaluate(`document.querySelector('.composer-caption .quota-chip')?.textContent.includes('Codex: 5 ч 80% ост.')`), 'chip follows the fresh reading')
   await evaluate(`document.querySelector('.new-chat').click()`)
@@ -359,7 +355,7 @@ async function exercise(win) {
   await waitFor(() => evaluate(`window.orbit.listRuns().then(runs => runs.some(run => run.prompt.startsWith('ORBIT_QUOTA_REFUSED') && run.status === 'completed'))`), 'reactive replacement run completes')
   const reactive = (await evaluate(`window.orbit.listRuns()`)).find(run => run.prompt.startsWith('ORBIT_QUOTA_REFUSED'))
   assert.deepEqual([reactive.agents[0].providerId, reactive.agents[0].handovers[0].reason, reactive.agents[0].turns, reactive.usage.providerTurns], ['claude', 'exhausted', 1, 1], 'the refused attempt is not a turn')
-  assert.deepEqual([codexRuns, claudeRuns], [1, 2])
+  assert.deepEqual([fixtureCounters().codexRuns, fixtureCounters().claudeRuns], [1, 2])
   await waitFor(() => evaluate(`document.querySelector('.conversation').textContent.includes('квота исчерпана') && document.querySelector('.conversation').textContent.includes('Ответ Claude после замены подписки.')`), 'refusal replacement announced in the chat')
   await waitFor(() => evaluate(`document.querySelector('.composer-caption .quota-chip.exhausted') !== null`), 'chip shows the refused provider as exhausted')
   await evaluate(`(() => { if (!document.querySelector('.agents-panel')) document.querySelector('.agents-toggle').click() })()`)
@@ -381,11 +377,42 @@ async function exercise(win) {
   await openSidebar('Квоты')
   await waitFor(() => evaluate(`document.querySelector('.quota-failover input[type=range]')?.value === '75'`), 'failover threshold survives reload')
   assert.ok(await evaluate(`Array.from(document.querySelectorAll('.quota-failover input[type=checkbox]')).at(-1).checked`), 'weaker-model permission survives reload')
-  assert.ok(quotaReads > 0)
+  assert.ok(fixtureCounters().quotaReads > 0)
+
+  // ---- The runtime process restarts with the window open (Settings → Runtime): a call made meanwhile waits for the new
+  // runtime, and everything the old one saved is there ----
+  if (runtimeMode === 'child') {
+    await evaluate(`document.querySelector('button[aria-label="Закрыть"]').click()`)
+    const runsBefore = (await evaluate(`window.orbit.listRuns()`)).length
+    const memoryBefore = (await evaluate(`window.orbit.listMemory(${JSON.stringify(workspaces[0])})`)).length
+    const before = await evaluate(`window.orbit.getRuntimeStatus()`)
+    await evaluate(`(() => { window.__runtimeStates = []; window.orbit.onRuntimeStatus(status => window.__runtimeStates.push(status.state)) })()`)
+    await openSidebar('Настройки')
+    const restartButton = `Array.from(document.querySelectorAll('button')).find(button => button.textContent.includes('Перезапустить runtime'))`
+    await waitFor(() => evaluate(`!!${restartButton} && !${restartButton}.disabled`), 'runtime section shown')
+    await evaluate(`(() => { ${restartButton}.click(); window.__listedDuring = window.orbit.listRuns().then(runs => runs.length) })()`)
+    await waitFor(() => evaluate(`!!document.querySelector('.runtime-result')`), 'runtime restart result shown')
+    const result = await evaluate(`({ ok: document.querySelector('.runtime-result').classList.contains('ok'), text: document.querySelector('.runtime-result').textContent })`)
+    assert.ok(result.ok, result.text)
+    const after = await evaluate(`window.orbit.getRuntimeStatus()`)
+    assert.deepEqual([after.state, after.mode, after.restarts], ['ready', 'child', 1])
+    assert.notEqual(after.pid, before.pid, 'a new runtime process')
+    assert.ok(result.text.includes(`${after.lastRestartMs} мс`) && result.text.includes(`pid ${after.pid}`), result.text)
+    assert.equal(await evaluate(`window.__listedDuring`), runsBefore, 'the call made during the restart was answered by the new runtime')
+    assert.ok(await evaluate(`window.__runtimeStates.includes('restarting') && window.__runtimeStates.at(-1) === 'ready'`), await evaluate(`JSON.stringify(window.__runtimeStates)`))
+    assert.equal((await evaluate(`window.orbit.listRuns()`)).length, runsBefore, 'the run history survives the runtime restart')
+    assert.equal((await evaluate(`window.orbit.listMemory(${JSON.stringify(workspaces[0])})`)).length, memoryBefore, 'so does the memory')
+    assert.ok(await evaluate(`!!document.querySelector('textarea[aria-label="Сообщение агенту"]')`), 'the window was never closed')
+    timings.runtimeRestartMs = after.lastRestartMs
+    await evaluate(`document.querySelector('.runtime-result').scrollIntoView({ block: 'center' })`)
+    await shot('runtime-restart.png')
+  }
   assert.deepEqual(errors, [])
-  console.log(JSON.stringify({ ok: true, projects: 2, runs: 7, agents: 8, communications: 4, agentGraph: true, alphaCalls, betaCalls, childCalls, reload: true, parallelChats: true, fixedInspectorTabs: true, scopeIsolation: true, skillVersions: 3, quotaPanel: true, failover: { proactive: true, refused: true, codexRuns, claudeRuns }, screenshotPath }))
+  const { codexRuns, claudeRuns } = fixtureCounters()
+  console.log(JSON.stringify({ ok: true, runtimeMode, projects: 2, runs: 7, agents: 8, communications: 4, agentGraph: true, alphaCalls, betaCalls, childCalls, reload: true, parallelChats: true, fixedInspectorTabs: true, scopeIsolation: true, skillVersions: 3, quotaPanel: true, failover: { proactive: true, refused: true, codexRuns, claudeRuns }, runtimeRestartMs: timings.runtimeRestartMs ?? null, screenshotPath }))
 }
 
+let orbit = null
 const timeout = setTimeout(() => { console.error('Desktop verification exceeded 60 seconds'); app.exit(1) }, 60000)
 let started = false
 app.on('browser-window-created', (_event, win) => {
@@ -394,6 +421,10 @@ app.on('browser-window-created', (_event, win) => {
   win.webContents.once('did-finish-load', async () => {
     let code = 0
     try { await exercise(win) } catch (error) { console.error(error.stack); code = 1 }
+    // The runtime shuts down as on quit (its runs stop, its stores are saved) before the process exits.
+    const stopping = Date.now()
+    try { await orbit?.shutdownRuntime('quit') } catch (error) { console.error(`runtime shutdown failed: ${error.stack}`); code = 1 }
+    console.log(JSON.stringify({ runtimeShutdownMs: Date.now() - stopping }))
     clearTimeout(timeout)
     server.closeAllConnections()
     server.close()
@@ -409,5 +440,5 @@ app.on('quit', () => {
 })
 server.listen(0, '127.0.0.1', () => {
   process.env.ORBIT_OPENAI_BASE_URL = `http://127.0.0.1:${server.address().port}/v1`
-  require('../electron/main.cjs')
+  orbit = require('../electron/main.cjs')
 })

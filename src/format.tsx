@@ -3,7 +3,7 @@ import type { RunStatus } from './types'
 
 const statusNames: Record<RunStatus, string> = {
   idle: 'Готов', waiting: 'В очереди', working: 'Работает', done: 'Завершён', completed: 'Завершён',
-  error: 'Ошибка', failed: 'Ошибка', cancelled: 'Остановлен', interrupted: 'Прерван',
+  error: 'Ошибка', failed: 'Ошибка', cancelled: 'Остановлен', interrupted: 'Прерван', restarting: 'Перезапуск Orbit',
 }
 export const statusText = (status?: RunStatus) => statusNames[status || 'idle']
 // «1 файл», «2 файла», «5 файлов»: the noun forms are for 1, 2–4 and 5+.

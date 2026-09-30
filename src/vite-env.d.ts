@@ -4,6 +4,7 @@ type StartTaskPayload = { projectId: string; chatId: string; prompt: string; his
 type ApplyArtifactPayload = { workspace: string; patchPath: string; worktreePath?: string }
 type ApplyArtifactResult = { ok: boolean; reason?: string; detail?: string }
 type QuotaUpdate = { providerId: string; snapshot: import('./types').QuotaSnapshot | null }
+type RuntimeRestartResult = { ok: boolean; ms: number; pid: number | null; error?: string }
 // The preload bridge (electron/preload.cjs) to Orbit's main process; absent when the renderer runs in a plain browser.
 interface OrbitBridge {
   pickWorkspace: () => Promise<GitContext | null>
@@ -36,8 +37,12 @@ interface OrbitBridge {
   openExternal: (target: string) => Promise<void>
   ping: () => Promise<{ pid: number; startedAt: number; healthy: boolean }>
   relaunch: () => Promise<{ ok: boolean; pid: number }>
+  restartRuntime: () => Promise<RuntimeRestartResult>
+  getRuntimeStatus: () => Promise<import('./types').RuntimeStatus>
   onQuotaUpdate: (handler: (update: QuotaUpdate) => void) => () => void
   onRuntimeEvent: (handler: (event: RuntimeEvent) => void) => () => void
+  onRestartNotice: (handler: (notice: import('./types').RestartNotice) => void) => () => void
+  onRuntimeStatus: (handler: (status: import('./types').RuntimeStatus) => void) => () => void
 }
 interface Window { orbit?: OrbitBridge }
 // END generated from electron/ipc-contract.cjs
@@ -97,4 +102,8 @@ interface RuntimeEvent {
   improvementStatus?: string
   usage?: { providerTurns: number; workerTurns?: number }
   router?: { routed: number; notices: number; refused: number }
+  // run.started of a continuation after a restart; the terminal event of a run that ended 'restarting' carries `restart`.
+  resumedFrom?: string
+  resumeChain?: number
+  restart?: import('./types').RunRestart
 }

@@ -7,7 +7,7 @@ import { clip, ellipsis } from './text.mts'
 // The files an agent touched, as the runtime publishes them on the agent.
 interface AgentFileList { wrote?: string[]; read?: string[] }
 // An agent as a saved snapshot or the live run holds it; only these fields are read here.
-interface AgentLike { id: string; name?: string; status?: string; task?: string; result?: string; error?: string; providerId?: string; model?: string; files?: AgentFileList | null }
+interface AgentLike { id: string; name?: string; status?: string; task?: string; result?: string; error?: string | null; providerId?: string; model?: string; files?: AgentFileList | null }
 interface MessageLike { agentId?: string; text?: string }
 interface CommunicationLike { kind?: string; fromAgentName?: string; toAgentName?: string; text?: string }
 // A run held in memory (`agentNodes`, a Map) or a saved snapshot (`agents`, an array).

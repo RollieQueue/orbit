@@ -1,4 +1,3 @@
-// @ts-nocheck
 // Runs one agent to its result. The envelope loop drives a fresh provider process per turn with the JSON tool
 // protocol, the loop guard and the poll budget; the session loop keeps one provider session alive and applies the
 // post-answer checks; executeAgent chooses between them and handles budgets, draft answers, errors and cancellation.
@@ -8,6 +7,7 @@ import { TERMINAL, AGENT_TERMINAL, ceiling, WORK_TOOLS, MUTATING_TOOLS, SKILL_RE
 import { ToolProtocolError, hasToolCalls, parseResponse } from './envelope.mts'
 import { sessionGuide, evaluationReminder, IMPROVEMENT_REMINDER, skillReminder } from './prompts.mts'
 import { describeCall } from './ledger.mts'
+import type { AgentRecord, AgentResult, MailboxContext, McpServerLike, OrbitRuntimeLike, PromptBase, ProviderResult, RunRecord, SessionInfo, TranscriptEntry } from '../types.mts'
 // Consecutive turns made only of identical repeats: warn, then stop the agent honestly.
 const STALL_WARN_TURNS = 2
 const STALL_STOP_TURNS = 4
@@ -26,31 +26,31 @@ export const SWITCH_TRANSPORT = Symbol('switch-transport')
 
 // Fields that change by themselves; they must not hide an otherwise identical repeated result.
 const VOLATILE_KEYS = new Set(['turns', 'progress', 'detail', 'promptChars', 'startedAt', 'finishedAt', 'updatedAt', 'time'])
-function canonical(value) {
+function canonical(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(canonical).join(',')}]`
-  if (value && typeof value === 'object') return `{${Object.keys(value).sort().map(key => `${JSON.stringify(key)}:${canonical(value[key])}`).join(',')}}`
+  if (value && typeof value === 'object') return `{${Object.keys(value).sort().map(key => `${JSON.stringify(key)}:${canonical((value as Record<string, unknown>)[key])}`).join(',')}}`
   return JSON.stringify(value) ?? 'null'
 }
 // Timings and clock times differ on every run of the same command (a test run prints its duration),
 // which would make an endless "run the tests again" loop look like new information each time.
-const NOISE = [
+const NOISE: [RegExp, string][] = [
   [/\b\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:[.,]\d+)?(?:Z|[+-]\d{2}:?\d{2})?/g, '<time>'],
   [/\b\d{1,2}:\d{2}:\d{2}(?:[.,]\d+)?\b/g, '<time>'],
   [/\bduration_ms\W+[\d.]+/gi, 'duration_ms <n>'],
   [/\b\d+(?:[.,]\d+)?\s?(?:ms|milliseconds?|s|secs?|seconds?)\b/gi, '<n>ms'],
 ]
-function steady(value) {
+function steady(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(steady)
   if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value).filter(([key]) => !VOLATILE_KEYS.has(key)).map(([key, item]) => [key, steady(item)]))
   return typeof value === 'string' ? NOISE.reduce((text, [pattern, mark]) => text.replace(pattern, mark), value) : value
 }
-const digestOf = (value) => createHash('sha1').update(canonical(steady(value))).digest('hex')
+const digestOf = (value: unknown): string => createHash('sha1').update(canonical(steady(value))).digest('hex')
 
 // Runs one agent to its result. The transport decides the loop: the envelope loop drives a fresh provider process per
 // turn with the JSON tool protocol; the session loop keeps one provider session alive and serves Orbit tools over MCP.
 // A handover to a provider of the other transport switches loops; everything else (budgets, draft answers, errors,
 // cancellation) is handled here for both.
-async function executeAgent(runtime, run, agent) {
+async function executeAgent(runtime: OrbitRuntimeLike, run: RunRecord, agent: AgentRecord): Promise<AgentResult> {
   const signal = runtime.agentSignal(run, agent)
   try {
     for (;;) {
@@ -61,12 +61,13 @@ async function executeAgent(runtime, run, agent) {
     }
   } catch (error) {
     if (error instanceof TurnBudgetError && !signal.aborted) return runtime.budgetHandoff(run, agent)
+    // Whatever was thrown, only its `message` is read (undefined for a non-Error).
     if (agent.draftAnswer && !signal.aborted && !TERMINAL.has(run.status)) {
       // Only an optional extra turn (a reminder, or a session resume after the answer) failed; the answer was complete.
-      runtime.trace(run, agent.id, 'budget', `The turn after the answer failed (${error.message}); the drafted answer is delivered`)
+      runtime.trace(run, agent.id, 'budget', `The turn after the answer failed (${(error as Error).message}); the drafted answer is delivered`)
       return runtime.completeAgent(run, agent, agent.draftAnswer)
     }
-    runtime.updateAgent(run, agent, { status: signal.aborted ? 'cancelled' : 'error', error: error.message, detail: error.message, finishedAt: new Date().toISOString() })
+    runtime.updateAgent(run, agent, { status: signal.aborted ? 'cancelled' : 'error', error: (error as Error).message, detail: (error as Error).message, finishedAt: new Date().toISOString() })
     // A failed parent must never leave its descendants executing unowned work.
     run.agentControllers.get(agent.id)?.controller.abort()
     throw error
@@ -76,13 +77,13 @@ async function executeAgent(runtime, run, agent) {
     runtime.releaseSession(run, agent)
   }
 }
-async function envelopeLoop(runtime, run, agent, signal) {
+async function envelopeLoop(runtime: OrbitRuntimeLike, run: RunRecord, agent: AgentRecord, signal: AbortSignal): Promise<AgentResult | typeof SWITCH_TRANSPORT> {
   const transcript = agent.transcript
   let protocolErrors = 0
   // Loop guard: what this agent already saw, and for how long it has gone without new information.
-  const guard = { seen: new Map(), staleTurns: 0, passiveTurns: 0, pollTurns: 0, evaluationReminders: 0, improvementReminders: 0 }
+  const guard = { seen: new Map<string, { digest: string; turn: number }>(), staleTurns: 0, passiveTurns: 0, pollTurns: 0, evaluationReminders: 0, improvementReminders: 0 }
   {
-    let base
+    let base: PromptBase
     while (agent.id === 'root' || agent.turns < ceiling(run.limits, 'maxTurns')) {
       await new Promise(resolve => setImmediate(resolve))
       if (signal.aborted) throw abortError()
@@ -91,7 +92,8 @@ async function envelopeLoop(runtime, run, agent, signal) {
       await runtime.preflightQuota(run, agent)
       if (agent.transport !== 'envelope') return SWITCH_TRANSPORT
       // Keep correspondence separate from rolling tool observations so trimming cannot lose it.
-      let mailbox, lastWorkerTurn, result
+      // `mailbox` and `lastWorkerTurn` are set by the prompt callback, which providerTurn calls before a result exists.
+      let mailbox!: MailboxContext, lastWorkerTurn!: boolean, result: ProviderResult
       for (;;) {
         // The prompt names the agent's provider settings, so it is built again after every switch.
         base = await runtime.context(run, agent)
@@ -190,13 +192,13 @@ async function envelopeLoop(runtime, run, agent, signal) {
         if (signal.aborted) throw abortError()
         runtime.trace(run, agent.id, 'tool', `${call.name} ${bounded(call.arguments, 1200)}`)
         const startedAt = runtime.clock()
-        let observation, failure = null
+        let observation: unknown, failure: string | null = null
         try {
           if (call.arguments.__invalidArguments) throw new Error('Tool arguments must be a JSON object')
           observation = await runtime.trackOperation(run, runtime.executeTool(run, agent, call.name, call.arguments), agent)
         } catch (error) {
           if (signal.aborted) throw error
-          failure = error.message
+          failure = (error as Error).message
           observation = { ok: false, error: failure }
         }
         // The same call with the same (steady) result is a repeat: no new information was gained.
@@ -206,15 +208,16 @@ async function envelopeLoop(runtime, run, agent, signal) {
         const earlier = guard.seen.get(signature)
         const repeat = earlier?.digest === digest && !(['wait_agent', 'wait_message'].includes(call.name) && runtime.clock() - startedAt >= 1000)
         guard.seen.set(signature, { digest, turn: agent.turns })
-        if (guard.seen.size > 400) guard.seen.delete(guard.seen.keys().next().value)
+        if (guard.seen.size > 400) guard.seen.delete(guard.seen.keys().next().value!)
         if (repeat) repeats.push(`${call.name} (first made in turn ${earlier.turn})`)
         else novel = true
-        if (!failure && observation?.ok !== false && MUTATING_TOOLS.has(call.name)) {
+        // An observation is JSON of the tool's own shape; only its optional `ok` flag is read here.
+        if (!failure && (observation as { ok?: unknown } | null | undefined)?.ok !== false && MUTATING_TOOLS.has(call.name)) {
           changed = true
           // Talking is not work: the router closes a discussion in which neither side has done anything else.
           if (WORK_TOOLS.has(call.name)) agent.workDone++
         }
-        runtime.recordLedger(agent, call.name, `#${agent.turns} ${describeCall(call, observation, failure, id => run.agentNodes.get(id)?.name || id)}${repeat ? ` (identical repeat of #${earlier.turn})` : ''}`)
+        runtime.recordLedger(agent, call.name, `#${agent.turns} ${describeCall(call, observation as Record<string, unknown>, failure, id => run.agentNodes.get(id)?.name || id)}${repeat ? ` (identical repeat of #${earlier.turn})` : ''}`)
         runtime.remember(agent, { type: 'tool_result', tool_call_id: call.id, name: call.name, result: bounded(observation, call.name === 'capability_read' ? Math.max(run.limits.maxOutputChars, SKILL_READ_CHARS) : run.limits.maxOutputChars), ...(repeat ? { note: `Identical repeat of the call from turn ${earlier.turn}: nothing changed since then. Do not repeat it.` } : {}) })
         runtime.trace(run, agent.id, 'observation', `${call.name}: ${bounded(observation, 4000)}`)
         runtime.trimTranscript(run, agent)
@@ -243,23 +246,25 @@ async function envelopeLoop(runtime, run, agent, signal) {
 // One provider session per agent: the first turn carries the whole prompt, later turns resume the same session with
 // only what is new. Orbit tools are served to the provider over MCP (dispatchMcp) while the turn runs; the answer a
 // turn returns is a candidate that the post-answer checks may send back for one more turn each.
-async function sessionLoop(runtime, run, agent, signal) {
+async function sessionLoop(runtime: OrbitRuntimeLike, run: RunRecord, agent: AgentRecord, signal: AbortSignal): Promise<AgentResult | typeof SWITCH_TRANSPORT> {
   const transcript = agent.transcript
-  const guard = { improvementReminders: 0, evaluationsAsked: new Set() }
-  let instruction = null
+  const guard = { improvementReminders: 0, evaluationsAsked: new Set<string>() }
+  let instruction: string | null = null
   while (agent.id === 'root' || agent.turns < ceiling(run.limits, 'maxTurns')) {
     await new Promise(resolve => setImmediate(resolve))
     if (signal.aborted) throw abortError()
     runtime.collectChildren(run, agent, transcript)
     await runtime.preflightQuota(run, agent)
     if (agent.transport !== 'session') return SWITCH_TRANSPORT
-    let mailbox, lastWorkerTurn, result, session
+    // `mailbox` and `lastWorkerTurn` are set by the prompt callback, which providerTurn calls before a result exists.
+    let mailbox!: MailboxContext, lastWorkerTurn!: boolean, result: ProviderResult, session: SessionInfo
     for (;;) {
       // A known session is resumed; otherwise (first turn, or the replacement after a handover) a fresh one starts.
       const resume = !!agent.sessionId
       // `activity` lets the provider's inactivity guard see that a silent CLI is waiting on an Orbit tool call, not stuck.
+      // (`runtime.mcp` is false once the server failed to start; `false?.activity` is undefined like `null?.activity`.)
       const token = agent.sessionToken
-      session = { id: agent.sessionId || randomUUID(), token, mcpUrl: runtime.mcpUrl(), systemAppend: bounded(sessionGuide(run, agent), SYSTEM_APPEND_LIMIT), resume, activity: () => { try { return runtime.mcp?.activity?.(token) || null } catch { return null } } }
+      session = { id: agent.sessionId || randomUUID(), token, mcpUrl: runtime.mcpUrl(), systemAppend: bounded(sessionGuide(run, agent), SYSTEM_APPEND_LIMIT), resume, activity: () => { try { return (runtime.mcp as McpServerLike | null)?.activity?.(token) || null } catch { return null } } }
       const base = resume ? null : await runtime.context(run, agent)
       try {
         result = await runtime.providerTurn(run, agent, () => {
@@ -273,12 +278,26 @@ async function sessionLoop(runtime, run, agent, signal) {
             const text0 = instruction || runtime.wakeInstruction(pending, mailbox.text)
             runtime.remember(agent, { type: 'instruction', content: text0, via: 'session' })
             text = runtime.resumePrompt(run, agent, text0, pending, mailbox.text, lastWorkerTurn)
-          } else text = runtime.promptForTurn(base, transcript, run, runtime.teamContext(run, agent) + mailbox.text, agent)
+          } else text = runtime.promptForTurn(base! /* not `resume`: built above */, transcript, run, runtime.teamContext(run, agent) + mailbox.text, agent)
           agent.sessionCursor = transcript.length
           return text
         }, session)
         break
       } catch (error) {
+        // A continuation after a restart tries the session from before it; one that cannot be resumed (a CLI killed
+        // mid-turn can leave it unreadable) is dropped once, and a fresh session starts from the restart note.
+        if (resume && run.resumeSession && run.resumeSession === agent.sessionId && !signal.aborted) {
+          run.resumeSession = undefined; agent.sessionId = null
+          runtime.trace(run, agent.id, 'transport', `The session from before the restart could not be resumed (${(error as Error)?.message || error}); starting a fresh one with the restart note`)
+          continue
+        }
+        // A session id the provider refuses to resume (providers.normalizeSession: malformed, it could pass for a CLI
+        // flag) is dropped once: a fresh session starts from the full prompt instead of every later turn failing alike.
+        if (resume && (error as { code?: unknown } | null)?.code === 'ORBIT_SESSION_ID' && !signal.aborted) {
+          runtime.trace(run, agent.id, 'transport', `The session id could not be resumed (${(error as Error).message}); starting a fresh session`)
+          agent.sessionId = null
+          continue
+        }
         // A refusal for quota (or a failed replacement) moves the agent to another subscription: the note is in the
         // transcript and the newcomer starts a fresh session (or the envelope loop) from it.
         if (!await runtime.recoverProvider(run, agent, error)) throw error
@@ -288,8 +307,10 @@ async function sessionLoop(runtime, run, agent, signal) {
     }
     agent.trial = null
     if (signal.aborted) throw abortError()
-    // The provider may name the session itself (a Codex thread id); the record of this turn names the real one.
-    agent.sessionId = (typeof result?.sessionId === 'string' && result.sessionId) || session.id
+    // The provider may name the session itself (a Codex thread id); the record of this turn names the real one. One that
+    // names its sessions (Cursor, Antigravity, Codex) says null when its stream carried no id: the next turn starts fresh
+    // instead of "resuming" the id Orbit proposed, which that CLI never saw.
+    agent.sessionId = typeof result?.sessionId === 'string' && result.sessionId ? result.sessionId : result?.sessionId === null ? null : session.id
     runtime.markCommunications(run, mailbox.deliveredIds, 'read', 'next-turn')
     const timing = agent.turnTimings.at(-1)
     if (timing) timing.sessionId = agent.sessionId
@@ -337,7 +358,7 @@ async function sessionLoop(runtime, run, agent, signal) {
   return runtime.budgetHandoff(run, agent)
 }
 // What a resumed session is told when the harness itself has no instruction: a woken agent gets its follow-up task or mail.
-function wakeInstruction(runtime, pending, mailbox) {
+function wakeInstruction(runtime: OrbitRuntimeLike, pending: TranscriptEntry[], mailbox: string): string {
   if (pending.some(entry => entry.type === 'followup_task')) return 'A follow-up task was assigned to you (below). Your earlier task and answer stand as context; complete the new task and report the result.'
   if (mailbox) return 'New messages arrived for you (below). Handle them; if nothing is required from you, say so briefly.'
   return 'You were resumed. Continue your work and give your answer.'

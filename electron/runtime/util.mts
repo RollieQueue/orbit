@@ -4,7 +4,7 @@ import path from 'node:path'
 import { clip } from '../text.mts'
 import type { AgentRecord, InternalAgentField, OrbitRuntimeLike, PublicAgent, RunLimits, RunRecord } from '../types.mts'
 
-const TERMINAL = new Set(['completed', 'failed', 'cancelled'])
+const TERMINAL = new Set(['completed', 'failed', 'cancelled', 'restarting'])
 const AGENT_TERMINAL = new Set(['done', 'error', 'cancelled'])
 const ceiling = (limits: RunLimits, key: keyof RunLimits): number => limits[key] ?? Infinity
 const MESSAGE_TOOLS = new Set(['send_message', 'broadcast_message', 'ask_team'])

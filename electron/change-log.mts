@@ -4,6 +4,7 @@ import { randomUUID } from 'node:crypto'
 import { runGit } from './git.mts'
 import { normalizeRel } from './file-activity.mts'
 import type { NativeToolEvent } from './file-activity.mts'
+import type { ChangeKind, ChangeSource, FileChange } from './types.mts'
 import { unifiedDiff, fragmentDiff, lineOf } from './diff.mts'
 
 // Every file change of one run with its unified diff. Orbit's own file tools report exact before/after text;
@@ -32,17 +33,7 @@ const REASONS = {
   TOO_MANY: 'too-many',             // beyond MAX_RECOVERED
 } as const
 type ChangeReason = (typeof REASONS)[keyof typeof REASONS]
-type ChangeKind = 'create' | 'modify' | 'delete' | 'unknown'
-// Where a diff came from: Orbit's own file tools ('exact'), a vendor tool's events ('event') or Git ('git').
-type ChangeSource = 'exact' | 'event' | 'git'
-
-// One file change of a run, as the run snapshot persists it and the Changes tab shows it.
-interface FileChange {
-  id: string; agentId: string; path: string; kind: ChangeKind; tool: string; time: string; added: number; removed: number
-  source: ChangeSource; hasDiff: boolean; diff?: string; truncated?: boolean; binary?: boolean
-  // Why there is no diff text (a REASONS value); for a recovered change, the short commit the diff is relative to.
-  reason?: string; base?: string
-}
+// ChangeKind, ChangeSource and FileChange (one change as the snapshot persists it) live in types.mts.
 // What `ChangeLog.add` takes: the change with either its before/after text, a ready diff, or a reason for having none.
 interface ChangeInput {
   agentId: string; path: unknown; kind?: ChangeKind; tool?: unknown; source: ChangeSource

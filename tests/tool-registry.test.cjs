@@ -119,6 +119,8 @@ test('the envelope response schema is unchanged by the registry refactor', () =>
     capability_read: { id: string },
     capability_feedback: { id: string, outcome: { type: 'string', enum: ['worked', 'partial', 'failed'] }, note: optional(string) },
     capability_install: { name: string, instructions: string, description: string, whenToUse: optional(string), id: optional(string), scope: optional({ type: 'string', enum: ['project', 'global'] }), source: optional(string) },
+    // Added after the refactor (TECH-DEBT item 1): tools outside the historical order follow it.
+    restart_orbit: { reason: string, continueWith: string, verify: optional(boolean) },
   }
   const expected = object({ content: string, tool_calls: { type: 'array', items: { anyOf: Object.entries(toolArguments).map(([name, properties]) => object({ id: string, name: { type: 'string', enum: [name] }, arguments: object(properties) })) } } })
   assert.deepEqual(ORBIT_RESPONSE_SCHEMA, expected)
@@ -157,9 +159,9 @@ test('validate refuses what the runtime used to refuse inline and normalises nul
 
 test('policy flags match the runtime: root-only, waiting, mutating and write-access tools', () => {
   const named = flag => PUBLIC_TOOLS.filter(tool => tool[flag]).map(tool => tool.name).sort()
-  assert.deepEqual(named('rootOnly'), ['improvement_plan', 'model_evaluate'])
+  assert.deepEqual(named('rootOnly'), ['improvement_plan', 'model_evaluate', 'restart_orbit'])
   assert.deepEqual(named('waits'), ['wait_agent', 'wait_message'], 'followup_agent restarts a worker and returns at once')
-  assert.deepEqual(PUBLIC_TOOLS.filter(tool => tool.minAccess === 'workspace-write').map(tool => tool.name).sort(), ['edit_file', 'run_command', 'write_file'])
+  assert.deepEqual(PUBLIC_TOOLS.filter(tool => tool.minAccess === 'workspace-write').map(tool => tool.name).sort(), ['edit_file', 'restart_orbit', 'run_command', 'write_file'])
   assert.ok(PUBLIC_TOOLS.every(tool => ['read-only', 'workspace-write', 'danger-full-access'].includes(tool.minAccess)))
   const mutating = runtimeSource.match(/const MUTATING_TOOLS = new Set\(\[([^\]]+)\]\)/)
   if (mutating) {

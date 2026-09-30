@@ -35,6 +35,7 @@ const TYPES = {
   ApplyArtifactPayload: '{ workspace: string; patchPath: string; worktreePath?: string }',
   ApplyArtifactResult: '{ ok: boolean; reason?: string; detail?: string }',
   QuotaUpdate: `{ providerId: string; snapshot: ${T('QuotaSnapshot')} | null }`,
+  RuntimeRestartResult: '{ ok: boolean; ms: number; pid: number | null; error?: string }',
 }
 
 const workspace = { name: 'workspace', type: 'string' }
@@ -77,6 +78,10 @@ const CALLS = [
   // Liveness probe used by the self-upgrade health check, and the in-place restart it or the user can ask for.
   { method: 'ping', channel: 'app:ping', args: [], returns: '{ pid: number; startedAt: number; healthy: boolean }' },
   { method: 'relaunch', channel: 'app:relaunch', args: [], returns: '{ ok: boolean; pid: number }' },
+  // The runtime (agents, stores, providers) lives in a child process: main restarts it without closing the window and
+  // reports its state. Both are answered by main itself (electron/runtime-client.cjs), never forwarded to the runtime.
+  { method: 'restartRuntime', channel: 'runtime:restart', args: [], returns: 'RuntimeRestartResult' },
+  { method: 'getRuntimeStatus', channel: 'runtime:status', args: [], returns: T('RuntimeStatus') },
 ]
 
 // main → renderer messages (webContents.send(channel, payload)); the handler receives the payload.
@@ -84,6 +89,10 @@ const CALLS = [
 const EVENTS = [
   { method: 'onQuotaUpdate', channel: 'quota:update', args: [{ name: 'handler', type: '(update: QuotaUpdate) => void' }], returns: '() => void', push: true },
   { method: 'onRuntimeEvent', channel: 'runtime:event', args: [{ name: 'handler', type: '(event: RuntimeEvent) => void' }], returns: '() => void', push: true },
+  // After a restart_orbit restart: the continuation run started, or why it did not (rolled back, loop limit, expired, failed).
+  { method: 'onRestartNotice', channel: 'restart:notice', args: [{ name: 'handler', type: `(notice: ${T('RestartNotice')}) => void` }], returns: '() => void', push: true },
+  // Every change of the runtime child's state (starting, ready, restarting, crashed, stopped), as main's client sees it.
+  { method: 'onRuntimeStatus', channel: 'runtime:status-changed', args: [{ name: 'handler', type: `(status: ${T('RuntimeStatus')}) => void` }], returns: '() => void', push: true },
 ]
 
 /** @type {IpcEntry[]} */

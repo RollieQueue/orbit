@@ -203,6 +203,25 @@ test('a failing change listener does not fail the write', async t => {
   assert.equal(fs.readFileSync(path.join(workspace, 'a.txt'), 'utf8'), 'y')
 })
 
+test('edit_file matches LF old_text in a CRLF file and keeps the file CRLF; a mixed file is edited verbatim', async t => {
+  const workspace = folder(t)
+  const { executeWorkspaceTool } = require('../electron/runtime-tools.mts')
+  const context = { workspace, accessMode: 'workspace-write', maxOutputChars: 1000 }
+  const file = (name) => fs.readFileSync(path.join(workspace, name), 'utf8')
+  fs.writeFileSync(path.join(workspace, 'crlf.ts'), 'const a = 1\r\nconst b = 2\r\n')
+  await executeWorkspaceTool('edit_file', { path: 'crlf.ts', old_text: 'const a = 1\nconst b = 2\n', new_text: 'const a = 1\nconst b = 3\n// added\n' }, context)
+  assert.equal(file('crlf.ts'), 'const a = 1\r\nconst b = 3\r\n// added\r\n', 'found through CRLF, written with CRLF')
+  await executeWorkspaceTool('edit_file', { path: 'crlf.ts', old_text: '// added', new_text: '// added\n// appended' }, context)
+  assert.equal(file('crlf.ts'), 'const a = 1\r\nconst b = 3\r\n// added\r\n// appended\r\n', 'a one-line match still inserts CRLF lines')
+  fs.writeFileSync(path.join(workspace, 'mixed.ts'), 'x\r\ny\nz\n')
+  await assert.rejects(executeWorkspaceTool('edit_file', { path: 'mixed.ts', old_text: 'x\ny', new_text: 'X' }, context), /old_text was not found/)
+  await executeWorkspaceTool('edit_file', { path: 'mixed.ts', old_text: 'y\nz', new_text: 'Y\nZ' }, context)
+  assert.equal(file('mixed.ts'), 'x\r\nY\nZ\n', 'a mixed file is edited verbatim')
+  fs.writeFileSync(path.join(workspace, 'lf.ts'), 'p\nq\n')
+  await executeWorkspaceTool('edit_file', { path: 'lf.ts', old_text: 'p\nq', new_text: 'P\nQ' }, context)
+  assert.equal(file('lf.ts'), 'P\nQ\n', 'an LF file stays LF')
+})
+
 // ---- a vendor's native tools ----------------------------------------------------------------------------
 
 const native = (tool, toolId, status, extra = {}) => ({ kind: 'tool', native: true, tool, toolId, status, text: tool, ...extra })

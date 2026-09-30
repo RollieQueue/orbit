@@ -1,4 +1,3 @@
-// @ts-nocheck — typing of this module was interrupted mid-way (see docs/TYPESCRIPT-MAIN.md, "Remaining work"); annotations already present are kept.
 // A run from start to end: payload validation and limits, the run record and its root agent, earlier turns of the
 // chat, finishing, failing and stopping, and the knowledge housekeeping that follows a finished run.
 import { randomUUID } from 'node:crypto'
@@ -10,20 +9,24 @@ import { TeamRouter } from '../router.mts'
 import * as chatMemory from '../chat-memory.mts'
 import { workspaceKey } from '../storage.mts'
 import { normalizeFailover } from '../failover.mts'
-import type { AgentResult, ChatRunView, HistoryEntry, HistoryInput, LimitsInput, OrbitRuntimeLike, RunLimits, RunRecord, RunSnapshot, StartPayload } from '../types.mts'
+import type { AgentResult, ApprovalPolicy, ChatRunView, HistoryEntry, HistoryInput, LimitsInput, OrbitRuntimeLike, RestartMark, RunLimits, RunRecord, StartPayload, StoredRun } from '../types.mts'
 import { TERMINAL, bounded, oneOf, withoutGoogleReasoning, overlappingWorkspaces, diagnostics } from './util.mts'
 import { ToolProtocolError, parseResponse } from './envelope.mts'
 import { TOOL_GUIDE } from './prompts.mts'
+import { restartNote, prepareContinuation } from './restart.mts'
 
 const DEFAULT_LIMITS: Readonly<RunLimits> = Object.freeze({ maxAgents: null, maxDepth: null, maxConcurrent: null, maxTurns: null, maxTotalTurns: null, maxMessages: null, maxToolCalls: null, maxOutputChars: 12000, maxContextChars: 120000, timeoutMs: null, runTimeoutMs: null })
 // Shared (cross-project) housekeeping looks at every project, so it runs at most this often.
 const SHARE_EVERY_MS = 6 * 3600000
+// What the agents of a run that ends for a restart show.
+const RESTART_DETAIL = 'Orbit перезапускается по запросу агента'
 function normalizeLimits(input: LimitsInput = {}): RunLimits {
   const limits: RunLimits = { ...DEFAULT_LIMITS }
   for (const key of Object.keys(limits) as (keyof RunLimits)[]) {
     const raw = input[key] === undefined ? (key === 'maxConcurrent' ? input.maxConcurrency : key === 'timeoutMs' ? process.env.ORBIT_PROVIDER_TIMEOUT_MS : undefined) : input[key]
     if (raw === undefined) continue
-    if (raw === null || raw === '') { if (!['maxOutputChars', 'maxContextChars'].includes(key)) limits[key] = null; continue }
+    // The two character limits are excluded right here, so only the nullable limits are ever set to null.
+    if (raw === null || raw === '') { if (!['maxOutputChars', 'maxContextChars'].includes(key)) (limits as Record<keyof RunLimits, number | null>)[key] = null; continue }
     const value = Number(raw)
     if (!Number.isSafeInteger(value) || value < (key === 'maxDepth' ? 0 : 1)) throw new Error(`Invalid limit: ${key}`)
     if (key.endsWith('Ms') && value > 2147483647) throw new Error(`${key} exceeds the platform timer range`)
@@ -45,6 +48,13 @@ function conversationHistory(entries: HistoryInput[]): HistoryEntry[] {
   }).slice(-24)
 }
 
+// What a continuation after a restart starts again from (resume.mts resumePending): the settings the run was started
+// with, as plain data, without the message and the chat history (the continuation brings its own message, and the chat
+// reaches it through the digest of earlier turns).
+function restartPayload(payload: StartPayload): StartPayload | undefined {
+  const { prompt, history, resumedFrom, resumeChain, restartNote, resumeSession, ...settings } = payload
+  try { return JSON.parse(JSON.stringify(settings)) as StartPayload } catch { return undefined }
+}
 async function start(runtime: OrbitRuntimeLike, payload: StartPayload = {}): Promise<string> {
   const prompt = String(payload.prompt || '').trim()
   if (!prompt) throw new Error('A message is required')
@@ -65,6 +75,10 @@ async function start(runtime: OrbitRuntimeLike, payload: StartPayload = {}): Pro
   const workspace = fs.realpathSync(payload.workspace)
   const existingRuns = [...runtime.runs.values()]
   if (payload.chatId && existingRuns.some(run => run.projectId === (payload.projectId || workspace) && run.chatId === payload.chatId && (!TERMINAL.has(run.status) || run.operations.size > 0))) throw new Error('В этом чате ещё выполняется задача или завершаются её процессы. Дождитесь остановки; другой диалог можно вести в новом чате.')
+  // restart_orbit is applying Orbit's new code (checks, build, restart): a run started meanwhile in another chat would be
+  // cut off by the restart, so it waits until Orbit is back (the requesting chat is busy with that run anyway).
+  const restarting = runtime.restartHost?.inFlight()
+  if (restarting && !(restarting.projectId === (payload.projectId || workspace) && restarting.chatId === payload.chatId)) throw new Error('Orbit сейчас применяет изменения своего кода и перезапустится; отправьте сообщение после перезапуска.')
   if (accessMode !== 'read-only' && existingRuns.some(run => TERMINAL.has(run.status) && run.operations.size > 0 && run.accessMode !== 'read-only' && overlappingWorkspaces(run.workspace, workspace))) throw new Error('Завершается остановка процессов в этом проекте. Повторите запуск после завершения очистки (process cleanup).')
   const run: RunRecord = {
     runId: randomUUID(), projectId: payload.projectId || workspace, chatId: payload.chatId || randomUUID(),
@@ -75,7 +89,8 @@ async function start(runtime: OrbitRuntimeLike, payload: StartPayload = {}): Pro
     failover: normalizeFailover(payload.quotaFailover), models: payload.models && typeof payload.models === 'object' ? payload.models : {}, catalogCache: null, brokenProviders: new Map(),
     history: Array.isArray(payload.history) ? conversationHistory(payload.history) : [],
     agentInstructions: bounded(payload.agentInstructions || '', 10000), accessMode, reasoningEffort: withoutGoogleReasoning(payload.providerId, payload.reasoningEffort ?? payload.providerOptions?.[payload.providerId]?.reasoningEffort ?? ''),
-    approvalPolicy: payload.approvalPolicy || 'never', status: 'working', startedAt: new Date().toISOString(),
+    // Checked against the known policies above.
+    approvalPolicy: (payload.approvalPolicy || 'never') as ApprovalPolicy, status: 'working', startedAt: new Date().toISOString(),
     limits: normalizeLimits(payload.limits), contextExplicit: Number(payload.limits?.maxContextChars) > 0,
     usage: { providerTurns: 0, workerTurns: 0, inputTokens: null, outputTokens: null },
     agentNodes: new Map(), agentControllers: new Map(), agentOperations: new Map(), tasks: new Map(), traces: [], messages: [], communications: [], messageWaiters: new Map(), controller: new AbortController(),
@@ -85,6 +100,9 @@ async function start(runtime: OrbitRuntimeLike, payload: StartPayload = {}): Pro
     // The router needs the record it serves, so it is made right below.
     router: null!,
   }
+  run.startPayload = restartPayload(payload)
+  if (typeof payload.resumedFrom === 'string' && /^[\w-]+$/.test(payload.resumedFrom)) run.resumedFrom = payload.resumedFrom
+  if (Number.isSafeInteger(payload.resumeChain) && Number(payload.resumeChain) >= 0) run.resumeChain = payload.resumeChain
   run.router = new TeamRouter(run, {
     record: (sender, target, text, extra) => runtime.recordCommunication(run, sender, target, text, extra),
     announce: (communication, persist) => runtime.emit(run, 'communication.added', { communication }, persist),
@@ -99,7 +117,8 @@ async function start(runtime: OrbitRuntimeLike, payload: StartPayload = {}): Pro
   setMaxListeners(0, run.controller.signal)
   runtime.runs.set(run.runId, run)
   const root = runtime.createAgent(run, null, { id: 'root', name: 'Orbit', task: run.prompt, reason: 'User message', providerId: run.providerId, model: run.model })
-  runtime.emit(run, 'run.started', { prompt: run.prompt, workspace: run.workspace, providerId: run.providerId, model: run.model, accessMode, access: accessMode, approvalPolicy: run.approvalPolicy, memoryEnabled: run.memoryEnabled, limits: run.limits, status: run.status })
+  if (typeof payload.restartNote === 'string' && payload.restartNote) prepareContinuation(runtime, run, root, bounded(payload.restartNote, 6000), payload.resumeSession)
+  runtime.emit(run, 'run.started', { prompt: run.prompt, workspace: run.workspace, providerId: run.providerId, model: run.model, accessMode, access: accessMode, approvalPolicy: run.approvalPolicy, memoryEnabled: run.memoryEnabled, limits: run.limits, status: run.status, ...(run.resumedFrom ? { resumedFrom: run.resumedFrom, resumeChain: run.resumeChain } : {}) })
   if (run.limits.runTimeoutMs) {
     run.timer = setTimeout(() => runtime.failRun(run, new Error('Run time budget exhausted')), run.limits.runTimeoutMs)
     run.timer.unref?.()
@@ -115,8 +134,8 @@ async function start(runtime: OrbitRuntimeLike, payload: StartPayload = {}): Pro
 }
 // Earlier turns of this chat, oldest first: the running ones in memory and the saved ones on disk.
 function previousRuns(runtime: OrbitRuntimeLike, run: RunRecord): ChatRunView[] {
-  const found = new Map<string, RunRecord | RunSnapshot>()
-  const sameChat = (item: RunRecord | RunSnapshot) => item.projectId === run.projectId && item.chatId === run.chatId && item.runId !== run.runId && String(item.startedAt) <= String(run.startedAt)
+  const found = new Map<string, RunRecord | StoredRun>()
+  const sameChat = (item: RunRecord | StoredRun) => item.projectId === run.projectId && item.chatId === run.chatId && item.runId !== run.runId && String(item.startedAt) <= String(run.startedAt)
   try {
     const stored = runtime.runStore?.forChat ? runtime.runStore.forChat(run.projectId, run.chatId, 12) : (runtime.runStore?.list?.() || [])
     for (const item of stored) if (sameChat(item)) found.set(item.runId, item)
@@ -171,5 +190,21 @@ function stop(runtime: OrbitRuntimeLike, runId: string): boolean {
   runtime.closeSessions(run)
   return true
 }
+// Orbit shuts down to restart with new code an agent asked for (restart_orbit, or the self-upgrade script from an
+// agent's shell): the run ends with the terminal status `restarting`, not cancelled or interrupted. Its agents stop as
+// they do for stop(), the record is saved at once (a terminal `run.finished`), and after the restart a new run in the
+// same chat continues it (resume.mts resumePending).
+function markRestarting(runtime: OrbitRuntimeLike, runId: string, mark: RestartMark = { reason: '', requestedAt: new Date().toISOString(), source: 'tool' }): boolean {
+  const run = runtime.runs.get(runId)
+  if (!run || TERMINAL.has(run.status)) return false
+  // The note is written first: the root's work log and a turn the restart cuts off are known only until the abort below.
+  const root = run.agentNodes.get('root')
+  const note = root ? restartNote(runtime, run, root) : undefined
+  clearTimeout(run.timer); run.status = 'restarting'; run.finishedAt = new Date().toISOString(); run.restart = { ...mark, ...(note ? { note } : {}) }
+  run.controller.abort(); runtime.cancelAgents(run, RESTART_DETAIL)
+  runtime.emit(run, 'run.finished', { status: run.status, restart: run.restart })
+  runtime.closeSessions(run)
+  return true
+}
 
-export { DEFAULT_LIMITS, normalizeLimits, start, previousRuns, finishRun, setSharing, maintainKnowledge, failRun, cancelAgents, stop }
+export { DEFAULT_LIMITS, normalizeLimits, start, previousRuns, finishRun, setSharing, maintainKnowledge, failRun, cancelAgents, stop, markRestarting }
