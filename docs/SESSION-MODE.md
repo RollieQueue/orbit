@@ -171,11 +171,14 @@ time: Cursor 50 s, Codex and Antigravity 59 min, 0 (no limit) for the others;
 ### Timeouts
 
 `runCli` gets `inactivityMs` (default 15 min, env `ORBIT_PROVIDER_INACTIVITY_MS`):
+the process is killed only when it emits nothing for that long. The old 30-minute
+total deadline applies only when `run.limits.timeoutMs` is set explicitly. The runtime's
+turn watchdog (`electron/runtime/watchdog.mts`, `ORBIT_STALL_MS`, default 10 min) stops a
+turn that reports no event while no tool, Orbit call or approval is pending, repeats it in
+a fresh session and, if it falls silent again, hands the agent over (docs/providers.md).
 
 Session processes also get `NO_PROXY`/`no_proxy` with `127.0.0.1,localhost,::1` appended (`providers.loopbackNoProxy`):
 with `HTTP_PROXY` set, Claude Code otherwise reports the loopback MCP server as `failed` (found in the first live check).
-the process is killed only when it emits nothing for that long. The old 30-minute
-total deadline applies only when `run.limits.timeoutMs` is set explicitly.
 
 ## MCP server (`electron/mcp-server.cjs`, new)
 
@@ -255,6 +258,25 @@ the existing `executeAgent`. The session loop:
    such a root starts fresh. A resume that fails
    (a CLI killed mid-turn can leave the session unreadable) drops the id once, with a
    `transport` trace, and a fresh session starts from the note (`runtime/loops.mts`).
+7. (2026-09-30) Steering (`runtime/steer.mts`): a message from the user or from an agent above
+   the recipient in the team rides whole on the end of its next Orbit tool result
+   (`mailbox.userMail`: `[orbit] MESSAGE FROM THE USER …`, then `[orbit] MESSAGE FROM YOUR
+   SUPERVISOR …` with the sender and the message id), marked read with `delivery: 'tool-result'`;
+   a prompt's mail block leads with the same two blocks. A turn that makes no Orbit call within
+   `ORBIT_STEER_GRACE_MS` (2 s) is checked every 250 ms and cut off (`activeTurn.interrupt('message')`)
+   at the first moment after the provider's first event when its turn watch
+   (`runtime/watchdog.mts`) sees no native tool running, no Orbit call announced in the stream
+   or in flight at the MCP server and no approval pending, and the model's step has only just
+   begun (`stepAge()` ≤ `ORBIT_STEER_STEP_MS`, 3 s, since the last tool call ended or the first
+   event). A step the model is thinking or writing is let finish, so the cut comes right after
+   its tool call, or the mail goes out with the next turn. `providerTurn` refunds the turn and
+   throws `PauseInterrupt` with the note `INTERRUPTED FOR A MESSAGE`; the session loop resumes the
+   same session with it (`pause.interruptedSession`). A first Claude turn that already streamed
+   resumes the session Orbit proposed with `--session-id`, as a restart continuation does (a pause
+   of such a turn too); Codex, Cursor and Antigravity name their sessions in the turn's result,
+   so their cut first turns start fresh with the note. A resumed turn cut after its provider
+   spoke (`PauseInterrupt.spoke`) keeps the session cursor: its prompt is in the session, so the
+   repeat carries only the new note, not again the entries and the notes of earlier cuts.
 
 Every CLI process a provider turn starts, on both transports (Claude, Codex exec and App
 Server, Cursor, Antigravity), gets `ProviderRunOptions.extraEnv` in its environment. The

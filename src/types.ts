@@ -1,7 +1,8 @@
 export type AccessMode = 'read-only' | 'workspace-write' | 'danger-full-access'
 export type ApprovalPolicy = 'never' | 'on-request' | 'auto-review'
 // restarting = ended because Orbit restarts (restart_orbit); the task goes on in a new run whose resumedFrom points back.
-export type AgentStatus = 'idle' | 'waiting' | 'working' | 'done' | 'error' | 'cancelled' | 'interrupted' | 'restarting'
+// paused = an agent held at the pause gate (by the user, or because an agent it works under is paused). Runs never carry it.
+export type AgentStatus = 'idle' | 'waiting' | 'working' | 'paused' | 'done' | 'error' | 'cancelled' | 'interrupted' | 'restarting'
 export type RunStatus = AgentStatus | 'completed' | 'failed'
 export type Agent = {
   id: string
@@ -31,6 +32,11 @@ export type Agent = {
   transport?: AgentTransport
   sessionId?: string | null
   turnTimings?: TurnTiming[]
+  // The user's own pause of this agent (an ancestor's pause holds it too, without this flag) and when it was set.
+  paused?: boolean
+  pausedAt?: string | null
+  // Cancelled by the user's Stop on this helper, not by the run ending.
+  stoppedByUser?: boolean
 }
 export type AgentFiles = { read: string[]; wrote: string[] }
 export type AgentTransport = 'session' | 'envelope'
@@ -66,7 +72,7 @@ export type HandoverTarget = { providerId: string; model: string; reasoningEffor
 export type Handover = {
   id: string
   time: string
-  reason: 'approaching' | 'exhausted' | 'replacement-failed'
+  reason: 'approaching' | 'exhausted' | 'replacement-failed' | 'stalled' | 'failed'
   from: HandoverTarget
   to: HandoverTarget
   fresh: boolean
@@ -74,6 +80,7 @@ export type Handover = {
   usedPercent: number | null
   resetsAt: number | null
   note?: string
+  turn?: number
 }
 export type FileTouch = { path: string; readers: string[]; writers: string[] }
 // One edit of one file by one agent. `diff` is a git-style unified diff. Run lists (listRuns) carry `hasDiff` instead of the
@@ -110,7 +117,13 @@ export type Message = {
   kind?: string
   client?: string
   model?: string
+  // Files the user attached to this message (saved by the runtime, electron/attachments.mts).
+  attachments?: Attachment[]
 }
+// A file the user attached to a chat message: saved under Orbit's data folder, the model gets its path.
+export type Attachment = { id: string; name: string; type: string; size: number; path: string }
+// A file as the window sends it to be saved: name, MIME type and content as base64.
+export type AttachmentUpload = { name: string; type: string; data: string }
 // chat = working notes of one task thread, project = knowledge about one codebase, global = what holds in every project.
 export type MemoryScope = 'chat' | 'project' | 'global'
 export type MemoryEntry = {
@@ -134,6 +147,17 @@ export type LibraryStats = {
   memory: { chat: TierStats; project: TierStats; global: TierStats; stored: number }
   skills: { project: TierStats; global: TierStats; used: number }
 }
+// Skills are add-ons Orbit builds for itself, of any form (electron/capabilities.mts): instructions for agents, and
+// optionally a package of files (pages, scripts, assets) with parameters the user sets, triggers Orbit runs on its own
+// (task-completed → show one of the package's pages full screen) and commands agents run in the package folder.
+export type SkillParamType = 'text' | 'url' | 'number' | 'seconds' | 'boolean'
+export type SkillParamValue = string | number | boolean
+export type SkillParam = { key: string; label: string; type: SkillParamType; default: SkillParamValue; value: SkillParamValue; hint?: string }
+export type SkillTrigger = { on: 'task-completed'; show: string }
+export type SkillCommand = { name: string; run: string; description?: string }
+export type SkillFile = { path: string; size: number }
+// `id` is the host of orbit-skill://<id>/<file> (electron/skill-files.mts), `dir` the package folder.
+export type SkillPackage = { id: string; dir: string }
 export type Capability = {
   id: string
   name: string
@@ -152,14 +176,34 @@ export type Capability = {
   lessons?: string[]
   usedIn?: string[]
   pinned?: boolean
+  enabled?: boolean
+  files?: SkillFile[]
+  params?: SkillParam[]
+  triggers?: SkillTrigger[]
+  commands?: SkillCommand[]
+  package?: SkillPackage
   lastUsed?: string
   editedBy?: string
   revisions?: { version: number; name: string; description: string; instructions: string; updatedAt: string }[]
 }
 export type Workspace = GitContext & { name: string; description?: string }
-export type ChatThread = { id: string; title: string; messages: Message[]; updated: string }
+// The endless improvement loop of one chat (renderer-driven, saved with the chat): while active and the improvement switch
+// is on, each ended run of the chat is followed by the next task as a new run with a fresh context (src/improvement-loop.ts).
+// iteration = the task number of the latest loop start; lastRunId = the run whose outcome was handled last; startingAt = when
+// the latest loop start was requested (ms); closedKeys = `id|title` of plan tasks already closed (`|blocked` added for a
+// blocked one). failures = runs in a row that failed or moved nothing; startFailures / busyStarts = starts in a row the
+// runtime refused (for another reason / because Orbit was busy), cleared once a started run is handled.
+export type LoopStopReason = 'user' | 'switch' | 'blocked' | 'manual' | 'moved'
+export type ImprovementLoop = {
+  active: boolean; goal: string; startedAt: string; iteration: number; failures: number; retryAt?: number
+  startFailures?: number; busyStarts?: number
+  lastRunId?: string; startingAt?: number; closedKeys: string[]; stopped?: { reason: LoopStopReason; at: string }
+}
+export type ChatThread = { id: string; title: string; messages: Message[]; updated: string; loop?: ImprovementLoop }
 export type Project = { id: string; workspace: Workspace; chats: ChatThread[]; activeChatId?: string; globalMemoryEnabled?: boolean; deletedChatIds?: string[] }
-export type TraceItem = { id: string; agentId?: string; agentName?: string; kind: string; text: string; time: string }
+// An image a tool result showed the agent (a screenshot it read): the run store's file name, its type and size in bytes.
+export type TraceImage = { id: string; mediaType: string; bytes: number }
+export type TraceItem = { id: string; agentId?: string; agentName?: string; kind: string; text: string; time: string; images?: TraceImage[] }
 export type Communication = {
   id: string
   fromAgentId: string
@@ -169,20 +213,25 @@ export type Communication = {
   text: string
   time: string
   status: 'queued' | 'delivered' | 'read'
-  delivery: 'next-turn' | 'mailbox'
+  delivery: 'next-turn' | 'mailbox' | 'tool-result'
   deliveredAt?: string
   readAt?: string
   kind?: 'spawn' | 'followup' | 'message' | 'notice'
   reason?: string
   replyTo?: string
   discussionId?: string
-  via?: 'router'
+  // 'user': a message the user sent an agent of a working run (fromAgentId 'user').
+  via?: 'router' | 'user'
   route?: { via: 'direct' | 'explicit' | 'match' | 'reply' | 'escalation'; reasons: string[] }
   about?: string
   aboutName?: string
   paths?: string[]
   conflict?: boolean
 }
+// What window.orbit.messageAgent answers once the message is in the agent's mailbox; a refusal rejects with the reason.
+export type AgentMessageResult = { ok: true; communicationId: string; agentId: string; status: Communication['status']; delivery: Communication['delivery'] }
+// What window.orbit.pauseAgent / resumeAgent / stopAgent answer; a refusal rejects with the reason.
+export type AgentControlResult = { ok: true; agentId: string; status: AgentStatus; paused: boolean }
 export type RunSnapshot = {
   runId: string
   projectId: string
@@ -207,6 +256,9 @@ export type RunSnapshot = {
   improvements?: ImprovementTask[]
   improvementStatus?: string
   improvementMode?: boolean
+  // An endless-improvement loop task: its number in the chat's loop, and what the plan hands to the next task's fresh context.
+  loopTask?: number
+  improvementHandoff?: string
   limits?: RunLimits
   usage?: { providerTurns: number; workerTurns?: number }
   streaming?: StreamingMessage

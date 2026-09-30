@@ -1,6 +1,6 @@
 /// <reference types="vite/client" />
 // BEGIN generated from electron/ipc-contract.cjs by scripts/gen-ipc-types.cjs; do not edit between the markers.
-type StartTaskPayload = { projectId: string; chatId: string; prompt: string; history: { role: 'user' | 'assistant'; content: string }[]; workspace: string; memoryEnabled: boolean; globalMemoryEnabled?: boolean; reasoningEffort?: string; providerId: string; model?: string; models?: Record<string, string>; quotaFailover?: import('./types').QuotaFailover; providerPool?: import('./types').PoolMember[]; providerOptions?: Record<string, import('./types').ProviderOption>; agentInstructions: string; accessMode: import('./types').AccessMode; approvalPolicy: import('./types').ApprovalPolicy; limits: import('./types').RunLimits }
+type StartTaskPayload = { projectId: string; chatId: string; prompt: string; history: { role: 'user' | 'assistant'; content: string }[]; workspace: string; memoryEnabled: boolean; globalMemoryEnabled?: boolean; reasoningEffort?: string; providerId: string; model?: string; models?: Record<string, string>; quotaFailover?: import('./types').QuotaFailover; providerPool?: import('./types').PoolMember[]; providerOptions?: Record<string, import('./types').ProviderOption>; agentInstructions: string; accessMode: import('./types').AccessMode; approvalPolicy: import('./types').ApprovalPolicy; limits: import('./types').RunLimits; improvementMode?: boolean; skillLearning?: boolean; loopTask?: number; attachments?: import('./types').Attachment[] }
 type ApplyArtifactPayload = { workspace: string; patchPath: string; worktreePath?: string }
 type ApplyArtifactResult = { ok: boolean; reason?: string; detail?: string }
 type QuotaUpdate = { providerId: string; snapshot: import('./types').QuotaSnapshot | null }
@@ -12,9 +12,16 @@ interface OrbitBridge {
   cloneWorkspace: (remote: string) => Promise<(GitContext & { error?: string }) | null>
   startTask: (payload: StartTaskPayload) => Promise<string>
   stopTask: (runId: string) => Promise<boolean>
+  pauseAgent: (runId: string, agentId: string) => Promise<import('./types').AgentControlResult>
+  resumeAgent: (runId: string, agentId: string) => Promise<import('./types').AgentControlResult>
+  stopAgent: (runId: string, agentId: string) => Promise<import('./types').AgentControlResult>
   listRuns: () => Promise<import('./types').RunSnapshot[]>
   getRun: (runId: string) => Promise<import('./types').RunSnapshot | null>
   getRunChanges: (runId: string) => Promise<import('./types').FileChange[]>
+  readTraceImage: (runId: string, imageId: string) => Promise<string | null>
+  messageAgent: (runId: string, agentId: string, text: string, attachments?: import('./types').Attachment[]) => Promise<import('./types').AgentMessageResult>
+  saveAttachments: (chatId: string, files: import('./types').AttachmentUpload[]) => Promise<import('./types').Attachment[]>
+  readAttachmentImage: (path: string) => Promise<string | null>
   loadState: () => Promise<import('./types').AppState | null>
   saveState: (state: import('./types').AppState) => Promise<unknown>
   projectIndexStatus: (workspace: string, rebuild?: boolean) => Promise<ProjectIndexStatus | null>
@@ -27,6 +34,8 @@ interface OrbitBridge {
   memoryStats: (workspace: string, chatId?: string) => Promise<import('./types').LibraryStats>
   listCapabilities: (workspace: string) => Promise<import('./types').Capability[]>
   pinCapability: (id: string, pinned: boolean, workspace: string) => Promise<import('./types').Capability>
+  setCapabilityEnabled: (id: string, enabled: boolean, workspace: string) => Promise<import('./types').Capability>
+  setCapabilityParams: (id: string, values: Record<string, import('./types').SkillParamValue>, workspace: string) => Promise<import('./types').Capability>
   readCapability: (id: string, workspace: string) => Promise<import('./types').Capability>
   installCapability: (entry: Partial<import('./types').Capability>) => Promise<import('./types').Capability>
   removeCapability: (id: string, workspace: string) => Promise<unknown>
@@ -35,8 +44,10 @@ interface OrbitBridge {
   getQuotas: (options?: Record<string, import('./types').ProviderOption>, force?: boolean) => Promise<Record<string, import('./types').QuotaSnapshot>>
   applyArtifact: (payload: ApplyArtifactPayload) => Promise<ApplyArtifactResult>
   openExternal: (target: string) => Promise<void>
+  openPath: (target: string) => Promise<string>
   ping: () => Promise<{ pid: number; startedAt: number; healthy: boolean }>
   relaunch: () => Promise<{ ok: boolean; pid: number }>
+  setFullScreen: (on: boolean) => Promise<boolean>
   restartRuntime: () => Promise<RuntimeRestartResult>
   getRuntimeStatus: () => Promise<import('./types').RuntimeStatus>
   onQuotaUpdate: (handler: (update: QuotaUpdate) => void) => () => void
@@ -100,6 +111,9 @@ interface RuntimeEvent {
   limits?: import('./types').RunLimits
   improvements?: import('./types').ImprovementTask[]
   improvementStatus?: string
+  // An endless-improvement loop task's number (run.started) and the handoff its plan leaves the next task (null: none).
+  loopTask?: number
+  improvementHandoff?: string | null
   usage?: { providerTurns: number; workerTurns?: number }
   router?: { routed: number; notices: number; refused: number }
   // run.started of a continuation after a restart; the terminal event of a run that ended 'restarting' carries `restart`.

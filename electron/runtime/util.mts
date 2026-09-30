@@ -14,7 +14,9 @@ const MUTATING_TOOLS = new Set(['write_file', 'edit_file', 'spawn_agent', 'follo
 // A skill an agent loads on purpose is read whole (an agent's skill is at most 12 000 characters, the user's 24 000).
 const SKILL_READ_CHARS = 28000
 const MCP_TOOL_PREFIX = 'mcp__orbit__'
-const INTERNAL_AGENT_FIELDS: readonly InternalAgentField[] = ['inbox', 'seenChildren', 'requestedModel', 'transcript', 'previousWork', 'ledger', 'ledgerDropped', 'workDone', 'failedCandidates', 'trial', 'partialTurn', 'quotaWarned', 'draftAnswer', 'activeTurn', 'stream', 'sessionToken', 'sessionCursor', 'transcriptChars']
+// The user as a sender of communications: the root's task, and messages written to an agent while a run works.
+const USER = Object.freeze({ id: 'user', name: 'Вы' })
+const INTERNAL_AGENT_FIELDS: readonly InternalAgentField[] = ['inbox', 'seenChildren', 'requestedModel', 'transcript', 'previousWork', 'ledger', 'ledgerDropped', 'workDone', 'failedCandidates', 'trial', 'partialTurn', 'quotaWarned', 'draftAnswer', 'activeTurn', 'stream', 'sessionToken', 'sessionCursor', 'transcriptChars', 'pausedSession']
 // Google models (Antigravity) have reasoning built in: Orbit never sends an effort for them,
 // whatever was persisted in settings, the provider pool or a spawn request.
 const withoutGoogleReasoning = (providerId: string, effort: string): string => providerId === 'antigravity' ? '' : effort
@@ -55,6 +57,14 @@ function abortable<T>(promise: T | PromiseLike<T>, signal: AbortSignal | null | 
     if (timeoutMs) timer = setTimeout(() => finish(reject, new Error(timeoutMessage)), timeoutMs)
   })
 }
+// A rejection of the provider call itself (runProvider), as opposed to Orbit's own work around a turn (building the
+// prompt, the turn time budget): only such an error moves an agent to another subscription (handover.recoverProvider).
+const FROM_PROVIDER = Symbol('orbit.fromProvider')
+function markProviderFailure(error: unknown): unknown {
+  if (error && typeof error === 'object') { try { Object.defineProperty(error, FROM_PROVIDER, { value: true }) } catch { /* A frozen error stays unmarked. */ } }
+  return error
+}
+const fromProvider = (error: unknown): boolean => !!error && typeof error === 'object' && (error as Record<symbol, unknown>)[FROM_PROVIDER] === true
 // An error Orbit deliberately survives (a best-effort index refresh, a usage counter, a quota reading) leaves a trace of
 // kind `diagnostic` on the run instead of vanishing in an empty catch. It never throws, and a run that has ended keeps
 // no new traces (trace() ignores it), so nothing here can break the path that called it.
@@ -62,4 +72,4 @@ function diagnostics(runtime: Pick<OrbitRuntimeLike, 'trace'>, run: RunRecord, w
   try { runtime.trace(run, agentId, 'diagnostic', `${where}: ${(error as Error | null | undefined)?.message || String(error)}`) } catch { /* Reporting a failure must not add one. */ }
 }
 
-export { TERMINAL, AGENT_TERMINAL, ceiling, WORK_TOOLS, MUTATING_TOOLS, SKILL_READ_CHARS, MCP_TOOL_PREFIX, withoutGoogleReasoning, answerLimit, publicAgent, isRecord, oneOf, bounded, clip, TurnBudgetError, abortError, overlappingWorkspaces, abortable, diagnostics }
+export { TERMINAL, AGENT_TERMINAL, ceiling, WORK_TOOLS, MUTATING_TOOLS, SKILL_READ_CHARS, MCP_TOOL_PREFIX, USER, withoutGoogleReasoning, answerLimit, publicAgent, isRecord, oneOf, bounded, clip, TurnBudgetError, abortError, overlappingWorkspaces, abortable, diagnostics, markProviderFailure, fromProvider }

@@ -311,6 +311,26 @@ test('Antigravity session parser: conversation id, call_mcp_tool as an Orbit cal
   assert.throws(() => failed.finish(), /User location is not supported/)
 })
 
+test('Antigravity session parser: a response that joins every message of the turn gives only the last message; any other response is kept whole', () => {
+  const turn = (response, messages) => {
+    const parser = createSessionParser('antigravity')
+    messages.forEach((text, index) => {
+      parser.line(JSON.stringify({ event: 'step_update', step_update: { step_index: 2 * index + 1, step_type: 'agent_response', state: 'DONE', text_delta: text } }))
+      parser.line(JSON.stringify({ event: 'step_update', step_update: { step_index: 2 * index + 2, step_type: 'tool', tool_name: 'view_file', state: 'DONE', tool_info: { parameters: { AbsolutePath: 'C:\\ws\\a.txt' } } } }))
+    })
+    parser.line(JSON.stringify({ event: 'result', result: { status: 'SUCCESS', response, conversation_id: 'conv-1' } }))
+    return parser.finish().text
+  }
+  const messages = ['Let me read the files first.\n', 'Now let me run the tests.\n', 'All 4 tests pass.\n\n{"answer": 42}\n']
+  // As the CLI reported the model audit's turns: every message in order, the trailing newline trimmed.
+  assert.equal(turn(messages.join('').trim(), messages), messages[2])
+  // Separators between the messages and an empty last message change nothing.
+  assert.equal(turn(messages.join('\n\n'), [...messages, '  ']), messages[2])
+  // A response that does not end with the last message is the CLI's own text and stays; so does one without messages.
+  assert.equal(turn('Summary written by the CLI', messages), 'Summary written by the CLI')
+  assert.equal(turn('Final text', []), 'Final text')
+})
+
 test('the session transport refuses anything but Full access; envelope runs pass extraEnv; closeSession of an unknown id is false', async () => {
   const helpers = { runCli: async () => { throw new Error('must not run') }, busyCheck: () => () => false, loopbackNoProxy: () => ({ NO_PROXY: '127.0.0.1', no_proxy: '127.0.0.1' }) }
   for (const [id, accessMode, approvalPolicy] of [['cursor', 'workspace-write', 'never'], ['antigravity', 'danger-full-access', 'on-request']]) {

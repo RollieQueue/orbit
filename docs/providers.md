@@ -57,6 +57,21 @@ because a CLI waiting on `wait_agent` is silent by design. The total deadline
 (`timeoutMs`) applies to a session run only when the caller passes one
 (`run.limits.timeoutMs`); envelope runs and direct `runProvider` calls without
 `timeoutMs` keep the 30-minute default, `ORBIT_PROVIDER_TIMEOUT_MS` overrides it.
+On top of both, the runtime watches every turn (`electron/runtime/watchdog.mts`):
+a turn whose provider reports no event (text, reasoning, a tool status,
+diagnostics) for `ORBIT_STALL_MS` (default 10 minutes, `0` disables) is aborted,
+unless a native tool it started is unfinished, an Orbit tool call is pending or
+an approval waits for the user. That stop and the inactivity timeout (its error
+carries `code: 'ORBIT_PROVIDER_IDLE'`) go to recovery: the turn is repeated once
+on the same model, in a fresh session, with a `WATCHDOG:` note; a second silent
+turn in a row hands the agent to another subscription (handover reason
+`stalled`), and without one the agent stops with the reason. A stopped turn is
+not counted against the turn budgets. A turn the provider itself failed (any
+error of `runProvider` other than a quota refusal or a cancellation) hands the
+agent over at once with reason `failed` when failover is on; an error that says
+the subscription cannot answer at all (`failover.unreachable`: region, sign-in,
+missing CLI) also keeps that provider away from every agent of the run for 10
+minutes. Orbit's own failures around a turn (its time budget) are not handed over.
 Cancellation kills the CLI process tree on Windows and its process group on
 POSIX; HTTP requests are aborted. stdout and stderr are consumed incrementally
 and bounded to 32 MB per invocation, with only a small raw diagnostic tail retained.
@@ -301,8 +316,11 @@ reports the provider as "unavailable" or "no data" instead of inventing numbers,
 a refusal) still works.
 
 Which model may replace which is decided by `electron/model-tiers.json`: ordered patterns on the lowercase model id that
-give a tier (3 flagship, 2 strong, 1 light). It follows naming conventions, not measured quality; edit it when a new
-model family appears. Doubtful models are placed low, which only makes a replacement rarer, never worse.
+give a tier (3 flagship, 2 strong, 1 light, 0.5 weak, 0 unknown or unreliable). The first patterns are measured: models
+the model audit (`docs/MODEL-AUDIT.md`) placed away from what their names suggest, each with the reason in `measured`
+(GPT-6 Luna is strong, not light; Claude Haiku 4.5 and the `haiku` alias are weak; GPT-OSS gave no answer and is taken
+only from the pool). The rest follow naming conventions; edit the file when a new model family appears or a new audit
+measures one. Doubtful models are placed low, which only makes a replacement rarer, never worse.
 
 ## Runtime contract
 

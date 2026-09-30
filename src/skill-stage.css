@@ -1,0 +1,31 @@
+/* The page stage (SkillStage.tsx) and the skill cards of the Skills panel (SkillsPanel.tsx). */
+
+/* Above everything in styles.css (its highest z-index is 70), including open modals. */
+.skill-stage{position:fixed;inset:0;z-index:1000;background:#000;overflow:hidden}
+.skill-stage-frame{position:absolute;inset:0;width:100%;height:100%;border:0;display:block;background:#000}
+.skill-stage-close{position:absolute;top:14px;right:18px;width:46px;height:46px;border-radius:50%;background:#000a;color:#fff;font-size:30px;line-height:1;border:2px solid #fff6}
+.skill-stage-close:hover,.skill-stage-close:focus-visible{background:#000d;border-color:#fff;outline:0}
+
+/* Skill cards: the on/off switch, kind badges, parameters, files and commands. */
+.library-entry.disabled{opacity:.55}
+.library-entry.disabled:hover,.library-entry.disabled:focus-within{opacity:.9}
+.skill-switch{display:inline-flex;align-items:center;gap:7px;margin-left:auto;font-size:11px;color:#a7c5b0;padding:3px 4px}
+.skill-switch-track{position:relative;width:28px;height:15px;border-radius:8px;background:#3a4340;transition:background .15s}
+.skill-switch-track::after{content:"";position:absolute;top:2px;left:2px;width:11px;height:11px;border-radius:50%;background:#c3d0c7;transition:transform .15s}
+.skill-switch[aria-pressed="true"] .skill-switch-track{background:#4f8a66}
+.skill-switch[aria-pressed="true"] .skill-switch-track::after{transform:translateX(13px);background:#fff}
+.skill-switch:disabled{opacity:.6}
+.skill-kinds{display:flex;flex-wrap:wrap;gap:6px;margin:8px 0 0;padding:0;list-style:none}
+.skill-kinds li{font-size:10px;line-height:1;padding:4px 7px;border-radius:9px;background:#26322d;color:#bbdcca;border:1px solid #3b4d44}
+.skill-params{margin-top:10px;padding:10px 12px;border:1px dashed #4a6357;border-radius:8px;background:#1b2421}
+.skill-params-form{display:grid;grid-template-columns:1fr 1fr;gap:8px 10px}
+.skill-params-form label{font-size:11px;color:#a9bbb0}
+.skill-params-form label.wide{grid-column:1/-1}
+.skill-params-form label.check{display:flex;align-items:center;gap:8px}
+.skill-params-form label.check input{width:auto}
+.skill-params-form small{display:block;margin-top:2px;font-size:10px;color:#73807a}
+.skill-params-form .capability-actions{grid-column:1/-1;margin-top:4px;gap:12px}
+.skill-tools{display:flex;flex-wrap:wrap;gap:14px;margin-top:10px}
+.skill-list{margin:8px 0 0;padding-left:18px;font-size:11px;line-height:1.7;color:#a9bbb0}
+.skill-list code{font-size:11px;color:#d3e4d9}
+.skill-list small{color:#73807a;margin-left:6px}

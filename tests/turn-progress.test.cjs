@@ -1,0 +1,35 @@
+const test = require('node:test')
+const assert = require('node:assert/strict')
+const fs = require('node:fs')
+const os = require('node:os')
+const path = require('node:path')
+const { OrbitRuntime } = require('../electron/runtime.mts')
+
+// A session turn can hold the whole task, so the window counts the agent's actions while the turn runs: a native tool
+// call is published (throttled to once a second) before the turn ends, not only with its end.
+
+test('an action counted during a turn reaches the window while the turn still runs', async t => {
+  const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'orbit-turn-progress-'))
+  t.after(() => fs.rmSync(workspace, { recursive: true, force: true }))
+  const live = []
+  let turnEnded = false
+  const runtime = new OrbitRuntime({ runProvider: async options => {
+    options.onEvent({ kind: 'tool', native: true, tool: 'Bash', toolId: 'call-1', text: 'npm test' })
+    options.onEvent({ kind: 'tool', native: true, tool: 'Bash', toolId: 'call-1', text: 'npm test', status: 'completed' })
+    await new Promise(resolve => setTimeout(resolve, 1300))
+    turnEnded = true
+    return { text: 'FINAL_ANSWER' }
+  } })
+  const unsub = runtime.onEvent(event => {
+    const timing = event.type === 'agent.updated' && event.agent?.id === 'root' ? event.agent.turnTimings?.at(-1) : null
+    if (timing && !turnEnded) live.push({ native: timing.nativeToolCalls, ended: timing.endedAt })
+  })
+  let finish
+  const finished = new Promise(resolve => { finish = resolve })
+  const off = runtime.onEvent(event => { if (['run.finished', 'run.failed', 'run.cancelled'].includes(event.type)) finish(event) })
+  await runtime.start({ workspace, projectId: 'project-1', chatId: 'chat-1', providerId: 'test', prompt: 'Task' })
+  const event = await finished
+  unsub(); off()
+  assert.equal(event.type, 'run.finished')
+  assert.ok(live.some(update => update.native === 1 && !update.ended), `the counted call is published during the turn: ${JSON.stringify(live)}`)
+})

@@ -1,4 +1,4 @@
-import type { Agent, HandoverTarget, Message, RestartNotice, RunSnapshot, RunStatus, TurnTiming } from './types'
+import type { Agent, AgentStatus, HandoverTarget, Message, RestartNotice, RunSnapshot, RunStatus, TurnTiming } from './types'
 
 // The renderer's view of runs: one snapshot per run id, updated by runtime events (applyRunEvent) and by the saved
 // run list on start-up (restoreRuns). Pure functions with an injectable clock, so tests can replay recorded sequences.
@@ -6,7 +6,8 @@ import type { Agent, HandoverTarget, Message, RestartNotice, RunSnapshot, RunSta
 export type RunMap = Record<string, RunSnapshot>
 // 'restarting' ends a run whose agent restarted Orbit (restart_orbit); the task goes on in a run whose resumedFrom points back.
 export const TERMINAL_STATUSES: readonly RunStatus[] = ['completed', 'failed', 'cancelled', 'interrupted', 'restarting']
-export const isActiveStatus = (status?: RunStatus) => status === 'working' || status === 'waiting'
+// 'paused' is an agent's status only (a run whose agents are paused stays 'working'); it counts as alive, not finished.
+export const isActiveStatus = (status?: RunStatus) => status === 'working' || status === 'waiting' || status === 'paused'
 const nowIso = () => new Date().toISOString()
 const isRoot = (agentId?: string) => !agentId || agentId === 'root'
 
@@ -37,6 +38,10 @@ export function applyRunEvent(previous: RunMap, event: RuntimeEvent, at = nowIso
   if (event.limits) run.limits = event.limits
   if (event.improvements) run.improvements = event.improvements
   if (event.improvementStatus) run.improvementStatus = event.improvementStatus
+  if (event.loopTask) run.loopTask = event.loopTask
+  // run.info sends null once the plan has no handoff.
+  if (typeof event.improvementHandoff === 'string') run.improvementHandoff = event.improvementHandoff
+  else if (event.improvementHandoff === null) delete run.improvementHandoff
   if (event.usage) run.usage = event.usage
   if (event.router) run.router = event.router
   if (event.resumedFrom) run.resumedFrom = event.resumedFrom
@@ -177,13 +182,13 @@ export function resumeLinks(runs: RunMap | RunSnapshot[], run?: RunSnapshot): { 
 }
 
 // Where each run's team strip and history hang in the chat: under its answer. A finished run that never answered (failed,
-// stopped) keeps them under the entry that opened it: the user's message, or the restart note of a continuation Orbit
-// started by itself.
+// stopped) keeps them under the entry that opened it: the user's message, the restart note of a continuation Orbit
+// started by itself, or the note of an endless-improvement loop task.
 export function historyAnchors(messages: Message[], runs: RunMap): Map<string, string> {
   const anchors = new Map<string, string>()
   for (const message of messages) if (message.author === 'orbit' && message.runId) anchors.set(message.runId, message.id)
   for (const message of messages) {
-    const opener = message.author === 'user' || (message.author === 'system' && message.kind === 'restart')
+    const opener = message.author === 'user' || (message.author === 'system' && (message.kind === 'restart' || message.kind === 'loop'))
     if (!opener || !message.runId || anchors.has(message.runId)) continue
     if (runs[message.runId] && !isActiveStatus(runs[message.runId].status)) anchors.set(message.runId, message.id)
   }
@@ -228,11 +233,28 @@ export function runNotices(run: RunSnapshot | undefined, label: (target: Handove
   return notices.sort((a, b) => String(a.time).localeCompare(String(b.time)))
 }
 
+// The agent that holds `agent` at the pause gate: itself, or its nearest ancestor, whose own pause flag is set; null when
+// nothing holds it. The runtime walks parentId the same way; the visited set guards against a broken cycle.
+export function pauseHolder(agents: Agent[], agent: Agent): Agent | null {
+  const seen = new Set<string>()
+  for (let current: Agent | undefined = agent; current && !seen.has(current.id); current = agents.find(a => a.id === current!.parentId)) {
+    if (current.paused) return current
+    seen.add(current.id)
+  }
+  return null
+}
+// The status to show: the user's own pause reads as paused at once, before the agent's turn is cut off and it reaches the gate.
+export const shownStatus = (agent: Agent): AgentStatus => agent.paused && isActiveStatus(agent.status) ? 'paused' : agent.status
+
 // The turn an agent is in now: the latest timing without an end.
 export function openTurn(agent?: Agent): TurnTiming | undefined {
   const timings = agent?.turnTimings || []
   for (let index = timings.length - 1; index >= 0; index--) if (!timings[index].endedAt) return timings[index]
   return undefined
+}
+// Everything an agent did across its turns: native tool calls (commands, edits) plus Orbit tool calls.
+export function actionCount(agent?: Agent): number {
+  return (agent?.turnTimings || []).reduce((sum, timing) => sum + (timing.nativeToolCalls ?? 0) + (timing.orbitToolCalls ?? 0), 0)
 }
 export function durationMs(from?: string | null, to?: string | null, at = Date.now()): number | null {
   const start = Date.parse(from || '')

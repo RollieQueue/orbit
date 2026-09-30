@@ -1,5 +1,5 @@
-import { useMemo, useRef, useState } from 'react'
-import type { Agent, Communication, Handover, InspectorTab, QuotaSnapshot, RunSnapshot } from './types'
+import { useMemo, useRef, useState, type KeyboardEvent } from 'react'
+import type { Agent, Communication, Handover, InspectorTab, QuotaSnapshot, RunSnapshot, TraceImage } from './types'
 import { AgentGraph } from './AgentGraph'
 import { TurnTimings } from './AgentHistory'
 import { ChangesTab } from './ChangesTab'
@@ -7,10 +7,13 @@ import { FilesTab } from './FilesTab'
 import { Icon } from './Icon'
 import { handoverLabel, handoverReason, usedNow, windowName, windowsFor } from './QuotaPanel'
 import { effortLabels } from './ReasoningPicker'
-import { Markdown, assistantOutput, timeOf } from './format'
+import { Markdown, assistantOutput, errorText, timeOf } from './format'
+import { TraceImages } from './TraceImages'
 import { fileMap } from './file-map'
 import { providerName, providers } from './providers'
-import { transportLabel } from './run-events'
+import { actionCount, isActiveStatus, pauseHolder, transportLabel } from './run-events'
+
+export type MessageAgent = (runId: string, agentId: string, text: string) => Promise<void>
 
 const routeLabel: Record<string, string> = {
   direct: 'напрямую', explicit: 'адресат указан отправителем', match: 'подобран по файлам и теме',
@@ -24,6 +27,7 @@ const ofAgent = (agent: Agent) => (item: { agentId?: string }) => (item.agentId 
 const isRouted = (message: Communication) => message.via === 'router' && !!message.route && message.route.via !== 'direct'
 
 function kindLabel(message: Communication) {
+  if (message.fromAgentId === 'user' && message.kind === 'message') return 'Сообщение от вас'
   if (message.kind === 'notice') return message.conflict ? 'Маршрутизатор · конфликт правок' : 'Маршрутизатор · файл изменён другим агентом'
   if (message.kind === 'spawn') return 'Создание агента · исходная задача'
   if (message.kind === 'followup') return 'Новая задача существующему агенту'
@@ -42,8 +46,9 @@ function budgetText(agent: Agent, run: RunSnapshot) {
   const turns = agent.parentId ? `Ходы: ${agent.turns || 0} / ${run.limits?.maxTurns ?? '∞'}` : `Ходы: ${agent.turns || 0} · без ограничения`
   const limited = !agent.budgetLimited ? ''
     : agent.stalled ? ' · Остановлен: повторял одни и те же вызовы, результаты сохранены' : ' · Лимит достигнут, результаты сохранены'
-  return `${turns}${limited}`
+  return `Действий: ${actionCount(agent)} · ${turns}${limited}`
 }
+const ACTIONS_HINT = 'Ход — один запуск модели; в режиме сессии модель делает за один ход много действий (команды, правки, инструменты Orbit).'
 
 function FileChips({ label, files }: { label: string; files: string[] }) {
   if (!files.length) return null
@@ -56,11 +61,14 @@ function FileChips({ label, files }: { label: string; files: string[] }) {
   </div>
 }
 
-function TraceItem({ trace, kind }: { trace: { id: string; text: string; time: string; kind: string }; kind: string }) {
-  return <details className="trace-item">
+// A trace with images (a screenshot the agent read) shows them under its line, visible without opening it.
+function TraceItem({ trace, kind, runId }: { trace: { id: string; text: string; time: string; kind: string; images?: TraceImage[] }; kind: string; runId: string }) {
+  const item = <details className="trace-item">
     <summary><span className={`trace-kind ${kind}`} /><span>{trace.text.slice(0, 120) || trace.kind}</span><time>{timeOf(trace.time)}</time></summary>
     <pre>{trace.text}</pre>
   </details>
+  if (!trace.images?.length) return item
+  return <div className="trace-with-images">{item}<TraceImages runId={runId} images={trace.images} /></div>
 }
 
 // The router is not a model: its activity is the list of routing decisions it recorded.
@@ -117,7 +125,7 @@ function AgentActivity({ run, agent, quotas }: { run: RunSnapshot; agent: Agent;
     </div>
     {agent.task && <div className="agent-task">{agent.task}</div>}
     {agent.reason && <p className="agent-reason">{agent.reason}</p>}
-    <p className="agent-budget">{budgetText(agent, run)}</p>
+    <p className="agent-budget" title={ACTIONS_HINT}>{budgetText(agent, run)}</p>
     <TurnTimings timings={agent.turnTimings} />
     {run.usage && <p className="agent-budget">Работают: {working} · Ходы помощников: {helperTurns}</p>}
     {!!windows.length && <p className="agent-budget">Квота {providerName(providerId)}: {quotaText}</p>}
@@ -150,7 +158,7 @@ function AgentActivity({ run, agent, quotas }: { run: RunSnapshot; agent: Agent;
           <div className="eyebrow">СООБЩЕНИЕ · {timeOf(trace.time)}</div>
           <Markdown text={assistantOutput(trace.text)} />
         </div>
-        : <TraceItem key={trace.id} trace={trace} kind={trace.kind} />)}
+        : <TraceItem key={trace.id} trace={trace} kind={trace.kind} runId={run.runId} />)}
       {replies.map(message => <div className="agent-output" key={message.id}>
         <div className="eyebrow">ОТВЕТ · {timeOf(message.time)}</div>
         <Markdown text={message.text} />
@@ -193,7 +201,7 @@ function CommunicationsTab({ run, agent, onlySelected, onToggle }: Communication
   return <div className="agent-communications">
     <div className="communications-heading">
       <h3>{onlySelected ? agent.name : 'Вся команда'}</h3>
-      <p>Сообщения между агентами этого запуска. Каждое проходит через маршрутизатор; он же сообщает об изменениях общих файлов.</p>
+      <p>Сообщения между агентами этого запуска и ваши сообщения агентам. Переписка агентов проходит через маршрутизатор; он же сообщает об изменениях общих файлов.</p>
     </div>
     <label className="communications-filter">
       <input type="checkbox" checked={onlySelected} onChange={event => onToggle(event.target.checked)} />
@@ -206,10 +214,79 @@ function CommunicationsTab({ run, agent, onlySelected, onToggle }: Communication
   </div>
 }
 
-type AgentInspectorProps = { run: RunSnapshot; agent: Agent; onSelect: (id: string) => void; quotas: Record<string, QuotaSnapshot>; initialTab?: InspectorTab }
+// A message to the selected agent while the run works: it reads it at its next step, and a finished helper starts again.
+// A refusal keeps the text and shows the runtime's reason.
+function AgentMessageBox({ run, agent, onMessage }: { run: RunSnapshot; agent: Agent; onMessage: MessageAgent }) {
+  const [text, setText] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState('')
+  const send = async () => {
+    const message = text.trim()
+    if (!message || busy) return
+    setBusy(true)
+    setError('')
+    try { await onMessage(run.runId, agent.id, message); setText('') } catch (reason) { setError(errorText(reason)) } finally { setBusy(false) }
+  }
+  const onKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
+    if (event.key !== 'Enter' || event.shiftKey || event.nativeEvent.isComposing) return
+    event.preventDefault()
+    void send()
+  }
+  return <div className="agent-message">
+    {agent.status === 'done' && <p className="agent-message-hint">Агент завершил работу — сообщение запустит его снова</p>}
+    {(agent.status === 'paused' || agent.paused) && <p className="agent-message-hint">Агент на паузе — прочитает сообщение после «Продолжить»</p>}
+    <form onSubmit={event => { event.preventDefault(); void send() }}>
+      <textarea aria-label={`Сообщение агенту ${agent.name}`} placeholder={`Написать ${agent.name}…`} rows={2} value={text} disabled={busy}
+        onChange={event => setText(event.target.value)} onKeyDown={onKeyDown} />
+      <button className="send-button" type="submit" aria-label="Отправить агенту" title="Агент получит сообщение на следующем шаге"
+        disabled={busy || !text.trim()}><Icon name="arrow" /></button>
+    </form>
+    {error && <p className="agent-message-error" role="alert">{error}</p>}
+  </div>
+}
+
+// Pause, resume and stop of one agent; each rejects with the runtime's reason.
+export type ControlAgent = (runId: string, agentId: string) => Promise<void>
+export type AgentControls = { pause: ControlAgent; resume: ControlAgent; stop: ControlAgent }
+
+// The controls under the tabs (every tab): pause or resume this agent (pausing holds its helpers too), stop for helpers.
+// The root is stopped by the chat's Stop, which ends the whole run. A refusal stays under the buttons until the next try.
+function AgentControlsBar({ run, agent, controls }: { run: RunSnapshot; agent: Agent; controls: AgentControls }) {
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState('')
+  const isRoot = agent.id === 'root'
+  // Held by an ancestor's pause, not by its own: it goes on when that one is resumed.
+  const holder = agent.status === 'paused' && !agent.paused ? pauseHolder(run.agents, agent) : null
+  const act = async (call: ControlAgent) => {
+    if (busy) return
+    setBusy(true)
+    setError('')
+    try { await call(run.runId, agent.id) } catch (reason) { setError(errorText(reason)) } finally { setBusy(false) }
+  }
+  return <div className="agent-controls">
+    <div className="agent-controls-buttons">
+      <button type="button" disabled={busy} aria-label={`${agent.paused ? 'Продолжить' : 'Пауза'}: ${agent.name}`}
+        onClick={() => void act(agent.paused ? controls.resume : controls.pause)}>
+        <Icon name={agent.paused ? 'play' : 'pause'} size={14} />{agent.paused ? 'Продолжить' : 'Пауза'}
+      </button>
+      {!isRoot && <button type="button" className="danger" disabled={busy} aria-label={`Остановить: ${agent.name}`}
+        title="Остановить этого помощника и его подагентов; руководитель получит, что он успел сделать" onClick={() => void act(controls.stop)}>
+        <Icon name="stop" size={14} />Остановить
+      </button>}
+    </div>
+    {isRoot && <p className="agent-controls-note">Остановить весь запуск — кнопка «Стоп» в чате</p>}
+    {holder && <p className="agent-controls-note">На паузе, пока на паузе {holder.name}</p>}
+    {error && <p className="agent-message-error" role="alert">{error}</p>}
+  </div>
+}
+
+type AgentInspectorProps = {
+  run: RunSnapshot; agent: Agent; onSelect: (id: string) => void; quotas: Record<string, QuotaSnapshot>; initialTab?: InspectorTab; onMessage: MessageAgent
+  controls: AgentControls
+}
 
 // One agent of the run, under five tabs: its activity, the team's correspondence, files, changes and the spawn graph.
-export function AgentInspector({ run, agent, onSelect, quotas, initialTab }: AgentInspectorProps) {
+export function AgentInspector({ run, agent, onSelect, quotas, initialTab, onMessage, controls }: AgentInspectorProps) {
   const [tab, setTab] = useState<InspectorTab>(initialTab || 'activity')
   const [focusPath, setFocusPath] = useState<string | undefined>()
   // Opened from a run's «файлов изменено» button: the changes of the whole team, for the agent first shown.
@@ -222,6 +299,11 @@ export function AgentInspector({ run, agent, onSelect, quotas, initialTab }: Age
   // Live events replace `run` many times a second; the file map only changes with the agents' file lists.
   const touched = useMemo(() => fileMap(run.agents).length, [run.agents])
   const tabClass = (id: InspectorTab) => `communication-tab ${tab === id ? 'active' : ''}`
+  // The runtime refuses stopped and failed agents, and a root agent that has already answered.
+  const canMessage = isActiveStatus(run.status) && agent.id !== 'router' && !['error', 'cancelled', 'interrupted'].includes(agent.status)
+    && !(agent.id === 'root' && agent.status === 'done')
+  // The runtime refuses pause and stop for an agent that has finished; the router is not an agent that can be held.
+  const canControl = canMessage && agent.status !== 'done'
   const body = tab === 'activity'
     ? (agent.id === 'router' ? <RouterActivity run={run} agent={agent} /> : <AgentActivity run={run} agent={agent} quotas={quotas} />)
     : tab === 'graph' ? <AgentGraph agents={run.agents} selectedId={agent.id} onSelect={onSelect} />
@@ -246,8 +328,10 @@ export function AgentInspector({ run, agent, onSelect, quotas, initialTab }: Age
         Граф
       </button>
     </nav>
+    {canControl && <AgentControlsBar key={`controls:${agent.id}`} run={run} agent={agent} controls={controls} />}
     <div className="agent-inspector">
     {body}
     </div>
+    {canMessage && <AgentMessageBox key={`message:${agent.id}`} run={run} agent={agent} onMessage={onMessage} />}
   </div>
 }

@@ -5,13 +5,13 @@ const path = require('node:path')
 
 // Same loader as tests/diff-parse.test.cjs: vite's oxc transform, then an ES module from a data URL.
 // run-events.ts only has type imports, which the transform erases.
-let applyRunEvent, restoreRuns, snapshotBase, runNotices, openTurn, durationMs, formatDuration, activeRunIds, interruptLost, isActiveStatus, LOST_RUN_ERROR
+let applyRunEvent, restoreRuns, snapshotBase, runNotices, openTurn, durationMs, formatDuration, activeRunIds, interruptLost, isActiveStatus, LOST_RUN_ERROR, historyAnchors, pauseHolder, shownStatus, actionCount
 test.before(async () => {
   const { transformWithOxc } = await import('vite')
   const file = path.join(__dirname, '..', 'src', 'run-events.ts')
   const out = await transformWithOxc(fs.readFileSync(file, 'utf8'), file, { lang: 'ts' })
   const mod = await import(`data:text/javascript;base64,${Buffer.from(out.code).toString('base64')}`)
-  ;({ applyRunEvent, restoreRuns, snapshotBase, runNotices, openTurn, durationMs, formatDuration, activeRunIds, interruptLost, isActiveStatus, LOST_RUN_ERROR } = mod)
+  ;({ applyRunEvent, restoreRuns, snapshotBase, runNotices, openTurn, durationMs, formatDuration, activeRunIds, interruptLost, isActiveStatus, LOST_RUN_ERROR, historyAnchors, pauseHolder, shownStatus, actionCount } = mod)
 })
 
 const AT = '2026-09-29T10:00:00.000Z'
@@ -252,6 +252,37 @@ test('a run the runtime process lost before its first save ends interrupted once
   assert.equal(interruptLost(settled, ['unknown'], snapshots), settled)
 })
 
+test('a paused agent counts as alive: a run that ends cancels it like a working one', () => {
+  assert.equal(isActiveStatus('paused'), true)
+  const LOST_AT = '2026-09-30T10:05:00.000Z'
+  const runs = fold(applyRunEvent, [ev('run.started', { prompt: 'p', workspace: 'w' }), ev('agent.created', { agent: agent('root', { status: 'working' }) }),
+    ev('agent.created', { agent: agent('agent-a', { status: 'paused', paused: true, parentId: 'root' }) })])
+  assert.equal(runs['run-1'].status, 'working', 'a paused agent does not end or pause the run')
+  const ended = interruptLost(runs, ['run-1'], [], LOST_AT)['run-1']
+  assert.deepEqual(ended.agents.map(item => [item.id, item.status, item.finishedAt]), [['root', 'cancelled', LOST_AT], ['agent-a', 'cancelled', LOST_AT]])
+})
+
+test('pauseHolder finds the agent whose own pause holds another one; shownStatus shows an own pause before the gate', () => {
+  const root = { id: 'root', name: 'Orbit', status: 'working' }
+  const lead = { id: 'lead', name: 'Lead', status: 'paused', parentId: 'root', paused: true }
+  const helper = { id: 'helper', name: 'Helper', status: 'paused', parentId: 'lead' }
+  const free = { id: 'free', name: 'Free', status: 'working', parentId: 'root' }
+  const agents = [root, lead, helper, free]
+  assert.equal(pauseHolder(agents, helper), lead, 'held by the nearest paused ancestor')
+  assert.equal(pauseHolder(agents, lead), lead, 'its own pause')
+  assert.equal(pauseHolder(agents, free), null)
+  assert.equal(pauseHolder([{ id: 'a', name: 'A', status: 'working', parentId: 'b' }, { id: 'b', name: 'B', status: 'working', parentId: 'a' }], { id: 'a', name: 'A', status: 'working', parentId: 'b' }), null, 'a parent cycle ends')
+  assert.equal(shownStatus({ ...lead, status: 'working' }), 'paused', 'the flag shows before the turn reaches the gate')
+  assert.equal(shownStatus(free), 'working')
+  assert.equal(shownStatus({ id: 'x', name: 'X', status: 'cancelled', paused: true }), 'cancelled', 'a finished agent keeps its end status')
+})
+
+test('actionCount sums native and Orbit tool calls over all turns', () => {
+  assert.equal(actionCount(undefined), 0)
+  assert.equal(actionCount({ id: 'a', name: 'A', status: 'working' }), 0)
+  assert.equal(actionCount({ id: 'a', name: 'A', status: 'working', turnTimings: [{ turn: 1, nativeToolCalls: 75, orbitToolCalls: 41 }, { turn: 2, orbitToolCalls: 2 }, { turn: 3 }] }), 118)
+})
+
 test('message.streaming keeps the root answer in progress on the run; message.added with the same id replaces it', () => {
   let runs = fold(applyRunEvent, [ev('run.started', { prompt: 'p', workspace: 'w' }), ev('agent.created', { agent: agent('root') })])
   runs = applyRunEvent(runs, ev('message.streaming', { agentId: 'root', messageId: 'm1', content: 'Смотрю' }), '2026-09-29T10:01:00.000Z')
@@ -326,4 +357,21 @@ test('openTurn, durationMs and formatDuration', () => {
   assert.equal(formatDuration(90000), '1 мин 30 с')
   assert.equal(formatDuration(3_720_000), '1 ч 2 мин')
   assert.equal(snapshotBase({ runId: 'r', projectId: 'p', chatId: 'c' }, AT).startedAt, AT)
+})
+
+test('run.started and run.info carry the loop task and the plan handoff onto the run', () => {
+  const base = { runId: 'r', projectId: 'p', chatId: 'c' }
+  let runs = applyRunEvent({}, { ...base, type: 'run.started', loopTask: 4, improvements: [{ id: '1', title: 't', status: 'pending', evidence: '' }], improvementStatus: 'implementing' }, AT)
+  assert.equal(runs.r.loopTask, 4)
+  assert.equal(runs.r.improvementHandoff, undefined)
+  runs = applyRunEvent(runs, { ...base, type: 'run.info', improvementHandoff: 'next: check the tests', improvementStatus: 'completed' }, AT)
+  assert.equal(runs.r.improvementHandoff, 'next: check the tests')
+  assert.equal(runs.r.loopTask, 4, 'kept by events without it')
+  assert.equal(runs.r.improvementStatus, 'completed')
+})
+
+test('historyAnchors hangs a loop task run that never answered under its loop note', () => {
+  const runs = { r: { runId: 'r', projectId: 'p', chatId: 'c', status: 'failed', agents: [], traces: [], messages: [], communications: [], startedAt: AT } }
+  const messages = [{ id: 'loop-r', author: 'system', kind: 'loop', runId: 'r', text: '∞ Задача 2', time: AT }]
+  assert.equal(historyAnchors(messages, runs).get('r'), 'loop-r')
 })

@@ -127,8 +127,11 @@ function rolledBack(rollback: RestartRollback | undefined): string {
   const paths = rollback.restored.map(entry => `${entry}/`).join(' and ')
   return `${head}: your changes to ${paths} were reverted to the rollback base ${rollback.base || '(unknown)'}. They are kept in ${patch} and ${ref}: re-apply them before fixing (git restore --source=${ref} --worktree -- ${rollback.restored.join(' ')}), then fix what the output shows and call restart_orbit again.`
 }
-function failure(result: Extract<RestartResult, { ok: false }>): Error {
-  const advice = result.status === 'rolled-back' ? rolledBack(result.rollback) : HINTS[result.status] || 'Nothing was restarted: the running Orbit keeps its current code. Fix what the output shows, then call restart_orbit again.'
+// Improvement mode: a restart refused for the cycle limit leaves the task done; the next task's restart applies it.
+const LOOP_CYCLE_LIMIT = ' Improvement mode: keep the task done with the evidence "verified, not applied yet (cycle limit)"; the next task\'s restart_orbit applies it.'
+function failure(result: Extract<RestartResult, { ok: false }>, run: RunRecord): Error {
+  const hint = HINTS[result.status] ? `${HINTS[result.status]}${result.status === 'cycle-limit' && run.improvementMode ? LOOP_CYCLE_LIMIT : ''}` : ''
+  const advice = result.status === 'rolled-back' ? rolledBack(result.rollback) : hint || 'Nothing was restarted: the running Orbit keeps its current code. Fix what the output shows, then call restart_orbit again.'
   const head = `restart_orbit failed (self-upgrade status ${result.status}${result.exitCode === null ? '' : `, exit code ${result.exitCode}`}${result.error ? `: ${result.error}` : ''}). ${advice}`
   return new Error(result.output ? `${head}\nOutput (last lines):\n${result.output}` : head)
 }
@@ -165,11 +168,14 @@ async function executeRestart(runtime: OrbitRuntimeLike, run: RunRecord, agent: 
   const continueWith = checkedText(args.continueWith, 'continueWith (what to do after the restart)', CONTINUE_CHARS)
   if (args.verify !== undefined && args.verify !== null && typeof args.verify !== 'boolean') throw new Error('restart_orbit: verify must be a boolean')
   const verify = args.verify !== false
-  refuseWhileOthersWork(runtime, run)
-  if (run.approvalPolicy === 'on-request' && !await runtime.approve(run, agent, { tool: 'restart_orbit', arguments: { reason, continueWith, verify } })) throw new Error('User declined this operation')
+  // A refusal the agent cannot fix (other chats working, the user declined, the cycle limit) defers the change to the
+  // next restart: improvement mode then accepts the answer without one (improvement.mts).
+  const deferred = (error: Error): Error => { run.restartDeferred = true; return error }
+  try { refuseWhileOthersWork(runtime, run) } catch (error) { throw deferred(error as Error) }
+  if (run.approvalPolicy === 'on-request' && !await runtime.approve(run, agent, { tool: 'restart_orbit', arguments: { reason, continueWith, verify } })) throw deferred(new Error('User declined this operation'))
   // A chat started while the user was asked: checked again, with nothing awaited between here and the script's start
   // (from then on new runs in other chats wait, see lifecycle.start).
-  refuseWhileOthersWork(runtime, run)
+  try { refuseWhileOthersWork(runtime, run) } catch (error) { throw deferred(error as Error) }
   const signal = runtime.agentSignal(run, agent)
   if (signal.aborted) throw abortError()
   const stop = new AbortController()
@@ -183,7 +189,8 @@ async function executeRestart(runtime: OrbitRuntimeLike, run: RunRecord, agent: 
   try { result = await Promise.race([host.request({ run, agent, reason, continueWith, verify, onLine: progress.line, signal: stop.signal }), restarting]) }
   finally { signal.removeEventListener('abort', onAbort); progress.close() }
   if (!result || stop.signal.aborted) throw abortError()
-  if (!result.ok) throw failure(result)
+  if (!result.ok) throw result.status === 'cycle-limit' ? deferred(failure(result, run)) : failure(result, run)
+  run.restartApplied = true
   return observation(result)
 }
 

@@ -207,7 +207,7 @@ function createParser(id: SubscriptionId, onEvent: ProviderEventListener | null 
           const output = Array.isArray(content) ? content.filter(block => block.type === 'text').map(block => block.text).join('') : ''
           if (output) onEvent?.({ providerId: id, kind: 'output', text: output, partial: true })
         }
-        if (event.type === 'tool_call') onEvent?.({ providerId: id, kind: 'tool', native: true, text: JSON.stringify(event.tool_call || {}), status: event.subtype })
+        if (event.type === 'tool_call') onEvent?.({ providerId: id, kind: 'tool', native: true, text: JSON.stringify(event.tool_call || {}), status: event.subtype, ...(typeof event.call_id === 'string' ? { toolId: event.call_id } : {}) })
         if (event.type === 'result') {
           result = event
           if (event.is_error || event.subtype !== 'success') failure = typeof event.result === 'string' ? event.result : 'Cursor request failed'
@@ -337,7 +337,10 @@ function createSessionParser(id: SubscriptionId, onEvent: ProviderEventListener 
     finish() {
       if (failure) throw new Error(failure)
       if (result === undefined) throw new Error(`${CONFIG[id].label} ended without a successful result`)
-      const text = result.trim() ? result : streamed
+      // Antigravity's `response` joins every message of the turn, the narration between tool calls included; the answer
+      // is its last message, as the other CLIs report it. A response that does not end with that message is kept whole.
+      const joined = id === 'antigravity' && streamed.trim() !== '' && result.trim().endsWith(streamed.trim())
+      const text = result.trim() && !joined ? result : streamed
       if (!text.trim()) throw new Error(`${CONFIG[id].label} completed without an assistant response`)
       return { text, model, sessionId }
     },

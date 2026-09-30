@@ -5,7 +5,7 @@ const os = require('node:os')
 const path = require('node:path')
 const quota = require('../electron/quota.mts')
 const { OrbitRuntime } = require('../electron/runtime.mts')
-const { normalizeFailover, tierOf, baselineTier, replacements, handoverNote } = require('../electron/failover.mts')
+const { normalizeFailover, tierOf, baselineTier, replacements, handoverNote, unreachable } = require('../electron/failover.mts')
 
 const w = (used, extra = {}) => ({ kind: 'session', scope: 'all', models: [], usedPercent: used, resetsAt: null, ...extra })
 const CATALOG = [
@@ -25,14 +25,27 @@ const config = (extra = {}) => normalizeFailover(extra)
 test('quality tiers follow naming conventions and place doubtful models low', () => {
   const expected = {
     'claude-opus-5-5-high': 3, 'claude-fable-5-thinking-high': 3, opus: 3, 'gpt-6-astra': 3, 'gpt-6-sol': 3, 'gpt-5.6-sol-high': 3, 'gemini-3.1-pro-high': 3, 'claude-opus-4-6-thinking': 3,
-    sonnet: 2, 'claude-sonnet-5-thinking-high': 2, 'gpt-5.6-terra': 2, 'gpt-5.5': 2, 'gpt-5.3-codex-high': 2, 'composer-2.5': 2, 'grok-4.7-high': 2, 'gpt-oss-120b-medium': 2,
-    haiku: 1, 'gemini-3.8-flash-high': 1, 'gpt-6-luna': 1, 'gpt-5.6-luna': 1, 'gpt-4o-mini': 1,
+    sonnet: 2, 'claude-sonnet-5-thinking-high': 2, 'gpt-5.6-terra': 2, 'gpt-5.5': 2, 'gpt-5.3-codex-high': 2, 'composer-2.5': 2, 'grok-4.7-high': 2,
+    'claude-haiku-5': 1, 'gemini-3.8-flash-high': 1, 'gpt-5.6-luna': 1, 'gpt-4o-mini': 1,
     auto: 0, '': 0, 'some-new-model': 0,
   }
   for (const [model, tier] of Object.entries(expected)) assert.equal(tierOf(model), tier, model)
   assert.equal(tierOf('GEMINI-3.1-PRO-HIGH'), 3, 'case does not matter')
   assert.equal(tierOf('gemini-3.8-flash-high'), 1, "'mini' inside 'gemini' must not make a light model of a strong one")
   assert.equal(tierOf('claude-haiku-pro'), 1, 'a light marker wins over a flagship one')
+})
+
+test('measured tiers of the 2026-09-30 audit come before the names: GPT-6 Luna strong, Haiku 4.5 weak, GPT-OSS unreliable', () => {
+  for (const model of ['gpt-6-luna', 'gpt-6-luna-high']) assert.equal(tierOf(model), 2, model)
+  for (const model of ['haiku', 'claude-haiku-4-5-20251001', 'claude-haiku-4.5', 'claude-4.5-haiku', 'claude-haiku-4-5@20251001']) assert.equal(tierOf(model), 0.5, model)
+  for (const model of ['gpt-oss-120b-medium', 'gpt-oss:20b', 'openai/gpt-oss-120b']) assert.equal(tierOf(model), 0, model)
+  assert.equal(tierOf('gpt-5.6-luna'), 1, 'only the measured model moves, not its whole family')
+  assert.equal(tierOf('claude-haiku-5'), 1, 'a later Haiku is light by its name until it is measured')
+  assert.equal(baselineTier('claude', 'haiku'), 0.5, 'a Haiku agent accepts light replacements')
+  assert.equal(baselineTier('antigravity', 'gpt-oss-120b-medium'), 3, 'an unreliable model is judged by the high provider baseline')
+  const { rules } = require('../electron/model-tiers.json')
+  assert.equal(rules.filter(rule => rule.measured).length, 3)
+  assert.ok(rules.slice(0, 3).every(rule => rule.measured), 'measured rules come first and say why')
 })
 
 test('the model being replaced is judged by its name, else by a deliberately high baseline', () => {
@@ -77,11 +90,32 @@ test('healthy subscriptions with the most headroom come first; those near or at 
 test('a weaker model is used only when allowed, and never a light one', () => {
   const list = allowWeaker => labels(replacements({ agent: agentOf(), catalog: CATALOG, quota: fakeQuota({}), config: config({ allowWeaker }) }))
   const strict = list(false), relaxed = list(true)
-  for (const weaker of ['claude/sonnet', 'codex/gpt-5.5', 'cursor/composer-2.5']) { assert.ok(!strict.includes(weaker), weaker); assert.ok(relaxed.includes(weaker), weaker) }
-  for (const light of ['claude/haiku', 'codex/gpt-6-luna', 'antigravity/gemini-3.8-flash-high']) assert.ok(!relaxed.includes(light), light)
+  for (const weaker of ['claude/sonnet', 'codex/gpt-5.5', 'cursor/composer-2.5', 'codex/gpt-6-luna']) { assert.ok(!strict.includes(weaker), weaker); assert.ok(relaxed.includes(weaker), weaker) }
+  for (const light of ['claude/haiku', 'antigravity/gemini-3.8-flash-high']) assert.ok(!relaxed.includes(light), light)
   assert.deepEqual(relaxed.slice(0, 5), strict, 'equal quality still comes before weaker')
   const sonnet = agentOf({ providerId: 'claude', model: 'claude-sonnet-5-thinking-high', requestedModel: 'sonnet' })
   assert.ok(labels(replacements({ agent: sonnet, catalog: CATALOG, quota: fakeQuota({}), config: config() })).includes('codex/gpt-5.5'), 'a strong-tier agent accepts strong-tier models')
+})
+
+test('measured tiers decide replacements: Luna stands in for strong models, Haiku only for light ones when weaker is allowed, GPT-OSS only from the pool', () => {
+  const pick = (agent, extra = {}) => labels(replacements({ agent, catalog: CATALOG, quota: fakeQuota({}), config: config(), ...extra }))
+  const sonnet = agentOf({ providerId: 'claude', model: 'sonnet', requestedModel: 'sonnet' })
+  assert.ok(pick(sonnet).includes('codex/gpt-6-luna'), 'GPT-6 Luna replaces a strong model')
+  const strongWeaker = pick(sonnet, { config: config({ allowWeaker: true }) })
+  assert.ok(strongWeaker.includes('antigravity/gemini-3.8-flash-high'), 'one step below strong is light')
+  assert.ok(!strongWeaker.includes('claude/haiku'), 'but never Haiku')
+  assert.ok(!pick(sonnet, { pool: [{ providerId: 'claude', model: 'haiku' }] }).includes('claude/haiku'), 'not even from the pool')
+  const flash = agentOf({ providerId: 'antigravity', model: 'gemini-3.8-flash-high', requestedModel: 'gemini-3.8-flash-high' })
+  assert.ok(!pick(flash).includes('claude/haiku'), 'Haiku is weaker than the light models')
+  const flashWeaker = replacements({ agent: flash, catalog: CATALOG, quota: fakeQuota({}), config: config({ allowWeaker: true }) })
+  const haikuAt = flashWeaker.findIndex(item => item.model === 'haiku')
+  assert.ok(haikuAt >= 0, 'one step down allowed: Haiku is a candidate')
+  assert.ok(flashWeaker.every((item, index) => item.tier < 1 || index < haikuAt), 'after every light or better model')
+  const withOss = CATALOG.map(entry => entry.id === 'antigravity' ? { ...entry, models: [...entry.models, 'gpt-oss-120b-medium'] } : entry)
+  const haiku = agentOf({ providerId: 'claude', model: 'haiku', requestedModel: 'haiku' })
+  assert.ok(pick(haiku, { catalog: withOss }).includes('antigravity/gemini-3.8-flash-high'), 'a Haiku agent takes light models')
+  assert.ok(!pick(haiku, { catalog: withOss, config: config({ allowWeaker: true }) }).includes('antigravity/gpt-oss-120b-medium'), 'GPT-OSS is never chosen on its own')
+  assert.ok(pick(haiku, { catalog: withOss, pool: [{ providerId: 'antigravity', model: 'gpt-oss-120b-medium' }] }).includes('antigravity/gpt-oss-120b-medium'), 'only from the pool')
 })
 
 test('models of unknown quality and local models count only when the user put them in the pool', () => {
@@ -140,6 +174,11 @@ test('the handover note states the change, the state, the cut-off turn and what 
   assert.match(clean, /previous turn had completed; nothing was cut off/)
   assert.match(handoverNote({ agent, from: { providerId: 'a' }, to: { providerId: 'b' }, reason: 'exhausted', interrupted: { text: '', actions: [] } }), /produced nothing before the cut/)
   assert.match(handoverNote({ agent, from: { providerId: 'a' }, to: { providerId: 'b' }, reason: 'replacement-failed', error: new Error('region blocked') }), /replacement chosen before could not run \(region blocked\)/)
+  const failed = handoverNote({ agent, from: { providerId: 'a' }, to: { providerId: 'b' }, reason: 'failed', error: new Error('API Error: Connection dropped'), interrupted: { text: 'Half a patch', actions: [] } })
+  assert.match(failed, /^HANDOVER: your model changed mid-task because the previous one failed with an error\./)
+  assert.match(failed, /turn failed with an error \(API Error: Connection dropped\)/)
+  assert.match(failed, /CUT OFF by the provider error/)
+  assert.match(handoverNote({ agent, from: { providerId: 'a' }, to: { providerId: 'b' }, reason: 'stalled', error: new Error('silent'), interrupted: { text: 'x', actions: [] } }), /because the previous one stopped responding[\s\S]*CUT OFF by Orbit's watchdog/)
   const long = handoverNote({ agent, from: { providerId: 'a' }, to: { providerId: 'b' }, reason: 'exhausted', interrupted: { text: 'x'.repeat(20000), actions: Array.from({ length: 200 }, (_, i) => `native action number ${i} `.repeat(20)) } })
   assert.ok(long.length <= 5020 && long.endsWith('[truncated]'), 'a huge cut-off turn cannot flood the prompt')
 })
@@ -307,6 +346,75 @@ test('a subscription that could not answer is dropped as a whole, not model by m
   assert.equal(calls.filter(call => call.startsWith('antigravity')).length, 1, 'three Antigravity models are listed, one attempt is enough to know the region is refused')
   assert.equal(calls.at(-1), 'claude/opus')
   assert.equal(snapshot.agents[0].handovers.length, 2)
+})
+
+// ---- An agent in error is replaced (user's rule 2026-09-30) ------------------------------------------------------------
+
+test('a subscription that cannot answer at all is told apart from a passing failure', () => {
+  for (const message of [
+    'Google отклонил доступ к Antigravity по региону.\n\nFAILED_PRECONDITION (code 400): User location is not supported for the API use.',
+    'error: Eligibility check failed: Your current account is not eligible for Antigravity, because it is not currently available in your location.',
+    'spawn agy ENOENT', 'Not logged in · Please run /login',
+  ]) assert.equal(unreachable(new Error(message)), true, message)
+  for (const message of ['API Error: Connection dropped (ECONNRESET)', 'error: invalid model selection (--model "x" --effort "max")', 'ActionRequiredError: Named models unavailable Free plans can only use Auto.', 'Provider returned an empty response']) {
+    assert.equal(unreachable(new Error(message)), false, message)
+  }
+})
+
+test('an agent whose own provider fails moves to another subscription, and one that cannot answer is dropped as a whole', async t => {
+  const workspace = folder(t), calls = []
+  const REGION = 'Google отклонил доступ к Antigravity по региону.\n\nFAILED_PRECONDITION (code 400): User location is not supported for the API use.'
+  const { runtime } = world(t, { codex: [w(20)], claude: [w(10)], antigravity: [w(1)] }, CATALOG.slice(0, 3))
+  const { snapshot } = await finished(runtime(async options => {
+    calls.push(`${options.providerId}/${options.model}`)
+    if (options.providerId === 'antigravity') throw new Error(REGION)
+    return { text: 'Готово' }
+  }), payload(workspace, { providerId: 'antigravity', model: 'gemini-3.1-pro-high' }))
+  assert.equal(snapshot.status, 'completed')
+  assert.deepEqual(calls, ['antigravity/gemini-3.1-pro-high', 'claude/opus'], 'the freer Antigravity model is not tried after a region refusal')
+  assert.deepEqual(snapshot.agents[0].handovers.map(handover => handover.reason), ['failed'])
+  assert.ok(snapshot.traces.some(trace => trace.kind === 'handover' && /ошибка провайдера/.test(trace.text)))
+  assert.equal(snapshot.usage.providerTurns, 1, 'the failed attempt is not a turn the agent took')
+})
+
+test('a passing provider error moves the agent on but keeps the subscription for its other models', async t => {
+  const workspace = folder(t), calls = []
+  const { runtime } = world(t, { codex: [w(1)], claude: [w(30)] }, CATALOG.slice(0, 2))
+  const { snapshot } = await finished(runtime(async options => {
+    calls.push(`${options.providerId}/${options.model}`)
+    if (calls.length === 1) throw new Error('API Error: Connection dropped (ECONNRESET)')
+    return { text: 'Готово' }
+  }), payload(workspace))
+  assert.equal(snapshot.status, 'completed')
+  assert.deepEqual(calls, ['codex/gpt-6-sol', 'codex/gpt-6-astra'])
+  assert.deepEqual(snapshot.agents[0].handovers.map(handover => handover.reason), ['failed'])
+})
+
+test('a failing agent with nobody to take over, or with failover off, stops with the provider\'s own error', async t => {
+  const workspace = folder(t)
+  for (const [catalog, extra] of [[[{ id: 'codex', available: true, models: ['gpt-6-sol'] }], {}], [CATALOG, { quotaFailover: { enabled: false } }]]) {
+    const calls = []
+    const { runtime } = world(t, { codex: [w(20)], claude: [w(10)] }, catalog)
+    const { snapshot, events } = await finished(runtime(async options => { calls.push(options.providerId); throw new Error('API Error: Connection dropped (ECONNRESET)') }), payload(workspace, extra))
+    assert.equal(snapshot.status, 'failed')
+    assert.deepEqual(calls, ['codex'])
+    assert.equal(snapshot.error, 'API Error: Connection dropped (ECONNRESET)')
+    assert.equal(events.filter(event => event.type === 'agent.handover').length, 0)
+    assert.ok(!snapshot.traces.some(trace => trace.kind === 'quota'), 'an error is not reported as a quota problem')
+  }
+})
+
+test('Orbit\'s own failure around a turn (its time budget) is not blamed on the provider: no handover', async t => {
+  const workspace = folder(t), calls = []
+  const { runtime } = world(t, { codex: [w(20)], claude: [w(10)] })
+  const { snapshot, events } = await finished(runtime(options => {
+    calls.push(options.providerId)
+    return new Promise((resolve, reject) => options.signal.addEventListener('abort', () => reject(new Error('cancelled')), { once: true }))
+  }), payload(workspace, { limits: { timeoutMs: 100 } }))
+  assert.equal(snapshot.status, 'failed')
+  assert.deepEqual(calls, ['codex'])
+  assert.match(snapshot.error, /time budget exhausted/)
+  assert.equal(events.filter(event => event.type === 'agent.handover').length, 0)
 })
 
 test('providers named to skip are not offered at all', () => {

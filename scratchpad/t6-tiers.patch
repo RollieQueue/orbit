@@ -1,0 +1,25 @@
+diff --git a/electron/model-tiers.json b/electron/model-tiers.json
+index 998a5f1..c8bf392 100644
+--- a/electron/model-tiers.json
++++ b/electron/model-tiers.json
+@@ -1,12 +1,16 @@
+ {
+   "notes": [
+-    "Quality tiers used to decide which model may replace another when a subscription runs out: 3 flagship, 2 strong, 1 light, 0 unknown.",
++    "Quality tiers used to decide which model may replace another when a subscription runs out: 3 flagship, 2 strong, 1 light, 0.5 weak, 0 unknown or unreliable.",
+     "Rules run top to bottom on the lowercase model id and the first match wins. A name fragment must be delimited by - _ / . or space, so 'mini' does not match 'gemini'.",
+-    "Rules are by naming convention, not measured quality. When unsure, a model is placed LOWER: a replacement is then only rarely chosen, never wrongly trusted.",
+-    "Unknown models (tier 0) are used as replacements only when the user listed them in the provider pool.",
+-    "baseline is the tier assumed for the model that is being replaced when its name is not known yet (the CLI default). It is deliberately high: an unknown model is not swapped for a weaker one."
++    "The first rules are measured: models the model audit of 2026-09-30 (docs/MODEL-AUDIT.md) placed away from what their names suggest. Each says why in 'measured'. The rest follow naming conventions, not measured quality.",
++    "When unsure, a model is placed LOWER: a replacement is then only rarely chosen, never wrongly trusted.",
++    "Weak (0.5) models replace only weak ones, or light ones when the run allows weaker models. Unknown or unreliable models (tier 0) are used as replacements only when the user listed them in the provider pool.",
++    "baseline is the tier assumed for the model that is being replaced when its name is not known yet (the CLI default) or its tier is 0. It is deliberately high: an unknown model is not swapped for a weaker one."
+   ],
+   "rules": [
++    { "tier": 2, "match": "(?:^|[-_/. ])gpt-6-luna(?=$|[-_/. ])", "measured": "GPT-6 Luna: 96.9 of 100, code, review, logic and repository questions without a mistake in 2.0 min; only its Russian text was weak. A light name, strong work." },
++    { "tier": 0.5, "match": "^haiku$|(?:^|[-_/. ])(?:haiku[-_.]4[-_.]5|4[-_.]5[-_.]haiku)(?=$|[-_/. ])", "measured": "Claude Haiku 4.5 (also the 'haiku' alias): 68.7 of 100, far below the other light models (Gemini 3.8 Flash 91.7, GPT-5.6 Luna 83.1): mistakes in code, review and logic." },
++    { "tier": 0, "match": "(?:^|[-_/. ])gpt-oss(?=$|[-_/.: ])", "measured": "GPT-OSS 120B: stopped reporting for 7 minutes and gave no answer (0 of 100). Never a replacement on its own, only from the pool." },
+     { "tier": 1, "match": "(?:^|[-_/. ])(?:haiku|mini|nano|lite|flash|luna|small|tiny|instant)(?=$|[-_/. ])" },
+     { "tier": 3, "match": "(?:^|[-_/. ])(?:opus|fable|astra|sol|pro)(?=$|[-_/. ])" },
+     { "tier": 2, "match": "(?:^|[-_/. ])(?:sonnet|terra|codex|composer|grok|oss|gemini|claude|gpt|deepseek|qwen|llama|mistral)" }

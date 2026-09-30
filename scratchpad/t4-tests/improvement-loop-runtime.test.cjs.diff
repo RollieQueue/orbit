@@ -1,0 +1,6 @@
+--- a/tests/improvement-loop-runtime.test.cjs
++++ b/tests/improvement-loop-runtime.test.cjs
+@@ -102 +102,2 @@
+-  assert.deepEqual([...live.improvementBaseline], ['y|Task y'])
++  assert.deepEqual([...live.improvementBaseline.keys()], ['y'])
++  assert.equal(live.improvementBaseline.get('y').title, 'Task y')

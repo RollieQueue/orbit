@@ -70,11 +70,26 @@ function runGit(workspace: string | null | undefined, args: readonly string[], {
   const merged: NodeJS.ProcessEnv = { ...process.env, ...ENV, ...env }
   const ceilings = [merged.GIT_CEILING_DIRECTORIES, ceiling].filter(Boolean).join(path.delimiter)
   if (ceilings) merged.GIT_CEILING_DIRECTORIES = ceilings
+  // On Windows the `git` found on PATH is often Git's cmd\git.exe, a wrapper that starts the real git.exe. execFile's own
+  // timeout ends only the wrapper, and the real Git lives on, holding the workspace, for as long as its stdin stays
+  // open. There the timeout ends the whole tree with taskkill /t.
+  const tree = process.platform === 'win32' && timeoutMs > 0
+  let expired = false
+  let timer: ReturnType<typeof setTimeout> | undefined
   return new Promise<GitResult<string | Buffer>>(resolve => {
     try {
-      execFile('git', argv, { cwd, timeout: timeoutMs, maxBuffer, encoding, windowsHide: true, env: merged },
-        (error, stdout, stderr) => resolve(outcome(error, stdout, stderr, settings)))
-    } catch (error) { resolve(outcome(error as RunFailure, '', '', settings)) }
+      const child = execFile('git', argv, { cwd, timeout: tree ? 0 : timeoutMs, maxBuffer, encoding, windowsHide: true, env: merged }, (error, stdout, stderr) => {
+        clearTimeout(timer)
+        // Ended by the tree kill: reported as execFile reports its own timeout.
+        const failure: RunFailure | null = error && expired ? { killed: true, code: null, signal: 'SIGTERM', message: error.message } : error
+        resolve(outcome(failure, stdout, stderr, settings))
+      })
+      if (tree) timer = setTimeout(() => {
+        expired = true
+        if (!child.pid) { child.kill(); return }
+        execFile('taskkill.exe', ['/pid', String(child.pid), '/t', '/f'], { windowsHide: true, timeout: 5000 }, failed => { if (failed) child.kill() })
+      }, timeoutMs)
+    } catch (error) { clearTimeout(timer); resolve(outcome(error as RunFailure, '', '', settings)) }
   })
 }
 

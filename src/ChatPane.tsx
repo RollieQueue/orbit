@@ -1,13 +1,15 @@
 import { useEffect, useRef } from 'react'
 import type { ChatThread, HandoverTarget, InspectorTab, Message, Project, RunSnapshot } from './types'
 import { RunHistory, runChangedFiles } from './AgentHistory'
+import { MessageAttachments } from './AttachmentChips'
 import { WorkingStatus } from './ChatNotices'
 import { Composer, type ComposerProps } from './Composer'
 import { Icon } from './Icon'
 import { handoverLabel } from './QuotaPanel'
 import { Markdown, plural, statusText, timeOf } from './format'
+import { loopPhaseText, type LoopView } from './improvement-loop'
 import { providers } from './providers'
-import { historyAnchors, isActiveStatus, resumeLinks, shortRunId, type RunMap } from './run-events'
+import { historyAnchors, isActiveStatus, resumeLinks, shortRunId, shownStatus, type RunMap } from './run-events'
 import { RESTART_WAIT_TEXT } from './state-store'
 
 type OpenTeam = (runId: string, tab?: InspectorTab, agentId?: string) => void
@@ -25,6 +27,8 @@ type ChatPaneProps = {
   // restartWait: the chat's agent restarted Orbit and the continuation has not started yet (state-store restartWaits).
   running: boolean; restartWait: boolean; starting: boolean; workingRun?: RunSnapshot; currentRun?: RunSnapshot; agentsOpen: boolean; storageError: string
   composer: ComposerProps
+  // The chat's endless-improvement loop while it is active: the banner with its state and actions.
+  loop?: LoopView; onStopLoop: () => void; onRunLoopNow: () => void
   onOpenSidebar: () => void; onToggleAgents: () => void; onOpenAgents: () => void; onOpenTeam: OpenTeam
   onSuggest: (text: string) => void; onAddProject: () => void
 }
@@ -32,13 +36,15 @@ type ChatPaneProps = {
 // Header, notices, the conversation (messages, the answer being written, the team's status) and the composer.
 export function ChatPane({
   project, chat, chatKey, runs, ready, desktop, running, restartWait, starting, workingRun, currentRun, agentsOpen, storageError, composer,
-  onOpenSidebar, onToggleAgents, onOpenAgents, onOpenTeam, onSuggest, onAddProject,
+  loop, onStopLoop, onRunLoopNow, onOpenSidebar, onToggleAgents, onOpenAgents, onOpenTeam, onSuggest, onAddProject,
 }: ChatPaneProps) {
   const bottom = useRef<HTMLDivElement>(null)
   const nearBottom = useRef(true)
   // The root agent's answer as it is being written, shown as a chat entry until the final message with the same id lands.
-  const streaming = workingRun?.streaming
-  const stub: Message | undefined = streaming && chat && !chat.messages.some(m => m.id === streaming.messageId)
+  // A paused root's cut-off turn is lost, so the half-written answer is not shown.
+  const rootPaused = !!workingRun?.agents.find(a => a.id === 'root')?.paused
+  const streaming = rootPaused ? undefined : workingRun?.streaming
+  const stub: Message | undefined = streaming && workingRun && chat &&!chat.messages.some(m => m.id === streaming.messageId)
     ? {
       id: streaming.messageId, author: 'orbit', text: streaming.content, time: streaming.startedAt, runId: workingRun.runId,
       model: workingRun.agents.find(a => a.id === 'root')?.model || workingRun.model,
@@ -69,6 +75,7 @@ export function ChatPane({
       <Icon name="terminal" size={16} /><span>Предпросмотр. Подключение проектов и работа агентов доступны в настольном Orbit.</span>
     </div>}
     {storageError && <div className="error-banner" role="alert">{storageError}</div>}
+    {loop && <LoopBanner loop={loop} onStop={onStopLoop} onRunNow={onRunLoopNow} />}
     {!!otherActiveChats && <div className="parallel-chat-notice" role="status">
       Других активных чатов в проекте: {otherActiveChats}. Файлы общие — поручайте изменения разных участков.
     </div>}
@@ -93,6 +100,19 @@ export function ChatPane({
     </div>
     <Composer {...composer} onSend={submit} />
   </main>
+}
+
+// «∞ Бесконечное улучшение · задача N» with its state; stopping lets a working task finish, a waiting retry can start now.
+function LoopBanner({ loop, onStop, onRunNow }: { loop: LoopView; onStop: () => void; onRunNow: () => void }) {
+  const busy = loop.phase === 'running' || loop.phase === 'restarting'
+  return <div className="loop-banner" role="status">
+    <span className={`status-dot ${loop.phase === 'retry' || loop.phase === 'waiting' ? 'waiting' : 'working'}`} />
+    <span><strong>∞ Бесконечное улучшение · задача {loop.task}</strong> · {loopPhaseText(loop)}</span>
+    {loop.phase === 'retry' && <button type="button" onClick={onRunNow}>Запустить сейчас</button>}
+    <button type="button" onClick={onStop} title={busy ? 'Текущая задача доработает, следующая не начнётся' : undefined}>
+      {busy ? 'Остановить цикл после текущей задачи' : 'Остановить цикл'}
+    </button>
+  </div>
 }
 
 type WelcomeProps = { project?: Project; desktop: boolean; onSuggest: (text: string) => void; onAddProject: () => void }
@@ -126,10 +146,12 @@ function ChatMessage({ message, run, anchored, loaded, streaming, onOpen }: {
       <div className="message-meta">
         <strong>{author}</strong>
         {message.model && <span>{message.model}</span>}
+        {message.kind === 'steer' && <span title="Отправлено агенту, пока он работал">во время работы</span>}
         {streaming && <span className="typing-label"><span className="status-dot working" />печатает…</span>}
         <time>{timeOf(message.time)}</time>
       </div>
-      <Markdown text={streaming && !message.text.trim() ? 'Формирует ответ…' : message.text} />
+      {(message.text.trim() || !message.attachments?.length) && <Markdown text={streaming && !message.text.trim() ? 'Формирует ответ…' : message.text} />}
+      <MessageAttachments attachments={message.attachments} />
       {anchored && <><TeamStrip run={run} onOpen={onOpen} /><RunHistory run={run} loaded={loaded} onOpen={onOpen} /></>}
     </div>
   </article>
@@ -143,7 +165,7 @@ function TeamStrip({ run, onOpen }: { run?: RunSnapshot; onOpen: (runId: string,
     {!!helpers.length && <button type="button" className="team-strip-open" onClick={() => onOpen(run.runId)}
       title="Открыть команду этого запуска: действия, переписку и файлы">
       <span className="team-strip-title"><Icon name="agents" size={13} />Команда · {helpers.length}</span>
-      {helpers.slice(0, 5).map(agent => <span key={agent.id} className="team-chip"><span className={`status-dot ${agent.status}`} />{agent.name}</span>)}
+      {helpers.slice(0, 5).map(agent => <span key={agent.id} className="team-chip"><span className={`status-dot ${shownStatus(agent)}`} />{agent.name}</span>)}
       {helpers.length > 5 && <span className="team-chip more">+{helpers.length - 5}</span>}
     </button>}
     {!!changed && <button type="button" className="team-files" onClick={() => onOpen(run.runId, 'changes')} title="Открыть изменения этого запуска">

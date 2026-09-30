@@ -62,6 +62,35 @@ const approvalDialogs = []
 // Main shows the approval dialogs the runtime process asks for.
 dialog.showMessageBox = async (_window, options) => { approvalDialogs.push(options); return { response: 1 } }
 const errors = []
+const pauseScenario = { requests: 0, aborted: false, resumedInput: '' }
+const stopScenario = { rootRequests: 0, helperRequests: 0, helperAborted: false, stoppedInput: '' }
+// The endless improvement loop: the fixture plays the root agent of three loop tasks, one run each. The task number is
+// read from the prompt the renderer generated (task 1 is the user's own message). Within a run, the first call records
+// the plan with improvement_plan, and the call whose transcript holds that call's result gives the final answer.
+const loopCalls = []
+const loopPlans = {
+  1: { status: 'implementing', handoff: 'ORBIT_HANDOFF_ONE: t1 проверена, дальше t2', tasks: [
+    { id: 't1', title: 'Первое улучшение', status: 'done', evidence: 'fixture: проверка t1 прошла' },
+    { id: 't2', title: 'Второе улучшение', status: 'pending', evidence: '' },
+  ] },
+  2: { status: 'implementing', handoff: 'ORBIT_HANDOFF_TWO: обе задачи сделаны', tasks: [
+    { id: 't1', title: 'Первое улучшение', status: 'done', evidence: 'fixture: проверка t1 прошла' },
+    { id: 't2', title: 'Второе улучшение', status: 'done', evidence: 'fixture: проверка t2 прошла' },
+  ] },
+  3: { status: 'blocked', tasks: [
+    { id: 't1', title: 'Первое улучшение', status: 'done', evidence: 'fixture: проверка t1 прошла' },
+    { id: 't2', title: 'Второе улучшение', status: 'done', evidence: 'fixture: проверка t2 прошла' },
+    { id: 't3', title: 'Цель цикла', status: 'blocked', evidence: 'goal reached: две задачи цели выполнены и проверены' },
+  ] },
+}
+function loopContent(input) {
+  const task = Number(/YOUR CURRENT TASK:\n∞ Бесконечное улучшение — задача №(\d+)\./.exec(input)?.[1] || 1)
+  const transcript = input.slice(input.lastIndexOf('AGENT TRANSCRIPT'))
+  const planned = transcript.includes(`"type":"tool_result","tool_call_id":"loop-plan-${task}","name":"improvement_plan"`)
+  loopCalls.push({ task, planned, input })
+  if (planned || !loopPlans[task]) return `Задача ${task} цикла выполнена и проверена.`
+  return JSON.stringify({ content: `Закрываю задачу ${task} цикла.`, tool_calls: [{ id: `loop-plan-${task}`, name: 'improvement_plan', arguments: loopPlans[task] }] })
+}
 const server = http.createServer(async (request, response) => {
   try {
     let body = ''
@@ -70,6 +99,60 @@ const server = http.createServer(async (request, response) => {
     assert.equal(payload.model, 'fixture-selected', 'selected model reaches the provider and child agents')
     assert.equal(payload.reasoning_effort, 'high', 'selected effort reaches root and child requests')
     const input = payload.messages[0].content
+    if (input.includes('ORBIT_PAUSE_ROOT')) {
+      pauseScenario.requests++
+      if (input.includes('PAUSED BY THE USER')) {
+        pauseScenario.resumedInput = input
+        setTimeout(() => {
+          response.writeHead(200, { 'content-type': 'application/json' })
+          response.end(JSON.stringify({ model: 'fixture-model', choices: [{ message: { content: 'Pause smoke run resumed and completed.' }, finish_reason: 'stop' }] }))
+        }, 40)
+      } else {
+        response.on('close', () => { if (!response.writableEnded) pauseScenario.aborted = true })
+      }
+      return
+    }
+    if (input.includes('ORBIT_STOP_HELPER_TASK') && /parent=agent-|parent=root/.test(input)) {
+      stopScenario.helperRequests++
+      response.on('close', () => { if (!response.writableEnded) stopScenario.helperAborted = true })
+      return
+    }
+    if (input.includes('ORBIT_STOP_HELPER')) {
+      stopScenario.rootRequests++
+      if (input.includes('Stopped by the user')) {
+        stopScenario.stoppedInput = input
+        setTimeout(() => {
+          response.writeHead(200, { 'content-type': 'application/json' })
+          response.end(JSON.stringify({ model: 'fixture-model', choices: [{ message: { content: 'The stopped helper was accounted for; this run is complete.' }, finish_reason: 'stop' }] }))
+        }, 40)
+      } else if (stopScenario.rootRequests === 1) {
+        const content = JSON.stringify({ tool_calls: [
+          { id: 'stop-smoke-spawn', name: 'spawn_agent', arguments: { name: 'PauseSmokeHelper', task: 'ORBIT_STOP_HELPER_TASK: wait for the parent to stop this helper', reason: 'Exercise helper stop from the inspector' } },
+          { id: 'stop-smoke-wait', name: 'wait_message', arguments: { timeout_ms: 12000 } },
+        ] })
+        setTimeout(() => {
+          response.writeHead(200, { 'content-type': 'application/json' })
+          response.end(JSON.stringify({ model: 'fixture-model', choices: [{ message: { content }, finish_reason: 'stop' }] }))
+        }, 40)
+      } else {
+        const content = JSON.stringify({ tool_calls: [
+          { id: `stop-smoke-wait-${stopScenario.rootRequests}`, name: 'wait_message', arguments: { timeout_ms: 12000 } },
+        ] })
+        setTimeout(() => {
+          response.writeHead(200, { 'content-type': 'application/json' })
+          response.end(JSON.stringify({ model: 'fixture-model', choices: [{ message: { content }, finish_reason: 'stop' }] }))
+        }, 40)
+      }
+      return
+    }
+    if (input.includes('ORBIT_LOOP')) {
+      const content = loopContent(input)
+      setTimeout(() => {
+        response.writeHead(200, { 'content-type': 'application/json' })
+        response.end(JSON.stringify({ model: 'fixture-model', choices: [{ message: { content }, finish_reason: 'stop' }] }))
+      }, 40)
+      return
+    }
     if (input.includes('ORBIT_PARALLEL_')) {
       parallelResponses.push(response)
       if (parallelResponses.length === 2) setTimeout(() => {
@@ -407,13 +490,117 @@ async function exercise(win) {
     await evaluate(`document.querySelector('.runtime-result').scrollIntoView({ block: 'center' })`)
     await shot('runtime-restart.png')
   }
+
+  // ---- The endless improvement loop: the switch on and one message; Orbit starts the next tasks itself, each as a new
+  // run of the same chat with a fresh context, and pauses when the plan ends blocked (the goal is reached) ----
+  await evaluate(`document.querySelector('button[aria-label="Закрыть"]')?.click()`)
+  await setSelect('Провайдер', 'custom')
+  await waitFor(() => evaluate(`document.querySelector('select[aria-label="Модель"]').value === 'fixture-selected'`), 'custom provider back for the loop')
+  await evaluate(`document.querySelector('.new-chat').click()`)
+  // ---- Pausing the root interrupts its in-flight provider request; resume sends an explicit recovery instruction ----
+  const pauseStarted = Date.now()
+  const pauseButtonLabel = 'Поставить на паузу'
+  const continueLabel = 'Продолжить'
+  const pausedStatus = 'Агент на паузе'
+  // The labels hold spaces and colons, so the attribute value is quoted inside the selector.
+  const byLabel = label => JSON.stringify(`button[aria-label=${JSON.stringify(label)}]`)
+  await send('ORBIT_PAUSE_ROOT: hold this request until the user pauses, then resume and finish')
+  await waitFor(() => evaluate(`window.orbit.listRuns().then(runs => runs.some(run => run.prompt.startsWith('ORBIT_PAUSE_ROOT') && run.status === 'working'))`), 'root pause run starts')
+  await waitFor(() => pauseScenario.requests === 1, 'root pause provider request is held')
+  await waitFor(() => evaluate(`!!document.querySelector('.working-indicator .status-dot.working')`), 'root working indicator is visible')
+  await evaluate(`document.querySelector(${byLabel(pauseButtonLabel)}).click()`)
+  await waitFor(() => pauseScenario.aborted, 'root provider request is aborted by pause')
+  // The indicator also holds the «Посмотреть действия» button, so its text only starts with the status.
+  await waitFor(() => evaluate(`!!document.querySelector('.working-indicator .status-dot.paused') && document.querySelector('.working-indicator').textContent.startsWith(${JSON.stringify(pausedStatus)})`), 'root working indicator shows paused')
+  assert.ok(await evaluate(`!!document.querySelector(${byLabel(continueLabel)})`), 'composer shows Continue while root is paused')
+  await delay(1500)
+  assert.equal(pauseScenario.requests, 1, 'no provider request starts while the root is paused')
+  await evaluate(`document.querySelector(${byLabel(continueLabel)}).click()`)
+  await waitFor(() => !!pauseScenario.resumedInput, 'resumed root request reaches the provider')
+  assert.ok(pauseScenario.resumedInput.includes('PAUSED BY THE USER'), 'resume request carries the pause recovery note')
+  await waitFor(() => evaluate(`window.orbit.listRuns().then(runs => runs.some(run => run.prompt.startsWith('ORBIT_PAUSE_ROOT') && run.status === 'completed'))`), 'root pause run completes')
+  await waitFor(() => evaluate(`document.querySelector('.conversation').textContent.includes('Pause smoke run resumed and completed.')`), 'resumed answer appears in chat')
+  timings.rootPauseResumeMs = Date.now() - pauseStarted
+
+  // ---- Stopping a helper in the inspector aborts its request and returns the stop note to its root ----
+  const helperStopStarted = Date.now()
+  const helperName = 'PauseSmokeHelper'
+  const helperStopLabel = 'Остановить: ' + helperName
+  const stoppedStatus = 'Остановлен'
+  await evaluate(`document.querySelector('.new-chat').click()`)
+  await send('ORBIT_STOP_HELPER: spawn and stop the held helper, then finish')
+  await waitFor(() => evaluate(`window.orbit.listRuns().then(runs => runs.some(run => run.prompt.startsWith('ORBIT_STOP_HELPER') && run.status === 'working'))`), 'helper stop run starts')
+  await waitFor(() => stopScenario.helperRequests === 1, 'helper provider request is held')
+  await evaluate(`(() => { if (!document.querySelector('.agents-panel')) document.querySelector('.agents-toggle').click() })()`)
+  await waitFor(() => evaluate(`Array.from(document.querySelectorAll('.agent-row')).some(row => row.querySelector('strong')?.textContent === ${JSON.stringify(helperName)})`), 'spawned helper appears in the agents panel')
+  await evaluate(`Array.from(document.querySelectorAll('.agent-row')).find(row => row.querySelector('strong')?.textContent === ${JSON.stringify(helperName)}).click()`)
+  await waitFor(() => evaluate(`!!document.querySelector(${byLabel(helperStopLabel)})`), 'selected helper exposes Stop')
+  await evaluate(`document.querySelector(${byLabel(helperStopLabel)}).click()`)
+  await waitFor(() => stopScenario.helperAborted, 'helper provider request is aborted by stop')
+  await waitFor(() => evaluate(`Array.from(document.querySelectorAll('.agent-row')).find(row => row.querySelector('strong')?.textContent === ${JSON.stringify(helperName)})?.querySelector('.agent-state')?.textContent.includes(${JSON.stringify(stoppedStatus)})`), 'helper row shows stopped')
+  await waitFor(() => !!stopScenario.stoppedInput, 'root receives the stopped helper result')
+  assert.ok(stopScenario.stoppedInput.includes('Stopped by the user'), 'root request includes the helper stop result')
+  await waitFor(() => evaluate(`window.orbit.listRuns().then(runs => runs.some(run => run.prompt.startsWith('ORBIT_STOP_HELPER') && run.status === 'completed'))`), 'helper stop run completes')
+  await waitFor(() => evaluate(`document.querySelector('.conversation').textContent.includes('The stopped helper was accounted for; this run is complete.')`), 'root answer after helper stop appears in chat')
+  timings.helperStopMs = Date.now() - helperStopStarted
+  await evaluate(`document.querySelector('.agents-toggle').click()`)
+  await evaluate(`document.querySelector('.new-chat').click()`)
+  await evaluate(`document.querySelector('.improvement-toggle input[type=checkbox]').click()`)
+  await waitFor(() => evaluate(`document.querySelector('.improvement-toggle input[type=checkbox]').checked`), 'improvement switch on')
+  const loopGoal = 'ORBIT_LOOP: сделай две задачи улучшения'
+  const loopStarted = Date.now()
+  await send(loopGoal)
+  await waitFor(() => evaluate(`window.orbit.listRuns().then(runs => runs.some(run => run.prompt === ${JSON.stringify(loopGoal)}))`), 'loop task 1 starts')
+  const loopChatId = (await evaluate(`window.orbit.listRuns()`)).find(run => run.prompt === loopGoal).chatId
+  const loopRuns = async () => (await evaluate(`window.orbit.listRuns()`)).filter(run => run.chatId === loopChatId).sort((a, b) => String(a.startedAt).localeCompare(String(b.startedAt)))
+  const conversation = () => evaluate(`document.querySelector('.conversation').textContent`)
+  await waitFor(async () => (await conversation()).includes('∞ Цикл на паузе'), 'the loop pauses after the blocked plan', 20000)
+  timings.loopMs = Date.now() - loopStarted
+  const ended = await loopRuns()
+  assert.deepEqual(ended.map(run => [run.status, run.loopTask ?? null]), [['completed', null], ['completed', 2], ['completed', 3]], JSON.stringify(ended.map(run => ({ status: run.status, loopTask: run.loopTask, error: run.error }))))
+  assert.ok(ended[1].prompt.startsWith('∞ Бесконечное улучшение — задача №2.') && ended[1].prompt.includes(`Цель цикла: ${loopGoal}`), ended[1].prompt)
+  assert.ok(ended[2].prompt.startsWith('∞ Бесконечное улучшение — задача №3.'), ended[2].prompt)
+  assert.deepEqual(ended.map(run => run.improvementStatus), ['implementing', 'implementing', 'blocked'])
+  assert.ok(ended[0].improvementHandoff?.startsWith('ORBIT_HANDOFF_ONE') && ended[1].improvementHandoff?.startsWith('ORBIT_HANDOFF_TWO'), JSON.stringify(ended.map(run => run.improvementHandoff)))
+  // What the fixture root saw: each run closed its task with one improvement_plan call and answered without a reminder;
+  // tasks 2 and 3 got the plan and the handoff of the previous run and no chat transcript.
+  assert.deepEqual(loopCalls.map(call => [call.task, call.planned]), [[1, false], [1, true], [2, false], [2, true], [3, false], [3, true]])
+  const firstCall = task => loopCalls.find(call => call.task === task && !call.planned).input
+  assert.ok(firstCall(1).includes('IMPROVEMENT MODE ON') && firstCall(1).includes('CURRENT IMPROVEMENT PROGRESS:\nPlan status: planning; tasks: 0 working, 0 pending, 0 done, 0 blocked.\nNo tasks recorded yet.'))
+  assert.ok(!firstCall(1).includes('HANDOFF FROM THE PREVIOUS TASK'))
+  for (const [task, counts, handoff] of [[2, '0 working, 1 pending, 1 done, 0 blocked', 'ORBIT_HANDOFF_ONE'], [3, '0 working, 0 pending, 2 done, 0 blocked', 'ORBIT_HANDOFF_TWO']]) {
+    const input = firstCall(task)
+    assert.ok(input.includes(`YOUR CURRENT TASK:\n∞ Бесконечное улучшение — задача №${task}.\nЦель цикла: ${loopGoal}`), `task ${task}: generated prompt`)
+    assert.ok(input.includes(`CURRENT IMPROVEMENT PROGRESS:\nPlan status: implementing; tasks: ${counts}.`), `task ${task}: plan carried over`)
+    assert.ok(input.includes(`HANDOFF FROM THE PREVIOUS TASK: ${handoff}`), `task ${task}: handoff carried over`)
+    assert.ok(input.includes('RECENT CHAT:\n[]'), `task ${task}: fresh context without the chat transcript`)
+  }
+  assert.ok(firstCall(2).includes('- [pending] t2: Второе улучшение') && firstCall(2).includes('- [done] t1: Первое улучшение — fixture: проверка t1 прошла'))
+  // The chat: one user message, a loop note for each task Orbit started, three answers, the pause note, no banner.
+  const loopState = async () => (await evaluate(`window.orbit.loadState()`)).projects.flatMap(project => project.chats).find(chat => chat.id === loopChatId)
+  await waitFor(async () => (await loopState())?.loop?.active === false, 'the paused loop is saved')
+  const saved = await loopState()
+  assert.deepEqual([saved.loop.stopped?.reason, saved.loop.iteration], ['blocked', 3], JSON.stringify(saved.loop))
+  assert.deepEqual(saved.messages.filter(message => message.kind === 'loop').map(message => [message.runId, message.text.slice(0, 11)]), [[ended[1].runId, '∞ Задача 2:'], [ended[2].runId, '∞ Задача 3:']])
+  assert.ok(saved.messages.some(message => message.kind === 'loop-state' && message.text.startsWith('∞ Цикл на паузе')), JSON.stringify(saved.messages.map(message => message.text)))
+  assert.deepEqual(saved.messages.filter(message => message.author === 'user').map(message => message.text), [loopGoal], 'loop prompts are not user messages')
+  const text = await conversation()
+  assert.ok(text.includes('∞ Задача 2:') && text.includes('∞ Задача 3:'), text)
+  assert.equal(await evaluate(`document.querySelectorAll('.message.orbit').length`), 3)
+  assert.equal(await evaluate(`document.querySelectorAll('.message.user').length`), 1)
+  assert.ok(!await evaluate(`!!document.querySelector('.loop-banner')`), 'no loop banner once the loop is paused')
+  // Paused means paused: no fourth task starts.
+  await delay(3000)
+  assert.equal((await loopRuns()).length, 3, 'no task starts after the pause')
+  assert.equal(loopCalls.length, 6)
+  await shot('improvement-loop.png')
   assert.deepEqual(errors, [])
   const { codexRuns, claudeRuns } = fixtureCounters()
-  console.log(JSON.stringify({ ok: true, runtimeMode, projects: 2, runs: 7, agents: 8, communications: 4, agentGraph: true, alphaCalls, betaCalls, childCalls, reload: true, parallelChats: true, fixedInspectorTabs: true, scopeIsolation: true, skillVersions: 3, quotaPanel: true, failover: { proactive: true, refused: true, codexRuns, claudeRuns }, runtimeRestartMs: timings.runtimeRestartMs ?? null, screenshotPath }))
+  console.log(JSON.stringify({ ok: true, runtimeMode, projects: 2, runs: 10, agents: 11, communications: 4, agentGraph: true, alphaCalls, betaCalls, childCalls, reload: true, parallelChats: true, fixedInspectorTabs: true, scopeIsolation: true, skillVersions: 3, quotaPanel: true, failover: { proactive: true, refused: true, codexRuns, claudeRuns }, rootPauseResumeMs: timings.rootPauseResumeMs, helperStopMs: timings.helperStopMs, runtimeRestartMs: timings.runtimeRestartMs ?? null, improvementLoop: { tasks: 3, loopCalls: loopCalls.length, paused: true, loopMs: timings.loopMs }, screenshotPath }))
 }
 
 let orbit = null
-const timeout = setTimeout(() => { console.error('Desktop verification exceeded 60 seconds'); app.exit(1) }, 60000)
+const timeout = setTimeout(() => { console.error('Desktop verification exceeded 75 seconds'); app.exit(1) }, 75000)
 let started = false
 app.on('browser-window-created', (_event, win) => {
   if (started) return

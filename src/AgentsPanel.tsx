@@ -1,12 +1,12 @@
 import type { ReactNode } from 'react'
 import type { Agent, InspectorTab, QuotaSnapshot, RunSnapshot } from './types'
 import { RunHistoryList } from './AgentHistory'
-import { AgentInspector } from './AgentInspector'
+import { AgentInspector, type AgentControls, type MessageAgent } from './AgentInspector'
 import { Icon } from './Icon'
 import { handoverLabel } from './QuotaPanel'
 import { plural, statusText } from './format'
 import { providerName, providers } from './providers'
-import { isActiveStatus, resumeLinks, shortRunId } from './run-events'
+import { isActiveStatus, resumeLinks, shortRunId, shownStatus } from './run-events'
 
 type TreeOptions = { run: RunSnapshot; selectedId?: string; onSelect: (id: string) => void }
 const handoverTitle = (agent: Agent) =>
@@ -24,7 +24,7 @@ function agentTree(items: Agent[], options: TreeOptions, parentId: string | null
     return <div key={agent.id}>
       <button className={`agent-row ${options.selectedId === agent.id ? 'selected' : ''}`} style={{ paddingLeft: 14 + Math.min(depth, 8) * 16 }}
         onClick={() => options.onSelect(agent.id)}>
-        <span className={`status-dot ${agent.status}`} />
+        <span className={`status-dot ${shownStatus(agent)}`} />
         <span className="agent-row-label">
           <strong>{agent.name || agent.id}</strong>
           <small title={modelLabel}>{modelLabel}</small>
@@ -32,7 +32,7 @@ function agentTree(items: Agent[], options: TreeOptions, parentId: string | null
           {!!files && files.wrote.length + files.read.length > 0 && <small>Файлы: изменил {files.wrote.length}, читал {files.read.length}</small>}
           {!!agent.handovers?.length && <small className="handover-badge" title={handoverTitle(agent)}>⇄ Сменил подписку: {agent.handovers.length}</small>}
         </span>
-        <span className="agent-state">{statusText(agent.status)}</span>
+        <span className="agent-state">{statusText(shownStatus(agent))}</span>
       </button>
       {agentTree(items, options, agent.id, depth + 1, nextSeen)}
     </div>
@@ -41,11 +41,11 @@ function agentTree(items: Agent[], options: TreeOptions, parentId: string | null
 
 type AgentsPanelProps = {
   chatRuns: RunSnapshot[]; currentRun?: RunSnapshot; selectedAgent: string; inspectorRequest: { runId: string; tab: InspectorTab; seq: number } | null
-  quotas: Record<string, QuotaSnapshot>; onClose: () => void; onPick: (runId: string) => void; onSelectAgent: (id: string) => void
+  quotas: Record<string, QuotaSnapshot>; onMessage: MessageAgent; controls: AgentControls; onClose: () => void; onPick: (runId: string) => void; onSelectAgent: (id: string) => void
 }
 
 // The agents panel: the chat's runs, the selected run's team as a tree (plus the router) and the inspector of one agent.
-export function AgentsPanel({ chatRuns, currentRun, selectedAgent, inspectorRequest, quotas, onClose, onPick, onSelectAgent }: AgentsPanelProps) {
+export function AgentsPanel({ chatRuns, currentRun, selectedAgent, inspectorRequest, quotas, onMessage, controls, onClose, onPick, onSelectAgent }: AgentsPanelProps) {
   const routerAgent: Agent = {
     id: 'router', name: 'Маршрутизатор', role: 'Системный участник', status: isActiveStatus(currentRun?.status) ? 'working' : 'done',
   }
@@ -94,7 +94,7 @@ export function AgentsPanel({ chatRuns, currentRun, selectedAgent, inspectorRequ
         </button>}
       </div>
       {selected && <AgentInspector key={requested ? `${currentRun.runId}:${requested.seq}` : currentRun.runId} run={currentRun} agent={selected}
-        onSelect={onSelectAgent} quotas={quotas} initialTab={requested?.tab} />}
+        onSelect={onSelectAgent} quotas={quotas} initialTab={requested?.tab} onMessage={onMessage} controls={controls} />}
     </>}
   </aside>
 }

@@ -1,0 +1,6 @@
+const fs=require('fs');const reg=require('../../electron/tool-registry.mts')
+const t=fs.readFileSync('tests/tool-registry.test.cjs','utf8')
+const m=t.match(/const ORIGINAL_GUIDE = `([\s\S]*?)`\n/)
+const exp=eval('`'+m[1]+'`').split('\n'), act=reg.describeForPrompt({id:'root'},{}).split('\n')
+exp.forEach((l,i)=>{ if(l!==act[i]) console.log(i,'\nEXP',l.slice(0,300),'\nACT',(act[i]||'').slice(0,300)) })
+console.log(exp.length,act.length)

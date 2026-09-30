@@ -79,6 +79,7 @@ class FakeRuntime extends EventEmitter {
 function loadMain({ lock = true, ready = false, healthFile = '0', mode, argv = [], userData = os.tmpdir(), runtime = 'ok', isPackaged = false, loaded = [], fingerprint } = {}) {
   const handlers = new Map(), appEvents = [], appHandlers = new Map(), calls = { relaunch: [], exit: [], quit: 0, lock: [] }
   const windows = [], forks = [], dialogs = [], opened = [], spawned = [], proxyLookups = [], executed = []
+  const privileged = [], protocols = new Map(), webRequests = []
   const behaviourOf = (index) => (Array.isArray(runtime) ? runtime[Math.min(index, runtime.length - 1)] : runtime)
   const saved = { ORBIT_USER_DATA: process.env.ORBIT_USER_DATA, ORBIT_HEALTH_FILE: process.env.ORBIT_HEALTH_FILE, ORBIT_RUNTIME_MODE: process.env.ORBIT_RUNTIME_MODE }
   delete process.env.ORBIT_USER_DATA
@@ -148,8 +149,9 @@ function loadMain({ lock = true, ready = false, healthFile = '0', mode, argv = [
       },
       BrowserWindow: FakeWindow,
       dialog: { showMessageBox: async (_window, options) => { dialogs.push(options); return { response: 1 } }, showOpenDialog: async () => ({ canceled: true, filePaths: [] }), showErrorBox() {} },
-      shell: { openExternal: async (url) => { opened.push(url) } },
-      session: { defaultSession: { resolveProxy: async (url) => { proxyLookups.push(url); return 'PROXY main-session.example:8080; DIRECT' } } },
+      shell: { openExternal: async (url) => { opened.push(url) }, openPath: async (target) => { opened.push(`path:${target}`); return '' } },
+      session: { defaultSession: { resolveProxy: async (url) => { proxyLookups.push(url); return 'PROXY main-session.example:8080; DIRECT' }, webRequest: { onBeforeSendHeaders: (filter, listener) => { webRequests.push({ filter, listener }) } } } },
+      protocol: { registerSchemesAsPrivileged: (schemes) => { schemes.forEach(scheme => privileged.push(scheme)) }, handle: (scheme, handler) => { protocols.set(scheme, handler) } },
       ipcMain: { handle: (channel, handler) => handlers.set(channel, handler) },
       utilityProcess: { fork: (modulePath, args, options) => { const child = new FakeRuntime(modulePath, args, options, behaviourOf(forks.length)); forks.push(child); return child } },
     }, { loaded, overrides: { 'node:child_process': fakeChildProcess, ...(fingerprint ? { './fingerprint.cjs': fingerprint } : {}) } })
@@ -159,7 +161,7 @@ function loadMain({ lock = true, ready = false, healthFile = '0', mode, argv = [
     // With a health file main.cjs installs a process-wide crash hook that exits the process; a test must not keep it.
     for (const listener of process.listeners('uncaughtException')) if (!crashHooks.includes(listener)) process.removeListener('uncaughtException', listener)
   }
-  return { handlers, appEvents, appHandlers, calls, exported, windows, forks, dialogs, opened, spawned, proxyLookups, executed }
+  return { handlers, appEvents, appHandlers, calls, exported, windows, forks, dialogs, opened, spawned, proxyLookups, executed, privileged, protocols, webRequests }
 }
 
 const trusted = { sender: { isDestroyed: () => false, getURL: () => 'file:///C:/orbit/dist/index.html' }, senderFrame: { url: 'file:///C:/orbit/dist/index.html', parent: null } }
@@ -225,6 +227,55 @@ test('in child mode main loads only shell files, also once the runtime runs: a r
   for (const file of local.filter(name => name.endsWith('.mts'))) {
     const imports = fs.readFileSync(path.join(repo, file), 'utf8').match(/^import (?!type\b)[^\n]*from '\.[^']*'/gm) || []
     assert.deepEqual(imports, [], `${file} imports electron/ modules at run time`)
+  }
+})
+
+test('orbit-skill:// serves the files of a skill package and nothing else; shell:open-path opens only attachments and skill packages', async () => {
+  const userData = fs.mkdtempSync(path.join(os.tmpdir(), 'orbit-main-skills-'))
+  const main = loadMain({ ready: true, userData })
+  try {
+    fs.mkdirSync(path.join(userData, 'skills', 'party'), { recursive: true })
+    fs.writeFileSync(path.join(userData, 'skills', 'party', 'page.html'), '<h1>party</h1>')
+    fs.writeFileSync(path.join(userData, 'secret.txt'), 'private')
+    await until(() => main.protocols.has('orbit-skill') && main.forks.length === 1 && main.windows.length === 1, 'the scheme is served once the app is ready')
+    assert.deepEqual(main.privileged.map(item => item.scheme), ['orbit-skill'])
+    assert.equal(main.privileged[0].privileges.standard, true); assert.equal(main.privileged[0].privileges.secure, true)
+    const serve = main.protocols.get('orbit-skill')
+    const page = await serve(new Request('orbit-skill://party/page.html'))
+    assert.equal(page.status, 200)
+    assert.match(page.headers.get('content-type'), /^text\/html/)
+    assert.equal(await page.text(), '<h1>party</h1>')
+    // No host but the YouTube frame: a page cannot send what it read anywhere.
+    const csp = page.headers.get('content-security-policy')
+    for (const rule of ["default-src 'self'", "connect-src 'self'", "form-action 'none'", 'frame-src https://www.youtube.com https://www.youtube-nocookie.com']) assert.ok(csp.includes(rule), rule)
+    assert.doesNotMatch(csp, /\*|https?:(?!\/\/www\.youtube)/, 'no wildcard or other web host')
+    // Its frame may move only within its own package.
+    const [win] = main.windows
+    const navigate = (from, to, isMainFrame = false) => { let prevented = false; win.webContents.fire('will-frame-navigate', { url: to, isMainFrame, frame: { url: from }, preventDefault: () => { prevented = true } }); return prevented }
+    assert.equal(navigate('orbit-skill://party/page.html', 'https://evil.example/?data=secret'), true)
+    assert.equal(navigate('orbit-skill://party/page.html', 'orbit-skill://other/page.html'), true)
+    assert.equal(navigate('orbit-skill://party/page.html', 'orbit-skill://party/next.html'), false)
+    assert.equal(navigate('https://www.youtube.com/embed/x', 'https://www.youtube.com/embed/y'), false, 'the player frame is not a skill page')
+    assert.equal(navigate('', 'orbit-skill://party/page.html'), false, 'the stage opening a page')
+    for (const url of ['orbit-skill://party/%2e%2e/%2e%2e/secret.txt', 'orbit-skill://party/..%2f..%2fsecret.txt', 'orbit-skill://party/missing.html', 'orbit-skill://party/', 'orbit-skill://other/page.html']) {
+      assert.equal((await serve(new Request(url))).status, 404, url)
+    }
+    // YouTube's embed gets a web Referer when the page sends none or its own scheme's; the player's own requests keep theirs.
+    const [hook] = main.webRequests
+    const referer = (headers) => new Promise(resolve => hook.listener({ requestHeaders: headers }, ({ requestHeaders }) => resolve(requestHeaders.Referer)))
+    assert.equal(await referer({}), 'https://orbit.local/')
+    assert.equal(await referer({ Referer: 'orbit-skill://party/' }), 'https://orbit.local/')
+    assert.equal(await referer({ Referer: 'https://www.youtube.com/embed/x' }), 'https://www.youtube.com/embed/x')
+    const open = main.handlers.get('shell:open-path')
+    assert.equal(await open(trusted, path.join(userData, 'skills', 'party')), '')
+    assert.equal(await open(trusted, path.join(userData, 'attachments', 'chat', 'a.png')), '')
+    for (const target of [path.join(userData, 'secret.txt'), path.join(userData, 'skills', '..', 'secret.txt'), '', 'C:\Windows']) {
+      await assert.rejects(async () => open(trusted, target), /Only Orbit attachments and skill packages/, String(target))
+    }
+    assert.deepEqual(main.opened, [`path:${path.join(userData, 'skills', 'party')}`, `path:${path.join(userData, 'attachments', 'chat', 'a.png')}`])
+  } finally {
+    await main.exported.shutdownRuntime('quit')
+    fs.rmSync(userData, { recursive: true, force: true })
   }
 })
 

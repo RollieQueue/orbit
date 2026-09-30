@@ -35,6 +35,10 @@ const { RUNTIME_CHANNELS, SHELL_CHANNELS } = require('./runtime-protocol.mts')
  * @property {(workspace: unknown) => Promise<GitContext>} getGitContext Throws unless `workspace` is an existing absolute folder.
  * @property {(remote: unknown) => Promise<GitContext | { error: string } | null>} cloneGitWorkspace
  * @property {(reason: string) => unknown} relaunchApp
+ * @property {(sender: import('electron').WebContents, on: boolean) => boolean} setFullScreen Puts the sender's window in or
+ *   out of full screen; returns whether it was full screen before.
+ * @property {(target: string) => Promise<string>} [openPath] Opens a file or folder of Orbit's attachments or skills with
+ *   the system's default app; answers the error text (empty on success) and throws for any other path.
  * @property {(reason: string) => Promise<RuntimeRestartResult>} restartRuntime
  * @property {() => Promise<unknown>} [whenStarted] settles once the start of this process has its health report; the
  *   window's runtime restart waits for it, as the --restart-runtime signal does
@@ -96,10 +100,15 @@ function createIpcHandlers(ctx) {
     if (typeof target !== 'string' || !/^https?:\/\//i.test(target)) throw new Error('Only http(s) links can be opened externally')
     return ctx.shell.openExternal(target)
   })
+  handle('shell:open-path', (_event, target) => {
+    if (!ctx.openPath) throw new Error('Opening files is not available here')
+    return ctx.openPath(typeof target === 'string' ? target : '')
+  })
   // Liveness for the self-upgrade health check (one round trip renderer → main → renderer) and the restart the upgrade
   // script or the window can ask for; the reply leaves before the process restarts.
   handle('app:ping', () => ({ pid: process.pid, startedAt: ctx.startedAt, healthy: ctx.isHealthy() }))
   handle('app:relaunch', () => { setImmediate(() => ctx.relaunchApp('ipc')); return { ok: true, pid: process.pid } })
+  handle('app:fullscreen', (event, on) => ctx.setFullScreen(event.sender, on === true))
   // A new runtime process with the code on disk; the window stays. The reply comes once the new runtime is ready. While
   // Orbit is still starting it waits for that start's report first: a restart on top of it would end a start that may
   // be about to work, and its own report would come before the start's.

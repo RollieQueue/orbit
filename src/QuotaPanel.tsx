@@ -44,6 +44,8 @@ export function handoverLabel(providers: ProviderInfo[], target: Handover['from'
 }
 export function handoverReason(handover: Handover) {
   if (handover.reason === 'approaching') return `квота почти исчерпана (${handover.usedPercent ?? '?'}%)`
+  if (handover.reason === 'stalled') return 'модель перестала отвечать'
+  if (handover.reason === 'failed') return 'ошибка провайдера'
   return handover.reason === 'exhausted' ? 'квота исчерпана' : 'предыдущая замена не запустилась'
 }
 export function handoverText(providers: ProviderInfo[], agentName: string, handover: Handover) {
@@ -119,7 +121,7 @@ export function QuotaPanel({ providers, connected, quotas, busy, onRefresh, fail
       <div className="settings-section-heading"><h3>Автозамена агента</h3></div>
       <label className="toggle-setting">
         <input type="checkbox" checked={failover.enabled} onChange={event => onFailover({ enabled: event.target.checked })} />
-        Заменять агента другой подпиской, когда квота на исходе
+        Заменять агента другой подпиской, когда квота на исходе, провайдер ответил ошибкой или модель перестала отвечать
       </label>
       <label className={`quota-slider ${failover.enabled ? '' : 'off'}`}>
         <span>Менять подписку, когда использовано <strong>{failover.switchAtPercent}%</strong> лимита</span>
@@ -133,7 +135,8 @@ export function QuotaPanel({ providers, connected, quotas, busy, onRefresh, fail
       </label>
       <p className="field-hint">
         Замена выбирается из подключённых подписок: сначала ваш пул моделей, затем модель того же уровня и с наибольшим запасом квоты. Уровень
-        определяется по названию модели (файл electron/model-tiers.json), неизвестные модели берутся только из пула. Новый агент получает журнал
+        модели берётся из замера (аудит моделей), для остальных — по названию (файл electron/model-tiers.json); неизвестные и ненадёжные модели
+        берутся только из пула. Новый агент получает журнал
         действий, файлы, состояние команды и незавершённый ход прежнего. Порог и разрешения действуют для новых задач.
       </p>
     </section>

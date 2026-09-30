@@ -1,0 +1,71 @@
+{
+ "status": "implementing",
+ "tasks": [
+  {
+   "id": "T2",
+   "title": "Antigravity: итог хода — только последнее сообщение, без промежуточных рассуждений (аудит №1: 17–28 тыс. символов вместо 2–3 тыс.)",
+   "status": "done",
+   "evidence": "Код: createSessionParser.finish() в electron/subscription-providers.mts — для antigravity итог = последнее завершённое непустое сообщение, если response.trim() им заканчивается, иначе response целиком; Cursor без изменений. Проверки: новый тест в tests/subscription-providers.test.cjs, subscription-providers + tool-handoff 40/40, оба tsc чистые; на записи аудита ace6360b все 8 сессионных ходов Antigravity заканчиваются последним сообщением, все 35 пар сообщений внутри хода разделены вызовом инструмента; Opus 4.6 19,5→4,0 тыс., Sonnet 4.6 (с Cursor) 17,2→2,4 тыс., Sonnet 4.6 28,4→23,9 тыс. Ревью на Gemini 3.1 Pro не состоялось: отказ Antigravity по региону. Применено: restart_orbit 2026-09-30 14:47:48Z, уровень runtime, verified=true (полный набор проверок), health ok через 1242 мс; отпечаток runtime на диске = работающему (6400e11e). Документация: docs/CHANGELOG.md, docs/MODEL-AUDIT.md (пункт 1, раздел Antigravity)."
+  },
+  {
+   "id": "T3",
+   "title": "Сторож бездействия для сессий провайдеров: ход без событий дольше N минут прерывается и уходит в восстановление/замену (аудит №3, GPT-OSS молчал 7 мин)",
+   "status": "done",
+   "evidence": "Код: electron/runtime/watchdog.mts (новый): ход без событий 10 мин (ORBIT_STALL_MS, 0 выкл.) останавливается, если не идут нативный инструмент, вызов Orbit по MCP или запрос разрешения; 1-й тихий ход → повтор на той же модели в новой сессии (записка WATCHDOG), 2-й подряд → handover 'stalled', иначе понятная ошибка (handover.mts recoverStall); тайм-аут процесса (ORBIT_PROVIDER_IDLE) — тот же путь; остановленный ход не идёт в лимит. По просьбе пользователя (15:02Z) ошибка провайдера → handover 'failed' (только ошибки runProvider, util.fromProvider); подписка, которая не может ответить (регион/вход/нет CLI, failover.unreachable), закрыта для запуска на 10 мин, иначе закрывается только модель. Проверки: оба tsc; tests/turn-watchdog.test.cjs 12/12 (новый), tests/failover.test.cjs 35/35 (+5). Первый restart_orbit отказал (цикл импортов watchdog→session, tests/runtime-modules) — recoverStall перенесён в handover.mts. Ревью Fable 5.1: 1 high + 3 мелких исправлены. Применено: restart_orbit 2026-09-30 ~15:24Z, уровень full, typecheck/test (728)/smoke/main-load пройдены, health ok, runtime готов за 466 мс; отпечатки на диске = работающим (runtime c87a5847), self-upgrade --dry-run: level none. Документация: CHANGELOG (2 записи), MODEL-AUDIT п.3, providers.md, SESSION-MODE.md."
+  },
+  {
+   "id": "T10",
+   "title": "Сообщения доходят до агента посреди хода: пользователь или руководитель могут отменить или поправить задачу, не дожидаясь конца долгого хода (просьба пользователя 2026-09-30 15:06Z)",
+   "status": "done",
+   "evidence": "Код: electron/runtime/steer.mts (новый): сообщение пользователя или предка (руководителя) при идущем ходе → через ORBIT_STEER_GRACE_MS (2 с) и после первого события провайдера ход режется на границе шагов (нет нативного инструмента, вызова Orbit и запроса разрешения: TurnWatch.busy/calling), возвращается в лимит и повторяется в той же сессии с запиской INTERRUPTED FOR A MESSAGE (pause.interruptedSession; первый ход Claude — сессия --session-id). Почта руководителя целиком с отправителем и id в результатах инструментов и в запросах (mailbox.steeringMail). Проверки: оба tsc; tests/steer-messages.test.cjs 13/13 (новый); полный набор вручную 3 раза 740/0. Ревью Fable 5.1: medium и low исправлены. Применено: 1-й restart_orbit отказал (1 из 741 тестов упал, имя в вывод не попало, вручную не воспроизвёлся), 2-й — 2026-09-30 ~16:03Z, уровень runtime, typecheck/test/smoke/main-load ok, health ok, runtime (child) готов за 960 мс; отпечаток runtime на диске = работающему (6c58145e, steer.mts входит), --dry-run: level none. Документация: CHANGELOG, README, ARCHITECTURE, SESSION-MODE п.7, TECH-DEBT 14, 16."
+  },
+  {
+   "id": "T4",
+   "title": "Бесконечное улучшение: отказ старта следующей задачи (идут процессы прошлой) повторяется через секунды, а не через минуту как неудача; мелочи TECH-DEBT 19",
+   "status": "pending",
+   "evidence": ""
+  },
+  {
+   "id": "T5",
+   "title": "Пауза и остановка: остановка помощника будит руководителя в wait_message, подагенты получают подпись «Остановлен вместе с руководителем», ход паузы не идёт в лимит (TECH-DEBT 20)",
+   "status": "pending",
+   "evidence": ""
+  },
+  {
+   "id": "T6",
+   "title": "Ранги моделей для замены при исчерпании квоты по замеру аудита (electron/model-tiers.json: GPT-6 Luna выше, Haiku 4.5 ниже), аудит №5",
+   "status": "pending",
+   "evidence": ""
+  },
+  {
+   "id": "T7",
+   "title": "Бесконечное улучшение: правка кода Orbit командой оболочки тоже требует restart_orbit (сравнение отпечатков файлов с работающим экземпляром, TECH-DEBT 17)",
+   "status": "pending",
+   "evidence": ""
+  },
+  {
+   "id": "T8",
+   "title": "Карточка запуска после отката restart_orbit показывает исход «откатился» (TECH-DEBT 13)",
+   "status": "pending",
+   "evidence": ""
+  },
+  {
+   "id": "T9",
+   "title": "Новая функция: выбор модели по типу поручения в spawn_agent (code/review/lookup/text) по таблице маршрутизации с учётом квот",
+   "status": "pending",
+   "evidence": ""
+  },
+  {
+   "id": "T11",
+   "title": "Прерванный первый ход Codex, Cursor и Antigravity продолжает свою сессию: провайдеры сообщают id сессии событием из потока, а не только в итоге хода (остаток TECH-DEBT 14; касается паузы и прерывания сообщением)",
+   "status": "pending",
+   "evidence": ""
+  },
+  {
+   "id": "T12",
+   "title": "Самообновление: полный вывод проверок сохраняется в artifacts, а отказ restart_orbit называет упавшие тесты (строки not ok): на T10 в последние 80 строк имя упавшего теста не попало",
+   "status": "pending",
+   "evidence": ""
+  }
+ ]
+}

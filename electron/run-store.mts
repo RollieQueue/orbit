@@ -1,9 +1,10 @@
 import fs from 'node:fs'
 import path from 'node:path'
+import { randomUUID } from 'node:crypto'
 import { readJSON, writeJSON, clone } from './storage.mts'
 import { recoverChanges } from './change-log.mts'
 import type { ReportedWrite } from './change-log.mts'
-import type { FileChange, StoredAgent, StoredRun } from './types.mts'
+import type { FileChange, StoredAgent, StoredRun, ToolImage, TraceImage } from './types.mts'
 
 // A record without a status is not active. `restarting` is terminal: a run Orbit ended to restart with new code is kept
 // as it is on load (never turned into `interrupted`), and the continuation after the restart links back to it.
@@ -13,6 +14,11 @@ const activeStatuses = new Set<string | undefined>(['running', 'working', 'waiti
 // (traces, messages, settings, timings); all of it is kept exactly as the runtime produced it.
 // A saved run is any JSON object with a truthy `runId`, as every version of Orbit wrote them.
 const isStoredRun = (value: unknown): value is StoredRun => Boolean((value as { runId?: unknown } | null | undefined)?.runId)
+
+// The images a trace can name: the types a tool result carries, by file extension, and the largest file kept.
+const IMAGE_EXTENSIONS: Record<string, string> = { 'image/png': 'png', 'image/jpeg': 'jpg', 'image/gif': 'gif', 'image/webp': 'webp' }
+const IMAGE_TYPES: Record<string, string> = Object.fromEntries(Object.entries(IMAGE_EXTENSIONS).map(([type, extension]) => [extension, type]))
+const MAX_IMAGE_BYTES = 20 * 1024 * 1024
 
 // A copy of a run record whose file changes carry no diff text, only `hasDiff`, so lists stay small. The text is
 // served by RunStore.getChanges / the runtime on demand. The copy is shallow: everything but `changes` is shared.
@@ -94,6 +100,29 @@ class RunStore {
     if (typeof id !== 'string' || !/^[\w-]+$/.test(id)) return null
     // A file this store did not load (older than the newest 200) is served as it was written.
     return this.records.has(id) ? clone(this.records.get(id)!) : readJSON(path.join(this.root, `${id}.json`), null) as StoredRun | null
+  }
+
+  // An image an agent looked at, as its own file under run-history/images/<run id>/ (the run file stays small); the
+  // trace keeps the returned name. Null for a type or a size this store does not keep.
+  saveImage(runId: string, image: ToolImage): TraceImage | null {
+    const extension = IMAGE_EXTENSIONS[image?.mediaType]
+    if (!extension || typeof runId !== 'string' || !/^[\w-]+$/.test(runId) || typeof image.data !== 'string') return null
+    const bytes = Buffer.from(image.data, 'base64')
+    if (!bytes.length || bytes.length > MAX_IMAGE_BYTES) return null
+    const id = `${randomUUID()}.${extension}`
+    const folder = path.join(this.root, 'images', runId)
+    fs.mkdirSync(folder, { recursive: true })
+    fs.writeFileSync(path.join(folder, id), bytes)
+    return { id, mediaType: image.mediaType, bytes: bytes.length }
+  }
+
+  // A saved image as a data: URL for the window, or null: only a name saveImage could have made is read.
+  readImage(runId: unknown, imageId: unknown): string | null {
+    if (typeof runId !== 'string' || !/^[\w-]+$/.test(runId) || typeof imageId !== 'string') return null
+    const type = IMAGE_TYPES[/^[\w-]+\.(\w+)$/.exec(imageId)?.[1] || '']
+    if (!type) return null
+    try { return `data:${type};base64,${fs.readFileSync(path.join(this.root, 'images', runId, imageId)).toString('base64')}` }
+    catch { return null }
   }
 
   // The full file changes (with diff text) of one run, for the renderer to ask for on demand.

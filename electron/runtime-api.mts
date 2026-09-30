@@ -10,6 +10,7 @@ import { PROVIDER_IDS } from './quota.mts'
 import { applyPatch, removeWorktree } from './worktree.mts'
 import { runGit } from './git.mts'
 import { workspaceKey } from './storage.mts'
+import { readAttachmentImage, saveAttachments, trustedAttachments } from './attachments.mts'
 import { RUNTIME_CHANNELS } from './runtime-protocol.mts'
 import type { OrbitRuntime } from './runtime.mts'
 import type { QuotaMonitor, QuotaReaderOptions } from './quota.mts'
@@ -88,7 +89,7 @@ function createRuntimeApi(ctx: RuntimeApiContext): Map<string, RuntimeHandler> {
     const workspace = validateWorkspace(payload?.workspace)
     if (!payload?.projectId || !payload?.chatId) throw new Error('Project and chat are required')
     const request: StartPayload & { artifactRoot: string } = {
-      ...payload, workspace,
+      ...payload, workspace, attachments: trustedAttachments(userData, payload.attachments),
       memoryContext: payload.memoryEnabled ? stores.memoryStore.search(payload.prompt, workspace, 6, payload.globalMemoryEnabled !== false, payload.chatId) : [],
       artifactRoot,
     }
@@ -96,6 +97,14 @@ function createRuntimeApi(ctx: RuntimeApiContext): Map<string, RuntimeHandler> {
   })
   // A run id that is not a string names no run: stop answers false and get null, as the runtime and the store did.
   handle('runtime:stop', (runId) => typeof runId === 'string' ? runtime.stop(runId) : false)
+  // The user's message to an agent of a working run; the runtime checks the run, the agent and the text.
+  handle('runtime:message', (runId, agentId, message, attachments) => runtime.postUserMessage(text(runId) ?? '', text(agentId) ?? '', message, trustedAttachments(userData, attachments)))
+  // Attached files: saved under <userData>/attachments and handed back as paths; the window's own paths are trusted only there.
+  handle('attachments:save', (chatId, files) => saveAttachments(userData, text(chatId) ?? '', files))
+  handle('attachments:image', (file) => readAttachmentImage(userData, file))
+  handle('runtime:pause', (runId, agentId) => runtime.pauseAgent(text(runId) ?? '', text(agentId) ?? ''))
+  handle('runtime:resume', (runId, agentId) => runtime.resumeAgent(text(runId) ?? '', text(agentId) ?? ''))
+  handle('runtime:stop-agent', (runId, agentId) => runtime.stopAgent(text(runId) ?? '', text(agentId) ?? ''))
   handle('runtime:list', () => {
     const records = new Map<string, StoredRun>(stores.runStore.list().map(run => [run.runId, run]))
     for (const run of runtime.getRuns()) records.set(run.runId, stripDiffs(run))
@@ -110,6 +119,8 @@ function createRuntimeApi(ctx: RuntimeApiContext): Map<string, RuntimeHandler> {
     const recovered = await stores.runStore.recoverChanges(runId, known).catch((): FileChange[] => [])
     return recovered.length ? known.concat(recovered) : known
   })
+  // The images a trace names (tool results an agent looked at), one at a time as the window shows them.
+  handle('runtime:image', (runId, imageId) => stores.runStore.readImage(runId, imageId))
   handle('state:load', () => stores.stateStore.load())
   handle('state:save', (state) => stores.stateStore.save(state))
   // Building the index is the same scan a task starts with; asking for it first just makes the first task faster.
@@ -130,6 +141,8 @@ function createRuntimeApi(ctx: RuntimeApiContext): Map<string, RuntimeHandler> {
   handle('memory:stats', (workspace, chatId) => ({ memory: stores.memoryStore.stats(text(workspace), text(chatId)), skills: stores.capabilityStore.stats(text(workspace)) }))
   handle('capabilities:list', (workspace) => stores.capabilityStore.list(text(workspace)))
   handle('capabilities:pin', (id, pinned, workspace) => stores.capabilityStore.pin(id, pinned === true, text(workspace)))
+  handle('capabilities:enable', (id, enabled, workspace) => stores.capabilityStore.setEnabled(id, enabled === true, text(workspace)))
+  handle('capabilities:params', (id, values, workspace) => stores.capabilityStore.setParams(id, values, text(workspace)))
   handle('capabilities:read', (id, workspace) => stores.capabilityStore.read(id, text(workspace)))
   handle('capabilities:install', (entry) => stores.capabilityStore.install(entry as SkillInput))
   handle('capabilities:remove', (id, workspace) => stores.capabilityStore.remove(id, text(workspace)))

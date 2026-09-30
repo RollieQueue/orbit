@@ -7,6 +7,7 @@ import { randomUUID } from 'node:crypto'
 import { StringDecoder } from 'node:string_decoder'
 import { isOrbitToolEnvelope, TOOL_HANDOFF } from './tool-schema.mts'
 import { removeTemporaryDirectory } from './storage.mts'
+import { attachmentsFolder } from './attachments.mts'
 import { claudeStreamLimit } from './quota.mts'
 import type { ClaudeRateLimitInfo, QuotaPartial, QuotaTaggedError } from './quota.mts'
 import { report } from './diagnostics.mts'
@@ -26,7 +27,9 @@ interface ProviderEventBase { providerId: string; kind: ProviderEventKind }
 interface OutputEvent extends ProviderEventBase { kind: 'output'; text: string; messageId?: string; partial?: boolean; replace?: boolean; parentToolId?: string | null }
 interface ReasoningEvent extends ProviderEventBase { kind: 'reasoning'; text: string; messageId?: string; partial?: boolean; parentToolId?: string | null }
 // A native CLI tool call, or an Orbit tool reached over MCP (`mcp: true`, `orbitTool` names it).
-interface ToolEvent extends ProviderEventBase { kind: 'tool'; text: string; tool?: string; toolId?: string; parentToolId?: string | null; status?: string; input?: unknown; output?: string; exitCode?: number | null; changes?: unknown; native: boolean; mcp?: boolean; server?: string; orbitTool?: string }
+interface ToolEvent extends ProviderEventBase { kind: 'tool'; text: string; tool?: string; toolId?: string; parentToolId?: string | null; status?: string; input?: unknown; output?: string; exitCode?: number | null; changes?: unknown; native: boolean; mcp?: boolean; server?: string; orbitTool?: string; images?: ToolImage[] }
+// An image a tool result carried (a screenshot the agent read): base64 bytes and the media type.
+interface ToolImage { mediaType: string; data: string }
 interface ObservationEvent extends ProviderEventBase { kind: 'observation'; text: string; source?: string; status?: string; usage?: unknown }
 // Account figures seen in the stream; the runtime feeds them to the quota monitor.
 interface QuotaEvent extends ProviderEventBase { kind: 'quota'; quota: QuotaPartial }
@@ -155,6 +158,22 @@ const isRecord = (value: unknown): value is Record<string, unknown> => typeof va
 // A parsed JSONL line is taken as the CLI's event shape once it is an object; the fields are checked where they are used.
 const isCodexEvent = (value: unknown): value is CodexEvent => isRecord(value)
 const isClaudeEvent = (value: unknown): value is ClaudeEvent => isRecord(value)
+
+// A Claude tool result's content as text, and the images in it (the Read tool on a screenshot, an MCP screenshot tool).
+// Content with an image names each image in the text instead of its base64 bytes; any other content reads as before.
+function claudeToolResult(content: unknown): { output: string; images: ToolImage[] } {
+  const images: ToolImage[] = []
+  const parts = Array.isArray(content) ? content.map((block: unknown) => {
+    const source = isRecord(block) && block.type === 'image' && isRecord(block.source) ? block.source : null
+    if (!source || source.type !== 'base64' || typeof source.data !== 'string' || typeof source.media_type !== 'string') {
+      return isRecord(block) && block.type === 'text' && typeof block.text === 'string' ? block.text : JSON.stringify(block)
+    }
+    images.push({ mediaType: source.media_type, data: source.data })
+    return `Изображение (${source.media_type}, ${Math.max(1, Math.round(source.data.length * 3 / 4 / 1024))} КБ)`
+  }) : []
+  if (!images.length) return { output: typeof content === 'string' ? content : JSON.stringify(content || ''), images }
+  return { output: parts.join('\n'), images }
+}
 
 const DEFAULT_TIMEOUT_MS = 30 * 60 * 1000
 // A session CLI is killed only when it has said nothing for this long (an Orbit tool call in flight does not count).
@@ -370,7 +389,8 @@ function runCli(file: string, args: string[], { cwd, input = '', timeoutMs, inac
         let busy = false
         try { busy = !!isBusy?.() } catch { busy = false }
         if (busy) return armIdle()
-        const error = new Error(`${file} produced no output for ${idle} ms`)
+        // The runtime's recovery (runtime/watchdog.mts) knows this timeout by its code.
+        const error = Object.assign(new Error(`${file} produced no output for ${idle} ms`), { code: 'ORBIT_PROVIDER_IDLE' })
         error.name = 'TimeoutError'
         stop(error)
       }, idle)
@@ -615,9 +635,9 @@ function createClaudeParser(onEvent: ProviderEventListener | null | undefined, r
       }
       if (event.type === 'user' && Array.isArray(content)) {
         for (const tool of content.filter(isToolResultBlock)) {
-          const output = typeof tool.content === 'string' ? tool.content : JSON.stringify(tool.content || '')
+          const { output, images } = claudeToolResult(tool.content)
           const name = toolNames.get(tool.tool_use_id)
-          dispatch({ kind: 'tool', text: output, output, toolId: tool.tool_use_id, parentToolId, status: tool.is_error ? 'failed' : 'completed', ...(name ? { tool: name } : {}), ...toolFlags(orbitToolName(name)) })
+          dispatch({ kind: 'tool', text: output, output, toolId: tool.tool_use_id, parentToolId, status: tool.is_error ? 'failed' : 'completed', ...(name ? { tool: name } : {}), ...(images.length ? { images } : {}), ...toolFlags(orbitToolName(name)) })
         }
       }
       if (event.type === 'system' && event.subtype === 'permission_denied') dispatch({ kind: 'observation', text: errorText(event.message || 'Claude denied a tool permission'), status: 'denied' })
@@ -660,8 +680,19 @@ function buildClaudeArgs(options: LaunchOptions): string[] {
   const permissionMode = restricted ? 'default' : 'bypassPermissions'
   const args = ['--print', '--output-format', 'stream-json', '--verbose', '--include-partial-messages', '--no-session-persistence', '--permission-mode', permissionMode]
   if (restricted) args.push('--tools', 'Read,Glob,Grep')
-  args.push(...claudeModelArgs(options))
+  args.push(...claudeAttachmentArgs(), ...claudeModelArgs(options))
   return args
+}
+
+// Files the user attached to a message live in <userData>/attachments, outside the workspace, and Claude's Read tool
+// refuses to go there in a restricted mode. The folder is made here so that a message that brings the first attachment
+// to a session already running (its turn resumes with these arguments) finds it known. The folder is the one the runtime
+// host configured (attachments.mts); without a host (a bare test) nothing is added.
+function claudeAttachmentArgs(env: NodeJS.ProcessEnv = process.env): string[] {
+  const folder = attachmentsFolder(env)
+  if (!folder) return []
+  try { fs.mkdirSync(folder, { recursive: true }) } catch { return [] }
+  return ['--add-dir', folder]
 }
 
 function claudeModelArgs(options: Pick<LaunchOptions, 'model' | 'reasoningEffort'>): string[] {
@@ -703,7 +734,7 @@ function buildClaudeSessionArgs(options: LaunchOptions, session: Pick<Normalized
   if (appendFile) args.push('--append-system-prompt-file', appendFile)
   if (options.approvalPolicy === 'on-request' && session.mcpUrl && session.token) args.push('--permission-prompt-tool', 'mcp__orbit__approve')
   args.push('--permission-mode', restricted ? 'default' : 'bypassPermissions')
-  args.push(...claudeModelArgs(options))
+  args.push(...claudeAttachmentArgs(), ...claudeModelArgs(options))
   return args
 }
 
@@ -1142,5 +1173,5 @@ export type {
   ApprovalRequest, ApprovalHandler, ProviderOptions, SessionActivity, SessionActivityCheck, SessionOptions, NormalizedSession, LaunchOptions, ProviderRunOptions, NativeRunOptions,
   ProviderResult, ProviderHealth, InspectOptions, CliLaunch, CliResult, LineReader, RunCliOptions, RunCli, CliHelpers, SessionHelpers, ParsedTurn, StreamParser,
 }
-export const _testing = { createCodexParser, createClaudeParser, createLineReader, buildCodexArgs, buildClaudeArgs, buildClaudeSessionArgs, buildCodexSessionArgs, claudeMcpConfig, normalizeSession, inactivityValue, runCli, resolveLaunch, requestSignal }
+export const _testing = { createCodexParser, createClaudeParser, createLineReader, buildCodexArgs, buildClaudeArgs, buildClaudeSessionArgs, buildCodexSessionArgs, claudeAttachmentArgs, claudeMcpConfig, normalizeSession, inactivityValue, runCli, resolveLaunch, requestSignal }
 export { loopbackNoProxy, codexMcpArgs, inspectProviders, runProvider, transportFor, mcpCallLimit, closeSession, resolveLaunch, terminateProcess, runCli, createLineReader }

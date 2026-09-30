@@ -3,7 +3,7 @@ import type { RunStatus } from './types'
 
 const statusNames: Record<RunStatus, string> = {
   idle: 'Готов', waiting: 'В очереди', working: 'Работает', done: 'Завершён', completed: 'Завершён',
-  error: 'Ошибка', failed: 'Ошибка', cancelled: 'Остановлен', interrupted: 'Прерван', restarting: 'Перезапуск Orbit',
+  paused: 'Пауза', error: 'Ошибка', failed: 'Ошибка', cancelled: 'Остановлен', interrupted: 'Прерван', restarting: 'Перезапуск Orbit',
 }
 export const statusText = (status?: RunStatus) => statusNames[status || 'idle']
 // «1 файл», «2 файла», «5 файлов»: the noun forms are for 1, 2–4 and 5+.
@@ -17,6 +17,8 @@ export const timeOf = (time?: string) => {
   return Number.isNaN(date.valueOf()) ? time : date.toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' })
 }
 export const errorText = (error: unknown) => error instanceof Error ? error.message : String(error)
+// A refused invoke arrives as "Error invoking remote method '<channel>': Error: <reason>"; only the reason is shown.
+export const remoteErrorText = (error: unknown) => errorText(error).replace(/^Error invoking remote method '[^']*': (?:\w*Error: )?/, '')
 
 export function inline(text: string): ReactNode[] {
   return text.split(/(`[^`]+`|\*\*[^*]+\*\*|\[[^\]]+\]\(https?:\/\/[^\s)]+\))/g).map((part, i) => {

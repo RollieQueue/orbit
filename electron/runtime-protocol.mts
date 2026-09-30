@@ -22,15 +22,17 @@ const LOG_LEVELS: readonly LogLevel[] = ['info', 'warn', 'error']
 // Call channels of electron/ipc-contract.cjs the runtime serves (electron/runtime-api.mts implements exactly these);
 // main forwards them with `client.call(channel, args)`.
 const RUNTIME_CHANNELS: readonly string[] = [
-  'runtime:start', 'runtime:stop', 'runtime:list', 'runtime:get', 'runtime:changes',
+  'runtime:pause', 'runtime:resume', 'runtime:stop-agent',
+  'runtime:start', 'runtime:stop', 'runtime:list', 'runtime:get', 'runtime:changes', 'runtime:image', 'runtime:message',
   'state:load', 'state:save', 'project-index:status',
   'memory:list', 'memory:save', 'memory:remove', 'memory:pin', 'memory:sharing', 'memory:forget-chat', 'memory:stats',
-  'capabilities:list', 'capabilities:pin', 'capabilities:read', 'capabilities:install', 'capabilities:remove', 'capabilities:restore',
+  'capabilities:list', 'capabilities:pin', 'capabilities:enable', 'capabilities:params', 'capabilities:read', 'capabilities:install', 'capabilities:remove', 'capabilities:restore',
+  'attachments:save', 'attachments:image',
   'providers:health', 'quota:get', 'artifact:apply',
 ]
 // Call channels main answers itself: dialogs, `shell`, `app`, health and restarts.
 const SHELL_CHANNELS: readonly string[] = [
-  'workspace:pick', 'workspace:inspect', 'workspace:clone', 'shell:open', 'app:ping', 'app:relaunch', 'runtime:restart', 'runtime:status',
+  'workspace:pick', 'workspace:inspect', 'workspace:clone', 'shell:open', 'shell:open-path', 'app:ping', 'app:relaunch', 'app:fullscreen', 'runtime:restart', 'runtime:status',
 ]
 // Push channels the runtime emits; main passes each on with `webContents.send(channel, payload)`.
 const EVENT_CHANNELS: readonly string[] = ['runtime:event', 'quota:update', 'restart:notice']

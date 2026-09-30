@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { AddProjectPanel } from './AddProjectPanel'
 import { AgentsPanel } from './AgentsPanel'
+import { useSkillTriggers } from './SkillStage'
 import { ChatPane } from './ChatPane'
 import { useLibrary } from './Library'
 import { MemoryPanel } from './MemoryPanel'
@@ -24,6 +25,7 @@ export default function App() {
   const [projectMenu, setProjectMenu] = useState(false)
   const [remote, setRemote] = useState('')
   const inspector = useInspector(chatKey, chatRuns)
+  const skillStage = useSkillTriggers(state.projects, ready, runs)
   const { currentRun, agentsOpen, setAgentsOpen } = inspector
   const library = useLibrary(panel, project?.workspace.path || '', chat?.id, orbit.libraryRevision, setNotice)
   useQuotaPolling(panel === 'quota', orbit.refreshQuotas)
@@ -47,15 +49,16 @@ export default function App() {
       workingRun={workingRun} currentRun={currentRun} agentsOpen={agentsOpen} storageError={orbit.storageError || orbit.runtimeStorageError}
       onOpenSidebar={() => setSidebarOpen(true)} onToggleAgents={() => setAgentsOpen(!agentsOpen)} onOpenAgents={() => setAgentsOpen(true)}
       onOpenTeam={inspector.openTeam} onSuggest={orbit.setDraft} onAddProject={() => setPanel('add')}
+      loop={orbit.loop} onStopLoop={orbit.stopLoop} onRunLoopNow={orbit.runLoopNow}
       composer={{
         settings: state.settings, project, chat, currentHealth: orbit.currentHealth, modelChoices: orbit.modelChoices, selectedEffort: orbit.selectedEffort,
-        quotas, draft: orbit.draft, running, restartWait, workingRun, ready, desktop, onDraft: orbit.setDraft, onSend: () => orbit.send(inspector.followNewRun),
-        onStop: () => void orbit.stop(), onSettings: updateSettings, onOpenQuota: () => setPanel('quota'),
+        quotas, draft: orbit.draft, files: orbit.files, onAttach: orbit.attachFiles, onDetach: orbit.detachFile, running, loopTask: orbit.loop?.task, canSteer: orbit.canSteer, restartWait, workingRun, ready, desktop, onDraft: orbit.setDraft, onSend: () => orbit.send(inspector.followNewRun),
+        onStop: () => void orbit.stop(), onTogglePause: orbit.togglePause, onSettings: updateSettings, onOpenQuota: () => setPanel('quota'),
       }}
     />
     {agentsOpen && <AgentsPanel
       chatRuns={chatRuns} currentRun={currentRun} selectedAgent={inspector.selectedAgent} inspectorRequest={inspector.inspectorRequest} quotas={quotas}
-      onClose={() => setAgentsOpen(false)} onPick={inspector.pickRun} onSelectAgent={inspector.setSelectedAgent}
+      onMessage={orbit.messageAgent} controls={{ pause: orbit.pauseAgent, resume: orbit.resumeAgent, stop: orbit.stopAgent }} onClose={() => setAgentsOpen(false)} onPick={inspector.pickRun} onSelectAgent={inspector.setSelectedAgent}
     />}
     {panel && <Modal panel={panel} onClose={() => setPanel(null)}>
       {panel === 'quota' && (desktop
@@ -71,8 +74,9 @@ export default function App() {
       {panel === 'memory' && <MemoryPanel desktop={desktop} project={project} chat={chat} entries={library.memory} stats={library.stats}
         loading={library.loading} onChanged={orbit.bumpLibrary} onError={setNotice} />}
       {panel === 'capabilities' && <SkillsPanel desktop={desktop} workspace={project?.workspace.path || ''} skills={library.capabilities}
-        stats={library.stats} loading={library.loading} onChanged={orbit.bumpLibrary} onError={setNotice} />}
+        stats={library.stats} loading={library.loading} onChanged={orbit.bumpLibrary} onError={setNotice} onPreview={skillStage.preview} />}
     </Modal>}
     <Toast text={notice} onClose={() => setNotice('')} />
+    {skillStage.stage}
   </div>
 }

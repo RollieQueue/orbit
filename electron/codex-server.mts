@@ -294,7 +294,7 @@ async function openCodexSession(options: CodexServerOptions, session: Normalized
             let busy = false
             try { busy = !!turnOptions.isBusy?.() } catch { busy = false }
             if (busy) return current.armIdle()
-            const error = new Error(`Codex App Server produced no output for ${idleMs} ms`); error.name = 'TimeoutError'
+            const error = Object.assign(new Error(`Codex App Server produced no output for ${idleMs} ms`), { code: 'ORBIT_PROVIDER_IDLE' }); error.name = 'TimeoutError'
             fail(error)
           }, idleMs)
         }

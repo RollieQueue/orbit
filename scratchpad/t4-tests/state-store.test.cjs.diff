@@ -1,0 +1,7 @@
+--- a/tests/state-store.test.cjs
++++ b/tests/state-store.test.cjs
+@@ -246,2 +246,2 @@
+-test('activateLoop reactivates a stopped loop: goal, start and task number kept, failures and retry cleared', () => {
+-  const stopped = { active: false, goal: 'Улучшай', startedAt: T0, iteration: 5, failures: 3, retryAt: 123, startingAt: 99, lastRunId: 'r5', closedKeys: ['k'], stopped: { reason: 'blocked', at: T1 } }
++test('activateLoop reactivates a stopped loop: goal, start and task number kept, failures, start counters and retry cleared', () => {
++  const stopped = { active: false, goal: 'Улучшай', startedAt: T0, iteration: 5, failures: 3, startFailures: 2, busyStarts: 4, retryAt: 123, startingAt: 99, lastRunId: 'r5', closedKeys: ['k'], stopped: { reason: 'blocked', at: T1 } }

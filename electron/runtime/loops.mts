@@ -3,10 +3,12 @@
 // post-answer checks; executeAgent chooses between them and handles budgets, draft answers, errors and cancellation.
 import { randomUUID, createHash } from 'node:crypto'
 import { targetLabel } from '../failover.mts'
-import { TERMINAL, AGENT_TERMINAL, ceiling, WORK_TOOLS, MUTATING_TOOLS, SKILL_READ_CHARS, bounded, TurnBudgetError, abortError } from './util.mts'
+import { TERMINAL, AGENT_TERMINAL, ceiling, USER, WORK_TOOLS, MUTATING_TOOLS, SKILL_READ_CHARS, bounded, TurnBudgetError, abortError } from './util.mts'
 import { ToolProtocolError, hasToolCalls, parseResponse } from './envelope.mts'
-import { sessionGuide, evaluationReminder, IMPROVEMENT_REMINDER, skillReminder } from './prompts.mts'
+import { sessionGuide, evaluationReminder, skillReminder } from './prompts.mts'
+import * as improvement from './improvement.mts'
 import { describeCall } from './ledger.mts'
+import { PauseInterrupt, pauseGate, interruptedSession, STOPPED_BY_USER } from './pause.mts'
 import type { AgentRecord, AgentResult, MailboxContext, McpServerLike, OrbitRuntimeLike, PromptBase, ProviderResult, RunRecord, SessionInfo, TranscriptEntry } from '../types.mts'
 // Consecutive turns made only of identical repeats: warn, then stop the agent honestly.
 const STALL_WARN_TURNS = 2
@@ -60,6 +62,10 @@ async function executeAgent(runtime: OrbitRuntimeLike, run: RunRecord, agent: Ag
       runtime.trace(run, agent.id, 'transport', `Continuing with the ${agent.transport} transport on ${targetLabel({ providerId: agent.providerId, model: agent.model })}`)
     }
   } catch (error) {
+    if (agent.stoppedByUser) {
+      runtime.updateAgent(run, agent, { status: 'cancelled', error: STOPPED_BY_USER, detail: 'Остановлен вами' })
+      return { agentId: agent.id, generation: agent.generation, status: 'cancelled', error: STOPPED_BY_USER, result: agent.result }
+    }
     if (error instanceof TurnBudgetError && !signal.aborted) return runtime.budgetHandoff(run, agent)
     // Whatever was thrown, only its `message` is read (undefined for a non-Error).
     if (agent.draftAnswer && !signal.aborted && !TERMINAL.has(run.status)) {
@@ -106,6 +112,7 @@ async function envelopeLoop(runtime: OrbitRuntimeLike, run: RunRecord, agent: Ag
           })
           break
         } catch (error) {
+          if (error instanceof PauseInterrupt) { runtime.remember(agent, { type: 'instruction', content: error.note }); continue }
           // A refusal for quota (or a failed replacement) moves the agent to another subscription and repeats the turn.
           if (!await runtime.recoverProvider(run, agent, error)) throw error
           if (agent.transport !== 'envelope') return SWITCH_TRANSPORT
@@ -157,12 +164,14 @@ async function envelopeLoop(runtime: OrbitRuntimeLike, run: RunRecord, agent: Ag
             continue
           }
         }
-        if (agent.id === 'root' && run.improvementMode && !['completed', 'blocked'].includes(run.improvementStatus)) {
+        // Improvement mode: the run's one task is closed and, in Orbit's own repository, applied (improvement.mts).
+        const improvementReminder = agent.id === 'root' ? improvement.reminderFor(runtime, run) : null
+        if (improvementReminder) {
           if (guard.improvementReminders++ < REMINDER_LIMIT) {
-            runtime.remember(agent, { type: 'instruction', content: IMPROVEMENT_REMINDER })
+            runtime.remember(agent, { type: 'instruction', content: improvementReminder })
             continue
           }
-          return runtime.completeAgent(run, agent, `${response.content}\n\n(Режим улучшения: план не закрыт через improvement_plan после ${REMINDER_LIMIT} напоминаний, поэтому ответ выдан без подтверждённого завершения плана.)`)
+          return runtime.completeAgent(run, agent, `${response.content}\n\n${improvement.acceptedWithout(runtime, run, REMINDER_LIMIT)}`)
         }
         // Skills grow from experience: once per run, when it was substantial or used a skill, the root is asked what to keep.
         if (agent.id === 'root' && run.memoryEnabled && run.skillLearning && !run.skillReminded && typeof runtime.capabilityStore?.save === 'function') {
@@ -189,6 +198,7 @@ async function envelopeLoop(runtime: OrbitRuntimeLike, run: RunRecord, agent: Ag
       let novel = false, changed = false
       const repeats = []
       for (const call of orderedCalls) {
+        await pauseGate(runtime, run, agent)
         if (signal.aborted) throw abortError()
         runtime.trace(run, agent.id, 'tool', `${call.name} ${bounded(call.arguments, 1200)}`)
         const startedAt = runtime.clock()
@@ -266,6 +276,7 @@ async function sessionLoop(runtime: OrbitRuntimeLike, run: RunRecord, agent: Age
       const token = agent.sessionToken
       session = { id: agent.sessionId || randomUUID(), token, mcpUrl: runtime.mcpUrl(), systemAppend: bounded(sessionGuide(run, agent), SYSTEM_APPEND_LIMIT), resume, activity: () => { try { return (runtime.mcp as McpServerLike | null)?.activity?.(token) || null } catch { return null } } }
       const base = resume ? null : await runtime.context(run, agent)
+      const cursorBeforeTurn = agent.sessionCursor
       try {
         result = await runtime.providerTurn(run, agent, () => {
           lastWorkerTurn = agent.id !== 'root' && (agent.turns >= ceiling(run.limits, 'maxTurns') || run.usage.workerTurns >= ceiling(run.limits, 'maxTotalTurns'))
@@ -275,15 +286,25 @@ async function sessionLoop(runtime: OrbitRuntimeLike, run: RunRecord, agent: Age
           let text
           if (resume) {
             const pending = transcript.slice(agent.sessionCursor)
-            const text0 = instruction || runtime.wakeInstruction(pending, mailbox.text)
+            const text0 = instruction || runtime.wakeInstruction(pending, mailbox.text, mailbox.fromUser > 0)
             runtime.remember(agent, { type: 'instruction', content: text0, via: 'session' })
             text = runtime.resumePrompt(run, agent, text0, pending, mailbox.text, lastWorkerTurn)
           } else text = runtime.promptForTurn(base! /* not `resume`: built above */, transcript, run, runtime.teamContext(run, agent) + mailbox.text, agent)
           agent.sessionCursor = transcript.length
           return text
         }, session)
+        agent.pausedSession = null
         break
       } catch (error) {
+        // A pause or a message cut the turn off: the same session goes on with the note (pause.interruptedSession).
+        if (error instanceof PauseInterrupt) { instruction = interruptedSession(runtime, agent, error, cursorBeforeTurn); continue }
+        // A killed CLI may leave its session unreadable. Try that session once, then carry the note into a fresh one.
+        if (resume && agent.pausedSession && agent.pausedSession === agent.sessionId && !signal.aborted) {
+          agent.pausedSession = null; agent.sessionId = null
+          if (instruction) runtime.remember(agent, { type: 'instruction', content: instruction })
+          runtime.trace(run, agent.id, 'transport', `The session from before the pause could not be resumed (${(error as Error)?.message || error}); starting a fresh one with the pause note`)
+          continue
+        }
         // A continuation after a restart tries the session from before it; one that cannot be resumed (a CLI killed
         // mid-turn can leave it unreadable) is dropped once, and a fresh session starts from the restart note.
         if (resume && run.resumeSession && run.resumeSession === agent.sessionId && !signal.aborted) {
@@ -328,7 +349,10 @@ async function sessionLoop(runtime: OrbitRuntimeLike, run: RunRecord, agent: Age
         runtime.updateAgent(run, agent, { status: 'waiting', detail: 'Waiting for delegated results' })
         await runtime.waitForTeam(run, agent, pending)
       }
-      instruction = pending.length || unseen ? 'Helpers you delegated to have finished since your last answer; their results are below. Integrate them, then give your final answer.' : 'Messages arrived after your last answer (below). Handle them, then give your final answer.'
+      // The user's words come first: they may have ended the wait for helpers before those finished.
+      instruction = runtime.pendingMail(run, agent).some(message => message.kind === 'message' && message.fromAgentId === USER.id) ? 'The user wrote to you while you were working (below). Act on it, then give your final answer.'
+        : pending.length || unseen ? 'Helpers you delegated to have finished since your last answer; their results are below. Integrate them, then give your final answer.'
+        : 'Messages arrived after your last answer (below). Handle them, then give your final answer.'
       continue
     }
     if (!candidate) throw new Error('Provider returned an empty response')
@@ -340,9 +364,10 @@ async function sessionLoop(runtime: OrbitRuntimeLike, run: RunRecord, agent: Age
         continue
       }
     }
-    if (agent.id === 'root' && run.improvementMode && !['completed', 'blocked'].includes(run.improvementStatus)) {
-      if (guard.improvementReminders++ < REMINDER_LIMIT) { instruction = IMPROVEMENT_REMINDER; continue }
-      return runtime.completeAgent(run, agent, `${candidate}\n\n(Режим улучшения: план не закрыт через improvement_plan после ${REMINDER_LIMIT} напоминаний, поэтому ответ выдан без подтверждённого завершения плана.)`)
+    const improvementReminder = agent.id === 'root' ? improvement.reminderFor(runtime, run) : null
+    if (improvementReminder) {
+      if (guard.improvementReminders++ < REMINDER_LIMIT) { instruction = improvementReminder; continue }
+      return runtime.completeAgent(run, agent, `${candidate}\n\n${improvement.acceptedWithout(runtime, run, REMINDER_LIMIT)}`)
     }
     if (agent.id === 'root' && run.memoryEnabled && run.skillLearning && !run.skillReminded && typeof runtime.capabilityStore?.save === 'function') {
       const unrated = [...run.skillUse].filter(([, use]) => !use.rated).map(([id, use]) => ({ id: id.slice(0, 12), name: use.name }))
@@ -358,8 +383,9 @@ async function sessionLoop(runtime: OrbitRuntimeLike, run: RunRecord, agent: Age
   return runtime.budgetHandoff(run, agent)
 }
 // What a resumed session is told when the harness itself has no instruction: a woken agent gets its follow-up task or mail.
-function wakeInstruction(runtime: OrbitRuntimeLike, pending: TranscriptEntry[], mailbox: string): string {
+function wakeInstruction(runtime: OrbitRuntimeLike, pending: TranscriptEntry[], mailbox: string, fromUser = false): string {
   if (pending.some(entry => entry.type === 'followup_task')) return 'A follow-up task was assigned to you (below). Your earlier task and answer stand as context; complete the new task and report the result.'
+  if (fromUser) return 'The user wrote to you (below). Your earlier task and answer stand as context; act on the message and report the result.'
   if (mailbox) return 'New messages arrived for you (below). Handle them; if nothing is required from you, say so briefly.'
   return 'You were resumed. Continue your work and give your answer.'
 }

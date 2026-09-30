@@ -19,6 +19,9 @@ const boolean: JsonSchema = { type: 'boolean' }
 const strings: JsonSchema = { type: 'array', items: string }
 const enumeration = (...values: string[]): JsonSchema => ({ type: 'string', enum: values })
 const object = (properties: Record<string, JsonSchema>, required = Object.keys(properties)): ObjectSchema => ({ type: 'object', properties, required, additionalProperties: false })
+// A property of a nested object that may be left out: listed as required with a null option, which is how a strict
+// output schema (the envelope) spells optional. The checks below accept it missing or null.
+const nullable = (schema: JsonSchema): JsonSchema => ({ anyOf: [schema, { type: 'null' }] })
 
 // One row per tool. `properties` lists every argument; `required` names the mandatory ones (the rest are optional and
 // may be omitted or null). `signature` is the prompt spelling, `blurb` the verbatim prompt fragment; `description`
@@ -106,23 +109,29 @@ const TOOL_ROWS: ToolRow[] = [
     properties: { id: string }, required: ['id'], mutating: true },
   { name: 'capability_search', signature: '{query,limit?}',
     blurb: '',
-    description: 'Ranked search of the reusable skills (procedures) you can reach.',
+    description: 'Ranked search of the skills you can reach (procedures, and packages with pages or commands); each shows its kinds.',
     properties: { query: string, limit: number }, required: ['query'] },
   { name: 'capability_list', signature: '{}',
     blurb: '',
-    description: 'List the reusable skills (procedures) you can reach.',
+    description: 'List the skills you can reach (procedures, and packages with pages or commands); each shows its kinds.',
     properties: {}, required: [] },
   { name: 'capability_read', signature: '{id}',
-    blurb: 'full instructions of one skill.',
-    description: 'Full instructions of one skill. When you are done using it, report the outcome with capability_feedback.',
+    blurb: 'full instructions of one skill, and for a package its folder (package.dir), files, parameters with their current values, triggers and commands.',
+    description: 'Full instructions of one skill, and for a package its folder (package.dir), files, parameters with their current values, triggers and commands. A skill the user switched off is refused. When you are done using it, report the outcome with capability_feedback.',
     properties: { id: string }, required: ['id'] },
   { name: 'capability_feedback', signature: '{id,outcome:worked|partial|failed,note?}',
     blurb: 'a failure\'s note becomes a pitfall for the next agent.',
     description: 'Report how a skill you loaded turned out (worked, partial or failed); a failure\'s note becomes a pitfall for the next agent.',
     properties: { id: string, outcome: enumeration('worked', 'partial', 'failed'), note: string }, required: ['id', 'outcome'], mutating: true },
-  { name: 'capability_install', signature: '{name,description,whenToUse?,instructions,id?,scope?,source?}',
-    blurb: 'save a self-contained procedure (prerequisites, exact steps or commands, how to verify, pitfalls); scope global when it does not depend on this project; improve an existing skill by passing its id rather than adding a near-copy. Verify helper scripts before saving a skill.',
-    properties: { name: string, instructions: string, description: string, whenToUse: string, id: string, scope: enumeration('project', 'global'), source: string }, required: ['name', 'instructions', 'description'], mutating: true },
+  { name: 'capability_install', signature: '{name?,description?,whenToUse?,instructions?,id?,scope?,source?,files?:[{path,content}],removeFiles?,fromDir?,params?:[{key,label,type,default,hint?}],triggers?:[{on,show}],commands?:[{name,run,description?}]}',
+    blurb: 'save a skill: any add-on that helps later, not only a procedure. name and instructions are required unless fromDir or id is given. A plain skill is a self-contained procedure (prerequisites, exact steps or commands, how to verify, pitfalls); scope global when it does not depend on this project; improve an existing skill by passing its id rather than adding a near-copy. A package also carries files (pages, scripts, assets; at most 40, 512 KB each, 4 MB in all): files writes text files, removeFiles deletes some, fromDir is an absolute folder inside the project or the temp folder whose files replace the package, and its skill.json may hold name, description, whenToUse, instructions, scope, params, triggers and commands. params are values the user sets in the skills panel (type text|url|number|seconds|boolean; a page reads them from its address); triggers [{on:"task-completed",show:"page.html"}] make Orbit show that page full screen when a task completes; commands [{name,run,description?}] are what agents run in the package folder. Omitted package fields keep what the skill has; params, triggers and commands given as [] are cleared, while files only adds or replaces the given files (use removeFiles or fromDir to drop others). Changing an existing package skill needs its id. Build a package in a folder and install it with fromDir; verify scripts before saving a skill.',
+    properties: {
+      name: string, instructions: string, description: string, whenToUse: string, id: string, scope: enumeration('project', 'global'), source: string,
+      files: { type: 'array', items: object({ path: string, content: string }) }, removeFiles: strings, fromDir: string,
+      params: { type: 'array', items: object({ key: string, label: string, type: enumeration('text', 'url', 'number', 'seconds', 'boolean'), default: { anyOf: [string, number, boolean] }, hint: nullable(string) }) },
+      triggers: { type: 'array', items: object({ on: enumeration('task-completed'), show: string }) },
+      commands: { type: 'array', items: object({ name: string, run: string, description: nullable(string) }) },
+    }, required: [], mutating: true },
   { name: 'context_save', signature: '{key,summary,files?}',
     blurb: 'upsert a shared project note with dependency hashes',
     description: 'Upsert a shared project note (visible to every agent) with dependency hashes of the files it names. Never store credentials.',
@@ -131,12 +140,12 @@ const TOOL_ROWS: ToolRow[] = [
     blurb: 'compact note index, or one note in full by key. Notes with stale=true need one targeted check of their listed files. Never store credentials.',
     description: 'Compact index of the shared project notes, or one note in full by key. Notes with stale=true need one targeted check of their listed files.',
     properties: { key: string }, required: [] },
-  { name: 'model_evaluate', signature: '{agentId,taskType,assessment,evidence}',
-    blurb: 'root only; after checking a completed worker\'s result, save an evidence-based model assessment to global memory. Distinguish measured results from subjective judgment; do not infer quality from completion alone.',
-    properties: { agentId: string, taskType: string, assessment: string, evidence: string }, required: ['agentId', 'taskType', 'assessment', 'evidence'], rootOnly: true, mutating: true },
-  { name: 'improvement_plan', signature: '{status,tasks:[{id,title,status,evidence}]}',
-    blurb: 'root only; maintain the improvement backlog. Plan status: planning, implementing, completed, blocked. Task status: pending, working, done, blocked. Completed requires all tasks done with verification evidence; blocked requires an explanation in task evidence. Reuse workers and shared findings.',
-    properties: { status: enumeration('planning', 'implementing', 'completed', 'blocked'), tasks: { type: 'array', items: object({ id: string, title: string, status: enumeration('pending', 'working', 'done', 'blocked'), evidence: string }) } },
+  { name: 'model_evaluate', signature: '{agentId,taskType,assessment,evidence,model?}',
+    blurb: 'root only; after checking a completed worker\'s result, save an evidence-based model assessment to global memory. Distinguish measured results from subjective judgment; do not infer quality from completion alone. model: the provider/model whose work you assess; required when the worker switched subscription (wait_agent shows ranOn).',
+    properties: { agentId: string, taskType: string, assessment: string, evidence: string, model: string }, required: ['agentId', 'taskType', 'assessment', 'evidence'], rootOnly: true, mutating: true },
+  { name: 'improvement_plan', signature: '{status,tasks:[{id,title,status,evidence}],handoff?}',
+    blurb: 'root only; maintain the improvement backlog. Plan status: planning, implementing, completed, blocked. Task status: pending, working, done, blocked. Completed requires all tasks done with verification evidence; blocked requires an explanation in task evidence. handoff: what the next task\'s fresh context must know (at most 2000 characters; omitted keeps the previous one). Reuse workers and shared findings.',
+    properties: { status: enumeration('planning', 'implementing', 'completed', 'blocked'), tasks: { type: 'array', items: object({ id: string, title: string, status: enumeration('pending', 'working', 'done', 'blocked'), evidence: string }) }, handoff: string },
     required: ['status', 'tasks'], rootOnly: true, mutating: true },
   // Not in the envelope guide text: runtime/prompts.mts tells the root agent about it only when Orbit can restart itself.
   { name: 'restart_orbit', signature: '{reason,continueWith,verify?}',
@@ -187,7 +196,7 @@ const GUIDE_LINES = () => [
   entry('run_command'),
   'MEMORY has three tiers. chat = working notes of THIS task thread (constraints the user gave, decisions in progress, what is left); project = verified knowledge about this codebase that outlives the chat; global = only what holds in EVERY project (user preferences, general how-tos, model assessments).',
   `${entry('memory_search')} ${entry('memory_save')} ${entry('memory_forget')} Save durable facts once and briefly. Never save credentials.`,
-  'SKILLS are reusable procedures: HOW to do something that will recur in other tasks (facts about this codebase belong in memory). Before improvising a multi-step procedure, check the SKILLS list or capability_search; after using a skill, report capability_feedback.',
+  'SKILLS are add-ons you build for yourself, of any form: a reusable procedure (HOW to do something that will recur in other tasks; facts about this codebase belong in memory), or a package of files (scripts, pages, assets) with parameters, a trigger Orbit runs by itself and commands. Before improvising a multi-step procedure, check the SKILLS list or capability_search; after using a skill, report capability_feedback.',
   `${sig('capability_search')}; ${sig('capability_list')}; ${entry('capability_read')} ${entry('capability_feedback')} ${entry('capability_install')}`,
   'Use context_save for shared discoveries and model_evaluate for checked model performance. Read cached project knowledge first; do not independently survey the entire repository.',
   'Your WORK LOG lists your own completed calls and stays authoritative even when older transcript entries are omitted: do not repeat a logged call just to re-check unchanged state; re-read a file range only when you need its exact text (for example to edit it) and it is no longer visible. Checks serve the task; once the evidence is enough, integrate and give the final answer.',
@@ -222,7 +231,10 @@ function check(value: unknown, schema: JsonSchema, label: string): string | null
   }
   if (schema.type === 'object') {
     if (!value || typeof value !== 'object' || Array.isArray(value)) return `${label} must be an object`
-    for (const key of schema.required || []) if ((value as Record<string, unknown>)[key] === undefined || (value as Record<string, unknown>)[key] === null) return `${label}.${key} is required`
+    for (const key of schema.required || []) {
+      const missing = (value as Record<string, unknown>)[key] === undefined || (value as Record<string, unknown>)[key] === null
+      if (missing && !schema.properties?.[key]?.anyOf?.some(option => option.type === 'null')) return `${label}.${key} is required`
+    }
     for (const [key, item] of Object.entries(value)) {
       const property = schema.properties?.[key]
       if (!property) { if (schema.additionalProperties === false) return `${label} has an unknown argument "${key}"`; continue }
@@ -248,7 +260,8 @@ const SEMANTIC: Record<string, (args: ToolArgs) => string | null> = {
   index_search: args => blank(args.query) ? 'A search query is required' : null,
   capability_search: args => blank(args.query) ? 'A search query is required' : null,
   memory_save: args => blank(args.title) || blank(args.content) ? 'Memory title and content are required' : null,
-  capability_install: args => blank(args.name) || blank(args.instructions) ? 'Capability name and instructions are required' : null,
+  // A skill folder's skill.json can supply them, and an existing skill (id) keeps its own: the store decides those cases.
+  capability_install: args => !args.fromDir && !args.id && (blank(args.name) || blank(args.instructions)) ? 'Capability name and instructions are required' : null,
   edit_file: args => !args.old_text ? 'Nonempty old_text and string new_text are required' : null,
   run_command: args => blank(args.command) || args.command!.includes('\0') ? 'Command must name an executable' : args.args?.some(item => item.includes('\0')) ? 'Command args must be an array of strings' : null,
   context_save: args => blank(args.key) ? 'A note key is required' : null,
@@ -258,6 +271,7 @@ const SEMANTIC: Record<string, (args: ToolArgs) => string | null> = {
     for (const item of args.tasks!) if (['done', 'blocked'].includes(item.status!) && blank(item.evidence)) return 'Done/blocked tasks require evidence'
     if (new Set(args.tasks!.map(item => item.id)).size !== args.tasks!.length) return 'Task ids must be unique'
     if (args.status === 'blocked' && !args.tasks!.some(item => item.status === 'blocked')) return 'Blocked plan requires a documented blocker'
+    if (typeof args.handoff === 'string' && args.handoff.length > 2000) return 'handoff is longer than 2000 characters; keep only what the next task must know'
     return null
   },
 }

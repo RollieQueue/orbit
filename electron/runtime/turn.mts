@@ -2,12 +2,29 @@
 // of events it produces (buffered traces, the root's streamed answer, usage, native file events, the cut-off record).
 import { randomUUID } from 'node:crypto'
 import { ORBIT_RESPONSE_SCHEMA } from '../tool-schema.mts'
-import { classifyQuotaError } from '../quota.mts'
-import { TERMINAL, ceiling, MCP_TOOL_PREFIX, answerLimit, bounded, clip, TurnBudgetError, abortError, abortable, diagnostics } from './util.mts'
+import { TERMINAL, ceiling, MCP_TOOL_PREFIX, answerLimit, bounded, clip, TurnBudgetError, abortError, abortable, diagnostics, markProviderFailure } from './util.mts'
 import { agentEnv } from './restart.mts'
-import type { AgentRecord, OrbitRuntimeLike, ProviderEvent, ProviderResult, RunRecord, SessionInfo, StreamState, TurnTiming, UsageFigures } from '../types.mts'
+import { pauseGate, pausedBy, PauseInterrupt, pauseNote } from './pause.mts'
+import type { InterruptReason } from './pause.mts'
+import { watchTurn, clearSilentTurns, isStall } from './watchdog.mts'
+import type { TurnWatch } from './watchdog.mts'
+import { messageNote, stopSteer } from './steer.mts'
+import type { AgentRecord, OrbitRuntimeLike, ProviderEvent, ProviderResult, RunRecord, SessionInfo, StreamState, ToolImage, TraceImage, TurnTiming, UsageFigures } from '../types.mts'
 // The root agent's answer in progress is published at most four times a second.
 const STREAM_INTERVAL_MS = 250
+// A session turn can hold the whole task, so the window counts the agent's actions (tool calls) while the turn runs:
+// a changed count is published at most once a second, and the delayed update carries the latest one.
+const PROGRESS_INTERVAL_MS = 1000
+const progressTimers = new WeakMap<AgentRecord, ReturnType<typeof setTimeout>>()
+function publishProgress(runtime: OrbitRuntimeLike, run: RunRecord, agent: AgentRecord): void {
+  if (progressTimers.has(agent)) return
+  const timer = setTimeout(() => {
+    progressTimers.delete(agent)
+    if (agent.activeTurn && !TERMINAL.has(run.status)) runtime.updateAgent(run, agent, {}, false)
+  }, PROGRESS_INTERVAL_MS)
+  timer.unref?.()
+  progressTimers.set(agent, timer)
+}
 
 // What a turn had produced when the provider cut it off: the last streamed message and the native tool actions.
 function notePartialTurn(runtime: OrbitRuntimeLike, agent: AgentRecord, event: ProviderEvent): void {
@@ -35,7 +52,9 @@ function providerEvent(runtime: OrbitRuntimeLike, run: RunRecord, agent: AgentRe
     return
   }
   runtime.notePartialTurn(agent, event)
+  const counted = agent.activeTurn?.timing.nativeToolCalls
   runtime.noteTurnEvent(agent, event)
+  if (agent.activeTurn && agent.activeTurn.timing.nativeToolCalls !== counted) publishProgress(runtime, run, agent)
   // Bookkeeping about touched files must never break the provider stream it is read from.
   if (event?.native) { try { runtime.trackNativeFiles(run, agent, event) } catch (error) { diagnostics(runtime, run, 'trackNativeFiles', error, agent.id) } }
   if (event?.usage) runtime.recordUsage(run, event.usage)
@@ -55,7 +74,18 @@ function providerEvent(runtime: OrbitRuntimeLike, run: RunRecord, agent: AgentRe
   }
   for (const [key, buffer] of run.providerBuffers) if (buffer.agentId === agent.id) runtime.flushProviderBuffer(run, key)
   const text = [event?.text || event?.message || '', event?.output ? bounded(event.output, 4000) : '', event?.exitCode !== undefined ? `exitCode=${event.exitCode}` : '', event?.status ? `status=${event.status}` : ''].filter(Boolean).join('\n')
-  runtime.trace(run, agent.id, event?.kind || 'provider', text || bounded(event, 4000))
+  const images = event?.images?.length ? saveImages(runtime, run, agent, event.images) : undefined
+  runtime.trace(run, agent.id, event?.kind || 'provider', text || bounded(event, 4000), undefined, images)
+}
+// The images of a tool result (a screenshot the agent read) go to the run store; the trace only names them. A few per
+// result at most, and a failed write never breaks the provider stream.
+function saveImages(runtime: OrbitRuntimeLike, run: RunRecord, agent: AgentRecord, images: ToolImage[]): TraceImage[] {
+  const saved: TraceImage[] = []
+  for (const image of images.slice(0, 8)) {
+    try { const record = runtime.runStore?.saveImage?.(run.runId, image); if (record) saved.push(record) }
+    catch (error) { diagnostics(runtime, run, 'saveImage', error, agent.id) }
+  }
+  return saved
 }
 function flushProviderBuffer(runtime: OrbitRuntimeLike, run: RunRecord, key: string): void {
   const buffer = run.providerBuffers.get(key)
@@ -69,6 +99,7 @@ function flushProviderBuffer(runtime: OrbitRuntimeLike, run: RunRecord, key: str
 function noteTurnEvent(runtime: OrbitRuntimeLike, agent: AgentRecord, event: ProviderEvent): void {
   const turn = agent.activeTurn
   if (!turn) return
+  turn.watch?.note(event)
   if (!turn.timing.firstEventAt) turn.timing.firstEventAt = new Date().toISOString()
   if (event?.kind !== 'tool' || !event.native || String(event.tool || '').startsWith(MCP_TOOL_PREFIX)) return
   const key = event.toolId || `${event.tool || 'tool'}:${turn.nativeSeen.size}`
@@ -119,11 +150,17 @@ function trackOperation<T>(runtime: OrbitRuntimeLike, run: RunRecord, operation:
 // One provider turn. `session` (session transport) is passed to the provider in place of the envelope schema; the
 // turn's slot object lets an MCP wait release the model slot and take it back (see dispatchMcp).
 async function providerTurn(runtime: OrbitRuntimeLike, run: RunRecord, agent: AgentRecord, prompt: string | (() => string), session: SessionInfo | null = null): Promise<ProviderResult> {
-  await runtime.acquireTurn(run, agent)
+  for (;;) {
+    await pauseGate(runtime, run, agent)
+    await runtime.acquireTurn(run, agent)
+    if (!pausedBy(run, agent)) break
+    runtime.releaseTurn(run)
+  }
   const signal = runtime.agentSignal(run, agent)
   const controller = new AbortController(), abort = () => controller.abort()
   const slot = { held: true }
   let providerTask: Promise<ProviderResult> | undefined, counted = false, timing: TurnTiming | null = null
+  let interrupted: InterruptReason | null = null, pauseHolder: AgentRecord | null = null, watch: TurnWatch | null = null
   signal.addEventListener('abort', abort, { once: true })
   try {
     if (signal.aborted) throw abortError()
@@ -136,13 +173,16 @@ async function providerTurn(runtime: OrbitRuntimeLike, run: RunRecord, agent: Ag
     agent.turnTimings.push(timing)
     runtime.updateAgent(run, agent, { status: 'working', detail: 'Provider is executing', startedAt: agent.startedAt || new Date().toISOString() })
     // `delivered`: the mail this turn's prompt carries; during a session turn it is no longer pending (see pendingMail).
-    agent.activeTurn = { slot, timing, changed: false, nativeSeen: new Set(), stream: null, delivered: new Set() }
+    agent.activeTurn = { slot, timing, changed: false, nativeSeen: new Set(), stream: null, delivered: new Set(),
+      interrupt: (reason: InterruptReason = 'pause') => { interrupted = reason; pauseHolder = pausedBy(run, agent); controller.abort() } }
     const resolvedPrompt = typeof prompt === 'function' ? prompt() : prompt
     run.usage.promptChars = (run.usage.promptChars || 0) + resolvedPrompt.length
     agent.promptChars = (agent.promptChars || 0) + resolvedPrompt.length
     timing.promptChars = resolvedPrompt.length
     // The provider's CLI (and every shell it opens) learns which run it serves: a self-upgrade started there continues it.
     const extraEnv = agentEnv(runtime, run, agent)
+    // A turn that reports nothing for too long is stopped (watchdog.mts); recoverProvider repeats it or hands it over.
+    const turnWatch = watch = agent.activeTurn.watch = watchTurn(agent, session, () => controller.abort())
     providerTask = runtime.trackOperation(run, Promise.resolve().then(() => runtime.runProvider({
       providerId: agent.providerId, model: agent.requestedModel, prompt: resolvedPrompt, workspace: run.workspace,
       mode: run.accessMode, accessMode: run.accessMode, approvalPolicy: run.approvalPolicy,
@@ -150,11 +190,12 @@ async function providerTurn(runtime: OrbitRuntimeLike, run: RunRecord, agent: Ag
       providerOptions: run.providerOptions[agent.providerId] || {},
       ...(session ? { session } : { responseSchema: ORBIT_RESPONSE_SCHEMA }),
       ...(Object.keys(extraEnv).length ? { extraEnv } : {}),
-      onApproval: request => runtime.approve(run, agent, request, controller.signal),
+      onApproval: request => turnWatch.hold(runtime.approve(run, agent, request, controller.signal)),
       signal: controller.signal, timeoutMs: run.limits.timeoutMs,
       onEvent: (event) => { if (!controller.signal.aborted) runtime.providerEvent(run, agent, event) },
-    })), agent)
-    const result = await abortable(providerTask, signal, run.limits.timeoutMs, 'Provider turn time budget exhausted')
+    })).catch((error: unknown) => { throw markProviderFailure(error) }), agent)
+    const result = await abortable(providerTask, controller.signal, run.limits.timeoutMs, 'Provider turn time budget exhausted')
+    clearSilentTurns(agent)
     // A continuation's resume of the session from before the restart answered: from now on it is an ordinary session.
     if (session && run.resumeSession === session.id) run.resumeSession = undefined
     if (result?.model) { runtime.updateAgent(run, agent, { model: result.model }); if (agent.id === 'root') run.model = result.model }
@@ -164,20 +205,32 @@ async function providerTurn(runtime: OrbitRuntimeLike, run: RunRecord, agent: Ag
     timing.endedAt = new Date().toISOString()
     runtime.emit(run, 'run.info', { agentId: agent.id, providerId: agent.providerId, model: agent.model, usage: { ...run.usage }, timing: { ...timing } })
     return result
-  } catch (error) {
-    // A turn the failover is about to redo on another subscription was never taken: it must not eat the turn budgets.
-    if (counted && runtime.failoverActive(run) && !signal.aborted && (agent.trial || classifyQuotaError(error, agent.providerId, runtime.clock()))) {
-      run.usage.providerTurns--; agent.turns--
-      if (agent.id !== 'root') run.usage.workerTurns--
+  } catch (caught) {
+    // A turn that is repeated at once (after a silence, on another subscription, or with a message the agent is to read
+    // now) was never taken: it must not eat the turn budgets.
+    const refund = () => { if (counted) { run.usage.providerTurns--; agent.turns--; if (agent.id !== 'root') run.usage.workerTurns-- } }
+    if (interrupted && !signal.aborted) {
+      if (interrupted === 'message') refund()
+      // The model itself spoke (a stderr line or a note from before the CLI started does not count): its session holds
+      // the turn's prompt. A first session turn of Claude that spoke has its session under Orbit's id (--session-id),
+      // which the repeat resumes, as a restart's continuation does (resume.rootSession).
+      const spoke = watch ? Number.isFinite(watch.stepAge()) : !!timing?.firstEventAt
+      const opened = session && !session.resume && agent.providerId === 'claude' && spoke ? session.id : null
+      throw new PauseInterrupt(interrupted === 'message' ? messageNote(agent) : pauseNote(agent, pauseHolder), interrupted, opened, spoke)
     }
+    // A turn the watchdog stopped ends as a stall, whatever the aborted provider reported.
+    const error = watch?.stalled && !signal.aborted ? watch.stalled : caught
+    if (!signal.aborted && (isStall(error) || runtime.failoverActive(run))) refund()
     throw error
   } finally {
+    watch?.stop()
     for (const [key, buffer] of run.providerBuffers) if (buffer.agentId === agent.id) {
       runtime.flushProviderBuffer(run, key)
       run.providerBuffers.delete(key)
     }
     if (timing && !timing.endedAt) timing.endedAt = new Date().toISOString()
     if (agent.activeTurn?.stream) runtime.flushStream(run, agent, agent.activeTurn.stream)
+    stopSteer(agent.activeTurn)
     agent.activeTurn = null
     controller.abort(); signal.removeEventListener('abort', abort)
     // Releasing a slot/overwrite lock before a cancelled process tree exits permits races. A slot an MCP wait gave
@@ -188,4 +241,4 @@ async function providerTurn(runtime: OrbitRuntimeLike, run: RunRecord, agent: Ag
   }
 }
 
-export { notePartialTurn, providerEvent, flushProviderBuffer, noteTurnEvent, streamOutput, flushStream, recordUsage, trackOperation, providerTurn }
+export { notePartialTurn, providerEvent, flushProviderBuffer, noteTurnEvent, streamOutput, flushStream, recordUsage, trackOperation, providerTurn, publishProgress }

@@ -11,7 +11,8 @@ export type ApprovalPolicy = 'never' | 'on-request' | 'auto-review'
 export type Transport = 'session' | 'envelope'
 // `restarting`: the run ended because Orbit restarted with new code at an agent's request; a new run continues it.
 export type RunStatus = 'working' | 'completed' | 'failed' | 'cancelled' | 'restarting'
-export type AgentStatus = 'waiting' | 'working' | 'done' | 'error' | 'cancelled'
+export type AgentStatus = 'waiting' | 'working' | 'paused' | 'done' | 'error' | 'cancelled'
+export interface AgentControlResult { ok: true; agentId: string; status: AgentStatus; paused: boolean }
 export type MemoryScope = 'chat' | 'project' | 'global'
 export type MemoryProfile = 'project' | 'project-global'
 export type SkillScope = 'project' | 'global'
@@ -19,8 +20,9 @@ export type ImprovementStatus = 'planning' | 'implementing' | 'completed' | 'blo
 export type TaskStatus = 'pending' | 'working' | 'done' | 'blocked'
 export type CommunicationKind = 'spawn' | 'followup' | 'message' | 'notice'
 export type CommunicationStatus = 'queued' | 'delivered' | 'read'
-export type CommunicationDelivery = 'next-turn' | 'mailbox'
-export type HandoverReason = 'exhausted' | 'approaching' | 'replacement-failed'
+// tool-result: the user's (or a supervisor's) message went to a session agent at the end of an Orbit tool result within its turn.
+export type CommunicationDelivery = 'next-turn' | 'mailbox' | 'tool-result'
+export type HandoverReason = 'exhausted' | 'approaching' | 'replacement-failed' | 'stalled' | 'failed'
 export type FileAction = 'read' | 'write'
 
 // ---- Limits, usage, timings ---------------------------------------------------------------------------------------
@@ -44,13 +46,20 @@ export interface TurnTiming {
 }
 
 // ---- Records a run publishes --------------------------------------------------------------------------------------
-export interface Trace { id: string; agentId: string; agentName: string; kind: string; text: string; time: string }
+// `images`: what a tool result showed the agent (a screenshot it read), saved by the run store; the trace names them.
+export interface Trace { id: string; agentId: string; agentName: string; kind: string; text: string; time: string; images?: TraceImage[] }
+// A saved image: its file name under the run's image folder (RunStore.saveImage), its type and size in bytes.
+export interface TraceImage { id: string; mediaType: string; bytes: number }
+// An image as a provider's tool result carried it: base64 bytes and the media type.
+export interface ToolImage { mediaType: string; data: string }
 export interface Message { id: string; agentId: string; generation: number; author: 'orbit'; text: string; kind: string; model: string; client: string; lane: string; time: string }
 export interface MessageRoute { via: string; reasons: string[] }
 export interface Communication {
   id: string; fromAgentId: string; toAgentId: string; fromAgentName: string; toAgentName: string; text: string; time: string
   status: CommunicationStatus; delivery: CommunicationDelivery; kind?: CommunicationKind; reason?: string; via?: string; route?: MessageRoute
   replyTo?: string; discussionId?: string; deliveredAt?: string; readAt?: string
+  // Files the user attached to the message (electron/attachments.mts).
+  attachments?: Attachment[]
   // Router notices: whose write it reports, which files, and whether the reader had changed them too.
   about?: string; aboutName?: string; paths?: string[]; conflict?: boolean
 }
@@ -109,7 +118,7 @@ export interface ToolArgs {
   start_line?: number; recursive?: boolean; content?: string; old_text?: string; new_text?: string; command?: string; args?: string[]; cwd?: string
   title?: string; scope?: string; type?: string; confidence?: number; outcome?: string; note?: string; description?: string; whenToUse?: string; instructions?: string; source?: string
   key?: string; summary?: string; status?: string; tasks?: ImprovementTaskInput[]; taskType?: string; assessment?: string; evidence?: string
-  continueWith?: string; verify?: boolean
+  continueWith?: string; verify?: boolean; handoff?: string
   __invalidArguments?: boolean
   [extra: string]: unknown
 }
@@ -138,13 +147,18 @@ export interface PoolMember { providerId: string; model: string; reasoningEffort
 export interface HandoverRecord {
   id: string; time: string; reason: HandoverReason; from: ModelTarget; to: ModelTarget; fresh: boolean
   usedPercent: number | null; resetsAt: number | null; interrupted: boolean; note?: string
+  // Turns the agent had completed when it switched (absent in records saved before this was kept).
+  turn?: number
 }
+// One model that really worked for an agent (see agents.modelsWorked): `turns` is a human range such as 'turns 1–3'.
+export interface WorkedModel { label: string; providerId: string; model: string; turns?: string }
 export interface InterruptedTurn { text: string; actions: string[] }
 export interface PartialTurn { messages: Map<string, string>; tools: Map<string, string> }
 export interface StreamState { messageId: string; parts: Map<string, string>; lastAt: number; timer: ReturnType<typeof setTimeout> | null; dirty: boolean }
 export interface TurnSlot { held: boolean }
-export interface ActiveTurn { slot: TurnSlot; timing: TurnTiming; changed: boolean; nativeSeen: Set<string>; stream: StreamState | null; delivered: Set<string> }
+export interface ActiveTurn { slot: TurnSlot; timing: TurnTiming; changed: boolean; nativeSeen: Set<string>; stream: StreamState | null; delivered: Set<string>; interrupt: (reason?: import('./runtime/pause.mts').InterruptReason) => void; watch?: import('./runtime/watchdog.mts').TurnWatch | null }
 export interface AgentRecord {
+  paused?: boolean; pausedAt?: string | null; stoppedByUser?: boolean; pausedSession?: string | null
   id: string; parentId: string | null; depth: number; name: string; role: string; task: string; reason: string
   providerId: string; model: string; memoryProfile: MemoryProfile; reasoningEffort: string; requestedModel: string
   status: AgentStatus; progress: number; detail: string; startedAt: string | null; finishedAt: string | null; result: string; error: string | null
@@ -157,7 +171,7 @@ export interface AgentRecord {
   draftAnswer?: string | null; budgetLimited?: boolean; stalled?: boolean; promptChars?: number
 }
 // The fields that stay inside the runtime; snapshots and events carry the rest (util.INTERNAL_AGENT_FIELDS).
-export type InternalAgentField = 'inbox' | 'seenChildren' | 'requestedModel' | 'transcript' | 'previousWork' | 'ledger' | 'ledgerDropped' | 'workDone' | 'failedCandidates' | 'trial' | 'partialTurn' | 'quotaWarned' | 'draftAnswer' | 'activeTurn' | 'stream' | 'sessionToken' | 'sessionCursor' | 'transcriptChars'
+export type InternalAgentField = 'inbox' | 'seenChildren' | 'requestedModel' | 'transcript' | 'previousWork' | 'ledger' | 'ledgerDropped' | 'workDone' | 'failedCandidates' | 'trial' | 'partialTurn' | 'quotaWarned' | 'draftAnswer' | 'activeTurn' | 'stream' | 'sessionToken' | 'sessionCursor' | 'transcriptChars' | 'pausedSession'
 export type PublicAgent = Omit<AgentRecord, InternalAgentField>
 // What an agent's execution resolves to (completeAgent), or the error a scheduled agent ended with.
 export interface AgentResult { agentId: string; generation: number; status: AgentStatus; result?: string; error?: string; budgetLimited?: boolean }
@@ -165,8 +179,10 @@ export interface SpawnResult { ok: boolean; reason?: string; instruction?: strin
 export interface FollowupResult { ok: true; agentId: string; generation: number; status: AgentStatus }
 export interface TeamDigest { running: string[]; finished: string[] }
 export interface AgentDirectoryEntry {
+  paused: boolean
   id: string; name: string; parentId: string | null; status: AgentStatus; generation: number; providerId: string; model: string; task: string
   result: string; resultTruncated?: boolean; fullResult?: string; error: string | null; budgetLimited: boolean
+  ranOn?: string[]
 }
 export interface AgentController { controller: AbortController; parentSignal: AbortSignal | null; abort: () => void }
 export interface TurnWaiter { resolve: () => void; reject: (error: Error) => void; signal: AbortSignal; abort: () => void }
@@ -182,6 +198,7 @@ export interface ProjectPacket { overview: unknown; notes: SharedNote[]; updated
 // No index signature: providers.mts ProviderHealth (an interface, the catalog main.cjs passes) must fit it.
 export interface CatalogEntry { id: string; available?: boolean; models?: string[]; reasoningLevels?: Record<string, string[]> }
 export interface RunRecord {
+  pauseWaiters: Set<() => void>
   runId: string; projectId: string; chatId: string; prompt: string; workspace: string; providerId: string; model: string
   memoryEnabled: boolean; globalMemoryEnabled: boolean; memoryContext: MemoryEntry[]
   improvementMode: boolean; improvements: ImprovementTask[]; improvementStatus: ImprovementStatus
@@ -202,6 +219,10 @@ export interface RunRecord {
   // row led here, and for a run that ended `restarting`, why and when the restart was asked for. `resumeSession`: the
   // old root's provider session a continuation is resuming, until its first turn answers (runtime/restart.mts).
   startPayload?: StartPayload; resumedFrom?: string; resumeChain?: number; restart?: RestartMark; resumeSession?: string
+  // The improvement loop (runtime/improvement.mts): the loop's task number the renderer gave this run, what the next task
+  // must know, the closed task keys (`id|title`) the run started with, and whether restart_orbit applied this run's change
+  // or was refused in a way the next task's restart resolves (cycle limit, other chats working, declined).
+  loopTask?: number; improvementHandoff?: string; improvementBaseline?: Map<string, ImprovementTask>; restartApplied?: boolean; restartDeferred?: boolean
 }
 // `note`: what the root of the continuation is told about the run the restart ended (work log, files, helpers, cut-off turn);
 // `intentId`: the id of the intent (pending-resume.json) that marked it, the only one that continues it (resume.mts).
@@ -214,6 +235,7 @@ export interface RunSnapshot {
   traces: Trace[]; messages: Message[]; communications: Communication[]; summary: RunSummary | null; error: string | null
   files: FileActivitySnapshot[]; changes: FileChange[]; router: RouterStats
   startPayload?: StartPayload; resumedFrom?: string; resumeChain?: number; restart?: RestartMark
+  loopTask?: number; improvementHandoff?: string
 }
 // An earlier turn of the chat as chat-memory presents it (a live run or a saved snapshot): chat-memory's own RunView.
 export type ChatRunView = import('./chat-memory.mts').RunView
@@ -225,12 +247,18 @@ export interface StoredRun {
   startedAt?: string; finishedAt?: string | null; updatedAt?: string; error?: string | null
   agents?: StoredAgent[]; changes?: FileChange[]
   startPayload?: StartPayload; resumedFrom?: string; resumeChain?: number; restart?: RestartMark
+  // The improvement plan an improvement-mode run left (read back by runtime/improvement.mts loadPlan).
+  improvements?: unknown; improvementStatus?: unknown; improvementHandoff?: unknown; loopTask?: number
 }
 export interface StartPayload {
   prompt?: string; providerId?: string; workspace?: string; projectId?: string; chatId?: string; mode?: string; accessMode?: string; approvalPolicy?: string
   reasoningEffort?: string; model?: string; providerOptions?: Record<string, ProviderOptions>; providerPool?: PoolMember[]
   memoryEnabled?: boolean; globalMemoryEnabled?: boolean; memoryContext?: MemoryEntry[]; improvementMode?: boolean; quotaFailover?: unknown; models?: Record<string, unknown> | null
   history?: HistoryInput[]; agentInstructions?: string; limits?: LimitsInput; skillLearning?: boolean
+  // The improvement loop's task number (the renderer starts one run per task); a safe integer ≥ 1, else ignored.
+  loopTask?: number
+  // Files the user attached to the message that starts the run (saved first with attachments:save).
+  attachments?: Attachment[]
   // A continuation after a restart (resume.mts): the run it continues, how many restarts in a row led to it, the note its
   // root starts with, and the old root's provider session to resume when the root keeps that provider.
   resumedFrom?: string; resumeChain?: number; restartNote?: string; resumeSession?: { id: string; providerId: string }
@@ -259,7 +287,7 @@ export interface ProviderRunOptions {
 export interface ProviderEvent {
   kind: string; providerId?: string; text?: string; message?: string; messageId?: string; partial?: boolean; replace?: boolean; parentToolId?: string | null
   native?: boolean; tool?: string; toolId?: string; status?: string; changes?: unknown; input?: unknown; output?: unknown; exitCode?: number | null
-  mcp?: boolean; server?: string; orbitTool?: string
+  mcp?: boolean; server?: string; orbitTool?: string; images?: ToolImage[]
   // `usage` is the vendor's figures, unchecked (providers.mts types it unknown): read it as UsageFigures only defensively.
   usage?: unknown; quota?: QuotaUpdate; source?: string
   // No index signature: every member of providers.mts's ProviderEvent union (interfaces) must fit this shape, since
@@ -299,13 +327,33 @@ export interface MemorySaveResult { entry: MemoryEntry; merged?: boolean; unchan
 export interface RecallQuery { query: string; workspace: string; chatId: string; includeGlobal: boolean; models: boolean }
 export interface RecallItem { entry: MemoryEntry; relevant: boolean; pinned: boolean }
 export interface RecallResult { tiers: Record<MemoryScope, RecallItem[]>; totals?: Partial<Record<MemoryScope, number>> }
+// Skills are add-ons Orbit builds for itself, of any form: instructions for agents, and optionally a package of files
+// (pages, scripts, assets) with parameters the user sets, triggers Orbit runs on its own and commands agents run in the
+// package folder (electron/capabilities.mts, electron/skill-files.mts). src/types.ts mirrors these.
+export type SkillParamType = 'text' | 'url' | 'number' | 'seconds' | 'boolean'
+export type SkillParamValue = string | number | boolean
+export interface SkillParam { key: string; label: string; type: SkillParamType; default: SkillParamValue; value: SkillParamValue; hint?: string }
+// task-completed: a run of the skill's project completed (after a restart_orbit restart, the continuation's completion).
+export interface SkillTrigger { on: 'task-completed'; show: string }
+export interface SkillCommand { name: string; run: string; description?: string }
+export interface SkillFile { path: string; size: number }
+export interface SkillPackage { id: string; dir: string }
+// A file of a package as an install passes it: its path in the package and its text.
+export interface SkillFileInput { path: string; content: string }
 export interface SkillView {
   id: string; name: string; description?: string; whenToUse?: string; scope: SkillScope; version?: number; uses?: number; reliability?: number
   lessons?: string[]; successes?: number; failures?: number; workspace?: string; source?: string; relevant?: boolean
+  enabled?: boolean; files?: SkillFile[]; params?: SkillParam[]; triggers?: SkillTrigger[]; commands?: SkillCommand[]; package?: SkillPackage
 }
 export interface SkillEntry extends SkillView { instructions: string }
 export interface SkillSuggestion { skills: SkillView[]; total: number }
-export interface SkillSaveInput { id?: string; name: string; description?: string; whenToUse?: string; instructions: string; scope: SkillScope; workspace?: string; source?: string }
+export interface SkillSaveInput {
+  id?: string; name: string; description?: string; whenToUse?: string; instructions: string; scope: SkillScope; workspace?: string; source?: string
+  files?: SkillFileInput[]; removeFiles?: string[]; fromDir?: string; params?: unknown[]; triggers?: unknown[]; commands?: unknown[]
+}
+// A file the user attached to a chat message (electron/attachments.mts) and the upload the window sends to save one.
+export interface Attachment { id: string; name: string; type: string; size: number; path: string }
+export interface AttachmentUpload { name: string; type: string; data: string }
 export interface SkillSaveResult { entry: SkillEntry; merged?: boolean; improved?: string; evicted?: number }
 export interface SkillFeedbackInput { outcome?: string; note?: string; includeGlobal?: boolean }
 export interface MaintainOptions { workspace: string; chatId?: string; crossProject: boolean; projects: string[] }
@@ -331,6 +379,7 @@ export interface CapabilityStoreLike {
   find(id: string, workspace: string, includeGlobal: boolean): SkillView | null
   feedback(id: string, workspace: string, input: SkillFeedbackInput): SkillView & { lessonDropped?: boolean }
   save(input: SkillSaveInput, options?: { origin?: string }): SkillSaveResult
+  setEnabled?(id: string, enabled: boolean, workspace: string): SkillView
   suggest?(query: string, workspace: string, limit: number, includeGlobal: boolean): SkillSuggestion
   recordUse?(id: string, workspace: string, includeGlobal: boolean): string | null
   maintain?(options: Omit<MaintainOptions, 'chatId'>): unknown
@@ -341,6 +390,7 @@ export interface RunStoreLike {
   save?(snapshot: RunSnapshot): void | Promise<unknown>
   forChat?(projectId: string, chatId: string, limit: number): StoredRun[]
   list?(): StoredRun[]
+  saveImage?(runId: string, image: ToolImage): TraceImage | null
 }
 export interface ProjectIndexLike {
   refresh(workspace: string, options?: { force?: boolean }): Promise<IndexDiff>
@@ -430,7 +480,8 @@ export interface CommandResult { ok: boolean; exitCode?: number | null; signal?:
 
 // ---- Prompts and mail ---------------------------------------------------------------------------------------------
 export interface PromptBase { required: string; optional: string }
-export interface MailboxContext { text: string; deliveredIds: string[] }
+// `fromUser`: how many of the delivered messages the user wrote (runtime:message); they lead the text as the user's own words.
+export interface MailboxContext { text: string; deliveredIds: string[]; fromUser: number }
 export interface ReadMessagesResult { messages: Communication[]; remainingUnread: number; timedOut?: boolean }
 export interface SendResult { ok: true; communicationId: string; agentId: string; status: CommunicationStatus; delivery: CommunicationDelivery }
 export interface AskTeamResult { ok: true; discussionId: string; via: string; routedTo: { agentId: string; name: string; reason?: string; status?: CommunicationStatus; error?: string }[] }
@@ -475,7 +526,7 @@ export interface OrbitRuntimeLike {
   persistenceError(run: RunRecord, error: Error): void
   schedulePersist(run: RunRecord, delay?: number): void
   emit(run: RunRecord, type: string, data?: RuntimeEventData, persist?: boolean): void
-  trace(run: RunRecord, agentId: string, kind: string, text: string, id?: string): void
+  trace(run: RunRecord, agentId: string, kind: string, text: string, id?: string, images?: TraceImage[]): void
   updateAgent(run: RunRecord, agent: AgentRecord, patch: Partial<AgentRecord>, persist?: boolean): void
   message(run: RunRecord, agent: AgentRecord, text: string, kind?: string): void
   pruneRuns(): void
@@ -488,6 +539,9 @@ export interface OrbitRuntimeLike {
   failRun(run: RunRecord, error: Error): void
   cancelAgents(run: RunRecord, detail: string): void
   stop(runId: string): boolean
+  pauseAgent(runId: string, agentId: string): AgentControlResult
+  resumeAgent(runId: string, agentId: string): AgentControlResult
+  stopAgent(runId: string, agentId: string): AgentControlResult
   markRestarting(runId: string, mark?: RestartMark): boolean
   // restart
   setRestartHost(host: import('./resume.mts').RestartHost | null): void
@@ -518,6 +572,8 @@ export interface OrbitRuntimeLike {
   waitAgentMessage(run: RunRecord, agent: AgentRecord, args: ToolArgs): Promise<ReadMessagesResult>
   mailboxContext(run: RunRecord, agent: AgentRecord): MailboxContext
   askTeam(run: RunRecord, sender: AgentRecord, args: ToolArgs): AskTeamResult
+  postUserMessage(runId: string, agentId: string, text: unknown): SendResult
+  userMail(run: RunRecord, agent: AgentRecord): string
   // prompts
   teamContext(run: RunRecord, agent: AgentRecord): string
   fileMapContext(run: RunRecord): string
@@ -566,7 +622,7 @@ export interface OrbitRuntimeLike {
   executeAgent(run: RunRecord, agent: AgentRecord): Promise<AgentResult>
   envelopeLoop(run: RunRecord, agent: AgentRecord, signal: AbortSignal): Promise<AgentResult | typeof SWITCH_TRANSPORT>
   sessionLoop(run: RunRecord, agent: AgentRecord, signal: AbortSignal): Promise<AgentResult | typeof SWITCH_TRANSPORT>
-  wakeInstruction(pending: TranscriptEntry[], mailboxText: string): string
+  wakeInstruction(pending: TranscriptEntry[], mailboxText: string, fromUser?: boolean): string
   // session
   prepareSession(run: RunRecord, agent: AgentRecord): Promise<boolean>
   releaseSession(run: RunRecord, agent: AgentRecord): void

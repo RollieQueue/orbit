@@ -1,12 +1,13 @@
 import type { Agent } from './types'
 import { useEffect, useRef } from 'react'
+import { shownStatus } from './run-events'
 
 const statusLabel: Record<Agent['status'], string> = {
-  idle: 'Ожидает', waiting: 'Ожидает', working: 'Работает', done: 'Ответил', error: 'Ошибка', cancelled: 'Остановлен', interrupted: 'Прерван',
+  idle: 'Ожидает', waiting: 'Ожидает', working: 'Работает', paused: 'Пауза', done: 'Ответил', error: 'Ошибка', cancelled: 'Остановлен', interrupted: 'Прерван',
   restarting: 'Перезапуск Orbit',
 }
-const nodeLabel = (agent: Agent) => agent.budgetLimited ? (agent.stalled ? 'Остановлен · повтор' : 'Лимит · результат сохранён') : statusLabel[agent.status]
-const nodeClass = (agent: Agent, selected: boolean) => `agent-graph-node ${agent.status} ${selected ? 'selected' : ''}`
+const nodeLabel = (agent: Agent) => agent.budgetLimited ? (agent.stalled ? 'Остановлен · повтор' : 'Лимит · результат сохранён') : statusLabel[shownStatus(agent)]
+const nodeClass = (agent: Agent, selected: boolean) => `agent-graph-node ${shownStatus(agent)} ${selected ? 'selected' : ''}`
 const isActivation = (key: string) => key === 'Enter' || key === ' '
 
 export function AgentGraph({ agents, selectedId, onSelect }: { agents: Agent[]; selectedId: string; onSelect: (id: string) => void }) {

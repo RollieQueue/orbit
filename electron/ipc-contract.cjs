@@ -31,7 +31,7 @@ const T = (name) => `import('./types').${name}`
 
 // Named helper types emitted before the bridge interface, in this order.
 const TYPES = {
-  StartTaskPayload: `{ projectId: string; chatId: string; prompt: string; history: { role: 'user' | 'assistant'; content: string }[]; workspace: string; memoryEnabled: boolean; globalMemoryEnabled?: boolean; reasoningEffort?: string; providerId: string; model?: string; models?: Record<string, string>; quotaFailover?: ${T('QuotaFailover')}; providerPool?: ${T('PoolMember')}[]; providerOptions?: Record<string, ${T('ProviderOption')}>; agentInstructions: string; accessMode: ${T('AccessMode')}; approvalPolicy: ${T('ApprovalPolicy')}; limits: ${T('RunLimits')} }`,
+  StartTaskPayload: `{ projectId: string; chatId: string; prompt: string; history: { role: 'user' | 'assistant'; content: string }[]; workspace: string; memoryEnabled: boolean; globalMemoryEnabled?: boolean; reasoningEffort?: string; providerId: string; model?: string; models?: Record<string, string>; quotaFailover?: ${T('QuotaFailover')}; providerPool?: ${T('PoolMember')}[]; providerOptions?: Record<string, ${T('ProviderOption')}>; agentInstructions: string; accessMode: ${T('AccessMode')}; approvalPolicy: ${T('ApprovalPolicy')}; limits: ${T('RunLimits')}; improvementMode?: boolean; skillLearning?: boolean; loopTask?: number; attachments?: ${T('Attachment')}[] }`,
   ApplyArtifactPayload: '{ workspace: string; patchPath: string; worktreePath?: string }',
   ApplyArtifactResult: '{ ok: boolean; reason?: string; detail?: string }',
   QuotaUpdate: `{ providerId: string; snapshot: ${T('QuotaSnapshot')} | null }`,
@@ -51,9 +51,21 @@ const CALLS = [
   { method: 'cloneWorkspace', channel: 'workspace:clone', args: [{ name: 'remote', type: 'string' }], returns: '(GitContext & { error?: string }) | null' },
   { method: 'startTask', channel: 'runtime:start', args: [{ name: 'payload', type: 'StartTaskPayload' }], returns: 'string' },
   { method: 'stopTask', channel: 'runtime:stop', args: [{ name: 'runId', type: 'string' }], returns: 'boolean' },
+  { method: 'pauseAgent', channel: 'runtime:pause', args: [{ name: 'runId', type: 'string' }, { name: 'agentId', type: 'string' }], returns: T('AgentControlResult') },
+  { method: 'resumeAgent', channel: 'runtime:resume', args: [{ name: 'runId', type: 'string' }, { name: 'agentId', type: 'string' }], returns: T('AgentControlResult') },
+  { method: 'stopAgent', channel: 'runtime:stop-agent', args: [{ name: 'runId', type: 'string' }, { name: 'agentId', type: 'string' }], returns: T('AgentControlResult') },
   { method: 'listRuns', channel: 'runtime:list', args: [], returns: `${T('RunSnapshot')}[]` },
   { method: 'getRun', channel: 'runtime:get', args: [{ name: 'runId', type: 'string' }], returns: `${T('RunSnapshot')} | null` },
   { method: 'getRunChanges', channel: 'runtime:changes', args: [{ name: 'runId', type: 'string' }], returns: `${T('FileChange')}[]` },
+  // An image a trace names (a screenshot an agent looked at) as a data: URL, or null when the run store has no such file.
+  { method: 'readTraceImage', channel: 'runtime:image', args: [{ name: 'runId', type: 'string' }, { name: 'imageId', type: 'string' }], returns: 'string | null' },
+  // The user's message to an agent of a working run (the root or any helper): it goes to the agent's mailbox and reaches
+  // the model at its next step; a finished helper is started again by it. Rejects with the reason when it cannot.
+  { method: 'messageAgent', channel: 'runtime:message', args: [{ name: 'runId', type: 'string' }, { name: 'agentId', type: 'string' }, { name: 'text', type: 'string' }, { name: 'attachments', type: `${T('Attachment')}[]`, optional: true }], returns: T('AgentMessageResult') },
+  // Files the user attaches to a chat message: saved by the runtime under Orbit's data folder before the message is sent;
+  // the model gets their paths. An attached image is read back (as a data: URL) for its thumbnail in the chat.
+  { method: 'saveAttachments', channel: 'attachments:save', args: [{ name: 'chatId', type: 'string' }, { name: 'files', type: `${T('AttachmentUpload')}[]` }], returns: `${T('Attachment')}[]` },
+  { method: 'readAttachmentImage', channel: 'attachments:image', args: [{ name: 'path', type: 'string' }], returns: 'string | null' },
   { method: 'loadState', channel: 'state:load', args: [], returns: `${T('AppState')} | null` },
   { method: 'saveState', channel: 'state:save', args: [{ name: 'state', type: T('AppState') }], returns: 'unknown' },
   { method: 'projectIndexStatus', channel: 'project-index:status', args: [workspace, { name: 'rebuild', type: 'boolean', optional: true }], returns: 'ProjectIndexStatus | null' },
@@ -66,6 +78,10 @@ const CALLS = [
   { method: 'memoryStats', channel: 'memory:stats', args: [workspace, chatId], returns: T('LibraryStats') },
   { method: 'listCapabilities', channel: 'capabilities:list', args: [workspace], returns: `${T('Capability')}[]` },
   { method: 'pinCapability', channel: 'capabilities:pin', args: [id, pinned, workspace], returns: T('Capability') },
+  // A switched-off skill is not offered to agents, and its triggers do not run.
+  { method: 'setCapabilityEnabled', channel: 'capabilities:enable', args: [id, { name: 'enabled', type: 'boolean' }, workspace], returns: T('Capability') },
+  // The values the user gives a skill's parameters (checked against their types); not a new version of the skill.
+  { method: 'setCapabilityParams', channel: 'capabilities:params', args: [id, { name: 'values', type: `Record<string, ${T('SkillParamValue')}>` }, workspace], returns: T('Capability') },
   { method: 'readCapability', channel: 'capabilities:read', args: [id, workspace], returns: T('Capability') },
   { method: 'installCapability', channel: 'capabilities:install', args: [{ name: 'entry', type: `Partial<${T('Capability')}>` }], returns: T('Capability') },
   { method: 'removeCapability', channel: 'capabilities:remove', args: [id, workspace], returns: 'unknown' },
@@ -75,9 +91,14 @@ const CALLS = [
   // The only path into electron/worktree.mts; unused by the renderer today, kept for the write-lane flow.
   { method: 'applyArtifact', channel: 'artifact:apply', args: [{ name: 'payload', type: 'ApplyArtifactPayload' }], returns: 'ApplyArtifactResult' },
   { method: 'openExternal', channel: 'shell:open', args: [{ name: 'target', type: 'string' }], returns: 'void' },
+  // Opens a file or folder Orbit keeps (an attachment, a skill package) with the system's default app; answers the
+  // error text, empty on success. Paths outside Orbit's attachments and skills folders are refused.
+  { method: 'openPath', channel: 'shell:open-path', args: [{ name: 'target', type: 'string' }], returns: 'string' },
   // Liveness probe used by the self-upgrade health check, and the in-place restart it or the user can ask for.
   { method: 'ping', channel: 'app:ping', args: [], returns: '{ pid: number; startedAt: number; healthy: boolean }' },
   { method: 'relaunch', channel: 'app:relaunch', args: [], returns: '{ ok: boolean; pid: number }' },
+  // The window enters or leaves full screen (a skill page a trigger shows); answers whether it was full screen before.
+  { method: 'setFullScreen', channel: 'app:fullscreen', args: [{ name: 'on', type: 'boolean' }], returns: 'boolean' },
   // The runtime (agents, stores, providers) lives in a child process: main restarts it without closing the window and
   // reports its state. Both are answered by main itself (electron/runtime-client.cjs), never forwarded to the runtime.
   { method: 'restartRuntime', channel: 'runtime:restart', args: [], returns: 'RuntimeRestartResult' },

@@ -1,6 +1,8 @@
-import type { AccessMode, AppState, ChatThread, Message, Project, RestartNotice, RestartNoticeKind, RunSnapshot, Settings, Workspace } from './types'
+import type { AccessMode, AppState, ChatThread, ImprovementLoop, LoopStopReason, Message, Project, RestartNotice, RestartNoticeKind, RunSnapshot, Settings, Workspace } from './types'
 import { mergeMessage, type RunMap } from './run-events'
+import { loopNote, loopNoteId, stopNote, stoppedLoop } from './improvement-loop'
 import { providers } from './providers'
+import { attachmentNote } from './attachments'
 
 // The renderer's persistent state (projects, chats, settings) and everything that restores or transforms it.
 //
@@ -42,7 +44,7 @@ export function normalize(value: Partial<AppState>): AppState {
   const savedProjects = Array.isArray(value.projects) ? value.projects : []
   const messagesOf = (c: ChatThread) => (Array.isArray(c.messages) ? c.messages : []).filter(m => m.id !== 'welcome')
   const projects = savedProjects.filter(p => p?.id && p.workspace?.path).map(p => ({
-    ...p, chats: (Array.isArray(p.chats) ? p.chats : []).map(c => ({ ...c, messages: messagesOf(c) })),
+    ...p, chats: (Array.isArray(p.chats) ? p.chats : []).map(c => withLoop({ ...c, messages: messagesOf(c) })),
   }))
   const settings = { ...defaults, ...value.settings, models: { ...value.settings?.models }, limits: { ...defaults.limits, ...value.settings?.limits } }
   if (!value.settings?.limitVersion) {
@@ -71,6 +73,21 @@ export function normalize(value: Partial<AppState>): AppState {
   return { version: 3, projects, activeProjectId, settings, savedAt: value.savedAt }
 }
 
+// A saved loop that is not one any more is dropped; closedKeys is always a list.
+function withLoop(chat: ChatThread): ChatThread {
+  const loop = chat.loop
+  if (loop === undefined) return chat
+  if (!loop || typeof loop !== 'object' || typeof loop.goal !== 'string') { const { loop: _dropped, ...rest } = chat; return rest }
+  const { startFailures, busyStarts, ...kept } = loop
+  return {
+    ...chat, loop: {
+      ...kept, active: loop.active === true, iteration: Number.isFinite(loop.iteration) ? loop.iteration : 1,
+      failures: Number.isFinite(loop.failures) ? loop.failures : 0, closedKeys: Array.isArray(loop.closedKeys) ? loop.closedKeys.filter(k => typeof k === 'string') : [],
+      ...(Number.isFinite(startFailures) ? { startFailures } : {}), ...(Number.isFinite(busyStarts) ? { busyStarts } : {}),
+    },
+  }
+}
+
 // The state for the first render: the mirror of the last save, or the separate keys versions before v3 used.
 export function initialState(read: Reader): AppState {
   const saved = stored<AppState | null>(read, STATE_KEY, null)
@@ -94,7 +111,8 @@ export function reconcileSaved(local: AppState, durable: AppState | null): AppSt
 
 // Runs the desktop kept for chats this state does not know (a chat deleted here stays deleted): each gets its project,
 // its chat, its prompt as the user's message and the root agent's replies. A continuation Orbit started after a restart
-// was not asked by the user: it gets the restart note instead of its prompt. Messages end up in time order.
+// was not asked by the user: it gets the restart note instead of its prompt, and a task of an endless-improvement loop
+// (loopTask) its loop note. Messages end up in time order.
 export function reconcileRuns(state: AppState, snapshots: RunSnapshot[]): AppState {
   let next = state
   for (const run of [...snapshots].sort((a, b) => String(a.startedAt || '').localeCompare(String(b.startedAt || '')))) {
@@ -112,7 +130,10 @@ export function reconcileRuns(state: AppState, snapshots: RunSnapshot[]): AppSta
       // The live notice's note, when it came, is kept: it says more than what the saved runs remember.
       const note = resumedNote(run, snapshots)
       if (!chat.messages.some(m => m.id === note.id)) next = addChatMessage(next, run.projectId, run.chatId, note)
-    } else if (run.prompt && !chat.messages.some(m => m.author === 'user' && m.runId === run.runId)) {
+    } else if (run.loopTask) {
+      const known = chat.messages.some(m => m.id === loopNoteId(run.runId) || (m.kind === 'loop' && m.runId === run.runId))
+      if (!known) next = addChatMessage(next, run.projectId, run.chatId, loopNote(run.runId, run.loopTask, run.startedAt))
+    } else if (run.prompt && !chat.messages.some(m => m.author === 'user' && m.kind !== 'steer' && m.runId === run.runId)) {
       const legacyMessage = chat.messages.find(m => m.author === 'user' && !m.runId && m.text === run.prompt)
       const message: Message = legacyMessage ? { ...legacyMessage, runId: run.runId }
         : { id: `prompt-${run.runId}`, author: 'user', text: run.prompt, time: run.startedAt, runId: run.runId }
@@ -162,6 +183,9 @@ export function restartNote(notice: RestartNotice): Message {
   if (notice.kind === 'resumed' && notice.resumedRunId) note.runId = notice.resumedRunId
   return note
 }
+// The note of a restart about `runId` that started no continuation, when the chat has one.
+export const settlingRestartText = (chat: ChatThread, runId: string) =>
+  chat.messages.find(m => settlingKinds.some(kind => m.id === restartNoteId({ kind, runId, time: '' })))?.text
 // The note a saved continuation gets when its live notice never reached this window (or before it does).
 function resumedNote(run: RunSnapshot, snapshots: RunSnapshot[]): Message {
   const reason = snapshots.find(item => item.runId === run.resumedFrom)?.restart?.reason
@@ -244,6 +268,42 @@ export const openChat = (state: AppState, projectId: string, chat: ChatThread) =
 export function addChatMessage(state: AppState, projectId: string, chatId: string, message: Message): AppState {
   return updateChat(state, projectId, chatId, c => ({ ...c, updated: now(), messages: mergeMessage(c.messages, message) }))
 }
+// ---- The endless improvement loop of a chat (src/improvement-loop.ts decides, these transitions save) ----
+
+export const setChatLoop = (state: AppState, projectId: string, chatId: string, loop: ImprovementLoop): AppState =>
+  updateChat(state, projectId, chatId, c => ({ ...c, loop }))
+// A note about the loop's state in its chat (a retry, a stop); not a loop task's note (kind 'loop').
+export const loopStateNote = (text: string, at: string, id: string = uid()): Message => ({ id, author: 'system', kind: 'loop-state', text, time: at })
+export function stopLoop(state: AppState, projectId: string, chatId: string, reason: LoopStopReason, at = now(), note = stopNote(reason)): AppState {
+  const loop = state.projects.find(p => p.id === projectId)?.chats.find(c => c.id === chatId)?.loop
+  if (!loop?.active) return state
+  return addChatMessage(setChatLoop(state, projectId, chatId, stoppedLoop(loop, reason, at)), projectId, chatId, loopStateNote(note, at))
+}
+// A message sent with the improvement switch on started a run: the chat's loop begins (goal = the message, task 1, the
+// closed tasks of the chat's newest plan as the baseline) or, when it has one, goes on (goal kept, failures and a pending
+// retry cleared). One active loop in all of Orbit: the others stop ('moved'). A second loop would keep a chat working
+// almost all the time, and restart_orbit refuses while other chats work, so Orbit's own changes would never be installed.
+export function activateLoop(state: AppState, projectId: string, chatId: string, goal: string, closedKeys: string[], at = now()): AppState {
+  const project = state.projects.find(p => p.id === projectId)
+  const chat = project?.chats.find(c => c.id === chatId)
+  if (!project || !chat) return state
+  let next = state
+  for (const otherProject of state.projects) {
+    for (const other of otherProject.chats) {
+      if ((otherProject.id !== projectId || other.id !== chatId) && other.loop?.active) next = stopLoop(next, otherProject.id, other.id, 'moved', at)
+    }
+  }
+  const loop: ImprovementLoop = chat.loop
+    ? { ...chat.loop, active: true, failures: 0 }
+    : { active: true, goal, startedAt: at, iteration: 1, failures: 0, closedKeys }
+  delete loop.retryAt
+  delete loop.stopped
+  delete loop.startingAt
+  delete loop.startFailures
+  delete loop.busyStarts
+  return setChatLoop(next, projectId, chatId, loop)
+}
+
 export const dropMessage = (state: AppState, projectId: string, chatId: string, messageId: string) =>
   updateChat(state, projectId, chatId, c => ({ ...c, messages: c.messages.filter(m => m.id !== messageId) }))
 // The first prompt names a chat that still has the default title.
@@ -275,7 +335,7 @@ export function addWorkspace(state: AppState, workspace: Workspace, chat: () => 
 // ---- Views of the settings the composer and the settings panel share ----
 
 export const chatHistory = (chat: ChatThread) => chat.messages.filter(m => m.author === 'user' || m.author === 'orbit').slice(-40)
-  .map(m => ({ role: m.author === 'user' ? 'user' as const : 'assistant' as const, content: m.text }))
+  .map(m => ({ role: m.author === 'user' ? 'user' as const : 'assistant' as const, content: [m.text, attachmentNote(m.attachments)].filter(Boolean).join('\n\n') }))
 // Ask mode is on-request approval over workspace-write; every other choice is an access mode with no approval prompts.
 export const accessChoice = (settings: Settings) => settings.approvalPolicy === 'on-request' ? 'ask' : settings.accessMode
 export const accessPatch = (value: string): Partial<Settings> =>

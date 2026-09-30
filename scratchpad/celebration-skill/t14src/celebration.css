@@ -1,0 +1,35 @@
+/* The celebration overlay (CelebrationOverlay.tsx) and the action skill's controls in the Skills panel (SkillsPanel.tsx). */
+
+/* Above everything in styles.css (its highest z-index is 70), including open modals. */
+.celebration{position:fixed;inset:0;z-index:1000;background:#000;overflow:hidden}
+.celebration-video{position:absolute;inset:0;width:100%;height:100%;border:0;display:block}
+.celebration-confetti{position:absolute;inset:0;width:100%;height:100%;pointer-events:none}
+.celebration-catcher{position:absolute;inset:0;cursor:pointer}
+.celebration-close{position:absolute;top:14px;right:18px;width:46px;height:46px;border-radius:50%;background:#000a;color:#fff;font-size:30px;line-height:1;border:2px solid #fff6}
+.celebration-close:hover,.celebration-close:focus-visible{background:#000d;border-color:#fff;outline:0}
+
+/* The flyer only moves (transform set from the code); the spin and the look are on the parts inside. */
+.celebration-flyer{position:absolute;left:0;top:0;width:max-content;pointer-events:none;will-change:transform,filter;transition:filter .35s;
+  font-family:"Jokerman","Curlz MT","Showcard Gothic","Comic Sans MS","Comic Neue",cursive;font-size:6.5vw;font-weight:900;line-height:1.05;text-align:center}
+.celebration-spin{animation:celebration-spin 2.5s linear infinite;
+  filter:drop-shadow(.012em .012em 0 #4a0d7a) drop-shadow(.024em .024em 0 #4a0d7a) drop-shadow(.036em .036em 0 #3a0a63) drop-shadow(.06em .06em .02em #0009)}
+.celebration-word{display:block;padding:0 .08em;transform:skew(-8deg,2deg);
+  background:linear-gradient(100deg,#ff2d55,#ff9500,#ffe600,#34e36b,#19c3ff,#7a4dff,#ff2d9e);-webkit-background-clip:text;background-clip:text;
+  color:transparent;-webkit-text-fill-color:transparent;-webkit-text-stroke:.055em #fff;paint-order:stroke fill}
+@keyframes celebration-spin{to{transform:rotate(360deg)}}
+
+/* Skill cards: the on/off switch and the action form. */
+.library-entry.disabled{opacity:.55}
+.library-entry.disabled:hover,.library-entry.disabled:focus-within{opacity:.9}
+.skill-switch{display:inline-flex;align-items:center;gap:7px;margin-left:auto;font-size:11px;color:#a7c5b0;padding:3px 4px}
+.skill-switch-track{position:relative;width:28px;height:15px;border-radius:8px;background:#3a4340;transition:background .15s}
+.skill-switch-track::after{content:"";position:absolute;top:2px;left:2px;width:11px;height:11px;border-radius:50%;background:#c3d0c7;transition:transform .15s}
+.skill-switch[aria-pressed="true"] .skill-switch-track{background:#4f8a66}
+.skill-switch[aria-pressed="true"] .skill-switch-track::after{transform:translateX(13px);background:#fff}
+.skill-switch:disabled{opacity:.6}
+.skill-action{margin-top:10px;padding:10px 12px;border:1px dashed #4a6357;border-radius:8px;background:#1b2421}
+.skill-action>p{margin:0 0 6px;font-size:12px;color:#bbdcca}
+.skill-action-form{display:grid;grid-template-columns:1fr 1fr;gap:8px 10px}
+.skill-action-form label{font-size:11px;color:#a9bbb0}
+.skill-action-form label:first-child{grid-column:1/-1}
+.skill-action-form .capability-actions{grid-column:1/-1;margin-top:4px;gap:12px}

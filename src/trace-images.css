@@ -1,0 +1,19 @@
+/* Images in an agent's actions (TraceImages.tsx): thumbnails under the tool result that carried them, and the enlarged view. */
+.trace-with-images{border-bottom:1px solid #2b3134}
+.trace-with-images>.trace-item{border-bottom:0;padding-bottom:6px}
+.trace-images{display:flex;flex-wrap:wrap;gap:8px;padding:0 0 12px 12px}
+.trace-image{display:block;padding:0;max-width:100%;border:1px solid #343b40;border-radius:7px;background:#111619;overflow:hidden;cursor:zoom-in}
+.trace-image:hover:not(:disabled){border-color:#6f8a7a}
+.trace-image:disabled{cursor:progress;opacity:1}
+.trace-image img{display:block;max-width:100%;max-height:180px;object-fit:contain}
+.trace-image-loading,.trace-image.missing{display:block;padding:14px 16px;font-size:11px;color:var(--muted)}
+.trace-image.missing{border-style:dashed;cursor:default}
+.image-viewer{position:fixed;inset:0;z-index:70;background:#000000e0;display:flex;flex-direction:column}
+.image-viewer-bar{display:flex;align-items:center;gap:14px;padding:10px 14px 10px 22px;font-size:12px;color:#c3ccc6;flex-shrink:0}
+.image-viewer-bar>span{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.image-viewer-size{font-size:11px;color:#a7c5b0;padding:6px 9px;border-radius:6px}
+.image-viewer-size:hover{background:#2a302c}
+.image-viewer-stage{flex:1;min-height:0;display:flex;align-items:center;justify-content:center;padding:0 24px 24px;overflow:auto}
+.image-viewer-stage img{max-width:100%;max-height:100%;object-fit:contain;cursor:zoom-in;border-radius:4px;box-shadow:0 12px 60px #000a}
+.image-viewer-stage.actual{align-items:flex-start;justify-content:flex-start}
+.image-viewer-stage.actual img{max-width:none;max-height:none;margin:auto;cursor:zoom-out}

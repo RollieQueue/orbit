@@ -51,7 +51,8 @@ test('Custom SSE and Ollama NDJSON agents exchange durable messages through one 
     if (!workerReplied) {
       // A child may enter its first turn before the parent executes the next
       // tool in the spawn/send envelope. Wait without occupying a model slot.
-      if (!prompt.includes(JSON.stringify(hello).slice(1, -1))) return envelope(tool('wait_message', { timeout_ms: 2000 }))
+      // The root is the Worker's supervisor: its message leads the prompt whole (MESSAGE FROM YOUR SUPERVISOR), unescaped.
+      if (!prompt.includes('Orbit (message ') || !prompt.includes(hello)) return envelope(tool('wait_message', { timeout_ms: 2000 }))
       workerReplied = true
       return envelope(tool('send_message', { agentId: 'root', message: reply }), tool('wait_message', { timeout_ms: 2000 }))
     }

@@ -4,8 +4,8 @@ import { randomUUID } from 'node:crypto'
 import { setMaxListeners } from 'node:events'
 import { saveNote } from '../shared-context.mts'
 import * as chatMemory from '../chat-memory.mts'
-import type { AgentDirectoryEntry, AgentRecord, AgentResult, ChildResultEntry, FollowupResult, OrbitRuntimeLike, PublicAgent, RunRecord, SpawnResult, TeamDigest, ToolArgs, TurnWaiter } from '../types.mts'
-import { TERMINAL, AGENT_TERMINAL, ceiling, withoutGoogleReasoning, answerLimit, publicAgent, bounded, clip, abortError } from './util.mts'
+import type { AgentDirectoryEntry, AgentRecord, AgentResult, ChildResultEntry, FollowupResult, ModelTarget, OrbitRuntimeLike, PublicAgent, RunRecord, SpawnResult, TeamDigest, ToolArgs, TurnWaiter, WorkedModel } from '../types.mts'
+import { TERMINAL, AGENT_TERMINAL, ceiling, USER, withoutGoogleReasoning, answerLimit, publicAgent, bounded, clip, abortError } from './util.mts'
 
 function createAgent(runtime: OrbitRuntimeLike, run: RunRecord, parent: AgentRecord | null, spec: ToolArgs): AgentRecord {
   const sameProvider = !spec.providerId || spec.providerId === (parent?.providerId || run.providerId)
@@ -39,7 +39,7 @@ function createAgent(runtime: OrbitRuntimeLike, run: RunRecord, parent: AgentRec
   if (parentSignal?.aborted) controller.abort()
   run.agentControllers.set(agent.id, { controller, parentSignal, abort })
   runtime.emit(run, 'agent.created', { agent: publicAgent(agent) })
-  runtime.recordCommunication(run, parent || { id: 'user', name: 'Вы' }, agent, agent.task, { kind: 'spawn', reason: agent.reason })
+  runtime.recordCommunication(run, parent || USER, agent, agent.task, { kind: 'spawn', reason: agent.reason })
   return agent
 }
 function scheduleAgent(runtime: OrbitRuntimeLike, run: RunRecord, agent: AgentRecord): Promise<AgentResult> {
@@ -96,7 +96,7 @@ function followupAgent(runtime: OrbitRuntimeLike, run: RunRecord, sender: AgentR
   if (target.turns >= ceiling(run.limits, 'maxTurns') || run.usage.workerTurns >= ceiling(run.limits, 'maxTotalTurns')) throw new Error('Agent or shared worker turn budget exhausted; follow-up cannot reset budgets')
   if (target.id === 'root') throw new Error('Continue the root agent through the project chat')
   const parent = target.parentId === null ? undefined : run.agentNodes.get(target.parentId)
-  if (!parent || !['working', 'waiting'].includes(parent.status) || runtime.agentSignal(run, parent).aborted) throw new Error('The original parent is no longer active')
+  if (!parent || !['working', 'waiting', 'paused'].includes(parent.status) || runtime.agentSignal(run, parent).aborted) throw new Error('The original parent is no longer active')
   target.previousWork.push({ generation: target.generation, task: target.task, result: target.result, error: target.error })
   target.previousWork = target.previousWork.slice(-3)
   const old = run.agentControllers.get(target.id)
@@ -135,13 +135,50 @@ function teamDigest(runtime: OrbitRuntimeLike, run: RunRecord, agent: AgentRecor
   const team = [...run.agentNodes.values()].filter(other => other.id !== agent.id && (agent.id === 'root' || other.parentId === agent.id))
   return { running: team.filter(other => !AGENT_TERMINAL.has(other.status)).map(other => other.name), finished: team.filter(other => AGENT_TERMINAL.has(other.status)).map(other => other.name) }
 }
+const modelLabel = (target: Pick<ModelTarget, 'providerId' | 'model'>): string => target.model ? `${target.providerId}/${target.model}` : target.providerId
+// The models that really did the agent's work, in order: the one it started on, each handover's target, the current one.
+// A model whose segment ended in a `fresh` handover (no turn, no logged action) did nothing and is left out. `turns` is a
+// human range when the handovers carry their turn number.
+function modelsWorked(agent: Pick<AgentRecord, 'providerId' | 'model' | 'handovers'>): WorkedModel[] {
+  const { handovers } = agent
+  if (!handovers.length) return [{ label: modelLabel(agent), providerId: agent.providerId, model: agent.model }]
+  const segments: { target: Pick<ModelTarget, 'providerId' | 'model'>; start?: number; end?: number | null; fresh: boolean }[] = []
+  let start: number | undefined = 1
+  let target: Pick<ModelTarget, 'providerId' | 'model'> = handovers[0]?.from || agent
+  for (const handover of handovers) {
+    segments.push({ target, start, end: handover.turn, fresh: handover.fresh })
+    target = handover.to; start = handover.turn === undefined ? undefined : handover.turn + 1
+  }
+  segments.push({ target: handovers.length ? agent : target, start, end: null, fresh: false })
+  const merged: typeof segments = []
+  for (const segment of segments.filter(item => !item.fresh)) {
+    const last = merged.at(-1)
+    if (last && modelLabel(last.target) === modelLabel(segment.target)) { last.end = segment.end; if (last.start === undefined) last.start = segment.start } else merged.push({ ...segment })
+  }
+  return merged.map(({ target: { providerId, model }, start, end }): WorkedModel => {
+    const known = start !== undefined && end !== undefined
+    const turns = !known ? undefined : end === null ? `turns ${start}–` : end < start ? undefined : end === start ? `turn ${start}` : `turns ${start}–${end}`
+    return { label: modelLabel({ providerId, model }), providerId, model, ...(turns ? { turns } : {}) }
+  })
+}
+// "codex/gpt-6-astra → antigravity/gemini-3.1-pro-high after turn 3 (exhausted)", one clause per switch.
+function handoverSummary(agent: Pick<AgentRecord, 'handovers'>): string {
+  return clip(agent.handovers.map(({ from, to, turn, reason }) => `${modelLabel(from)} → ${modelLabel(to)}${turn === undefined ? '' : turn ? ` after turn ${turn}` : ' before any turn'} (${reason})`).join('; '), 400)
+}
+// What a caller needs to see when an agent moved between subscriptions: who worked, and where the switches were.
+function ranOnFields(agent: Pick<AgentRecord, 'providerId' | 'model' | 'handovers'>): { ranOn?: string[]; switched?: string } {
+  const worked = modelsWorked(agent)
+  return worked.length > 1 ? { ranOn: worked.map(item => item.turns ? `${item.label} (${item.turns})` : item.label), switched: handoverSummary(agent) } : {}
+}
 // Compact directory: every participant fits one observation, results are excerpts.
+function directoryRanOn(agent: AgentRecord): { ranOn?: string[] } { const worked = modelsWorked(agent); return worked.length > 1 ? { ranOn: worked.map(item => item.label) } : {} }
 function agentDirectory(runtime: OrbitRuntimeLike, run: RunRecord): AgentDirectoryEntry[] {
   const agents = [...run.agentNodes.values()]
   const share = Math.max(300, Math.floor((run.limits.maxOutputChars - 1000) / Math.max(1, agents.length)) - 280)
   return agents.map(agent => ({
+    paused: !!agent.paused,
     id: agent.id, name: agent.name, parentId: agent.parentId, status: agent.status, generation: agent.generation,
-    providerId: agent.providerId, model: agent.model, task: clip(agent.task, 240),
+    providerId: agent.providerId, model: agent.model, ...directoryRanOn(agent), task: clip(agent.task, 240),
     result: bounded(agent.result, share), ...(agent.result.length > share ? { resultTruncated: true, fullResult: 'wait_agent {agentId} returns a direct child result in full' } : {}),
     error: agent.error, budgetLimited: !!agent.budgetLimited,
   }))
@@ -188,4 +225,4 @@ function stallHandoff(runtime: OrbitRuntimeLike, run: RunRecord, agent: AgentRec
   return runtime.completeAgent(run, agent, content, true, 'Stopped: repeated identical calls', { stalled: true })
 }
 
-export { createAgent, scheduleAgent, spawnSubAgent, resolveAgent, resultKey, followupAgent, acquireTurn, releaseTurn, agentSignal, teamDigest, agentDirectory, cancelDescendants, completeAgent, budgetHandoff, stallHandoff }
+export { createAgent, scheduleAgent, spawnSubAgent, resolveAgent, resultKey, followupAgent, acquireTurn, releaseTurn, agentSignal, teamDigest, agentDirectory, modelsWorked, ranOnFields, cancelDescendants, completeAgent, budgetHandoff, stallHandoff }

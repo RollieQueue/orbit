@@ -2,7 +2,7 @@
 // messages. Nothing here decides what an agent does; it records and publishes what the other modules did.
 import { randomUUID } from 'node:crypto'
 import { ROUTER } from '../router.mts'
-import type { AgentRecord, FileChange, Message, OrbitRuntimeLike, RunRecord, RunSnapshot, RuntimeEvent, RuntimeEventData, StoredRun, Trace } from '../types.mts'
+import type { AgentRecord, FileChange, Message, OrbitRuntimeLike, RunRecord, RunSnapshot, RuntimeEvent, RuntimeEventData, StoredRun, Trace, TraceImage } from '../types.mts'
 import { TERMINAL, answerLimit, publicAgent, bounded } from './util.mts'
 
 // The inspector keeps this many traces per run; the run file is written at most this often while a run is active.
@@ -24,6 +24,8 @@ function snapshot(runtime: OrbitRuntimeLike, run: RunRecord): RunSnapshot {
     ...(run.startPayload ? { startPayload: run.startPayload } : {}),
     ...(run.resumedFrom ? { resumedFrom: run.resumedFrom } : {}), ...(run.resumeChain !== undefined ? { resumeChain: run.resumeChain } : {}),
     ...(run.restart ? { restart: run.restart } : {}),
+    // The improvement loop: the task number of this run and what the next task must know.
+    ...(run.loopTask ? { loopTask: run.loopTask } : {}), ...(run.improvementHandoff ? { improvementHandoff: run.improvementHandoff } : {}),
   })
 }
 // A run's file changes with their diff text: the live run first, then the saved one.
@@ -59,10 +61,10 @@ function emit(runtime: OrbitRuntimeLike, run: RunRecord, type: string, data: Run
   if (['run.finished', 'run.failed', 'run.cancelled'].includes(type)) runtime.persist(run)
   else runtime.schedulePersist(run, TERMINAL.has(run.status) ? 100 : PERSIST_DELAY_MS)
 }
-function trace(runtime: OrbitRuntimeLike, run: RunRecord, agentId: string, kind: string, text: string, id?: string): void {
+function trace(runtime: OrbitRuntimeLike, run: RunRecord, agentId: string, kind: string, text: string, id?: string, images?: TraceImage[]): void {
   if (TERMINAL.has(run.status)) return
   const previous: Trace | undefined = id ? run.traces.find(trace => trace.id === id) : undefined
-  const trace: Trace = { id: id || randomUUID(), agentId, agentName: agentId === ROUTER.id ? ROUTER.name : run.agentNodes.get(agentId)?.name || 'Orbit', kind, text: bounded(text, ['output', 'reasoning', 'assistant_update'].includes(kind) ? 32 * 1024 * 1024 : 6000), time: previous?.time || new Date().toISOString() }
+  const trace: Trace = { id: id || randomUUID(), agentId, agentName: agentId === ROUTER.id ? ROUTER.name : run.agentNodes.get(agentId)?.name || 'Orbit', kind, text: bounded(text, ['output', 'reasoning', 'assistant_update'].includes(kind) ? 32 * 1024 * 1024 : 6000), time: previous?.time || new Date().toISOString(), ...(images?.length ? { images } : {}) }
   if (previous) Object.assign(previous, trace)
   else run.traces.push(trace)
   if (run.traces.length > TRACE_LIMIT) run.traces.splice(0, run.traces.length - TRACE_LIMIT)

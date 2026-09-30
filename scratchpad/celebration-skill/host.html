@@ -1,0 +1,9 @@
+<!doctype html><meta charset="utf-8"><title>host</title>
+<style>html,body{margin:0;height:100%;background:#123}iframe{position:fixed;inset:0;width:100%;height:100%;border:0}</style>
+<iframe id="stage" sandbox="allow-scripts allow-same-origin allow-presentation" allow="autoplay; fullscreen; encrypted-media; picture-in-picture"></iframe>
+<script>
+window.__msgs = []
+const t0 = Date.now()
+window.addEventListener('message', e => { window.__msgs.push({ at: Date.now() - t0, src: e.source === document.getElementById('stage').contentWindow, data: e.data }) })
+document.getElementById('stage').src = new URLSearchParams(location.search).get('page')
+</script>

@@ -1,0 +1,42 @@
+/* The celebration page: a psychedelic backdrop, the video over it, confetti and the WordArt text over the video. */
+html,body{margin:0;height:100%;overflow:hidden;background:#000}
+#stage{position:fixed;inset:0;overflow:hidden;background:#000}
+
+/* Shown while there is no video (no network, a bad link, before the player starts). */
+#backdrop{position:absolute;inset:-25%;
+  background:conic-gradient(from 0deg,#ff2d55,#ff9500,#ffe600,#34e36b,#19c3ff,#7a4dff,#ff2d9e,#ff2d55);
+  filter:saturate(1.2) brightness(.75);animation:backdrop-turn 14s linear infinite}
+@keyframes backdrop-turn{to{transform:rotate(360deg)}}
+
+#video{position:absolute;inset:0;width:100%;height:100%;border:0;display:block;background:#000}
+#video[hidden]{display:none}
+#confetti{position:absolute;inset:0;width:100%;height:100%;pointer-events:none}
+#catcher{position:absolute;inset:0;cursor:pointer}
+
+/* The flyer only moves (transform set from the script); the spin and the WordArt look are on the parts inside. */
+#flyer{position:absolute;left:0;top:0;width:max-content;pointer-events:none;will-change:transform,filter;transition:filter .35s;
+  font-family:Impact,"Arial Black","Comic Sans MS","Comic Neue",fantasy;font-size:6.5vw;font-weight:900;line-height:1.02;text-align:center;
+  text-transform:uppercase;letter-spacing:.03em}
+#spin{animation:word-spin 3s linear infinite;
+  filter:drop-shadow(.012em .012em 0 #4a0d7a) drop-shadow(.024em .024em 0 #4a0d7a) drop-shadow(.036em .036em 0 #3a0a63)
+         drop-shadow(.048em .048em 0 #2b0748) drop-shadow(.075em .075em .03em #000a)}
+#words{animation:word-pulse 1.1s ease-in-out infinite alternate}
+.word{display:block;padding:0 .08em;transform:skew(-8deg,2deg);
+  background:linear-gradient(100deg,#ff2d55,#ff9500,#ffe600,#34e36b,#19c3ff,#7a4dff,#ff2d9e);
+  -webkit-background-clip:text;background-clip:text;color:transparent;-webkit-text-fill-color:transparent;
+  -webkit-text-stroke:.06em #fff;paint-order:stroke fill}
+.word:nth-child(even){font-family:"Comic Sans MS","Comic Neue",cursive;transform:skew(8deg,-2deg);
+  background-image:linear-gradient(280deg,#ff2d55,#ff9500,#ffe600,#34e36b,#19c3ff,#7a4dff,#ff2d9e)}
+@keyframes word-spin{to{transform:rotate(360deg)}}
+@keyframes word-pulse{from{transform:scale(.94)}to{transform:scale(1.06)}}
+
+#hint{position:absolute;left:0;right:0;bottom:14px;text-align:center;color:#fff;font:14px "Segoe UI",sans-serif;
+  text-shadow:0 1px 4px #000;pointer-events:none;animation:hint-out .6s ease 5s forwards}
+@keyframes hint-out{to{opacity:0}}
+
+/* Gentler motion: a slower turn, no pulse and no spinning backdrop. */
+@media (prefers-reduced-motion:reduce){
+  #spin{animation-duration:9s}
+  #words{animation:none}
+  #backdrop{animation:none}
+}

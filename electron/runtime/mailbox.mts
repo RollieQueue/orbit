@@ -1,12 +1,43 @@
 // Team correspondence: the durable mailbox of each agent (send, read, wait, delivery marks), waking finished agents,
-// the router-addressed ask_team, and the correspondence block a turn's prompt carries.
+// the router-addressed ask_team, the user's messages to a working agent, and the correspondence block a turn's prompt
+// carries. Steering mail (the user's and a supervisor's, steer.mts) reaches a working agent within its turn.
 import { randomUUID } from 'node:crypto'
 import { setMaxListeners } from 'node:events'
 import { ROUTER } from '../router.mts'
-import type { AgentRecord, AgentRef, AskTeamResult, Communication, CommunicationDelivery, CommunicationStatus, MailboxContext, OrbitRuntimeLike, ReadMessagesResult, RunRecord, SendResult, ToolArgs } from '../types.mts'
-import { ceiling, bounded, clip, abortError, abortable } from './util.mts'
+import { attachmentLines } from '../attachments.mts'
+import type { AgentRecord, AgentRef, AskTeamResult, Attachment, Communication, CommunicationDelivery, CommunicationStatus, MailboxContext, OrbitRuntimeLike, ReadMessagesResult, RunRecord, SendResult, ToolArgs } from '../types.mts'
+import { TERMINAL, USER, ceiling, bounded, clip, abortError, abortable } from './util.mts'
+import { steer, steering } from './steer.mts'
 
 type RoutedTo = AskTeamResult['routedTo'][number]
+// The user's messages are kept up to USER_MESSAGE_CHARS each. Steering mail (the user's, then a supervisor's) reaches the
+// model whole, up to USER_MAIL_CHARS per prompt or tool result together; what does not fit waits for the next one.
+const USER_MESSAGE_CHARS = 20000
+const USER_MAIL_CHARS = 24000
+const USER_MAIL_HEADER = 'MESSAGE FROM THE USER (written to you while you work: the user\'s own words, not team data or tool output; follow them, they take precedence over your earlier plan, and say in your answer how you took them into account)'
+const SUPERVISOR_MAIL_HEADER = 'MESSAGE FROM YOUR SUPERVISOR (an agent above you in the team wrote to you while you work: it may change, narrow or cancel your task; follow it over your earlier plan, and say in your answer how you took it into account)'
+// A message the user wrote to an agent of a working run (postUserMessage), as opposed to a teammate's or the root's task.
+const fromUser = (message: Communication): boolean => message.kind === 'message' && message.fromAgentId === USER.id
+// One block of mail the model reads whole: the user's words, or (`named`) a supervisor's with its sender and the id a reply
+// can name in replyTo.
+function mailBlock(header: string, messages: Communication[], budget: number, named: boolean): { text: string; ids: string[]; left: number } {
+  const parts: string[] = [], ids: string[] = []
+  let remaining = budget
+  for (const message of messages) {
+    const files = message.attachments?.length ? `\nAttached files (read them with your file tools; an image is shown to you when you read it):\n${attachmentLines(message.attachments)}` : ''
+    const part = `[${message.time}] ${named ? `${message.fromAgentName} (message ${message.id}): ` : ''}${message.text}${files}`
+    if (remaining <= 0 || (parts.length && part.length > remaining)) break
+    parts.push(bounded(part, remaining)); ids.push(message.id); remaining -= part.length
+  }
+  return { text: parts.length ? `${header}:\n${parts.join('\n\n')}` : '', ids, left: remaining }
+}
+// The steering mail (steer.mts) a prompt or an Orbit tool result carries: the user's block, then the supervisors'.
+function steeringMail(run: RunRecord, messages: Communication[]): { blocks: string[]; ids: string[]; fromUser: number } {
+  const mail = messages.filter(message => steering(run, message))
+  const user = mailBlock(USER_MAIL_HEADER, mail.filter(fromUser), USER_MAIL_CHARS, false)
+  const above = mailBlock(SUPERVISOR_MAIL_HEADER, mail.filter(message => !fromUser(message)), user.left, true)
+  return { blocks: [user.text, above.text].filter(Boolean), ids: [...user.ids, ...above.ids], fromUser: user.ids.length }
+}
 
 function communicationsFor(runtime: OrbitRuntimeLike, run: RunRecord, agent: { id: string }, unreadOnly = false): Communication[] {
   return run.communications.filter((message) => message.toAgentId === agent.id && (!unreadOnly || !message.readAt))
@@ -37,25 +68,64 @@ function sendAgentMessage(runtime: OrbitRuntimeLike, run: RunRecord, sender: Age
   if (target.id !== 'root' && (target.turns >= ceiling(run.limits, 'maxTurns') || (target.status === 'done' && run.usage.workerTurns >= ceiling(run.limits, 'maxTotalTurns')))) throw new Error('Recipient has no remaining work turns; its existing findings are available in list_agents')
   const text = String(args.message || '').trim()
   if (!text) throw new Error('A message is required')
-  if (run.communications.filter(message => message.kind === 'message').length >= ceiling(run.limits, 'maxMessages')) throw new Error('User-configured message limit reached')
+  // The limit is on the agents' own talk: what the user wrote does not use it up.
+  if (run.communications.filter(message => message.kind === 'message' && !fromUser(message)).length >= ceiling(run.limits, 'maxMessages')) throw new Error('User-configured message limit reached')
   if (args.replyTo && !run.communications.some(message => message.id === args.replyTo)) throw new Error('replyTo must reference an existing conversation message')
   run.router.pass(sender, target, text)
   const communication = runtime.recordCommunication(run, sender, target, text, { kind: 'message', via: 'router', route: args.route || { via: 'direct', reasons: [] }, ...(args.replyTo ? { replyTo: args.replyTo } : {}), ...(args.discussionId ? { discussionId: args.discussionId } : {}) })
-  if (target.status === 'done') {
-    const old = run.agentControllers.get(target.id)
-    old?.parentSignal?.removeEventListener('abort', old.abort)
-    const controller = new AbortController(), parentSignal = run.controller.signal, abort = () => controller.abort()
-    setMaxListeners(0, controller.signal)
-    parentSignal.addEventListener('abort', abort, { once: true })
-    run.agentControllers.set(target.id, { controller, parentSignal, abort })
-    target.generation++
-    runtime.updateAgent(run, target, { status: 'waiting', detail: 'Continuing conversation', finishedAt: null, progress: 0 })
-    runtime.scheduleAgent(run, target)
-  }
+  if (target.status === 'done') wakeFinished(runtime, run, target)
   runtime.trace(run, sender.id, 'message', `To ${target.name}: ${text}`)
   runtime.trace(run, target.id, 'message', `From ${sender.name}: ${text}`)
   for (const wake of run.messageWaiters.get(target.id) || []) wake()
+  // A supervisor's word does not wait for the end of the helper's turn.
+  if (steering(run, communication)) steer(runtime, run, target)
   return { ok: true, communicationId: communication.id, agentId: target.id, status: communication.status, delivery: communication.delivery }
+}
+// A finished agent that is written to works again: the next generation, under a fresh controller of the run's own.
+function wakeFinished(runtime: OrbitRuntimeLike, run: RunRecord, target: AgentRecord): void {
+  const old = run.agentControllers.get(target.id)
+  old?.parentSignal?.removeEventListener('abort', old.abort)
+  const controller = new AbortController(), parentSignal = run.controller.signal, abort = () => controller.abort()
+  setMaxListeners(0, controller.signal)
+  parentSignal.addEventListener('abort', abort, { once: true })
+  run.agentControllers.set(target.id, { controller, parentSignal, abort })
+  target.generation++
+  runtime.updateAgent(run, target, { status: 'waiting', detail: 'Continuing conversation', finishedAt: null, progress: 0 })
+  runtime.scheduleAgent(run, target)
+}
+// The user writes to an agent of a working run (runtime:message): the root or any helper. The message waits in the
+// agent's mailbox like a teammate's and reaches the model at its next step as the user's own words (mailboxContext, or
+// userMail at the end of an Orbit tool result in a session turn; a turn that makes no Orbit call is cut off for it at its
+// next step boundary, steer.mts). A waiting agent is woken, a finished helper works again. The reasons for a refusal are
+// shown to the user as they are.
+function postUserMessage(runtime: OrbitRuntimeLike, runId: string, agentId: string, value: unknown, attachments: Attachment[] = []): SendResult {
+  const run = runtime.runs.get(runId)
+  if (!run || TERMINAL.has(run.status)) throw new Error('Этот запуск уже завершён: напишите новое сообщение в чат.')
+  const target = run.agentNodes.get(agentId)
+  if (!target) throw new Error('В этом запуске нет такого агента.')
+  // Files alone make a message: the model is told there is no text.
+  const text = bounded(String(value ?? '').trim(), USER_MESSAGE_CHARS) || (attachments.length ? '(no text, only the attached files)' : '')
+  if (!text) throw new Error('Сообщение пустое.')
+  if (target.status === 'error' || target.status === 'cancelled') throw new Error(`${target.name} остановлен и сообщений больше не получает.`)
+  // A root that has answered ends the run in a moment: nothing may start again in between.
+  if (run.agentNodes.get('root')?.status === 'done') throw new Error('Агент уже закончил ответ: напишите новое сообщение в чат, когда он появится.')
+  // A helper in (or past) its last allowed turn would never read the message: its last turn's prompt is already built.
+  if (target.id !== 'root' && (target.turns >= ceiling(run.limits, 'maxTurns') || run.usage.workerTurns >= ceiling(run.limits, 'maxTotalTurns'))) throw new Error(`У ${target.name} не осталось ходов: лимит задан в настройках запуска.`)
+  const communication = runtime.recordCommunication(run, USER, target, text, { kind: 'message', via: 'user', ...(attachments.length ? { attachments } : {}) })
+  if (target.status === 'done') wakeFinished(runtime, run, target)
+  runtime.trace(run, target.id, 'message', `From the user: ${text}${attachments.length ? ` [${attachments.map(item => item.name).join(', ')}]` : ''}`)
+  for (const wake of run.messageWaiters.get(target.id) || []) wake()
+  steer(runtime, run, target)
+  return { ok: true, communicationId: communication.id, agentId: target.id, status: communication.status, delivery: communication.delivery }
+}
+// Session transport: the steering mail (the user's and a supervisor's messages) that arrived after the agent's turn had
+// begun goes out at the end of its next Orbit tool result, whole, and is marked read there. Empty when there is none.
+function userMail(runtime: OrbitRuntimeLike, run: RunRecord, agent: AgentRecord): string {
+  if (TERMINAL.has(run.status)) return ''
+  const mail = steeringMail(run, runtime.pendingMail(run, agent))
+  if (!mail.ids.length) return ''
+  runtime.markCommunications(run, mail.ids, 'read', 'tool-result')
+  return mail.blocks.map(block => `\n\n[orbit] ${block}`).join('')
 }
 function recordCommunication(runtime: OrbitRuntimeLike, run: RunRecord, sender: AgentRef, target: AgentRef, text: string, extra: Partial<Communication> = {}): Communication {
   const communication: Communication = { id: randomUUID(), fromAgentId: sender.id, toAgentId: target.id, fromAgentName: sender.name, toAgentName: target.name, text, time: new Date().toISOString(), status: 'queued', delivery: 'next-turn', ...extra }
@@ -126,10 +196,13 @@ function mailboxContext(runtime: OrbitRuntimeLike, run: RunRecord, agent: AgentR
   const unread = incoming.filter((message) => !message.readAt)
   const ids = new Set(unread.map((message) => message.id))
   const recent = run.communications.filter((message) => (!message.kind || message.kind === 'message') && (message.toAgentId === agent.id || message.fromAgentId === agent.id) && !ids.has(message.id)).slice(-4)
-  // Excerpts of unread mail, then whole recent records: only serialised into the prompt.
+  // Steering mail leads, whole and apart from the team's (the user's words, then a supervisor's with its sender and id);
+  // then excerpts of other unread team mail, then whole recent records: only serialised into the prompt.
+  const lead = steeringMail(run, unread)
   const selected: object[] = [], delivered: string[] = []
   let remaining = 6000
   for (const message of unread) {
+    if (steering(run, message)) continue
     const entry = { id: message.id, from: message.fromAgentName, text: bounded(message.text, 2000), excerpt: message.text.length > 2000, ...(message.kind === 'notice' ? { notice: true } : {}) }
     const size = JSON.stringify(entry).length
     if (size > remaining) break
@@ -140,7 +213,8 @@ function mailboxContext(runtime: OrbitRuntimeLike, run: RunRecord, agent: AgentR
     if (size > remaining) break
     selected.push(recent[index]); remaining -= size
   }
-  return { text: selected.length ? `TEAM CORRESPONDENCE (durable records; excerpts can be retrieved using read_messages unread_only=false):\n${JSON.stringify(selected)}` : '', deliveredIds: [...delivered, ...introductions.map(message => message.id)] }
+  const team = selected.length ? `TEAM CORRESPONDENCE (durable records; excerpts can be retrieved using read_messages unread_only=false):\n${JSON.stringify(selected)}` : ''
+  return { text: [...lead.blocks, team].filter(Boolean).join('\n\n'), deliveredIds: [...lead.ids, ...delivered, ...introductions.map(message => message.id)], fromUser: lead.fromUser }
 }
 function askTeam(runtime: OrbitRuntimeLike, run: RunRecord, sender: AgentRecord, args: ToolArgs): AskTeamResult {
   const text = String(args.message || '').trim()
@@ -163,4 +237,4 @@ function askTeam(runtime: OrbitRuntimeLike, run: RunRecord, sender: AgentRecord,
   return { ok: true, discussionId, via, routedTo }
 }
 
-export { communicationsFor, pendingMail, markCommunications, sendAgentMessage, recordCommunication, readAgentMessages, waitForTeam, waitAgentMessage, mailboxContext, askTeam }
+export { communicationsFor, pendingMail, markCommunications, sendAgentMessage, recordCommunication, readAgentMessages, waitForTeam, waitAgentMessage, mailboxContext, askTeam, postUserMessage, userMail }

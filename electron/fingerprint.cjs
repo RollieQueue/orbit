@@ -37,6 +37,7 @@ const SHELL_FILES = Object.freeze([
   'electron/fingerprint.cjs',
   'electron/git.mts',
   'electron/runtime-protocol.mts',
+  'electron/skill-files.mts',
   'package.json',
 ])
 

@@ -2,9 +2,11 @@
 // feedback, install) and model assessments, plus the usage marks that decide what the memory keeps.
 import { randomUUID, createHash } from 'node:crypto'
 import { reliability as skillReliability } from '../capabilities.mts'
+import { folderManifest } from '../skill-packages.mts'
 import { projectReferences, describe as describeReferences, scrub } from '../scope-guard.mts'
 import { bounded, clip, diagnostics } from './util.mts'
-import type { AgentRecord, CapabilityStoreLike, MemoryEntry, MemoryScope, MemorySaveInput, MemorySaveResult, Observation, OrbitRuntimeLike, RunRecord, SkillScope, SkillView, ToolArgs } from '../types.mts'
+import { modelsWorked } from './agents.mts'
+import type { AgentRecord, CapabilityStoreLike, MemoryEntry, MemoryScope, MemorySaveInput, MemorySaveResult, Observation, OrbitRuntimeLike, RunRecord, SkillSaveInput, SkillScope, SkillView, ToolArgs } from '../types.mts'
 
 // A note that matched the task, or was read on purpose, counts as used (once per run). Usage decides what the memory keeps.
 function markMemoryUse(runtime: OrbitRuntimeLike, run: RunRecord, entries: readonly (Pick<MemoryEntry, 'id'> | null | undefined)[]): void {
@@ -22,12 +24,22 @@ async function executeKnowledgeTool(runtime: OrbitRuntimeLike, run: RunRecord, a
     const target = runtime.resolveAgent(run, args.agentId)
     if (!['done', 'error'].includes(target.status)) throw new Error('Evaluate completed work only')
     if (![args.taskType, args.assessment, args.evidence].every(value => typeof value === 'string' && value.trim())) throw new Error('Task type, assessment and verification evidence are required')
-    if (!target.model) throw new Error('Provider did not identify the model; select an explicit model before evaluating')
-    const id = `model-${createHash('sha256').update(`${target.providerId}:${target.model}:${args.taskType}`).digest('hex').slice(0, 24)}`
+    // The assessment belongs to the model that did the work, which after a subscription switch is not always the one the agent ended on.
+    const worked = modelsWorked(target)
+    const listing = worked.map(item => item.turns ? `${item.label} (${item.turns})` : item.label).join(', ')
+    const wanted = typeof args.model === 'string' ? args.model.trim() : ''
+    let chosen = worked[0]
+    if (wanted) {
+      const matches = worked.filter(item => item.label === wanted || item.model === wanted)
+      if (matches.length !== 1) throw new Error(`Agent ${target.name} did not run on model "${wanted}" (or it is ambiguous). Models that did its work: ${listing}. Pass model as "<provider>/<model>".`)
+      chosen = matches[0]
+    } else if (worked.length > 1) throw new Error(`Agent ${target.name} ran on several models: ${listing}. Pass model: "<provider>/<model>" naming the one whose work you assessed; evaluate each separately if both did real work.`)
+    if (!chosen.model) throw new Error('Provider did not identify the model; select an explicit model before evaluating')
+    const id =`model-${createHash('sha256').update(`${chosen.providerId}:${chosen.model}:${args.taskType}`).digest('hex').slice(0, 24)}`
     const previous = runtime.memoryStore.list(run.workspace).find(entry => entry.id === id)
     // An assessment is shared by every project, so it carries no path of this one, and it is a running record: newest first, twelve at most.
-    const observation = { provider: target.providerId, model: target.model, taskType: clip(scrub(args.taskType, run.workspace), 120), assessment: clip(scrub(args.assessment, run.workspace), 400), evidence: clip(scrub(args.evidence, run.workspace), 400), runId: run.runId, agentId: target.id, turns: target.turns, status: target.status, date: new Date().toISOString() }
-    const record: MemorySaveInput = { id, scope: 'global', type: 'fact', title: `Model: ${target.providerId}/${target.model} — ${observation.taskType}`, content: [JSON.stringify(observation), ...String(previous?.content || '').split('\n').filter(Boolean)].slice(0, 12).join('\n') }
+    const observation = { provider: chosen.providerId, model: chosen.model, ...(worked.length > 1 ? { ranOn: worked.map(item => item.label) } : {}), taskType: clip(scrub(args.taskType, run.workspace), 120), assessment: clip(scrub(args.assessment, run.workspace), 400), evidence: clip(scrub(args.evidence, run.workspace), 400), runId: run.runId, agentId: target.id, turns: target.turns, status: target.status, date: new Date().toISOString() }
+    const record: MemorySaveInput = { id, scope: 'global', type: 'fact', title: `Model: ${chosen.label} — ${observation.taskType}`, content: [JSON.stringify(observation), ...String(previous?.content || '').split('\n').filter(Boolean)].slice(0, 12).join('\n') }
     const entry = runtime.memoryStore.save ? runtime.memoryStore.save(record, { origin: 'system' }).entry : runtime.memoryStore.upsert(record)
     run.evaluations.add(runtime.resultKey(target))
     return entry
@@ -78,44 +90,68 @@ async function executeKnowledgeTool(runtime: OrbitRuntimeLike, run: RunRecord, a
     const store: CapabilityStoreLike = runtime.capabilityStore!
     // A project that switched shared memory off neither sees nor changes the shared library. Who may CREATE a shared skill is decided below.
     const shared = run.globalMemoryEnabled
-    const brief = ({ id, name, description, whenToUse, scope, uses, reliability, lessons }: SkillView) => ({ id, name, description, whenToUse, scope, uses, reliability, ...(lessons?.length ? { pitfalls: lessons.slice(0, 3) } : {}) })
-    if (name === 'capability_list') return (await store.list(run.workspace, shared)).slice(0, 60).map(brief)
+    // What a skill is made of, so the agent sees at once whether it is a procedure to follow, a page Orbit shows, or commands to run.
+    const brief = ({ id, name, description, whenToUse, scope, uses, reliability, lessons, files, triggers, commands }: SkillView) => ({
+      id, name, description, whenToUse, scope, uses, reliability, kinds: ['instructions', ...(triggers?.length ? ['page'] : []), ...(commands?.length ? ['commands'] : [])],
+      ...(files?.length ? { files: files.length } : {}), ...(lessons?.length ? { pitfalls: lessons.slice(0, 3) } : {}),
+    })
+    // A skill the user switched off is invisible to agents: it is not found, read, rated or suggested.
+    const switchedOff = (skill: Pick<SkillView, 'enabled'> | null | undefined): void => { if (skill && skill.enabled === false) throw new Error('This skill is switched off') }
+    // A skill the user switched off is invisible to agents (the list is filtered before the cap, so off skills take no place).
+    if (name === 'capability_list') return (await store.list(run.workspace, shared)).filter(skill => skill.enabled !== false).slice(0, 60).map(brief)
     if (name === 'capability_search') {
       if (!String(args.query || '').trim()) throw new Error('A search query is required')
       return store.search(String(args.query), run.workspace, Number(args.limit) || 8, shared).map(brief)
     }
     if (name === 'capability_read') {
       const skill = await store.read(String(args.id || ''), run.workspace, shared)
+      switchedOff(skill)
       // Loading it again in the same run is not another use.
       if (!run.skillUse.has(skill.id)) { store.recordUse?.(skill.id, run.workspace, shared); run.skillUse.set(skill.id, { name: skill.name, rated: false }) }
       // The instructions come last: if an observation is ever cut, the tail lost is prose, not the pitfalls.
       return { id: skill.id, name: skill.name, description: skill.description, whenToUse: skill.whenToUse, scope: skill.scope, version: skill.version, uses: skill.uses, reliability: Math.round(skillReliability(skill) * 100) / 100,
-        ...(skill.lessons?.length ? { pitfalls: skill.lessons } : {}), note: 'When you are done, report the outcome with capability_feedback', instructions: skill.instructions }
+        ...(skill.lessons?.length ? { pitfalls: skill.lessons } : {}),
+        ...(skill.package ? { package: skill.package, files: skill.files } : {}),
+        ...(skill.params?.length ? { params: skill.params.map(({ key, label, type, value, default: initial, hint }) => ({ key, label, type, value, default: initial, ...(hint ? { hint } : {}) })) } : {}),
+        ...(skill.triggers?.length ? { triggers: skill.triggers } : {}), ...(skill.commands?.length ? { commands: skill.commands } : {}),
+        note: `When you are done, report the outcome with capability_feedback${skill.commands?.length ? '. Commands run in the package folder (package.dir)' : ''}`, instructions: skill.instructions }
     }
     if (name === 'capability_feedback') {
+      switchedOff(store.find(String(args.id || ''), run.workspace, shared))
       const result = store.feedback(String(args.id || ''), run.workspace, { outcome: args.outcome, note: args.note, includeGlobal: shared })
       run.skillUse.set(result.id, { name: result.name, rated: true })
       return { ok: true, id: result.id, name: result.name, uses: result.uses, reliability: result.reliability, ...(result.lessonDropped ? { note: 'The pitfall was not stored: a shared skill cannot name this project' } : {}) }
     }
     if (name === 'capability_install') {
-      if (!String(args.name || '').trim() || !String(args.instructions || '').trim()) throw new Error('Capability name and instructions are required')
-      let scope: SkillScope = args.scope === 'global' ? 'global' : 'project', kept = ''
+      const known = args.id ? store.find(String(args.id), run.workspace, shared) : null
+      // A package folder's skill.json supplies what the call leaves out, so the guard below reads the skill it would actually save.
+      const manifest = args.fromDir ? folderManifest(String(args.fromDir), run.workspace, true) : null
+      const field = (key: 'name' | 'description' | 'whenToUse' | 'instructions' | 'scope'): string | undefined => args[key] ?? manifest?.[key]
+      if (!known && (!String(field('name') || '').trim() || !String(field('instructions') || '').trim())) throw new Error('Capability name and instructions are required (unless fromDir holds a skill.json with them, or id names a skill to change)')
+      let scope: SkillScope = field('scope') === 'global' ? 'global' : 'project', kept = ''
       if (scope === 'global') {
         // Sharing a skill is the agent's call, but a skill that only makes sense here stays here, and so does one from a project that opted out.
-        const references = describeReferences(projectReferences([args.name, args.description, args.whenToUse, args.instructions].filter(Boolean).join('\n'), run.workspace))
+        const references = describeReferences(projectReferences([field('name'), field('description'), field('whenToUse'), field('instructions')].filter(Boolean).join('\n'), run.workspace))
         if (!(shared && agent.memoryProfile === 'project-global')) kept = 'sharing is switched off for this project or worker'
         else if (references) kept = `it names ${references}`
         if (kept) scope = 'project'
       }
-      const known = args.id ? store.find(String(args.id), run.workspace, shared) : null
       // An agent is never the user, the harness or the promotion pass, whatever it writes as the source.
       const source = /^(user|system|promoted)$/i.test(String(args.source || '').trim()) ? '' : args.source
-      const saved = store.save({ id: known?.id ?? args.id, name: bounded(args.name, 160), description: bounded(args.description, 1000), whenToUse: bounded(args.whenToUse, 400), instructions: bounded(args.instructions, 20000), scope, workspace: run.workspace, source: bounded(source || `agent:${agent.id}`, 300) }, { origin: 'agent' })
+      // The package fields go to the store as they came: it validates them (limits, paths, types) and names what is wrong.
+      const pack = args as Record<string, unknown>
+      const text = (value: string | undefined, max: number): string | undefined => value === undefined ? undefined : bounded(value, max)
+      const saved = store.save({
+        id: known?.id ?? args.id, name: text(field('name'), 160)!, description: text(field('description'), 1000), whenToUse: text(field('whenToUse'), 400), instructions: text(field('instructions'), 20000)!,
+        scope, workspace: run.workspace, source: bounded(source || `agent:${agent.id}`, 300),
+        files: pack.files as SkillSaveInput['files'], removeFiles: pack.removeFiles as string[] | undefined, fromDir: pack.fromDir as string | undefined,
+        params: pack.params as unknown[] | undefined, triggers: pack.triggers as unknown[] | undefined, commands: pack.commands as unknown[] | undefined,
+      }, { origin: 'agent' })
       run.skillSaved = true
       const notes: string[] = []
       if (saved.merged) notes.push(`A skill named "${saved.improved}" was very similar and was improved instead of duplicated (its previous version stays in the history). If yours is a different procedure, save it under a clearly different name.`)
       if (kept) notes.push(`Saved to this PROJECT's skills instead of the shared library: ${kept}.`)
-      if (String(args.instructions).trim().length > saved.entry.instructions.length) notes.push(`The instructions were cut to ${saved.entry.instructions.length} characters: keep a skill short, or split it.`)
+      if (String(field('instructions') || '').trim().length > saved.entry.instructions.length) notes.push(`The instructions were cut to ${saved.entry.instructions.length} characters: keep a skill short, or split it.`)
       return { ok: true, id: saved.entry.id, name: saved.entry.name, scope: saved.entry.scope, version: saved.entry.version,
         ...(saved.merged ? { merged: true } : {}), ...(kept ? { demoted: true } : {}), ...(notes.length ? { note: notes.join(' ') } : {}) }
     }

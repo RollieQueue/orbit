@@ -25,14 +25,14 @@ read_file {path,start_line?,limit?}; list_files {path?,recursive?,limit?}; write
 run_command {command,args?,cwd?,timeout_ms?}: executable and argument array, no shell; requires write access. Report actual checks.
 MEMORY has three tiers. chat = working notes of THIS task thread (constraints the user gave, decisions in progress, what is left); project = verified knowledge about this codebase that outlives the chat; global = only what holds in EVERY project (user preferences, general how-tos, model assessments).
 memory_search {query?,limit?}: ranked search over the tiers you can reach. memory_save {title,content,scope?,type?,id?,confidence?}: scope chat|project|global, default project. Anything that names this project's paths, files or repository stays in the project even if you ask for global. A note that restates an existing one updates it; pass id to revise one on purpose. memory_forget {id}: remove a note that turned out wrong or obsolete (ids are in the MEMORY block; notes the user wrote or pinned are theirs to remove). Save durable facts once and briefly. Never save credentials.
-SKILLS are reusable procedures: HOW to do something that will recur in other tasks (facts about this codebase belong in memory). Before improvising a multi-step procedure, check the SKILLS list or capability_search; after using a skill, report capability_feedback.
-capability_search {query,limit?}; capability_list {}; capability_read {id}: full instructions of one skill. capability_feedback {id,outcome:worked|partial|failed,note?}: a failure's note becomes a pitfall for the next agent. capability_install {name,description,whenToUse?,instructions,id?,scope?,source?}: save a self-contained procedure (prerequisites, exact steps or commands, how to verify, pitfalls); scope global when it does not depend on this project; improve an existing skill by passing its id rather than adding a near-copy. Verify helper scripts before saving a skill.
+SKILLS are add-ons you build for yourself, of any form: a reusable procedure (HOW to do something that will recur in other tasks; facts about this codebase belong in memory), or a package of files (scripts, pages, assets) with parameters, a trigger Orbit runs by itself and commands. Before improvising a multi-step procedure, check the SKILLS list or capability_search; after using a skill, report capability_feedback.
+capability_search {query,limit?}; capability_list {}; capability_read {id}: full instructions of one skill, and for a package its folder (package.dir), files, parameters with their current values, triggers and commands. capability_feedback {id,outcome:worked|partial|failed,note?}: a failure's note becomes a pitfall for the next agent. capability_install {name?,description?,whenToUse?,instructions?,id?,scope?,source?,files?:[{path,content}],removeFiles?,fromDir?,params?:[{key,label,type,default,hint?}],triggers?:[{on,show}],commands?:[{name,run,description?}]}: save a skill: any add-on that helps later, not only a procedure. name and instructions are required unless fromDir or id is given. A plain skill is a self-contained procedure (prerequisites, exact steps or commands, how to verify, pitfalls); scope global when it does not depend on this project; improve an existing skill by passing its id rather than adding a near-copy. A package also carries files (pages, scripts, assets; at most 40, 512 KB each, 4 MB in all): files writes text files, removeFiles deletes some, fromDir is an absolute folder inside the project or the temp folder whose files replace the package, and its skill.json may hold name, description, whenToUse, instructions, scope, params, triggers and commands. params are values the user sets in the skills panel (type text|url|number|seconds|boolean; a page reads them from its address); triggers [{on:"task-completed",show:"page.html"}] make Orbit show that page full screen when a task completes; commands [{name,run,description?}] are what agents run in the package folder. Omitted package fields keep what the skill has; params, triggers and commands given as [] are cleared, while files only adds or replaces the given files (use removeFiles or fromDir to drop others). Changing an existing package skill needs its id. Build a package in a folder and install it with fromDir; verify scripts before saving a skill.
 Use context_save for shared discoveries and model_evaluate for checked model performance. Read cached project knowledge first; do not independently survey the entire repository.
 Your WORK LOG lists your own completed calls and stays authoritative even when older transcript entries are omitted: do not repeat a logged call just to re-check unchanged state; re-read a file range only when you need its exact text (for example to edit it) and it is no longer visible. Checks serve the task; once the evidence is enough, integrate and give the final answer.`
 const ORIGINAL_CONTEXT_LINES = [
   'context_save {key,summary,files?}: upsert a shared project note with dependency hashes; context_read {key?}: compact note index, or one note in full by key. Notes with stale=true need one targeted check of their listed files. Never store credentials.',
-  'model_evaluate {agentId,taskType,assessment,evidence}: root only; after checking a completed worker\'s result, save an evidence-based model assessment to global memory. Distinguish measured results from subjective judgment; do not infer quality from completion alone.',
-  'improvement_plan {status,tasks:[{id,title,status,evidence}]}: root only; maintain the improvement backlog. Plan status: planning, implementing, completed, blocked. Task status: pending, working, done, blocked. Completed requires all tasks done with verification evidence; blocked requires an explanation in task evidence. Reuse workers and shared findings.',
+  'model_evaluate {agentId,taskType,assessment,evidence,model?}: root only; after checking a completed worker\'s result, save an evidence-based model assessment to global memory. Distinguish measured results from subjective judgment; do not infer quality from completion alone. model: the provider/model whose work you assess; required when the worker switched subscription (wait_agent shows ranOn).',
+  'improvement_plan {status,tasks:[{id,title,status,evidence}],handoff?}: root only; maintain the improvement backlog. Plan status: planning, implementing, completed, blocked. Task status: pending, working, done, blocked. Completed requires all tasks done with verification evidence; blocked requires an explanation in task evidence. handoff: what the next task\'s fresh context must know (at most 2000 characters; omitted keeps the previous one). Reuse workers and shared findings.',
 ]
 
 test('describeForPrompt reproduces the envelope prompt text verbatim', () => {
@@ -92,8 +92,8 @@ test('the envelope response schema is unchanged by the registry refactor', () =>
     spawn_agent: { task: string, reason: string, name: optional(string), providerId: optional(string), model: optional(string), reasoningEffort: optional({ type: 'string', enum: ['', 'none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra', 'enabled'] }), memoryProfile: optional({ type: 'string', enum: ['project', 'project-global'] }), continueFrom: optional(string) },
     context_read: { key: optional(string) },
     context_save: { key: string, summary: string, files: optional(strings) },
-    model_evaluate: { agentId: string, taskType: string, assessment: string, evidence: string },
-    improvement_plan: { status: { type: 'string', enum: ['planning', 'implementing', 'completed', 'blocked'] }, tasks: { type: 'array', items: object({ id: string, title: string, status: { type: 'string', enum: ['pending', 'working', 'done', 'blocked'] }, evidence: string }) } },
+    model_evaluate: { agentId: string, taskType: string, assessment: string, evidence: string, model: optional(string) },
+    improvement_plan: { status: { type: 'string', enum: ['planning', 'implementing', 'completed', 'blocked'] }, tasks: { type: 'array', items: object({ id: string, title: string, status: { type: 'string', enum: ['pending', 'working', 'done', 'blocked'] }, evidence: string }) }, handoff: optional(string) },
     wait_agent: { agentId: optional(string), timeout_ms: optional(number) },
     send_message: { agentId: string, message: string, replyTo: optional(string) },
     broadcast_message: { message: string, agentIds: optional(strings), replyTo: optional(string) },
@@ -118,7 +118,13 @@ test('the envelope response schema is unchanged by the registry refactor', () =>
     capability_search: { query: string, limit: optional(number) },
     capability_read: { id: string },
     capability_feedback: { id: string, outcome: { type: 'string', enum: ['worked', 'partial', 'failed'] }, note: optional(string) },
-    capability_install: { name: string, instructions: string, description: string, whenToUse: optional(string), id: optional(string), scope: optional({ type: 'string', enum: ['project', 'global'] }), source: optional(string) },
+    capability_install: {
+      name: optional(string), instructions: optional(string), description: optional(string), whenToUse: optional(string), id: optional(string), scope: optional({ type: 'string', enum: ['project', 'global'] }), source: optional(string),
+      files: optional({ type: 'array', items: object({ path: string, content: string }) }), removeFiles: optional(strings), fromDir: optional(string),
+      params: optional({ type: 'array', items: object({ key: string, label: string, type: { type: 'string', enum: ['text', 'url', 'number', 'seconds', 'boolean'] }, default: { anyOf: [string, number, boolean] }, hint: optional(string) }) }),
+      triggers: optional({ type: 'array', items: object({ on: { type: 'string', enum: ['task-completed'] }, show: string }) }),
+      commands: optional({ type: 'array', items: object({ name: string, run: string, description: optional(string) }) }),
+    },
     // Added after the refactor (TECH-DEBT item 1): tools outside the historical order follow it.
     restart_orbit: { reason: string, continueWith: string, verify: optional(boolean) },
   }
@@ -143,6 +149,12 @@ test('validate refuses what the runtime used to refuse inline and normalises nul
   assert.match(validate('memory_save', { title: 't', content: ' ' }).error, /title and content/)
   assert.match(validate('memory_save', { title: 't', content: 'c', scope: 'team' }).error, /scope must be one of/)
   assert.match(validate('capability_install', { name: 'n', instructions: ' ', description: 'd' }).error, /name and instructions/)
+  assert.equal(validate('capability_install', { fromDir: '/tmp/pack' }).ok, true, 'a folder with a skill.json needs no name')
+  assert.equal(validate('capability_install', { id: 'known', files: [{ path: 'a.txt', content: 'x' }] }).ok, true, 'an existing skill keeps its text')
+  assert.match(validate('capability_install', { name: 'n', instructions: 'i', files: [{ path: 'a.txt' }] }).error, /files\[0\]\.content is required/)
+  assert.match(validate('capability_install', { name: 'n', instructions: 'i', params: [{ key: 'k', label: 'L', type: 'color', default: 'x' }] }).error, /type must be one of/)
+  assert.match(validate('capability_install', { name: 'n', instructions: 'i', triggers: [{ on: 'never', show: 'p.html' }] }).error, /on must be one of/)
+  assert.equal(validate('capability_install', { name: 'n', instructions: 'i', params: [{ key: 'k', label: 'L', type: 'number', default: 3, hint: null }], commands: [{ name: 'go', run: 'node go.js' }] }).ok, true, 'nested optional fields may be null or missing')
   assert.match(validate('capability_feedback', { id: 'x', outcome: 'meh' }).error, /outcome must be one of/)
   assert.match(validate('edit_file', { path: 'a', old_text: '', new_text: 'b' }).error, /Nonempty old_text/)
   assert.match(validate('model_evaluate', { agentId: 'a', taskType: 't', assessment: ' ', evidence: 'e' }).error, /assessment and verification evidence/)
@@ -152,6 +164,8 @@ test('validate refuses what the runtime used to refuse inline and normalises nul
   assert.match(validate('improvement_plan', { status: 'blocked', tasks: [{ id: '1', title: 't', status: 'pending', evidence: '' }] }).error, /documented blocker/)
   assert.match(validate('improvement_plan', { status: 'planning', tasks: [{ id: '1', title: 't', status: 'pending', evidence: '', extra: 1 }] }).error, /unknown argument "extra"/)
   assert.equal(validate('improvement_plan', { status: 'completed', tasks: [{ id: '1', title: 't', status: 'done', evidence: 'ran tests' }] }).ok, true)
+  assert.equal(validate('improvement_plan', { status: 'implementing', tasks: [], handoff: 'next: run the smoke' }).ok, true)
+  assert.match(validate('improvement_plan', { status: 'implementing', tasks: [], handoff: 'x'.repeat(2001) }).error, /longer than 2000/)
   assert.match(validate('unknown_tool', {}).error, /Unknown tool/)
   assert.match(validate('read_file', 'path').error, /must be an object/)
   assert.equal(validate('approve', { tool_name: 'Bash', input: { command: 'ls' }, permission_suggestions: [] }).ok, true, 'the permission handler accepts extra fields Claude Code sends')

@@ -1,19 +1,81 @@
 import { useState } from 'react'
-import type { Capability, LibraryStats } from './types'
+import type { Capability, LibraryStats, SkillParam, SkillParamValue } from './types'
+import './skill-stage.css'
 import { Icon } from './Icon'
 import { LibraryForm, TierBar } from './Library'
 import { Markdown, errorText } from './format'
+import { completionPages } from './skill-triggers'
 
-type CardProps = { entry: Capability; workspace: string; onSaved: () => void; onError: (message: string) => void }
+type CardProps = { entry: Capability; workspace: string; onSaved: () => void; onError: (message: string) => void; onPreview?: (skill: Capability) => void }
 const dayOf = (time: string) => new Date(time).toLocaleDateString('ru-RU')
+const kilobytes = (size: number) => size < 1024 ? `${size} Б` : `${(size / 1024).toFixed(size < 10240 ? 1 : 0)} КБ`
 
-// One skill: its provenance, use statistics and pitfalls; the instructions load on demand and can be edited or rolled back.
-function CapabilityCard({ entry, workspace, onSaved, onError }: CardProps) {
+// What the skill is, for the card: any of an instruction, a page shown on a trigger, commands, files.
+function kindsOf(entry: Capability): string[] {
+  const kinds = ['Инструкция']
+  if (completionPages(entry).length) kinds.push('Страница: по завершении задачи')
+  if (entry.commands?.length) kinds.push(`Команды: ${entry.commands.length}`)
+  if (entry.files?.length) kinds.push(`Файлы: ${entry.files.length}`)
+  return kinds
+}
+
+// The form holds text; a value is converted to its type only on save, so the user can clear a number field while typing.
+function paramValues(params: SkillParam[], draft: Record<string, string | boolean>): Record<string, SkillParamValue> | string {
+  const values: Record<string, SkillParamValue> = {}
+  for (const param of params) {
+    const raw = draft[param.key]
+    if (param.type === 'boolean') values[param.key] = raw === true
+    else if (param.type === 'number' || param.type === 'seconds') {
+      const number = typeof raw === 'string' && raw.trim() ? Number(raw) : NaN
+      if (!Number.isFinite(number) || (param.type === 'seconds' && number < 0)) return `«${param.label}»: укажите число${param.type === 'seconds' ? ' секунд (не меньше 0)' : ''}.`
+      values[param.key] = number
+    } else values[param.key] = typeof raw === 'string' ? raw.trim() : ''
+  }
+  return values
+}
+
+function ParamsForm({ entry, workspace, onSaved, onError }: Pick<CardProps, 'entry' | 'workspace' | 'onSaved' | 'onError'>) {
+  const params = entry.params ?? []
+  const [draft, setDraft] = useState<Record<string, string | boolean>>(() =>
+    Object.fromEntries(params.map(param => [param.key, param.type === 'boolean' ? param.value === true : String(param.value)])))
+  const [busy, setBusy] = useState(false)
+  async function save() {
+    if (!window.orbit || busy) return
+    const values = paramValues(params, draft)
+    if (typeof values === 'string') { onError(values); return }
+    setBusy(true)
+    try { await window.orbit.setCapabilityParams(entry.id, values, workspace); onSaved() }
+    catch (error) { onError(errorText(error)) }
+    finally { setBusy(false) }
+  }
+  const set = (key: string, value: string | boolean) => setDraft(current => ({ ...current, [key]: value }))
+  return <div className="skill-params">
+    <div className="skill-params-form">
+      {params.map(param => {
+        const hint = param.hint ? <small>{param.hint}</small> : null
+        if (param.type === 'boolean') return <label key={param.key} className="wide check">
+          <input type="checkbox" checked={draft[param.key] === true} onChange={event => set(param.key, event.target.checked)} />{param.label}{hint}
+        </label>
+        const number = param.type === 'number' || param.type === 'seconds'
+        return <label key={param.key} className={number ? '' : 'wide'}>{param.label}
+          <input type={number ? 'number' : param.type === 'url' ? 'url' : 'text'} min={param.type === 'seconds' ? 0 : undefined} step={number ? 'any' : undefined}
+            value={String(draft[param.key] ?? '')} onChange={event => set(param.key, event.target.value)} />{hint}
+        </label>
+      })}
+      <div className="capability-actions"><button className="secondary-button" disabled={busy} onClick={() => void save()}>Сохранить</button></div>
+    </div>
+  </div>
+}
+
+// One skill: what it is (kind badges), its parameters, provenance, use statistics and pitfalls; the instructions load on
+// demand and can be edited or rolled back.
+function CapabilityCard({ entry, workspace, onSaved, onError, onPreview }: CardProps) {
   const [detail, setDetail] = useState<Capability | null>(null)
   const [busy, setBusy] = useState(false)
   const [editing, setEditing] = useState(false)
   const [instructions, setInstructions] = useState('')
   const [revision, setRevision] = useState('')
+  const enabled = entry.enabled !== false
   async function load() {
     if (detail || busy || !window.orbit) return
     setBusy(true)
@@ -27,7 +89,12 @@ function CapabilityCard({ entry, workspace, onSaved, onError }: CardProps) {
     try {
       if (action === 'remove') await window.orbit.removeCapability(entry.id, workspace)
       else if (action === 'restore') await window.orbit.restoreCapability(entry.id, Number(revision), workspace)
-      else if (detail) await window.orbit.installCapability({ ...detail, instructions: instructions.trim(), source: 'user' })
+      else if (detail) {
+        // Only the text fields go back: the files, parameters, triggers and commands stay in the store as they are (the
+        // view's file list has sizes, not contents, and would read as an attempt to replace the package).
+        const { files, params, triggers, commands, package: pack, revisions, ...text } = detail
+        await window.orbit.installCapability({ ...text, instructions: instructions.trim(), source: 'user' })
+      }
       onSaved()
     } catch (error) { onError(errorText(error)) }
     finally { setBusy(false) }
@@ -36,7 +103,18 @@ function CapabilityCard({ entry, workspace, onSaved, onError }: CardProps) {
     setBusy(true)
     window.orbit?.pinCapability(entry.id, !entry.pinned, workspace).then(onSaved).catch(error => onError(errorText(error))).finally(() => setBusy(false))
   }
-  const usage = entry.uses ? `Применялся: ${entry.uses} · успешно ${Math.round((entry.reliability ?? 0.5) * 100)}%` : 'Ещё не применялся'
+  function toggle() {
+    setBusy(true)
+    window.orbit?.setCapabilityEnabled(entry.id, !enabled, workspace).then(onSaved).catch(error => onError(errorText(error))).finally(() => setBusy(false))
+  }
+  // shell.openPath answers with an error text, empty on success.
+  async function openFolder() {
+    if (!window.orbit || !entry.package) return
+    try { const failure = await window.orbit.openPath(entry.package.dir); if (failure) onError(failure) }
+    catch (error) { onError(errorText(error)) }
+  }
+  const pages = completionPages(entry)
+  const usage = entry.uses ? `Применялся: ${entry.uses} · успешно ${Math.round((entry.reliability ?? 0.5) * 100)}%` : pages.length ? 'Срабатывает при завершении задачи' : 'Ещё не применялся'
   const usedIn = entry.scope === 'global' && entry.usedIn?.length ? ` · проектов: ${entry.usedIn.length}` : ''
   const provenance = detail && [
     detail.source === 'user' ? 'Добавлен пользователем' : `Источник: ${detail.source || 'агент'}`,
@@ -44,10 +122,14 @@ function CapabilityCard({ entry, workspace, onSaved, onError }: CardProps) {
   ].join('')
   const scopeLabel = `${entry.pinned ? 'закреплён · ' : ''}${entry.scope === 'global' ? 'Общий' : 'Проект'}${entry.version ? ` · v${entry.version}` : ''}`
   const pinLabel = `${entry.pinned ? 'Открепить' : 'Закрепить'} навык ${entry.name}`
-  return <article className={`library-entry ${entry.pinned ? 'pinned' : ''}`}>
+  const switchLabel = `${enabled ? 'Выключить' : 'Включить'} навык ${entry.name}`
+  return <article className={`library-entry ${entry.pinned ? 'pinned' : ''} ${enabled ? '' : 'disabled'}`}>
     <div>
       <strong>{entry.name}</strong>
       <span className="scope-label">{scopeLabel}</span>
+      <button className="skill-switch" disabled={busy} aria-pressed={enabled} aria-label={switchLabel} onClick={toggle}>
+        <span className="skill-switch-track" aria-hidden="true" />{enabled ? 'Включён' : 'Выключен'}
+      </button>
       <button className="icon-button" disabled={busy} aria-pressed={!!entry.pinned} aria-label={pinLabel} onClick={pin}><Icon name="pin" size={14} /></button>
       <button className="icon-button" disabled={busy} aria-label={`Удалить навык ${entry.name}`} onClick={() => void mutate('remove')}>
         <Icon name="trash" size={15} />
@@ -55,6 +137,22 @@ function CapabilityCard({ entry, workspace, onSaved, onError }: CardProps) {
     </div>
     <p>{entry.description}</p>
     {entry.whenToUse && <p className="skill-when">Когда применять: {entry.whenToUse}</p>}
+    <ul className="skill-kinds" aria-label="Из чего состоит навык">{kindsOf(entry).map(kind => <li key={kind}>{kind}</li>)}</ul>
+    {!!entry.params?.length && <ParamsForm entry={entry} workspace={workspace} onSaved={onSaved} onError={onError} />}
+    {(pages.length > 0 || entry.package) && <div className="skill-tools">
+      {pages.length > 0 && <button className="text-button" title="Показывает страницу с сохранёнными параметрами" disabled={!onPreview} onClick={() => onPreview?.(entry)}>Показать</button>}
+      {entry.package && <button className="text-button" title={entry.package.dir} onClick={() => void openFolder()}><Icon name="folder" size={13} /> Открыть папку</button>}
+    </div>}
+    {!!entry.files?.length && <details>
+      <summary>Файлы ({entry.files.length})</summary>
+      <ul className="skill-list">{entry.files.map(file => <li key={file.path}><code>{file.path}</code><small>{kilobytes(file.size)}</small></li>)}</ul>
+    </details>}
+    {!!entry.commands?.length && <details>
+      <summary>Команды ({entry.commands.length})</summary>
+      <ul className="skill-list">{entry.commands.map(command => <li key={command.name}>
+        <code>{command.name}</code>{command.description && <small>{command.description}</small>}<br /><code>{command.run}</code>
+      </li>)}</ul>
+    </details>}
     <small className="entry-meta">{usage}{usedIn}</small>
     {!!entry.lessons?.length && <ul className="skill-pitfalls" aria-label="Подводные камни">
       {entry.lessons.slice(0, 3).map(lesson => <li key={lesson}>{lesson}</li>)}
@@ -88,11 +186,11 @@ function CapabilityCard({ entry, workspace, onSaved, onError }: CardProps) {
 
 type SkillsPanelProps = {
   desktop: boolean; workspace: string; skills: Capability[]; stats: LibraryStats | null; loading: boolean
-  onChanged: () => void; onError: (message: string) => void
+  onChanged: () => void; onError: (message: string) => void; onPreview?: (skill: Capability) => void
 }
 
 // Project and shared skills, pinned ones first, then by use.
-export function SkillsPanel({ desktop, workspace, skills, stats, loading, onChanged, onError }: SkillsPanelProps) {
+export function SkillsPanel({ desktop, workspace, skills, stats, loading, onChanged, onError, onPreview }: SkillsPanelProps) {
   if (!desktop) return <p className="inline-notice">Навыки доступны в настольном приложении.</p>
   const ordered = [...skills].sort((a, b) => Number(!!b.pinned) - Number(!!a.pinned) || (b.uses ?? 0) - (a.uses ?? 0))
   const tiers = stats && [
@@ -100,15 +198,15 @@ export function SkillsPanel({ desktop, workspace, skills, stats, loading, onChan
   ]
   return <>
     <p className="modal-intro">
-      Навык — проверенная процедура, которой агент научился в работе, например поднять изолированное окружение. Агент находит подходящий навык по задаче,
-      применяет его, оценивает результат и дописывает подводные камни, так что набор растёт и улучшается сам. Общие навыки доступны во всех проектах,
-      проектные остаются в своём.
+      Навык — надстройка, которую Orbit делает себе сам, в любой форме: проверенная процедура (например, поднять изолированное окружение), страница
+      с анимацией по завершении задачи, набор скриптов и команд. Инструкции агент находит по задаче, применяет, оценивает результат и дописывает подводные
+      камни; параметры страниц вы меняете здесь. Общие навыки доступны во всех проектах, проектные остаются в своём.
     </p>
     {tiers && <TierBar items={tiers} />}
     <LibraryForm kind="capability" workspace={workspace} onSaved={onChanged} onError={onError} />
     {loading ? <p className="muted">Загружаем навыки…</p> : ordered.length ? ordered.map(entry =>
-      <CapabilityCard key={`${entry.id}-${entry.version}-${entry.uses}-${entry.pinned}`} entry={entry} workspace={workspace}
-        onSaved={onChanged} onError={onError} />,
+      <CapabilityCard key={`${entry.id}-${entry.version}-${entry.uses}-${entry.pinned}-${entry.enabled}-${entry.params?.map(param => String(param.value)).join('|')}`} entry={entry} workspace={workspace}
+        onSaved={onChanged} onError={onError} onPreview={onPreview} />,
     ) : <div className="empty-library">
       <Icon name="skill" size={28} />
       <p>Навыков пока нет. Агент создаёт их по мере работы, когда находит повторяемую процедуру; вы также можете добавить свой.</p>

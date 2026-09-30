@@ -20,7 +20,7 @@ interface QuotaPeeker { peek(id: string): QuotaAssessable | null }
 interface ReplacementsInput { agent: FailoverAgent; catalog?: CatalogEntry[]; pool?: PoolMember[]; models?: Record<string, string | undefined>; quota?: QuotaPeeker | null; config: FailoverConfig; now?: number; relaxed?: boolean; skip?: Set<string> }
 interface Replacement { providerId: string; model: string; tier: number; inPool: boolean; key: string; usedPercent: number | null; reasoningEffort: string }
 interface Target { providerId: string; model?: string | null }
-type HandoverReason = 'approaching' | 'exhausted' | 'replacement-failed'
+type HandoverReason = 'approaching' | 'exhausted' | 'replacement-failed' | 'stalled' | 'failed'
 // The level the runtime hands over: a quota assessment, or the synthetic `{ usedPercent: 100 }` after a refusal.
 type HandoverLevel = Partial<Pick<QuotaLevel, 'usedPercent' | 'resetsAt'>> & { window?: { kind?: string } | null }
 interface HandoverReasonInput { reason: HandoverReason; level?: HandoverLevel | null; error?: unknown }
@@ -109,27 +109,38 @@ function replacements({ agent, catalog = [], pool = [], models = {}, quota, conf
 }
 
 const clock = (time: number | null | undefined): string => Number.isFinite(time) ? new Date(time as number).toISOString().replace('T', ' ').slice(0, 16) + ' UTC' : 'unknown'
+// The error is whatever the provider threw; its message is used when it has one, otherwise the value itself is printed.
+const errorText = (error: unknown): string => String((error as { message?: unknown } | null | undefined)?.message || error).replace(/\s+/g, ' ').slice(0, 200)
 function reasonText({ reason, level, error }: HandoverReasonInput): string {
   if (reason === 'approaching') return `the subscription quota is nearly used up (${level?.usedPercent ?? '?'}% of its ${level?.window?.kind === 'week' ? 'weekly' : '5-hour'} window; it resets ${clock(level?.resetsAt)})`
-  // The error is whatever the provider threw; its message is used when it has one, otherwise the value itself is printed.
-  if (reason === 'replacement-failed') return `the replacement chosen before could not run (${String((error as { message?: unknown } | null | undefined)?.message || error).replace(/\s+/g, ' ').slice(0, 200)})`
+  if (reason === 'replacement-failed') return `the replacement chosen before could not run (${errorText(error)})`
+  if (reason === 'stalled') return `the previous model reported nothing for too long in two turns in a row, and Orbit's watchdog stopped it (${errorText(error)})`
+  if (reason === 'failed') return `the previous model's turn failed with an error (${errorText(error)})`
   return `the provider refused the request because the quota is exhausted${level?.resetsAt ? ` (it resets ${clock(level.resetsAt)})` : ''}`
 }
+// Why the model changed and what cut the last turn off, as the handover note says it.
+const CAUSE: Partial<Record<HandoverReason, [string, string]>> = { stalled: ['the previous one stopped responding', "Orbit's watchdog"], failed: ['the previous one failed with an error', 'the provider error'] }
+const QUOTA_CAUSE: [string, string] = ['of subscription quota', 'the quota refusal']
+// A refusal that says the subscription cannot answer at all, whatever the model: a region or eligibility check, a missing
+// sign-in, a CLI that is not installed. Such a provider is not offered to any agent of the run for a while.
+const UNREACHABLE = /eligib|location is not supported|not (?:currently )?available in your (?:location|country|region)|unsupported (?:country|region|location)|отклонил доступ|not (?:logged|signed) in|must (?:be )?(?:logged|signed) in|(?:log|sign) ?in (?:is )?required|please (?:log|sign) ?in|\b(?:codex|claude|agy|agent) login\b|not authenticated|invalid credentials|unauthori[sz]ed|authentication (?:failed|required|error)|invalid api key|spawn \S+ ENOENT|is not recognized as an internal or external command|command not found/i
+const unreachable = (error: unknown): boolean => UNREACHABLE.test(String((error as { message?: unknown } | null | undefined)?.message ?? error ?? ''))
 const excerpt = (value: unknown, limit: number): string => { const text = String(value ?? '').trim(); return text.length > limit ? `…${text.slice(-limit)}` : text }
 
 // What the newcomer is told. The runtime already keeps the agent's memory outside any model (work log, transcript, team
 // directory, file map), so this states the change, digests the state, and reports what the previous turn left half done.
 function handoverNote({ agent, from, to, reason, level, error, interrupted, team = { running: [], finished: [] }, unread = 0, actions = [] }: HandoverNoteInput): string {
   const files = agent.files || { read: [], wrote: [] }
+  const [cause, cut] = CAUSE[reason] || QUOTA_CAUSE
   const lines = [
-    'HANDOVER: your model changed mid-task because of subscription quota.',
+    `HANDOVER: your model changed mid-task because ${cause}.`,
     `Before: ${targetLabel(from)}. Now: ${targetLabel(to)}. Reason: ${reasonText({ reason, level, error })}.`,
     `You are still the same agent, "${agent.name}" (id=${agent.id}), and your task is unchanged. Orbit keeps your memory outside the model: the WORK LOG, AGENT TRANSCRIPT, TEAM DIRECTORY and FILE MAP in this prompt are the complete record of what you did before the change. Continue from that record; do not restart the task and do not repeat completed calls.`,
     `State at the handover: ${agent.turns} turn(s) taken; files written: ${JSON.stringify(files.wrote.slice(-8))}; files read: ${JSON.stringify(files.read.slice(-6))}; teammates still running: ${JSON.stringify(team.running)}; finished: ${JSON.stringify(team.finished)}; unread messages: ${unread}.`,
   ]
   if (actions.length) lines.push(`Your last recorded actions:\n${actions.map(action => `- ${action}`).join('\n')}`)
   if (interrupted && (interrupted.text || interrupted.actions?.length)) {
-    lines.push('The previous model\'s LAST TURN WAS CUT OFF by the quota refusal, so its result is missing.')
+    lines.push(`The previous model's LAST TURN WAS CUT OFF by ${cut}, so its result is missing.`)
     if (interrupted.text) lines.push(`Text it had streamed before the cut (may be incomplete): ${JSON.stringify(excerpt(interrupted.text, 1500))}`)
     if (interrupted.actions?.length) lines.push(`Native tool actions it had started in that turn (they may already have taken effect):\n${interrupted.actions.map(action => `- ${action}`).join('\n')}`)
     lines.push('Check the real state (read the files, run the check) before repeating any write or command from that turn.')
@@ -140,4 +151,4 @@ function handoverNote({ agent, from, to, reason, level, error, interrupted, team
 }
 
 export type { ModelTiers, FailoverConfig, CatalogEntry, PoolMember, FailoverAgent, QuotaPeeker, ReplacementsInput, Replacement, Target, HandoverReason, HandoverLevel, HandoverNoteInput, InterruptedTurn }
-export { normalizeFailover, tierOf, baselineTier, replacements, handoverNote, reasonText, targetKey, targetLabel, DEFAULTS, LOCAL }
+export { normalizeFailover, tierOf, baselineTier, replacements, handoverNote, reasonText, unreachable, targetKey, targetLabel, DEFAULTS, LOCAL }

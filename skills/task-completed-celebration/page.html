@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>TASK COMPLETED</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<!-- The page needs nothing but its own files and the YouTube player frame. -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src data:; frame-src https://www.youtube.com https://www.youtube-nocookie.com">
+<link rel="stylesheet" href="celebration.css">
+</head>
+<body>
+<div id="stage">
+  <div id="backdrop"></div>
+  <iframe id="video" title="Видео к завершению задачи" hidden
+    allow="autoplay; encrypted-media; fullscreen; picture-in-picture" referrerpolicy="strict-origin-when-cross-origin"></iframe>
+  <canvas id="confetti" aria-hidden="true"></canvas>
+  <div id="flyer" aria-hidden="true"><div id="spin"><div id="words"></div></div></div>
+  <div id="catcher"></div>
+  <div id="hint">Esc или клик — закрыть</div>
+</div>
+<script src="celebration.js"></script>
+</body>
+</html>

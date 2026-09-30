@@ -9,7 +9,7 @@
 //   store      snapshots, coalesced persistence, events, traces, agent updates, chat messages
 //   lifecycle  start, finish, fail, stop, earlier turns of the chat, knowledge housekeeping
 //   agents     the agent tree: creation, scheduling, follow-ups, signals, slots, completion, cancellation
-//   mailbox    team correspondence: send, read, wait, notices, ask_team, the prompt's mail block
+//   mailbox    team correspondence: send, read, wait, notices, ask_team, the user's messages, the prompt's mail block
 //   changes    file activity, change capture, attributed commands, index readiness
 //   turn       one provider turn and its event stream (buffers, streaming, usage, timings)
 //   handover   subscription failover as applied to an agent (preflight, handover, recovery)
@@ -24,6 +24,7 @@ import { parseResponse } from './runtime/envelope.mts'
 import * as store from './runtime/store.mts'
 import * as lifecycle from './runtime/lifecycle.mts'
 import * as agents from './runtime/agents.mts'
+import * as pause from './runtime/pause.mts'
 import * as mailbox from './runtime/mailbox.mts'
 import * as changes from './runtime/changes.mts'
 import * as prompts from './runtime/prompts.mts'
@@ -37,11 +38,11 @@ import * as knowledge from './runtime/knowledge.mts'
 import * as restart from './runtime/restart.mts'
 import type { RestartHost } from './resume.mts'
 import type {
-  AgentRecord, AgentRef, AgentResult, ApprovalHandler, ApprovalRequest, CapabilityStoreLike, CatalogLike, ChangeDescription, ChangeInput,
+  AgentRecord, AgentRef, AgentResult, ApprovalHandler, Attachment, ApprovalRequest, CapabilityStoreLike, CatalogLike, ChangeDescription, ChangeInput,
   CloseSession, Communication, CommunicationDelivery, CommunicationStatus, ContextStoreLike, FileAction, FileWrite, HandoverRequest,
   McpApproveRequest, McpServerLike, MemoryEntry, MemoryStoreLike, OrbitRuntimeLike, OrbitRuntimeOptions, ProjectIndexLike, PromptBase,
   ProviderEvent, QuotaMonitorLike, RestartMark, RunProvider, RunRecord, RunStoreLike, RuntimeEventData, RuntimeListener, SessionInfo, SessionRef,
-  StartPayload, StreamState, ToolArgs, ToolRegistryLike, TranscriptEntry, TransportFor, UsageFigures, WorkspaceContext,
+  StartPayload, StreamState, ToolArgs, ToolRegistryLike, TraceImage, TranscriptEntry, TransportFor, UsageFigures, WorkspaceContext,
 } from './types.mts'
 const { DEFAULT_LIMITS, normalizeLimits } = lifecycle
 // Captured at load; session.mts compares an instance's runProvider against the same value. main.cjs passes the providers
@@ -104,7 +105,7 @@ class OrbitRuntime implements OrbitRuntimeLike {
   persistenceError(run: RunRecord, error: Error) { return store.persistenceError(this, run, error) }
   schedulePersist(run: RunRecord, delay?: number) { return store.schedulePersist(this, run, delay) }
   emit(run: RunRecord, type: string, data?: RuntimeEventData, persist?: boolean) { return store.emit(this, run, type, data, persist) }
-  trace(run: RunRecord, agentId: string, kind: string, text: string, id?: string) { return store.trace(this, run, agentId, kind, text, id) }
+  trace(run: RunRecord, agentId: string, kind: string, text: string, id?: string, images?: TraceImage[]) { return store.trace(this, run, agentId, kind, text, id, images) }
   updateAgent(run: RunRecord, agent: AgentRecord, patch: Partial<AgentRecord>, persist?: boolean) { return store.updateAgent(this, run, agent, patch, persist) }
   message(run: RunRecord, agent: AgentRecord, text: string, kind?: string) { return store.message(this, run, agent, text, kind) }
   pruneRuns() { return store.pruneRuns(this) }
@@ -117,6 +118,9 @@ class OrbitRuntime implements OrbitRuntimeLike {
   failRun(run: RunRecord, error: Error) { return lifecycle.failRun(this, run, error) }
   cancelAgents(run: RunRecord, detail: string) { return lifecycle.cancelAgents(this, run, detail) }
   stop(runId: string) { return lifecycle.stop(this, runId) }
+  pauseAgent(runId: string, agentId: string) { return pause.pauseAgent(this, runId, agentId) }
+  resumeAgent(runId: string, agentId: string) { return pause.resumeAgent(this, runId, agentId) }
+  stopAgent(runId: string, agentId: string) { return pause.stopAgent(this, runId, agentId) }
   markRestarting(runId: string, mark?: RestartMark) { return lifecycle.markRestarting(this, runId, mark) }
   // ---- restart: restart_orbit's host ----
   setRestartHost(host: RestartHost | null) { return restart.setRestartHost(this, host) }
@@ -147,6 +151,8 @@ class OrbitRuntime implements OrbitRuntimeLike {
   waitAgentMessage(run: RunRecord, agent: AgentRecord, args: ToolArgs) { return mailbox.waitAgentMessage(this, run, agent, args) }
   mailboxContext(run: RunRecord, agent: AgentRecord) { return mailbox.mailboxContext(this, run, agent) }
   askTeam(run: RunRecord, sender: AgentRecord, args: ToolArgs) { return mailbox.askTeam(this, run, sender, args) }
+  postUserMessage(runId: string, agentId: string, text: unknown, attachments?: Attachment[]) { return mailbox.postUserMessage(this, runId, agentId, text, attachments) }
+  userMail(run: RunRecord, agent: AgentRecord) { return mailbox.userMail(this, run, agent) }
   // ---- prompts: what an agent is told ----
   teamContext(run: RunRecord, agent: AgentRecord) { return prompts.teamContext(this, run, agent) }
   fileMapContext(run: RunRecord) { return prompts.fileMapContext(this, run) }
@@ -195,7 +201,7 @@ class OrbitRuntime implements OrbitRuntimeLike {
   executeAgent(run: RunRecord, agent: AgentRecord) { return loops.executeAgent(this, run, agent) }
   envelopeLoop(run: RunRecord, agent: AgentRecord, signal: AbortSignal) { return loops.envelopeLoop(this, run, agent, signal) }
   sessionLoop(run: RunRecord, agent: AgentRecord, signal: AbortSignal) { return loops.sessionLoop(this, run, agent, signal) }
-  wakeInstruction(pending: TranscriptEntry[], mailboxText: string) { return loops.wakeInstruction(this, pending, mailboxText) }
+  wakeInstruction(pending: TranscriptEntry[], mailboxText: string, fromUser?: boolean) { return loops.wakeInstruction(this, pending, mailboxText, fromUser) }
   // ---- session: transport, MCP server, tokens, MCP handlers ----
   prepareSession(run: RunRecord, agent: AgentRecord) { return session.prepareSession(this, run, agent) }
   releaseSession(run: RunRecord, agent: AgentRecord) { return session.releaseSession(this, run, agent) }

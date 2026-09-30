@@ -47,7 +47,7 @@ const REAP_WAIT_MS = 5000
  * (runtime:start, memory:save, …) fails, as does every call a crash or a shutdown interrupts.
  */
 const REPEATABLE = new Set([
-  'runtime:list', 'runtime:get', 'runtime:changes', 'state:load', 'state:save', 'project-index:status',
+  'runtime:list', 'runtime:get', 'runtime:changes', 'runtime:image', 'state:load', 'state:save', 'project-index:status',
   'memory:list', 'memory:stats', 'capabilities:list', 'capabilities:read', 'providers:health', 'quota:get',
 ])
 

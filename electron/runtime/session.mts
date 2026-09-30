@@ -1,6 +1,8 @@
 // The session transport's plumbing: which transport an agent gets, the in-process MCP server and its tokens, the
 // tools/list, approve and tools/call handlers the server calls back into, and closing sessions when a run ends.
 import { randomUUID } from 'node:crypto'
+import { pausedBy } from './pause.mts'
+import { publishProgress } from './turn.mts'
 import type { ActiveTurn, AgentRecord, CloseSession, McpApproveRequest, McpDispatchResult, McpServerLike, Observation, OrbitRuntimeLike, RunRecord, SessionRef, ToolCall, ToolRegistryLike, ToolSpec, Transport } from '../types.mts'
 // A token as the MCP server hands it back, or the { runId, agentId } it resolved itself.
 type SessionToken = string | SessionRef | null | undefined
@@ -229,20 +231,21 @@ async function approveMcp(runtime: OrbitRuntimeLike, token: SessionToken, reques
 }
 // One Orbit tool call arriving over MCP while the agent's provider turn runs. Executed exactly as an envelope call
 // (ledger, work log, file activity, change capture, traces, transcript), with the model slot released around a
-// waiting tool. Never throws: the result carries `ok`, the observation text and the agent's unread-mail count, which
-// the server appends as a suffix.
+// waiting tool. Never throws: the result carries `ok`, the observation text (followed by the user's messages that came
+// in during the turn) and the agent's unread-mail count, which the server appends as a suffix.
 async function dispatchMcp(runtime: OrbitRuntimeLike, token: SessionToken, name: string, args: unknown = {}): Promise<McpDispatchResult> {
   const session = runtime.sessionFor(token)
   if (!session) return { ok: false, error: 'Unknown or expired Orbit session token', text: JSON.stringify({ ok: false, error: 'Unknown or expired Orbit session token' }), unread: 0 }
   const { run, agent } = session
   const refuse = (error: string): McpDispatchResult => ({ ok: false, error, observation: { ok: false, error }, text: JSON.stringify({ ok: false, error }), unread: runtime.pendingMail(run, agent).length })
   if (TERMINAL.has(run.status) || AGENT_TERMINAL.has(agent.status)) return refuse('This agent is no longer active')
+  if (pausedBy(run, agent)) return refuse('Paused by the user')
   const signal = runtime.agentSignal(run, agent)
   if (signal.aborted) return refuse('Run cancelled')
   const raw = args && typeof args === 'object' && !Array.isArray(args) ? args : null
   const call: ToolCall = { id: randomUUID(), name: String(name || ''), arguments: raw ? Object.fromEntries(Object.entries(raw).filter(([, value]) => value !== null)) : { __invalidArguments: true } }
   const turn = agent.activeTurn
-  if (turn) turn.timing.orbitToolCalls++
+  if (turn) { turn.timing.orbitToolCalls++; publishProgress(runtime, run, agent) }
   runtime.trace(run, agent.id, 'tool', `${call.name} ${bounded(call.arguments, 1200)}`)
   const waits = WAIT_TOOLS.has(call.name)
   const limit = callLimit(agent), calledAt = Date.now()
@@ -314,7 +317,9 @@ async function dispatchMcp(runtime: OrbitRuntimeLike, token: SessionToken, name:
     ? `${call.name} ${clip(call.name === 'run_command' ? [call.arguments.command, ...(Array.isArray(call.arguments.args) ? call.arguments.args : [])].join(' ') : JSON.stringify(call.arguments), 110)} → still running after ${span(parked)} (the same call again collects the result)`
     : `${describeCall(call, observation as Record<string, unknown>, failure, id => run.agentNodes.get(id)?.name || id)}${answer !== observation ? ` (cut at ${span(limit)}, still running)` : ''}`
   runtime.recordLedger(agent, call.name, `#${agent.turns} ${logged}`)
+  // What the user wrote to the agent during this turn rides on the result, whole (userMail marks it read).
   const text = bounded(answer, call.name === 'capability_read' ? Math.max(run.limits.maxOutputChars, SKILL_READ_CHARS) : run.limits.maxOutputChars)
+    + (turn && agent.activeTurn === turn && !signal.aborted ? runtime.userMail(run, agent) : '')
   runtime.remember(agent, { type: 'tool_result', tool_call_id: call.id, name: call.name, result: text, via: 'mcp' })
   runtime.trimTranscript(run, agent)
   runtime.trace(run, agent.id, 'observation', `${call.name}: ${bounded(answer, 4000)}`)

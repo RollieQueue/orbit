@@ -1,5 +1,5 @@
 // @ts-check
-const { app, BrowserWindow, dialog, ipcMain, session, shell, utilityProcess } = require('electron')
+const { app, BrowserWindow, dialog, ipcMain, protocol, session, shell, utilityProcess } = require('electron')
 const { execFile, spawn } = require('node:child_process')
 const fs = require('node:fs')
 const os = require('node:os')
@@ -9,6 +9,7 @@ const { createIpcHandlers, registerIpcHandlers } = require('./ipc-handlers.cjs')
 const { createRuntimeClient, utilityFork } = require('./runtime-client.cjs')
 const { ERROR_CODES } = require('./runtime-protocol.mts')
 const git = require('./git.mts')
+const { SKILL_SCHEME, SKILLS_DIR, resolvePackageFile, mimeType } = require('./skill-files.mts')
 
 // The shell. Main keeps the window, the dialogs, `shell`, the health reports and the restarts; the runtime (agents,
 // stores, providers, quotas, the Orbit MCP server) runs in a child process that electron/runtime-client.cjs drives
@@ -130,6 +131,9 @@ const startGeneration = beginGeneration('full')
 let rendererGeneration = startGeneration
 
 if (process.env.ORBIT_USER_DATA) app.setPath('userData', path.resolve(process.env.ORBIT_USER_DATA))
+// A skill's pages load from orbit-skill://<package>/<file> (serveSkillPages): a standard, secure scheme of its own, so a
+// page is an origin apart from the window's. Schemes are registered before the app is ready.
+protocol.registerSchemesAsPrivileged([{ scheme: SKILL_SCHEME, privileges: { standard: true, secure: true, supportFetchAPI: true, stream: true } }])
 
 /**
  * Which restart a second instance asks the running one for. additionalData is the reliable channel (Chromium may
@@ -795,6 +799,8 @@ function createWindow(generation) {
       preload: path.join(__dirname, 'preload.cjs'),
       contextIsolation: true,
       nodeIntegration: false,
+      // An action skill's celebration starts its video with sound, with no click first.
+      autoplayPolicy: 'no-user-gesture-required',
     },
   })
 
@@ -805,6 +811,13 @@ function createWindow(generation) {
   })
   win.webContents.on('will-navigate', (event, url) => {
     if (url !== win.webContents.getURL()) event.preventDefault()
+  })
+  // A skill page (orbit-skill://) stays in its own package: its frame may not be sent to another address, which could
+  // carry data away in the URL (the page's CSP, serveSkillPages, already closes fetch, images, forms and other frames).
+  win.webContents.on('will-frame-navigate', (details) => {
+    const from = details.frame?.url
+    if (details.isMainFrame || !from || !skillFrame(from)) return
+    if (!sameSkillPackage(from, details.url)) details.preventDefault()
   })
 
   // Unpackaged, the renderer is ../dist/index.html of this repository (npm run build); packaged, the same path inside app.asar.
@@ -843,6 +856,23 @@ function createWindow(generation) {
 // and every handler runs behind the sender guard.
 registerIpcHandlers(ipcMain, createIpcHandlers({
   dialog, shell, getGitContext, cloneGitWorkspace, relaunchApp, restartRuntime, runtimeStatus, startedAt,
+  setFullScreen: (sender, on) => {
+    const win = BrowserWindow.fromWebContents(sender)
+    if (!win || win.isDestroyed()) return false
+    const was = win.isFullScreen()
+    if (was !== on) win.setFullScreen(on)
+    return was
+  },
+  // Only what Orbit keeps for the user: an attached file, a skill package (or those folders themselves).
+  openPath: async (target) => {
+    const resolved = path.resolve(String(target || ''))
+    const inside = ['attachments', SKILLS_DIR].some((name) => {
+      const relative = path.relative(path.join(app.getPath('userData'), name), resolved)
+      return !relative.startsWith('..') && !path.isAbsolute(relative)
+    })
+    if (!target || !inside) throw new Error('Only Orbit attachments and skill packages can be opened')
+    return shell.openPath(resolved)
+  },
   // The window's runtime restart waits for the start's report, as the --restart-runtime signal does; there is nothing
   // to wait for when restartRuntime refuses anyway (no runtime yet, or it runs inside main).
   whenStarted: () => (client && runtimeMode === 'child' ? started : Promise.resolve()),
@@ -850,7 +880,53 @@ registerIpcHandlers(ipcMain, createIpcHandlers({
   isHealthy: () => lastReportOk,
 }), { isDev })
 
+// YouTube's embedded player refuses to play without a web Referer ("Video player configuration error", code 153), and a
+// page loaded from file:// or orbit-skill:// sends none or its own scheme's: the embed request of a skill page gets one
+// here. Requests that carry an http(s) Referer (the player's own ones) are left as they are.
+const EMBED_REFERER = 'https://orbit.local/'
+function allowVideoEmbeds() {
+  session.defaultSession.webRequest.onBeforeSendHeaders({ urls: ['https://www.youtube.com/*', 'https://www.youtube-nocookie.com/*'] }, (details, callback) => {
+    const headers = details.requestHeaders
+    const referer = headers.Referer || headers.referer
+    if (!referer || !/^https?:/i.test(referer)) { delete headers.referer; headers.Referer = EMBED_REFERER }
+    callback({ requestHeaders: headers })
+  })
+}
+
+// What a skill page may reach: its own package, inline code and styles, data: and blob: media, and the YouTube player
+// frame; no other host, so a page an agent wrote cannot send what it read anywhere (fetch, images, forms, frames).
+const SKILL_PAGE_CSP = [
+  "default-src 'self'", "script-src 'self' 'unsafe-inline'", "style-src 'self' 'unsafe-inline'", "img-src 'self' data: blob:",
+  "media-src 'self' data: blob:", "font-src 'self' data:", "connect-src 'self'", "frame-src https://www.youtube.com https://www.youtube-nocookie.com",
+  "form-action 'none'", "base-uri 'none'", "object-src 'none'",
+].join('; ')
+/** @param {string | undefined} url */
+const skillFrame = (url) => typeof url === 'string' && url.startsWith(`${SKILL_SCHEME}://`)
+/** Whether `to` is a page of the same skill package as `from` (both orbit-skill:// URLs). @param {string} from @param {string} to */
+function sameSkillPackage(from, to) {
+  try { return skillFrame(to) && new URL(from).host === new URL(to).host } catch { return false }
+}
+
+// orbit-skill://<package>/<file>: the file of that skill package folder (electron/skill-files.mts keeps the path inside
+// it), read-only and never cached; anything else is 404. The window shows such a page in a sandboxed frame.
+function serveSkillPages() {
+  const userData = app.getPath('userData')
+  protocol.handle(SKILL_SCHEME, async (request) => {
+    let file = null
+    try {
+      const url = new URL(request.url)
+      file = resolvePackageFile(userData, url.hostname, decodeURIComponent(url.pathname.replace(/^\/+/, '')))
+    } catch { /* A malformed URL is not found. */ }
+    if (!file) return new Response('Not found', { status: 404 })
+    try {
+      return new Response(await fs.promises.readFile(file), { headers: { 'content-type': mimeType(file), 'cache-control': 'no-store', 'content-security-policy': SKILL_PAGE_CSP } })
+    } catch { return new Response('Not found', { status: 404 }) }
+  })
+}
+
 app.whenReady().then(() => {
+  allowVideoEmbeds()
+  serveSkillPages()
   client = startRuntime()
   createWindow(startGeneration)
 

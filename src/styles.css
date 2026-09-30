@@ -119,6 +119,21 @@
 @media(max-width:700px){.chat-notices{margin-left:38px}}
 /* Orbit restarts: a run that ended by restarting Orbit, its link to the continuation, and the runtime process line. */
 .status-dot.restarting{background:#9fc3d6}
+.status-dot.paused{background:#e0b566;box-shadow:0 0 0 3px #e0b56618}
+.agent-graph-node.paused circle{fill:#e0b566}
+.pause-button{background:#3d4942;color:#d5e9dd;border:1px solid #78897f}
+.pause-button:hover:not(:disabled){background:#4a574f;color:#eef8f1}
+.pause-button.paused{background:#e0b566;color:#2b2413;border-color:#e0b566}
+.pause-button.paused:hover:not(:disabled){background:#ecc67d;color:#221b0d}
+.agent-controls{flex-shrink:0;margin:10px 18px 0;display:flex;flex-direction:column;gap:6px;min-width:0}
+.agent-controls-buttons{display:flex;flex-wrap:wrap;gap:6px}
+.agent-controls-buttons button{display:inline-flex;align-items:center;gap:6px;height:28px;padding:0 10px;font-size:11.5px;background:#242a2b;color:#d5e3da;border:1px solid #3a4546;border-radius:7px}
+.agent-controls-buttons button:hover:not(:disabled){background:#2d3536;border-color:#5b6b62}
+.agent-controls-buttons button.danger{color:#e0b3b3;border-color:#5a4040}
+.agent-controls-buttons button.danger:hover:not(:disabled){background:#3a2b2b;border-color:#7d5555}
+.agent-controls-buttons button:disabled{opacity:.55;cursor:default}
+.agent-controls-note,.agent-controls .agent-message-error{margin:0;font-size:10.5px;line-height:1.5;color:#8b9c90;overflow-wrap:anywhere}
+.agent-controls .agent-message-error{color:#e0a9a9}
 .run-notice.restarting{background:#232a30;border-color:#35434d;color:#b5cad8}
 .chat-notices .restarting{color:#a9c6d8}
 .run-resume-links{display:flex;flex-wrap:wrap;gap:6px 14px;padding:0 18px 14px;margin-top:-8px;font-size:10px;color:#8fa5b3}
@@ -129,3 +144,5 @@
 .runtime-label.fading{animation:runtime-fade 6s ease-in forwards}
 @keyframes runtime-fade{0%,70%{opacity:1}100%{opacity:0}}
 .runtime-result.ok{color:#b1d6bc}.runtime-result.failed{color:#e0a9a9}
+.composer-actions{display:flex;gap:7px;flex-shrink:0}.agent-message{flex-shrink:0;border-top:1px solid #2c2f34;padding:10px 14px 12px}.agent-message form{display:flex;align-items:flex-end;gap:8px;border:1px solid #3a3e45;border-radius:9px;background:#1c1e22;padding:6px 6px 6px 9px}.agent-message form:focus-within{border-color:#677b6d}.agent-message textarea{border:0;background:transparent;padding:2px 0;resize:none;font-size:11px;line-height:1.6;color:#e0e6e1}.agent-message .send-button{width:28px;height:28px;border-radius:7px}.agent-message-hint,.agent-message-error{font-size:10px;line-height:1.6;color:#8b9c90;margin:0 0 7px}.agent-message-error{color:#e0a9a9;margin:7px 0 0;overflow-wrap:anywhere}
+.loop-banner{display:flex;align-items:center;gap:10px;padding:9px 28px;background:#232924;color:#bbcdbf;border-bottom:1px solid #343e36;font-size:11px;line-height:1.6}.loop-banner>span:nth-child(2){flex:1;min-width:0}.loop-banner strong{font-weight:600;color:#d2e5d9}.loop-banner button{font-size:10px;text-decoration:underline;text-underline-offset:3px;white-space:nowrap}

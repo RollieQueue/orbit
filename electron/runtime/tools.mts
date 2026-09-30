@@ -5,14 +5,13 @@ import { randomUUID } from 'node:crypto'
 import { executeWorkspaceTool, WORKSPACE_TOOLS } from '../runtime-tools.mts'
 import { projectPacket, saveNote } from '../shared-context.mts'
 import * as chatMemory from '../chat-memory.mts'
-import { ceiling, bounded, clip, abortable, oneOf } from './util.mts'
+import { ceiling, bounded, clip, abortable } from './util.mts'
 import { noteIndex } from './prompts.mts'
+import { ranOnFields } from './agents.mts'
 import * as knowledge from './knowledge.mts'
 import * as restart from './restart.mts'
-import type { AgentRecord, ApprovalRequest, Communication, ImprovementStatus, ImprovementTask, Observation, OrbitRuntimeLike, RunRecord, TaskStatus, ToolArgs, WorkspaceContext } from '../types.mts'
-
-const PLAN_STATUSES: readonly ImprovementStatus[] = ['planning', 'implementing', 'completed', 'blocked']
-const TASK_STATUSES: readonly TaskStatus[] = ['pending', 'working', 'done', 'blocked']
+import * as improvement from './improvement.mts'
+import type { AgentRecord, ApprovalRequest, Communication, Observation, OrbitRuntimeLike, RunRecord, ToolArgs, WorkspaceContext } from '../types.mts'
 
 async function approve(runtime: OrbitRuntimeLike, run: RunRecord, agent: AgentRecord, request: ApprovalRequest, signal: AbortSignal = runtime.agentSignal(run, agent)): Promise<boolean> {
   if (signal.aborted || !runtime.requestApproval) return false
@@ -42,20 +41,7 @@ async function executeTool(runtime: OrbitRuntimeLike, run: RunRecord, agent: Age
   if (name === 'improvement_plan') {
     if (agent.id !== 'root') throw new Error('Only the orchestrator can update the improvement plan')
     if (!run.improvementMode) throw new Error('Improvement mode is disabled')
-    if (!oneOf(PLAN_STATUSES, args.status) || !Array.isArray(args.tasks)) throw new Error('Invalid improvement plan')
-    const tasks = args.tasks.map((item): ImprovementTask => {
-      if (!item.id || !item.title || !oneOf(TASK_STATUSES, item.status)) throw new Error('Invalid improvement task')
-      if (['done', 'blocked'].includes(item.status) && !String(item.evidence || '').trim()) throw new Error('Done/blocked tasks require evidence')
-      return { id: String(item.id), title: String(item.title), status: item.status, evidence: String(item.evidence || '') }
-    })
-    if (new Set(tasks.map(item => item.id)).size !== tasks.length) throw new Error('Task ids must be unique')
-    if (run.improvements.some(old => old.status !== 'done' && !tasks.some(item => item.id === old.id))) throw new Error('Unfinished tasks cannot be silently removed')
-    if (args.status === 'completed' && (!tasks.length || tasks.some(item => item.status !== 'done'))) throw new Error('Completion requires verified tasks; if none are actionable, record a verified audit task')
-    if (args.status === 'blocked' && !tasks.some(item => item.status === 'blocked')) throw new Error('Blocked plan requires a documented blocker')
-    run.improvements = tasks; run.improvementStatus = args.status
-    run.sharedContext = saveNote(runtime.contextStore, run.workspace, run.sharedContext, { key: `progress:${run.chatId}`, summary: JSON.stringify({ request: run.prompt, status: args.status, tasks }) })
-    runtime.emit(run, 'run.info', { improvements: tasks, improvementStatus: args.status })
-    return { ok: true, status: args.status, tasks }
+    return improvement.updatePlan(runtime, run, args)
   }
   if (name === 'model_evaluate' || name === 'memory_search' || name === 'memory_save' || name === 'memory_forget' || name.startsWith('capability_')) return knowledge.executeKnowledgeTool(runtime, run, agent, name, args)
   if (name === 'restart_orbit') return restart.executeRestart(runtime, run, agent, args)
@@ -122,7 +108,8 @@ async function executeTool(runtime: OrbitRuntimeLike, run: RunRecord, agent: Age
     await runtime.waitForTeam(run, agent, children, timeout)
     return children.map((child) => {
       if (['done', 'error', 'cancelled'].includes(child.status)) agent.seenChildren.add(runtime.resultKey(child))
-      return { agentId: child.id, generation: child.generation, status: child.status, result: child.result, error: child.error }
+      // The model fields come before the result: a long result is cut at its end.
+      return { agentId: child.id, generation: child.generation, status: child.status, providerId: child.providerId, model: child.model, ...ranOnFields(child), result: child.result, error: child.error }
     })
   }
   throw new Error(`Unknown tool: ${name}`)

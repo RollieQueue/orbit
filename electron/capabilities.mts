@@ -5,9 +5,14 @@ import { TextIndex, uniqueTerms, similarity, signature } from './text-index.mts'
 import type { IndexField } from './text-index.mts'
 import { projectReferences, scrub } from './scope-guard.mts'
 import { oneLine } from './text.mts'
+import { skillPackageDir, skillPackageId } from './skill-files.mts'
+import { applyPackage, checkCommands, checkParams, checkSourceDir, checkTriggers, checkValues, planPackage, readFolder, removePackage, reviveCommands, reviveFiles, reviveParams, reviveTriggers } from './skill-packages.mts'
+import type { Manifest } from './skill-packages.mts'
+import type { SkillCommand, SkillFile, SkillPackage, SkillParam, SkillTrigger } from './types.mts'
 
-// Skills: what agents learned to do and can do again. A skill is a versioned, self-contained procedure. Beyond the
-// text it carries what makes the library improve by use instead of just growing: how often it was used, whether
+// Skills: what agents built or learned to do and can do again. A skill is a versioned add-on of any form: a procedure, or a
+// package (pages, scripts, assets in its own folder, electron/skill-packages.mts) with parameters, triggers and commands.
+// Beyond the text it carries what makes the library improve by use instead of just growing: how often it was used, whether
 // it worked, and the pitfalls agents ran into. Retrieval ranks by relevance and track record; the library is
 // capped per scope and what nobody uses, or what keeps failing, is pruned.
 const DAY = 86400000
@@ -32,6 +37,9 @@ interface Skill {
   source: string; editedBy?: string; version: number; updatedAt: string; revisions: SkillRevision[]
   created: string; lastUsed: string; uses: number; successes: number; failures: number
   lessons: string[]; usedIn: string[]; pinned: boolean; dupOf?: string
+  // Agents see only enabled skills. The package's files live in skillPackageDir(userData, id); the lists here are its current
+  // state (revisions keep the text only). Params hold the user's values next to the defaults.
+  enabled: boolean; files: SkillFile[]; params: SkillParam[]; triggers: SkillTrigger[]; commands: SkillCommand[]
   // An older version's stamp, read only where `updatedAt` may be missing.
   updated?: string
 }
@@ -39,9 +47,12 @@ interface Skill {
 type StoredSkill = { [Field in keyof Skill]?: unknown }
 const isStoredSkill = (value: unknown): value is StoredSkill => !!value && typeof (value as { instructions?: unknown }).instructions === 'string'
 // What `save`/`install` accept from the UI or an agent; nothing in it is trusted before it is checked.
-interface SkillInput { id?: unknown; scope?: unknown; workspace?: unknown; name?: unknown; description?: unknown; whenToUse?: unknown; instructions?: unknown; source?: unknown }
-// A skill as lists and search results show it: without the instructions and revisions, with its reliability.
-interface SkillSummary extends Omit<Skill, 'instructions' | 'revisions'> { reliability: number }
+interface SkillInput {
+  id?: unknown; scope?: unknown; workspace?: unknown; name?: unknown; description?: unknown; whenToUse?: unknown; instructions?: unknown; source?: unknown
+  files?: unknown; removeFiles?: unknown; fromDir?: unknown; params?: unknown; triggers?: unknown; commands?: unknown
+}
+// A skill as lists and search results show it: without the instructions and revisions, with its reliability and, when it has files, where they are.
+interface SkillSummary extends Omit<Skill, 'instructions' | 'revisions'> { reliability: number; package?: SkillPackage }
 interface SkillRank { entry: Skill; relevance: number; matched: number; score: number }
 interface SkillSuggestion { skills: Array<SkillSummary & { relevant: boolean }>; total: number }
 interface SaveResult { entry: Skill; merged: boolean; improved?: string; evicted: number }
@@ -53,13 +64,17 @@ interface Print { stamp?: string; text: Set<string>; title: Set<string> }
 const shortId = (id: string): string => id.length <= 14 ? id : id.slice(0, 12)
 const groupKey = (entry: Pick<Skill, 'scope' | 'workspace'>): string => `${entry.scope}|${entry.workspace || ''}`
 const authored = (entry: Skill): boolean => entry.source === 'user'
-const isProtected = (entry: Skill): boolean => entry.pinned === true || authored(entry)
+// A package is something the user may rely on (a page Orbit shows, commands agents run), so it is protected like a pinned or
+// user-written skill: never expired, evicted or merged.
+const hasPackage = (entry: Pick<Skill, 'files' | 'triggers' | 'commands'>): boolean => entry.files.length > 0 || entry.triggers.length > 0 || entry.commands.length > 0
+const isProtected = (entry: Skill): boolean => entry.pinned === true || authored(entry) || hasPackage(entry)
 const reliability = (entry: { successes?: number; failures?: number }): number => ((entry.successes || 0) + 1) / ((entry.successes || 0) + (entry.failures || 0) + 2)
 const fingerprint = (name: string, text: string): Print => ({ text: uniqueTerms(`${name} ${text}`), title: uniqueTerms(name) })
 const isPrint = (value: Skill | Print): value is Print => Boolean((value as Print).text)
 
 class CapabilityStore {
   declare file: string
+  declare userData: string
   declare clock: () => number
   declare key: (workspace: unknown) => string
   declare index: TextIndex
@@ -69,6 +84,7 @@ class CapabilityStore {
   declare entries: Skill[]
   constructor(userDataPath: string, { clock = Date.now }: { clock?: () => number } = {}) {
     this.file = path.join(userDataPath, 'capabilities.json')
+    this.userData = userDataPath
     this.clock = clock
     this.key = keyCache()
     this.index = new TextIndex()
@@ -84,13 +100,16 @@ class CapabilityStore {
   // `indexable`/`visible` wherever a skill is looked at.
   revive(entry: StoredSkill): Skill {
     const stamp = typeof entry.updatedAt === 'string' ? entry.updatedAt : new Date(this.clock()).toISOString()
-    return {
+    const revived = {
       ...entry, id: typeof entry.id === 'string' && entry.id ? entry.id : randomUUID(),
       ...(entry.workspace ? { workspace: this.key(entry.workspace) } : {}),
       description: entry.description || '', whenToUse: entry.whenToUse || '', updatedAt: stamp, created: entry.created || stamp, lastUsed: entry.lastUsed || stamp,
       uses: entry.uses || 0, successes: entry.successes || 0, failures: entry.failures || 0,
       lessons: Array.isArray(entry.lessons) ? entry.lessons : [], usedIn: Array.isArray(entry.usedIn) ? entry.usedIn : [], pinned: entry.pinned === true,
+      enabled: entry.enabled !== false, files: reviveFiles(entry.files), params: reviveParams(entry.params),
+      triggers: reviveTriggers(entry.triggers), commands: reviveCommands(entry.commands),
     } as Skill
+    return revived
   }
   indexable(entry: Skill): boolean { return entry.scope === 'global' || (entry.scope === 'project' && !!entry.workspace) }
   fields(entry: Skill): IndexField[] { return [[entry.name, 3], [entry.whenToUse, 2], [entry.description, 2], [entry.instructions, 1]] }
@@ -126,7 +145,10 @@ class CapabilityStore {
 
   present(entry: Skill): SkillSummary {
     const { instructions, revisions, ...rest } = entry
-    return { ...clone(rest), reliability: Math.round(reliability(entry) * 100) / 100 }
+    return { ...clone(rest), ...this.packageOf(entry), reliability: Math.round(reliability(entry) * 100) / 100 }
+  }
+  packageOf(entry: Skill): { package?: SkillPackage } {
+    return entry.files.length ? { package: { id: skillPackageId(entry.id), dir: skillPackageDir(this.userData, entry.id) } } : {}
   }
 
   list(workspace?: string | null, includeGlobal = true): SkillSummary[] { return this.visible(workspace, includeGlobal).map(entry => this.present(entry)) }
@@ -143,12 +165,13 @@ class CapabilityStore {
   }
   search(query: unknown, workspace: string | null | undefined, limit = 8, includeGlobal = true): SkillSummary[] {
     const empty = !uniqueTerms(query).size
-    return this.rank(query, this.distinct(workspace, includeGlobal)).filter(item => empty || item.matched > 0).sort((a, b) => b.score - a.score)
+    return this.rank(query, this.distinct(workspace, includeGlobal).filter(entry => entry.enabled !== false)).filter(item => empty || item.matched > 0).sort((a, b) => b.score - a.score)
       .slice(0, Math.max(1, Math.min(20, Number(limit) || 8))).map(item => this.present(item.entry))
   }
   // For a prompt: the skills that match the task, then a few proven ones so the agent knows the library has more.
+  // Disabled skills are hidden from agents, and a skill with a trigger and no commands is app behaviour (a page Orbit shows), not a procedure an agent could follow.
   suggest(query: unknown, workspace: string | null | undefined, limit = 6, includeGlobal = true): SkillSuggestion {
-    const ranked = this.rank(query, this.distinct(workspace, includeGlobal))
+    const ranked = this.rank(query, this.distinct(workspace, includeGlobal).filter(entry => entry.enabled !== false && !(entry.triggers.length && !entry.commands.length)))
     const relevant = ranked.filter(item => item.matched >= 1).sort((a, b) => b.score - a.score).slice(0, limit)
     const proven = ranked.filter(item => item.matched < 1 && item.entry.uses > 0 && reliability(item.entry) >= 0.5).sort((a, b) => this.value(b.entry) - this.value(a.entry)).slice(0, Math.min(3, limit - relevant.length))
     return { skills: [...relevant, ...proven].map(item => ({ ...this.present(item.entry), relevant: item.matched >= 1 })), total: ranked.length }
@@ -162,17 +185,17 @@ class CapabilityStore {
     const prefixed = wanted.length >= 6 ? visible.filter(entry => entry.id.startsWith(wanted)) : []
     return prefixed.length === 1 ? prefixed[0] : null
   }
-  read(id: unknown, workspace: string | null | undefined, includeGlobal = true): Skill {
+  read(id: unknown, workspace: string | null | undefined, includeGlobal = true): Skill & { package?: SkillPackage } {
     const entry = this.find(id, workspace, includeGlobal)
     if (!entry) throw new Error('Capability was not found in this project or shared library')
-    return clone(entry)
+    return { ...clone(entry), ...this.packageOf(entry) }
   }
 
   commit(next: Skill[], changed: Skill[] = [], removed: string[] = []): void {
     writeJSON(this.file, next)
     this.entries = next
     this.dirty = false
-    for (const id of removed) { this.index.delete(id); this.prints.delete(id) }
+    for (const id of removed) { this.index.delete(id); this.prints.delete(id); removePackage(skillPackageDir(this.userData, id)) }
     for (const entry of changed) if (this.indexable(entry)) this.index.set(entry.id, this.fields(entry))
   }
 
@@ -184,37 +207,54 @@ class CapabilityStore {
   }
 
   // origin 'agent' is bounded, and a skill that says what an existing one says improves that one instead of duplicating it.
-  // Track-record fields are never taken from the input: they change only through use and feedback.
+  // Track-record fields are never taken from the input: they change only through use and feedback. Everything the input says is
+  // validated (files included) before anything is written; a save that fails leaves the disk and the entry as they were.
+  // Package fields left out keep what the skill has, an empty list clears; `fromDir` replaces the files and its skill.json fills
+  // the fields the call does not give.
   save(input: SkillInput, { origin = 'user' }: { origin?: 'user' | 'agent' } = {}): SaveResult {
     if (!input || typeof input !== 'object') throw new Error('Capability is required')
-    const scope: SkillScope = input.scope === 'global' ? 'global' : 'project'
+    const guarded = origin === 'agent'
+    const folder = input.fromDir === undefined || input.fromDir === null || input.fromDir === '' ? null : readFolder(checkSourceDir(String(input.fromDir), input.workspace, guarded))
+    const manifest = folder?.manifest ?? {}
+    const given = <K extends keyof Manifest & keyof SkillInput>(key: K): unknown => input[key] ?? manifest[key]
+    const scope: SkillScope = given('scope') === 'global' ? 'global' : 'project'
     const workspace = scope === 'project' ? this.key(input.workspace) : ''
     if (scope === 'project' && !workspace) throw new Error('Project capability requires a workspace')
-    const guarded = origin === 'agent'
-    const name = redact(input.name || input.id).trim().slice(0, 120)
-    const instructions = redact(input.instructions).trim().slice(0, guarded ? AGENT_INSTRUCTION_CHARS : USER_INSTRUCTION_CHARS)
+    const byId = input.id ? this.entries.find(entry => entry.id === input.id) : undefined
+    const name = redact(input.name || manifest.name || byId?.name || input.id).trim().slice(0, 120)
+    const instructions = redact(input.instructions || manifest.instructions || byId?.instructions).trim().slice(0, guarded ? AGENT_INSTRUCTION_CHARS : USER_INSTRUCTION_CHARS)
     if (!name || !instructions) throw new Error('Capability name and instructions are required')
-    let existing: Skill | undefined = input.id ? this.entries.find(entry => entry.id === input.id) : this.visible(workspace).find(entry => entry.name === name && entry.scope === scope)
+    let existing: Skill | undefined = input.id ? byId : this.visible(workspace).find(entry => entry.name === name && entry.scope === scope)
     if (existing && (existing.scope !== scope || (existing.workspace || '') !== workspace)) {
       throw new Error('Cannot replace a capability from another project or scope')
     }
     // An agent cannot claim to be the user, the harness or the promotion pass.
     const claimed = redact(input.source || 'agent').slice(0, 300)
     const source = guarded && /^(user|system|promoted)$/i.test(claimed.trim()) ? 'agent' : claimed
+    const filled = (value: unknown): boolean => Array.isArray(value) && value.length > 0
     let merged = false
-    if (!existing && guarded) {
+    // A package is never the target or the source of a twin merge: two near-identical pages or command sets are two behaviours.
+    if (!existing && guarded && !folder && !filled(input.files) && !filled(given('triggers')) && !filled(given('commands'))) {
       const probe = fingerprint(name, `${input.whenToUse || ''} ${input.description || ''} ${instructions}`)
-      const twin = this.entries.find(item => groupKey(item) === groupKey({ scope, workspace }) && this.near(probe, item, MERGE_NAME, MERGE_TEXT))
+      const twin = this.entries.find(item => !hasPackage(item) && groupKey(item) === groupKey({ scope, workspace }) && this.near(probe, item, MERGE_NAME, MERGE_TEXT))
       if (twin) { existing = twin; merged = true }
     }
+    // An agent that names a package skill without its id could clear the page or commands of one the user relies on.
+    if (guarded && existing && !input.id && hasPackage(existing)) throw new Error(`A skill named "${existing.name}" already is a package (files, a page or commands); to change it pass its id "${existing.id}", or save yours under another name`)
+    const id = existing?.id || (typeof input.id === 'string' && input.id.trim() ? input.id.slice(0, 120) : randomUUID())
+    const dir = skillPackageDir(this.userData, id)
+    const plan = planPackage(existing?.files ?? [], { source: folder, files: input.files, removeFiles: input.removeFiles })
+    const params = given('params') === undefined ? existing?.params ?? [] : checkParams(given('params'), existing?.params ?? [])
+    const triggers = checkTriggers(given('triggers') ?? existing?.triggers ?? [], file => plan.files.some(item => item.path === file))
+    const commands = given('commands') === undefined ? existing?.commands ?? [] : checkCommands(given('commands'))
     const now = new Date(this.clock()).toISOString()
     const kept: Partial<Skill> = { ...existing }
     delete kept.dupOf
     const entry: Skill = {
       ...kept,
-      id: existing?.id || (typeof input.id === 'string' && input.id.trim() ? input.id.slice(0, 120) : randomUUID()), name,
-      description: redact(input.description ?? existing?.description ?? '').slice(0, 600),
-      whenToUse: redact(input.whenToUse ?? existing?.whenToUse ?? '').slice(0, 300), instructions,
+      id, name,
+      description: redact(given('description') ?? existing?.description ?? '').slice(0, 600),
+      whenToUse: redact(given('whenToUse') ?? existing?.whenToUse ?? '').slice(0, 300), instructions,
       scope, ...(workspace ? { workspace } : {}),
       // A skill the user wrote stays theirs (protected from pruning) when an agent improves it; the agent's edit is noted next to it.
       source: guarded && existing && authored(existing) ? existing.source : source,
@@ -226,11 +266,19 @@ class CapabilityStore {
       }].slice(-REVISIONS) : [],
       created: existing?.created || now, lastUsed: existing?.lastUsed || now, uses: existing?.uses || 0, successes: existing?.successes || 0, failures: existing?.failures || 0,
       lessons: existing?.lessons || [], usedIn: existing?.usedIn || [], pinned: existing?.pinned === true,
+      enabled: existing?.enabled !== false, files: plan.files, params, triggers, commands,
     }
     const entries = existing ? this.entries.map(item => item === existing ? entry : item) : [entry, ...this.entries]
     const evicted = this.overflow(entries, entry)
-    this.commit(evicted.length ? entries.filter(item => !evicted.includes(item.id)) : entries, [entry], evicted)
-    return { entry: clone(entry), merged, ...(merged ? { improved: existing?.name } : {}), evicted: evicted.length }
+    // Protected skills (packages, pinned, the user's) are never evicted: a new skill that would still not fit is refused, not squeezed in.
+    if (!existing && entries.filter(item => groupKey(item) === groupKey(entry)).length - evicted.length > LIMITS[scope]) {
+      throw new Error(`Skill limit: at most ${LIMITS[scope]} ${scope === 'global' ? 'shared' : 'project'} skills, and the rest are protected (packages, pinned or the user's); remove one or improve an existing skill by its id`)
+    }
+    // Leftovers of an earlier skill with this id must not become part of a new one.
+    if (!existing && plan.writes.size) removePackage(dir)
+    const undo = plan.writes.size || plan.deletes.length ? applyPackage(dir, plan) : (): void => {}
+    try { this.commit(evicted.length ? entries.filter(item => !evicted.includes(item.id)) : entries, [entry], evicted) } catch (error) { undo(); throw error }
+    return { entry: { ...clone(entry), ...this.packageOf(entry) }, merged, ...(merged ? { improved: existing?.name } : {}), evicted: evicted.length }
   }
   install(input: SkillInput, options?: { origin?: 'user' | 'agent' }): Skill { return this.save(input, options).entry }
 
@@ -282,6 +330,15 @@ class CapabilityStore {
     return this.present(next)
   }
 
+  // The switch next to every skill: a disabled skill stays in the library but agents neither find nor get it suggested. Not a new version.
+  setEnabled(id: unknown, enabled: unknown, workspace: string | null | undefined): SkillSummary {
+    const entry = this.find(id, workspace)
+    if (!entry) throw new Error('Capability was not found in this project or shared library')
+    const next = { ...entry, enabled: enabled === true }
+    this.commit(this.entries.map(item => item === entry ? next : item), [next])
+    return this.present(next)
+  }
+
   remove(id: unknown, workspace: string | null | undefined): boolean {
     const entry = this.visible(workspace).find(item => item.id === id)
     if (!entry) return false
@@ -289,11 +346,22 @@ class CapabilityStore {
     return true
   }
 
+  // The text comes back as a new version; the package (files, parameters, triggers, commands) is current state and stays.
   restore(id: unknown, version: unknown, workspace: string | null | undefined): Skill {
     const entry = this.read(id, workspace)
     const revision = entry.revisions.find(item => item.version === version)
     if (!revision) throw new Error('Capability revision was not found')
-    return this.install({ ...entry, ...revision, id: entry.id })
+    const { name, description, whenToUse, instructions } = revision
+    return this.install({ id: entry.id, name, description, whenToUse, instructions, scope: entry.scope, workspace: entry.workspace, source: entry.source })
+  }
+
+  // The user's values for a skill's parameters (the skills panel). Not a new version: it is the skill's settings, not its text.
+  setParams(id: unknown, values: unknown, workspace: string | null | undefined): SkillSummary {
+    const entry = this.find(id, workspace)
+    if (!entry) throw new Error('Capability was not found in this project or shared library')
+    const next = { ...entry, params: checkValues(entry.params, values) }
+    this.commit(this.entries.map(item => item === entry ? next : item), [next])
+    return this.present(next)
   }
 
   stats(workspace: string | null | undefined): { project: { count: number; limit: number }; global: { count: number; limit: number }; used: number } {
@@ -323,7 +391,7 @@ class CapabilityStore {
     for (const group of groups.values()) {
       for (let i = 0; i < group.length; i++) for (let j = i + 1; j < group.length; j++) {
         const a = work.get(group[i].id), b = work.get(group[j].id)
-        if (!a || !b || (isProtected(a) && isProtected(b)) || !this.near(a, b, MERGE_NAME, DUPLICATE_TEXT)) continue
+        if (!a || !b || hasPackage(a) || hasPackage(b) || (isProtected(a) && isProtected(b)) || !this.near(a, b, MERGE_NAME, DUPLICATE_TEXT)) continue
         const keeper = isProtected(a) !== isProtected(b) ? (isProtected(a) ? a : b) : this.value(a) >= this.value(b) ? a : b
         const other = keeper === a ? b : a
         edit(keeper, {
@@ -374,7 +442,7 @@ class CapabilityStore {
           id: randomUUID(), name: seed.name, description: seed.description, whenToUse: seed.whenToUse, instructions: seed.instructions, scope: 'global', source: 'promoted',
           version: 1, updatedAt: now, revisions: [], created: now, lastUsed: now, uses: family.reduce((sum, entry) => sum + (entry.uses || 0), 0),
           successes: family.reduce((sum, entry) => sum + (entry.successes || 0), 0), failures: family.reduce((sum, entry) => sum + (entry.failures || 0), 0),
-          lessons: [...new Set(family.flatMap(entry => entry.lessons.filter(lesson => !/<(?:project|file|repo)>/.test(lesson) && !projectReferences(lesson, entry.workspace).length)))].slice(0, LESSONS), usedIn: [], pinned: false,
+          lessons: [...new Set(family.flatMap(entry => entry.lessons.filter(lesson => !/<(?:project|file|repo)>/.test(lesson) && !projectReferences(lesson, entry.workspace).length)))].slice(0, LESSONS), usedIn: [], pinned: false, enabled: true, files: [], params: [], triggers: [], commands: [],
         }
         created.push(target); shared.push(target); report.shared++
       }
@@ -391,12 +459,13 @@ function renderSkills({ skills = [], total = 0 }: { skills?: SkillSummary[]; tot
   let used = 0
   for (const skill of skills) {
     const record = skill.uses ? `, used ${skill.uses}×, worked ${Math.round(skill.reliability * 100)}%` : ', untried'
-    const line = `- ${shortId(skill.id)} [${TIER[skill.scope] || skill.scope}${record}] ${oneLine(skill.name, 70)} — ${oneLine(skill.description, 170)}${skill.whenToUse ? ` Use when: ${oneLine(skill.whenToUse, 130)}` : ''}${skill.lessons?.length ? ` Pitfall: ${oneLine(skill.lessons[0], 110)}` : ''}`
+    const commands = skill.commands?.length ? ` [commands: ${oneLine(skill.commands.map(command => command.name).join(', '), 100)}]` : ''
+    const line = `- ${shortId(skill.id)} [${TIER[skill.scope] || skill.scope}${record}] ${oneLine(skill.name, 70)}${commands} — ${oneLine(skill.description, 170)}${skill.whenToUse ? ` Use when: ${oneLine(skill.whenToUse, 130)}` : ''}${skill.lessons?.length ? ` Pitfall: ${oneLine(skill.lessons[0], 110)}` : ''}`
     if (lines.length && used + line.length > budget) break
     lines.push(line); used += line.length + 1
   }
   return `${lines.join('\n')}${total > lines.length ? `\n(${total - lines.length} more skills stored: capability_search finds them)` : ''}`
 }
 
-export { CapabilityStore, renderSkills, reliability, shortId, LIMITS }
+export { CapabilityStore, renderSkills, reliability, shortId, hasPackage, LIMITS }
 export type { Skill, SkillInput, SkillSummary, SkillSuggestion, SkillScope, SkillOutcome, SkillRevision, SaveResult as SkillSaveResult, MaintainReport as SkillMaintainReport, MaintainOptions as SkillMaintainOptions }

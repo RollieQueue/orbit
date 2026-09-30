@@ -2,10 +2,11 @@
 // provider with its note, and the recovery after a refused or failed turn. The pure choice lives in ../failover.mts.
 import { randomUUID } from 'node:crypto'
 import { classifyQuotaError, assess } from '../quota.mts'
-import { replacements, handoverNote, targetLabel } from '../failover.mts'
+import { replacements, handoverNote, targetLabel, unreachable } from '../failover.mts'
 import type { AgentRecord, CatalogEntry, HandoverReason, HandoverRecord, HandoverRequest, InterruptedTurn, ModelTarget, OrbitRuntimeLike, RunRecord } from '../types.mts'
-import { withoutGoogleReasoning, publicAgent, bounded, clip, TurnBudgetError, diagnostics } from './util.mts'
+import { withoutGoogleReasoning, publicAgent, bounded, clip, TurnBudgetError, diagnostics, fromProvider } from './util.mts'
 import { closeAgentSession } from './session.mts'
+import { isStall, silentMinutes, stallNote, countSilentTurn, clearSilentTurns } from './watchdog.mts'
 // An agent changes provider at most this many times; readings older than the age are refreshed before a turn, but a
 // slow probe is never waited for longer than the wait.
 const MAX_HANDOVERS = 8
@@ -60,7 +61,8 @@ async function handover(runtime: OrbitRuntimeLike, run: RunRecord, agent: AgentR
   // Ahead of a refusal only comfortable headroom justifies the change; after one, anything with a little left beats stopping.
   const [choice] = replacements(context).concat(reason === 'approaching' ? [] : replacements({ ...context, relaxed: true }))
   if (!choice) {
-    if (agent.quotaWarned !== agent.providerId) {
+    // A silent or failing model is not a quota matter: its own error, or recoverStall, says why the agent stops.
+    if (reason !== 'stalled' && reason !== 'failed' && agent.quotaWarned !== agent.providerId) {
       agent.quotaWarned = agent.providerId
       runtime.trace(run, agent.id, 'quota', `Квота ${agent.providerId} ${reason === 'approaching' ? `на исходе (${level?.usedPercent ?? '?'}%)` : 'исчерпана'}, подходящей замены среди подключённых подписок нет`)
     }
@@ -73,7 +75,7 @@ async function handover(runtime: OrbitRuntimeLike, run: RunRecord, agent: AgentR
   const record: HandoverRecord = {
     id: randomUUID(), time: new Date().toISOString(), reason, from, to, fresh,
     usedPercent: level?.usedPercent ?? null, resetsAt: level?.resetsAt ?? null,
-    interrupted: !!(interrupted && (interrupted.text || interrupted.actions.length)),
+    interrupted: !!(interrupted && (interrupted.text || interrupted.actions.length)), turn: agent.turns,
   }
   // An agent that has done nothing yet simply starts on the other subscription, unless its cut-off turn had already
   // streamed text or started native actions: those may have taken effect and the newcomer must know.
@@ -84,22 +86,27 @@ async function handover(runtime: OrbitRuntimeLike, run: RunRecord, agent: AgentR
     record.note = bounded(note, 1500)
   }
   agent.trial = { key: choice.key }
-  const why = ({ approaching: `квота ${level?.usedPercent ?? '?'}%`, exhausted: 'квота исчерпана', 'replacement-failed': 'замена не запустилась' } satisfies Record<HandoverReason, string>)[reason]
+  const why = ({ approaching: `квота ${level?.usedPercent ?? '?'}%`, exhausted: 'квота исчерпана', 'replacement-failed': 'замена не запустилась', stalled: 'модель перестала отвечать', failed: 'ошибка провайдера' } satisfies Record<HandoverReason, string>)[reason]
   // The newcomer starts a fresh session (or the envelope loop) with the note in its first prompt; the old session is over,
   // so what its provider keeps alive for it is closed now.
   const transport = runtime.decideTransport(run, to.providerId, to.model)
   closeAgentSession(runtime, agent)
+  clearSilentTurns(agent)
   runtime.updateAgent(run, agent, { providerId: to.providerId, model: to.model, requestedModel: to.model, reasoningEffort: to.reasoningEffort, handovers: [...agent.handovers, record], transport, sessionId: null, detail: `Переключён на ${targetLabel(to)}` })
   runtime.trace(run, agent.id, 'handover', `${targetLabel(from)} → ${targetLabel(to)} (${why})${fresh ? '' : `. Новая модель получила журнал действий, файлы${record.interrupted ? ' и незавершённый ход' : ''}.`}`)
   runtime.emit(run, 'agent.handover', { agentId: agent.id, agent: publicAgent(agent), handover: record })
   return true
 }
-// After a failed provider turn: true when the agent was moved and the turn should be repeated, false when it is not a
-// case for failover (the caller rethrows), and an error when the agent must stop because nobody can take over.
+// After a failed provider turn: true when the agent was moved (or, after a silent turn, is to try again) and the turn
+// should be repeated, false when nothing can be done (the caller rethrows the provider's error), and an error when the
+// agent must stop because nobody can take over.
 async function recoverProvider(runtime: OrbitRuntimeLike, run: RunRecord, agent: AgentRecord, error: unknown): Promise<boolean> {
-  if (runtime.agentSignal(run, agent).aborted || !runtime.failoverActive(run) || error instanceof TurnBudgetError) return false
+  if (runtime.agentSignal(run, agent).aborted || error instanceof TurnBudgetError) return false
   const partial = agent.partialTurn
   const interrupted: InterruptedTurn | null = partial ? { text: [...partial.messages.values()].at(-1) || '', actions: [...partial.tools.values()] } : null
+  // A turn stopped for silence is repeated, then handed over; a replacement on trial is judged below.
+  if (isStall(error) && !agent.trial) return recoverStall(runtime, run, agent, error, interrupted)
+  if (!runtime.failoverActive(run)) return false
   const refusal = classifyQuotaError(error, agent.providerId, runtime.clock())
   // A failed provider turn rejects with an Error; its message is quoted below.
   if (refusal) {
@@ -108,14 +115,43 @@ async function recoverProvider(runtime: OrbitRuntimeLike, run: RunRecord, agent:
     const until = refusal.resetsAt ? ` (лимит снимется ${new Date(refusal.resetsAt).toLocaleString('ru-RU', { dateStyle: 'short', timeStyle: 'short' })})` : ''
     throw new Error(`Квота подписки «${agent.providerId}» исчерпана${until}, а подходящей замены среди подключённых подписок нет. Подключите другую подписку, разрешите более слабую модель в разделе «Квоты» или дождитесь сброса. Ход и журнал действий сохранены. Ответ провайдера: ${clip((error as Error).message, 240)}`, { cause: error })
   }
-  if (!agent.trial) return false
+  if (!agent.trial) {
+    // A provider that failed the turn moves the agent on too: an agent in error is replaced, not lost (the user's rule,
+    // 2026-09-30). Orbit's own failures around the turn (the prompt, the time budget) would follow it anywhere, so they
+    // stop it as before. A subscription that cannot answer at all (region, sign-in, missing CLI) is not offered to any
+    // agent of this run for a while; without a replacement the provider's own error stops the agent, as before.
+    if (!fromProvider(error)) return false
+    if (unreachable(error)) run.brokenProviders.set(agent.providerId, runtime.clock() + BROKEN_PROVIDER_MS)
+    return runtime.handover(run, agent, { reason: 'failed', level: null, error, interrupted })
+  }
   // The replacement itself failed before completing a turn: try the next one, never the same twice. A subscription that
-  // could not answer (wrong region, signed out, unreachable) is not offered again to any agent of this run for a while.
+  // could not answer (wrong region, signed out, missing CLI) is not offered again to any agent of this run for a while;
+  // any other failure rules out only that model, so one repeatable error cannot bar every subscription.
   agent.failedCandidates.add(agent.trial.key)
-  run.brokenProviders.set(agent.providerId, runtime.clock() + BROKEN_PROVIDER_MS)
+  if (unreachable(error)) run.brokenProviders.set(agent.providerId, runtime.clock() + BROKEN_PROVIDER_MS)
   if (await runtime.handover(run, agent, { reason: 'replacement-failed', level: null, error, interrupted })) return true
   const previous = agent.handovers.at(-1)?.from
   throw new Error(`Замена ${targetLabel({ providerId: agent.providerId, model: agent.model })}${previous ? ` вместо ${targetLabel(previous)}` : ''} не смогла продолжить работу, других подходящих нет: ${clip((error as Error).message, 240)}`, { cause: error })
+}
+// After a turn the watchdog (watchdog.mts) or the provider's inactivity timeout stopped: true when the turn is to be
+// repeated (the first time on the same model in a fresh session, then on another subscription), else an error that
+// stops the agent. A replacement on trial that falls silent goes the failover way of recoverProvider instead.
+async function recoverStall(runtime: OrbitRuntimeLike, run: RunRecord, agent: AgentRecord, error: unknown, interrupted: InterruptedTurn | null): Promise<boolean> {
+  const label = targetLabel({ providerId: agent.providerId, model: agent.model || agent.requestedModel })
+  const silent = silentMinutes(error)
+  if (countSilentTurn(agent) === 1) {
+    const fresh = agent.transport === 'session'
+    runtime.remember(agent, { type: 'instruction', content: stallNote(silent, interrupted, fresh) })
+    runtime.recordLedger(agent, 'watchdog', `#${agent.turns + 1} WATCHDOG: no activity for ${silent} min, the turn was stopped and repeated`)
+    runtime.trace(run, agent.id, 'watchdog', `Модель ${label} не присылала событий ${silent} мин: ход остановлен и повторяется${fresh ? ' в новой сессии' : ''}`)
+    // The killed CLI may have left its session unusable, and a stuck conversation is better not resumed.
+    if (fresh) { closeAgentSession(runtime, agent); agent.sessionId = null }
+    return true
+  }
+  clearSilentTurns(agent)
+  if (runtime.failoverActive(run) && await runtime.handover(run, agent, { reason: 'stalled', error, interrupted })) return true
+  const why = runtime.failoverActive(run) ? 'подходящей замены среди подключённых подписок нет' : 'автозамена подписок выключена'
+  throw new Error(`Модель ${label} не присылала событий ${silent} мин два хода подряд, поэтому сторож Orbit остановил агента: ${why}. Журнал действий сохранён.`, { cause: error })
 }
 
 export { failoverActive, providerCatalog, preflightQuota, handover, recoverProvider }
