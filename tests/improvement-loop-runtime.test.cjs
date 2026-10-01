@@ -151,6 +151,7 @@ test('a task left working is reminded, then the answer is accepted with a note n
 
 test('in Orbit\'s own repository a written change must be applied with restart_orbit', async t => {
   const { workspace } = fixture(t)
+  // A host that cannot tell what the running Orbit runs (no unapplied): the files the run wrote decide.
   const host = fakeHost(fs.realpathSync(workspace))
   let turn = 0
   const runtime = new OrbitRuntime({ restartHost: host, runProvider: async ({ prompt }) => {
@@ -167,6 +168,37 @@ test('in Orbit\'s own repository a written change must be applied with restart_o
   assert.equal(result.summary.text, 'Applied')
 })
 
+test('the code the running Orbit runs decides: a change no tool reported must be applied, an undone one need not be', async t => {
+  const { workspace } = fixture(t)
+  // A shell command changed the runtime code: no file activity, but the code on disk is not what runs.
+  const host = fakeHost(fs.realpathSync(workspace))
+  host.unapplied = () => ['runtime']
+  let turn = 0, reminded = ''
+  const runtime = new OrbitRuntime({ restartHost: host, runProvider: async ({ prompt }) => {
+    switch (++turn) {
+      case 1: return calls(['improvement_plan', { status: 'implementing', tasks: [task('t1', 'done')] }])
+      case 2: return { text: 'Done' }
+      case 3: reminded = prompt; return calls(['restart_orbit', { reason: 'apply t1', continueWith: 'Task t1 was applied: confirm the new code runs, then give the final answer' }])
+      default: return { text: 'Applied' }
+    }
+  } })
+  const shell = await run(runtime, { workspace, chatId: 'chat-shell' })
+  assert.match(reminded, /Orbit's code on disk differs from the code the running Orbit runs \(runtime\), so a change is not applied yet\. Call restart_orbit now/)
+  assert.equal(host.requests.length, 1)
+  assert.equal(shell.result.summary.text, 'Applied')
+  // A file written and undone: the tools saw a write, but the running Orbit runs the code on disk.
+  const undone = fakeHost(fs.realpathSync(workspace))
+  undone.unapplied = () => []
+  let second = 0
+  const quiet = new OrbitRuntime({ restartHost: undone, runProvider: async () => ++second === 1
+    ? calls(['write_file', { path: 'fix.txt', content: 'fixed' }], ['improvement_plan', { status: 'implementing', tasks: [task('t2', 'done')] }])
+    : { text: 'Undone, nothing to apply' } })
+  const reverted = await run(quiet, { workspace, chatId: 'chat-undone' })
+  assert.equal(reverted.result.usage.providerTurns, 2, 'no reminder')
+  assert.equal(undone.requests.length, 0)
+  assert.equal(reverted.result.summary.text, 'Undone, nothing to apply')
+})
+
 test('a restart refused for the cycle limit defers the change: the hint says so and the answer is accepted', async t => {
   const { workspace } = fixture(t)
   const host = fakeHost(fs.realpathSync(workspace), { ok: false, status: 'cycle-limit', exitCode: 3, output: '' })
@@ -181,6 +213,23 @@ test('a restart refused for the cycle limit defers the change: the hint says so 
   assert.match(observed, /verified, not applied yet \(cycle limit\)/)
   assert.equal(live.restartDeferred, true); assert.equal(live.restartApplied, undefined)
   assert.equal(result.summary.text, 'Verified, not applied yet')
+})
+
+test('a restart refused because Orbit writes no health report (ORBIT_HEALTH_FILE=0) defers the change too: no retry, the user restarts Orbit', async t => {
+  const { workspace } = fixture(t)
+  const host = fakeHost(fs.realpathSync(workspace), { ok: false, status: 'no-health-report', exitCode: 2, output: '' })
+  let turn = 0, observed = ''
+  const runtime = new OrbitRuntime({ restartHost: host, runProvider: async ({ prompt }) => {
+    switch (++turn) {
+      case 1: return calls(['write_file', { path: 'fix.txt', content: 'fixed' }], ['improvement_plan', { status: 'implementing', tasks: [task('t1', 'done')] }], ['restart_orbit', { reason: 'apply', continueWith: 'confirm' }])
+      default: observed = prompt; return { text: 'Not applied: restart Orbit by hand' }
+    }
+  } })
+  const { result, live } = await run(runtime, { workspace })
+  assert.match(observed, /ORBIT_HEALTH_FILE=0 and writes no health report/)
+  assert.doesNotMatch(observed, /Fix what the output shows/)
+  assert.equal(live.restartDeferred, true); assert.equal(live.restartApplied, undefined)
+  assert.deepEqual([result.summary.text, host.requests.length], ['Not applied: restart Orbit by hand', 1], 'no reminder asks for another restart')
 })
 
 test('a restart continuation keeps loopTask and is not asked to close another task', async t => {

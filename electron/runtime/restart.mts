@@ -9,8 +9,9 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { restartEnv } from '../resume.mts'
 import type { RestartHost, RestartLevel, RestartResult, RestartRollback } from '../resume.mts'
-import { TERMINAL, AGENT_TERMINAL, abortError, bounded, clip, overlappingWorkspaces } from './util.mts'
-import type { AgentRecord, OrbitRuntimeLike, RunRecord, ToolArgs } from '../types.mts'
+import { attachmentLines } from '../attachments.mts'
+import { TERMINAL, AGENT_TERMINAL, abortError, bounded, clip, overlappingWorkspaces, isMailMark } from './util.mts'
+import type { AgentRecord, Attachment, OrbitRuntimeLike, RunRecord, ToolArgs } from '../types.mts'
 
 const REASON_CHARS = 1000
 const CONTINUE_CHARS = 8000
@@ -18,12 +19,14 @@ const CONTINUE_CHARS = 8000
 const TRACE_EVERY_MS = 500
 const TRACE_CHARS = 6000
 const NOTE_CHARS = 5000
+const RESUMED_FILES = 'Files the user attached in that run (still in Orbit\'s attachments folder; read them with your file tools when the task needs them):'
 // What the model learns when the script refused before doing anything (the other statuses get the general advice).
 const HINTS: Record<string, string> = {
   'cycle-limit': 'Orbit was restarted too many times in a short while (ORBIT_UPGRADE_MAX_CYCLES); nothing was restarted. Tell the user, or try again later.',
   locked: 'Another self-upgrade is already running; wait for it to finish, then call restart_orbit again if it is still needed.',
   busy: 'Another restart is already in progress; wait for it to finish.',
   'spawn-failed': 'The self-upgrade script could not be started; nothing was restarted.',
+  'no-health-report': 'Orbit runs with ORBIT_HEALTH_FILE=0 and writes no health report, so a restart could be neither checked nor rolled back; nothing was restarted. Do not call restart_orbit again in this Orbit: tell the user to restart Orbit to apply the change.',
 }
 // Where a rolled-back upgrade keeps the failed change (scripts/self-upgrade.cjs), when its report does not say.
 const FAILED_PATCH = 'artifacts/self-upgrade-failed.patch'
@@ -85,11 +88,16 @@ function restartNote(runtime: OrbitRuntimeLike, run: RunRecord, agent: AgentReco
 }
 // The root of a continuation after a restart. When it keeps the old root's provider on the session transport, the old
 // session is resumed and its first turn carries the continuation's message; otherwise, or when that resume fails
-// (loops.mts drops the id once), the root starts fresh. Either way its transcript begins with the restart note.
-function prepareContinuation(runtime: OrbitRuntimeLike, run: RunRecord, root: AgentRecord, note: string, session?: { id: string; providerId: string }): void {
+// (loops.mts drops the id once), the root starts fresh. Either way its transcript begins with the restart note, followed
+// by the files the user attached in the run it continues (a fresh root has never seen their paths). A resumed session
+// keeps the mark of the old root's mail: the messages it already holds carry that mark, and Cursor would not hear of a
+// new one (it reads its instructions only in a session's first message).
+function prepareContinuation(runtime: OrbitRuntimeLike, run: RunRecord, root: AgentRecord, note: string, session?: { id: string; providerId: string; mailMark?: string }, files: Attachment[] = []): void {
   const resumable = !!session?.id && root.transport === 'session' && root.providerId === session.providerId
   if (resumable) { root.sessionId = session.id; run.resumeSession = session.id }
-  runtime.remember(root, { type: 'instruction', content: resumable ? `${run.prompt}\n\n${note}` : note })
+  if (resumable && isMailMark(session.mailMark)) root.mailMark = session.mailMark
+  const attached = files.length ? `\n${RESUMED_FILES}\n${attachmentLines(files)}` : ''
+  runtime.remember(root, { type: 'instruction', content: `${resumable ? `${run.prompt}\n\n` : ''}${note}${attached}` })
 }
 
 function checkedText(value: unknown, label: string, limit: number): string {
@@ -168,8 +176,8 @@ async function executeRestart(runtime: OrbitRuntimeLike, run: RunRecord, agent: 
   const continueWith = checkedText(args.continueWith, 'continueWith (what to do after the restart)', CONTINUE_CHARS)
   if (args.verify !== undefined && args.verify !== null && typeof args.verify !== 'boolean') throw new Error('restart_orbit: verify must be a boolean')
   const verify = args.verify !== false
-  // A refusal the agent cannot fix (other chats working, the user declined, the cycle limit) defers the change to the
-  // next restart: improvement mode then accepts the answer without one (improvement.mts).
+  // A refusal the agent cannot fix (other chats working, the user declined, the cycle limit, no health report) defers
+  // the change to the next restart: improvement mode then accepts the answer without one (improvement.mts).
   const deferred = (error: Error): Error => { run.restartDeferred = true; return error }
   try { refuseWhileOthersWork(runtime, run) } catch (error) { throw deferred(error as Error) }
   if (run.approvalPolicy === 'on-request' && !await runtime.approve(run, agent, { tool: 'restart_orbit', arguments: { reason, continueWith, verify } })) throw deferred(new Error('User declined this operation'))
@@ -189,7 +197,7 @@ async function executeRestart(runtime: OrbitRuntimeLike, run: RunRecord, agent: 
   try { result = await Promise.race([host.request({ run, agent, reason, continueWith, verify, onLine: progress.line, signal: stop.signal }), restarting]) }
   finally { signal.removeEventListener('abort', onAbort); progress.close() }
   if (!result || stop.signal.aborted) throw abortError()
-  if (!result.ok) throw result.status === 'cycle-limit' ? deferred(failure(result, run)) : failure(result, run)
+  if (!result.ok) throw result.status === 'cycle-limit' || result.status === 'no-health-report' ? deferred(failure(result, run)) : failure(result, run)
   run.restartApplied = true
   return observation(result)
 }

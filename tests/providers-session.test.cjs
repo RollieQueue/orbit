@@ -236,9 +236,12 @@ test('Cursor session: a stream without a chat id reports none, so the next turn 
 
 test('session ids: stream parsers take only plain ids, and normalizeSession refuses a malformed one with a code the runtime recognises', () => {
   const codex = id => {
-    const parser = _testing.createCodexParser(null)
+    const named = []
+    const parser = _testing.createCodexParser(event => { if (event.kind === 'session') named.push(event.sessionId) })
     for (const event of [{ type: 'thread.started', thread_id: id }, { type: 'item.completed', item: { id: 'a', type: 'agent_message', text: 'ok' } }, { type: 'turn.completed' }]) parser.line(JSON.stringify(event))
-    return parser.finish().sessionId
+    const { sessionId } = parser.finish()
+    assert.deepEqual(named, sessionId ? [sessionId] : [], 'the thread is announced as the stream names it, only a plain id')
+    return sessionId
   }
   assert.equal(codex('0199a3c4-thread'), '0199a3c4-thread')
   for (const bad of ['--config=evil', ' spaced', 'x'.repeat(200), '']) assert.equal(codex(bad), undefined, JSON.stringify(bad))
@@ -387,6 +390,15 @@ test('Codex session invocation: exec without --ephemeral, MCP config overrides, 
   const reviewResume = buildCodexSessionArgs({ workspace: '.', accessMode: 'workspace-write', approvalPolicy: 'auto-review' }, { ...SESSION, id: 't', resume: true })
   assert.ok(!reviewResume.includes('--approve-for-me') && !reviewResume.includes('approval_policy="never"'), 'resume keeps the thread\'s own approval policy')
   assert.throws(() => buildCodexSessionArgs({ workspace: '.', accessMode: 'nope' }, { ...SESSION, resume: false }), /Unsupported access mode/)
+  // The stable Orbit block is the thread's developer instructions, on a new thread and on a resume alike.
+  for (const args of [first, resumed]) assert.equal(args[args.indexOf(`developer_instructions="${SESSION.systemAppend}"`) - 1], '-c')
+  assert.ok(!buildCodexSessionArgs({ workspace: '.', accessMode: 'read-only' }, { ...SESSION, resume: false, systemAppend: '' }).some(arg => arg.startsWith('developer_instructions=')), 'no block, no override')
+  // A TOML basic string: JSON's escapes, but no escaped lone surrogate and no raw DEL, which TOML refuses (Codex would then
+  // take the value as raw text, escapes and all).
+  const text = 'say "hi" C:\\x\\\nnext\tline\x7f lone\ud800 low\udc00 pair\ud83d\ude00'
+  const encoded = buildCodexSessionArgs({ workspace: '.', accessMode: 'read-only' }, { ...SESSION, resume: false, systemAppend: text }).find(arg => arg.startsWith('developer_instructions=')).slice('developer_instructions='.length)
+  assert.equal(JSON.parse(encoded), text.replace('\ud800', '\ufffd').replace('\udc00', '\ufffd'))
+  assert.ok(!/[\x00-\x08\x0a-\x1f\x7f]/.test(encoded) && !/\\ud[89a-f]/i.test(encoded), encoded)
 })
 
 test('normalizeSession chooses a UUID for Claude, keeps ids, and refuses half-configured MCP access', () => {
@@ -496,9 +508,10 @@ test('Codex exec session run: config overrides and token in the environment, thr
     out({ type: 'turn.completed', usage: { input_tokens: 1, output_tokens: 1 } });
   `)
   const events = []
-  const first = await runProvider({ providerId: 'codex', workspace: cli.directory, accessMode: 'workspace-write', prompt: 'hello', onEvent: event => events.push(event), session: { token: 'codex-token', mcpUrl: 'http://127.0.0.1:9/mcp' } })
+  const first = await runProvider({ providerId: 'codex', workspace: cli.directory, accessMode: 'workspace-write', prompt: 'hello', onEvent: event => events.push(event), session: { token: 'codex-token', mcpUrl: 'http://127.0.0.1:9/mcp', systemAppend: 'STABLE ORBIT BLOCK' } })
   assert.equal(first.transport, 'session'); assert.equal(first.sessionId, 'thread-fixture-1'); assert.equal(first.text, 'Answer: hello'); assert.equal(first.client, 'Codex CLI')
   let record = cli.read()
+  assert.equal(record.args[record.args.indexOf('developer_instructions="STABLE ORBIT BLOCK"') - 1], '-c', 'the stable Orbit block is the thread\'s developer instructions')
   assert.equal(record.env.token, 'codex-token')
   assert.match(String(record.env.noProxy), /127.0.0.1/, 'loopback MCP calls bypass HTTP(S)_PROXY')
   assert.ok(record.args.includes('mcp_servers.orbit.url="http://127.0.0.1:9/mcp"') && record.args.includes('mcp_servers.orbit.bearer_token_env_var="ORBIT_MCP_TOKEN"') && record.args.includes('mcp_servers.orbit.tool_timeout_sec=3600'))
@@ -506,9 +519,10 @@ test('Codex exec session run: config overrides and token in the environment, thr
   assert.equal(record.input, 'hello')
   const orbitCall = events.find(event => event.kind === 'tool' && event.toolId === 'mcp1')
   assert.ok(orbitCall.orbitTool === 'list_agents' && orbitCall.native === false && orbitCall.text === 'orbit/list_agents')
-  const second = await runProvider({ providerId: 'codex', workspace: cli.directory, accessMode: 'workspace-write', prompt: 'again', session: { id: 'thread-fixture-1', resume: true, token: 'codex-token', mcpUrl: 'http://127.0.0.1:9/mcp' } })
+  const second = await runProvider({ providerId: 'codex', workspace: cli.directory, accessMode: 'workspace-write', prompt: 'again', session: { id: 'thread-fixture-1', resume: true, token: 'codex-token', mcpUrl: 'http://127.0.0.1:9/mcp', systemAppend: 'STABLE ORBIT BLOCK' } })
   record = cli.read()
   assert.deepEqual(record.args.slice(0, 2), ['exec', 'resume'])
+  assert.ok(record.args.includes('developer_instructions="STABLE ORBIT BLOCK"'), 'a resume passes the block too')
   assert.deepEqual(record.args.slice(-2), ['thread-fixture-1', '-'])
   assert.equal(record.cwd.toLowerCase(), fs.realpathSync(cli.directory).toLowerCase(), 'resume has no -C: the process cwd is the workspace')
   assert.equal(second.sessionId, 'thread-fixture-1'); assert.equal(second.text, 'Answer: again')
@@ -519,11 +533,21 @@ const appServerFixture = `
   let turns = 0;
   require('node:readline').createInterface({ input: process.stdin }).on('line', line => {
     const m = JSON.parse(line);
+    // FIXTURE_LOG: the thread and turn requests, one JSON line each.
+    if (process.env.FIXTURE_LOG && /^(thread|turn)\\//.test(m.method)) require('node:fs').appendFileSync(process.env.FIXTURE_LOG, JSON.stringify({ method: m.method, params: m.params }) + '\\n');
+    // A request the test holds: the fixture writes its pid to FIXTURE_MARK when it arrives and answers it 400 ms later.
+    if (process.env.FIXTURE_HOLD && m.method === process.env.FIXTURE_HOLD) {
+      require('node:fs').writeFileSync(process.env.FIXTURE_MARK, String(process.pid));
+      const result = m.method === 'initialize' ? {} : { thread: { id: m.params.threadId || 'thread-' + process.pid }, model: 'fixture-model' };
+      return setTimeout(() => send({ id: m.id, result }), 400);
+    }
     if (m.method === 'initialize') return send({ id: m.id, result: {} });
     if (m.method === 'thread/resume') return send({ id: m.id, error: { code: -32602, message: 'unknown thread' } });
     if (m.method === 'thread/start') {
       if (m.params.ephemeral !== false || m.params.approvalPolicy !== 'on-request') throw new Error('session threads persist and ask');
-      return send({ id: m.id, result: { thread: { id: 'thread-' + process.pid }, model: 'fixture-model' } });
+      const answer = JSON.stringify({ id: m.id, result: { thread: { id: 'thread-' + process.pid }, model: 'fixture-model' } });
+      // FIXTURE_TRAIL: a rate-limit notice follows the answer in the same write, so Orbit reads both at once.
+      return process.stdout.write(answer + '\\n' + (process.env.FIXTURE_TRAIL ? JSON.stringify({ method: 'account/rateLimits/updated', params: { rateLimits: {} } }) + '\\n' : ''));
     }
     if (m.method === 'turn/start') {
       turns++;
@@ -542,8 +566,8 @@ const appServerFixture = `
     }
   });
 `
-const helpers = launches => ({
-  resolveLaunch: (_command, args) => { launches.push(args); return { executable: process.execPath, args: ['-e', appServerFixture], env: process.env } },
+const helpers = (launches, env = {}) => ({
+  resolveLaunch: (_command, args) => { launches.push(args); return { executable: process.execPath, args: ['-e', appServerFixture], env: { ...process.env, ...env } } },
   terminateProcess, createLineReader: _testing.createLineReader, busyCheck: () => () => false,
 })
 
@@ -557,6 +581,8 @@ test('Codex App Server session: one process and thread across turns, MCP overrid
   const pid = Number(first.sessionId.replace('thread-', ''))
   assert.ok(pid > 0)
   t.after(async () => { await codexServer.closeSession(first.sessionId) })
+  assert.deepEqual(events.filter(event => event.kind === 'session').map(event => event.sessionId), [first.sessionId], 'the thread is named before the turn runs')
+  assert.ok(events.findIndex(event => event.kind === 'session') < events.findIndex(event => event.kind === 'tool'))
   assert.ok(launches[0].includes('mcp_servers.orbit.url="http://127.0.0.1:9/mcp"') && launches[0].includes('mcp_servers.orbit.bearer_token_env_var="ORBIT_MCP_TOKEN"') && launches[0].includes('features.multi_agent=false'))
   assert.equal(launches[0][launches[0].indexOf('mcp_servers.orbit.tool_timeout_sec=3600') - 1], '-c', 'the App Server gets the same per-call tool timeout as exec')
   const orbitCall = events.find(event => event.kind === 'tool' && event.toolId === 'mcp')
@@ -582,6 +608,33 @@ test('Codex App Server session: one process and thread across turns, MCP overrid
   await codexServer.closeSession(revived.sessionId)
 })
 
+test('Codex App Server session: the stable Orbit block is the thread\'s developer instructions, on thread/start and thread/resume', async t => {
+  const launches = []
+  const folder = fs.mkdtempSync(path.join(os.tmpdir(), 'orbit-codex-threads-'))
+  t.after(() => fs.rmSync(folder, { recursive: true, force: true }))
+  const fixture = helpers(launches, { FIXTURE_LOG: path.join(folder, 'requests.jsonl') })
+  const requests = prefix => fs.readFileSync(path.join(folder, 'requests.jsonl'), 'utf8').trim().split('\n').map(line => JSON.parse(line)).filter(entry => entry.method.startsWith(prefix))
+  const base = { workspace: process.cwd(), accessMode: 'workspace-write', approvalPolicy: 'on-request', inactivityMs: 3000 }
+  const session = { id: null, resume: false, token: 't', mcpUrl: 'http://127.0.0.1:9/mcp', systemAppend: 'STABLE ORBIT BLOCK "quoted"\nline two' }
+  const first = await codexServer.runCodexSessionTurn({ ...base, prompt: 'one' }, session, fixture)
+  await codexServer.closeSession(first.sessionId)
+  // The process is gone: the resume asks thread/resume (the fixture refuses it) and then starts a thread, both with the block.
+  const revived = await codexServer.runCodexSessionTurn({ ...base, prompt: 'two' }, { ...session, id: first.sessionId, resume: true }, fixture)
+  await codexServer.closeSession(revived.sessionId)
+  const plain = await codexServer.runCodexSessionTurn({ ...base, prompt: 'three' }, { ...session, systemAppend: '' }, fixture)
+  await codexServer.closeSession(plain.sessionId)
+  assert.deepEqual(requests('thread/').map(entry => [entry.method, entry.params.developerInstructions]), [
+    ['thread/start', session.systemAppend], ['thread/resume', session.systemAppend], ['thread/start', session.systemAppend], ['thread/start', undefined],
+  ])
+  assert.ok(launches.flat().every(arg => !arg.includes('developer_instructions')), 'the App Server gets the block in its requests, not on its command line')
+  // A string bounded inside an emoji (an agent's name, a chat message) goes out well-formed: Codex drops a JSON-RPC line
+  // with an escaped lone surrogate and never answers it.
+  const cut = await codexServer.runCodexSessionTurn({ ...base, prompt: 'cut \ud83d' }, { ...session, systemAppend: 'name \ud83d' }, fixture)
+  await codexServer.closeSession(cut.sessionId)
+  assert.equal(requests('thread/').at(-1).params.developerInstructions, 'name �')
+  assert.equal(requests('turn/').at(-1).params.input[0].text, 'cut �')
+})
+
 test('Codex App Server session: a dying process fails the turn and forgets the session; cancellation kills it', async () => {
   const launches = []
   const base = { workspace: process.cwd(), accessMode: 'workspace-write', approvalPolicy: 'on-request', inactivityMs: 3000 }
@@ -601,6 +654,56 @@ test('Codex App Server session: a dying process fails the turn and forgets the s
   await assert.rejects(codexServer.runCodexSessionTurn({ ...base, prompt: 'hang', inactivityMs: 300 }, { ...session, id: silent.sessionId, resume: true }, helpers(launches)), error => error.name === 'TimeoutError' && /no output for 300 ms/.test(error.message))
   assert.throws(() => process.kill(silentPid, 0), { code: 'ESRCH' })
   assert.equal(codexServer.sessions.size, 0)
+})
+
+test('Codex App Server session: a cancellation while the session opens kills the process and keeps no session; one at the thread\'s event closes only a session the call opened', async t => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'orbit-open-cancel-'))
+  // Fixture processes not yet shown to be gone: a failed assertion leaves none running. One shown gone is dropped, as
+  // Windows reuses pids.
+  const unproven = new Set()
+  t.after(async () => {
+    for (const pid of unproven) { try { process.kill(pid) } catch { /* Already gone. */ } }
+    for (const id of [...codexServer.sessions.keys()]) await codexServer.closeSession(id)
+    fs.rmSync(directory, { recursive: true, force: true })
+  })
+  const gone = (pid, message) => { assert.throws(() => process.kill(pid, 0), { code: 'ESRCH' }, message); unproven.delete(pid) }
+  const launches = []
+  const base = { workspace: process.cwd(), accessMode: 'workspace-write', approvalPolicy: 'on-request', inactivityMs: 3000 }
+  const session = { id: null, resume: false, token: 't', mcpUrl: 'http://127.0.0.1:9/mcp' }
+  const pidIn = file => { try { return Number(fs.readFileSync(file, 'utf8')) } catch { return 0 } }
+  for (const [hold, opening] of [['initialize', session], ['thread/start', session], ['thread/resume', { ...session, id: 'thread-gone', resume: true }]]) {
+    const mark = path.join(directory, hold.replace('/', '-'))
+    const controller = new AbortController(), events = []
+    const pending = codexServer.runCodexSessionTurn({ ...base, prompt: 'one', signal: controller.signal, onEvent: event => events.push(event) }, opening, helpers(launches, { FIXTURE_HOLD: hold, FIXTURE_MARK: mark }))
+    await until(() => pidIn(mark) > 0)
+    const pid = pidIn(mark); unproven.add(pid)
+    controller.abort()
+    await assert.rejects(pending, { name: 'AbortError' }, `cancelled during ${hold}`)
+    gone(pid, `the open fails once the process tree is gone (${hold})`)
+    assert.equal(codexServer.sessions.size, 0, `no session is kept (${hold})`)
+    assert.ok(!events.some(event => event.kind === 'session'), `no thread is named (${hold})`)
+  }
+  const started = launches.length
+  await assert.rejects(codexServer.openCodexSession({ ...base, signal: AbortSignal.abort() }, session, helpers(launches)), { name: 'AbortError' })
+  assert.equal(launches.length, started, 'a cancelled open starts nothing')
+  // Cancelled in the same read as the thread's answer (by the rate-limit notice that follows it): nothing is kept either.
+  const sameRead = new AbortController()
+  await assert.rejects(codexServer.runCodexSessionTurn({ ...base, prompt: 'one', signal: sameRead.signal, onEvent: event => { if (event.kind === 'quota') sameRead.abort() } }, session, helpers(launches, { FIXTURE_TRAIL: '1' })), { name: 'AbortError' })
+  assert.equal(codexServer.sessions.size, 0, 'no session is kept after a cancellation in the same read')
+  // The runtime stops the turn on the thread's event when the server opened another thread than the one to resume: the
+  // session this call opened is closed; a live session the call reused stays for the next turn.
+  const stray = new AbortController()
+  let strayPid = 0
+  const strayed = codexServer.runCodexSessionTurn({ ...base, prompt: 'one', signal: stray.signal, onEvent: event => { if (event.kind === 'session') { strayPid = Number(event.sessionId.replace('thread-', '')); unproven.add(strayPid); stray.abort() } } }, { ...session, id: 'thread-gone', resume: true }, helpers(launches))
+  await assert.rejects(strayed, { name: 'AbortError' })
+  gone(strayPid, 'the opened session is closed')
+  assert.equal(codexServer.sessions.size, 0)
+  const live = await codexServer.runCodexSessionTurn({ ...base, prompt: 'one' }, session, helpers(launches))
+  const livePid = Number(live.sessionId.replace('thread-', ''))
+  const reused = new AbortController()
+  await assert.rejects(codexServer.runCodexSessionTurn({ ...base, prompt: 'two', signal: reused.signal, onEvent: event => { if (event.kind === 'session') reused.abort() } }, { ...session, id: live.sessionId, resume: true }, helpers(launches)), { name: 'AbortError' })
+  assert.ok(codexServer.sessions.has(live.sessionId), 'the reused session stays')
+  assert.doesNotThrow(() => process.kill(livePid, 0))
 })
 
 test('extraEnv reaches every CLI process Orbit starts, and Orbit\'s own transport variables win over it', async t => {

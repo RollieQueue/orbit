@@ -1,6 +1,7 @@
 // Helpers and constants shared by the runtime modules: bounded text, cancellation plumbing, the public view of an
 // agent, and the diagnostic trace. Every other runtime module may require this one; it requires none of them.
 import path from 'node:path'
+import { randomBytes } from 'node:crypto'
 import { clip } from '../text.mts'
 import type { AgentRecord, InternalAgentField, OrbitRuntimeLike, PublicAgent, RunLimits, RunRecord } from '../types.mts'
 
@@ -16,7 +17,14 @@ const SKILL_READ_CHARS = 28000
 const MCP_TOOL_PREFIX = 'mcp__orbit__'
 // The user as a sender of communications: the root's task, and messages written to an agent while a run works.
 const USER = Object.freeze({ id: 'user', name: 'Вы' })
-const INTERNAL_AGENT_FIELDS: readonly InternalAgentField[] = ['inbox', 'seenChildren', 'requestedModel', 'transcript', 'previousWork', 'ledger', 'ledgerDropped', 'workDone', 'failedCandidates', 'trial', 'partialTurn', 'quotaWarned', 'draftAnswer', 'activeTurn', 'stream', 'sessionToken', 'sessionCursor', 'transcriptChars', 'pausedSession']
+// The secret mark of an agent's steering mail: the user's and a supervisor's words come under "[orbit:<mark>] MESSAGE
+// FROM …" (mailbox.mts), and only the agent's own instructions name the mark (prompts.mts), so the same heading in a
+// file, a command's output or a helper's result cannot pass for them. One per agent for its whole life, since Cursor
+// reads its instructions only in a session's first message; a continuation that resumes the root's session keeps it.
+const newMailMark = (): string => randomBytes(5).toString('hex')
+const isMailMark = (value: unknown): value is string => typeof value === 'string' && /^[0-9a-f]{10}$/.test(value)
+const mailTag = (agent: Pick<AgentRecord, 'mailMark'>): string => `[orbit:${agent.mailMark}]`
+const INTERNAL_AGENT_FIELDS: readonly InternalAgentField[] = ['inbox', 'seenChildren', 'requestedModel', 'transcript', 'previousWork', 'ledger', 'ledgerDropped', 'workDone', 'failedCandidates', 'trial', 'partialTurn', 'quotaWarned', 'draftAnswer', 'activeTurn', 'stream', 'sessionToken', 'sessionCursor', 'transcriptChars', 'pausedSession', 'mailMark']
 // Google models (Antigravity) have reasoning built in: Orbit never sends an effort for them,
 // whatever was persisted in settings, the provider pool or a spawn request.
 const withoutGoogleReasoning = (providerId: string, effort: string): string => providerId === 'antigravity' ? '' : effort
@@ -72,4 +80,4 @@ function diagnostics(runtime: Pick<OrbitRuntimeLike, 'trace'>, run: RunRecord, w
   try { runtime.trace(run, agentId, 'diagnostic', `${where}: ${(error as Error | null | undefined)?.message || String(error)}`) } catch { /* Reporting a failure must not add one. */ }
 }
 
-export { TERMINAL, AGENT_TERMINAL, ceiling, WORK_TOOLS, MUTATING_TOOLS, SKILL_READ_CHARS, MCP_TOOL_PREFIX, USER, withoutGoogleReasoning, answerLimit, publicAgent, isRecord, oneOf, bounded, clip, TurnBudgetError, abortError, overlappingWorkspaces, abortable, diagnostics, markProviderFailure, fromProvider }
+export { TERMINAL, AGENT_TERMINAL, ceiling, WORK_TOOLS, MUTATING_TOOLS, SKILL_READ_CHARS, MCP_TOOL_PREFIX, USER, newMailMark, isMailMark, mailTag, withoutGoogleReasoning, answerLimit, publicAgent, isRecord, oneOf, bounded, clip, TurnBudgetError, abortError, overlappingWorkspaces, abortable, diagnostics, markProviderFailure, fromProvider }

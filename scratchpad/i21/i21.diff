@@ -1,0 +1,203 @@
+diff --git a/scratchpad/i21/base/codex-server.mts b/electron/codex-server.mts
+index af22e98..ebe7f25 100644
+--- a/scratchpad/i21/base/codex-server.mts
++++ b/electron/codex-server.mts
+@@ -166,16 +166,18 @@ function mcpOverrides(session: Pick<NormalizedSession, 'mcpUrl' | 'token'> | nul
+ 
+ async function openCodexSession(options: CodexServerOptions, session: NormalizedSession, helpers: CliHelpers): Promise<CodexSessionApi> {
+   const { resolveLaunch, terminateProcess, createLineReader } = helpers
++  if (options.signal?.aborted) throw cancelledError()
+   const launch = resolveLaunch(options.providerOptions?.command || process.env.ORBIT_CODEX_COMMAND || 'codex', ['app-server', '-c', 'features.multi_agent=false', ...mcpOverrides(session)])
+   const child = spawn(launch.executable, launch.args, { cwd: options.workspace, env: { ...launch.env, ...(session?.token ? { ORBIT_MCP_TOKEN: session.token, ...loopbackNoProxy() } : {}) }, windowsHide: true, shell: false, detached: process.platform !== 'win32', stdio: ['pipe', 'pipe', 'pipe'] })
+   const requests = new Map<number | string, PendingRequest>(), items = new Map<string | undefined, CodexServerItem>()
+   let sequence = 0, closed = false, stderr = '', bytes = 0, threadId: string | null = null, actualModel = options.model || ''
+-  let turn: TurnState | null = null, idleTimer: NodeJS.Timeout | null = null
++  let turn: TurnState | null = null, idleTimer: NodeJS.Timeout | null = null, failure: Error | null = null
+   let onEvent = options.onEvent, onApproval = options.onApproval
+   const emit = (event: ParserEvent) => { try { onEvent?.({ providerId: 'codex', ...event }) } catch { /* UI observers do not control the provider. */ } }
+   const send = (message: CodexClientMessage) => { if (!closed && !child.stdin.destroyed) child.stdin.write(JSON.stringify(message) + '\n') }
++  // A request after the connection closed fails with what closed it (the cancellation, the process's end).
+   const request = <T = unknown,>(method: string, params?: unknown) => new Promise<T>((resolve, reject) => {
+-    if (closed) return reject(new Error('Codex connection closed'))
++    if (closed) return reject(failure || new Error('Codex connection closed'))
+     const id = ++sequence
+     requests.set(id, { resolve, reject })
+     send({ id, method, params })
+@@ -195,6 +197,7 @@ async function openCodexSession(options: CodexServerOptions, session: Normalized
+   const fail = (error: Error) => {
+     if (closed) return termination
+     closed = true
++    failure = error
+     clearTimeout(idleTimer ?? undefined)
+     for (const pending of requests.values()) pending.reject(error)
+     requests.clear()
+@@ -305,6 +308,10 @@ async function openCodexSession(options: CodexServerOptions, session: Normalized
+       })
+     },
+   }
++  // Cancelled while the session opens (initialize, thread/resume or thread/start unanswered): the process is killed now,
++  // not left to the idle timer or to a server that never answers, and the open fails once its tree is gone, as a turn does.
++  const cancelOpen = () => { fail(cancelledError()) }
++  options.signal?.addEventListener('abort', cancelOpen, { once: true })
+   try {
+     await request('initialize', { clientInfo: { name: 'orbit', title: 'Orbit', version: '0.3.1' } })
+     send({ method: 'initialized', params: {} })
+@@ -315,14 +322,19 @@ async function openCodexSession(options: CodexServerOptions, session: Normalized
+       try { thread = await request<CodexThreadResult>('thread/resume', { threadId: session.id, cwd: options.workspace, ...(options.model ? { model: options.model } : {}), approvalPolicy: 'on-request', sandbox }) } catch { thread = null }
+     }
+     if (!thread?.thread?.id) thread = await request<CodexThreadResult>('thread/start', { cwd: options.workspace, ...(options.model ? { model: options.model } : {}), approvalPolicy: 'on-request', sandbox, ephemeral: false })
++    // The process can end, or the open be cancelled, between that answer and here: such a session is not kept, and the
++    // open fails with what closed it (fail() has set `failure`).
++    if (closed) throw failure
+     threadId = thread.thread.id
+     actualModel = thread.model || thread.thread?.model || actualModel
+     sessions.set(threadId, api)
+     armSessionIdle()
+     return api
+   } catch (error) {
+-    fail(error as Error)
++    await fail(error as Error)
+     throw error
++  } finally {
++    options.signal?.removeEventListener('abort', cancelOpen)
+   }
+ }
+ 
+@@ -332,9 +344,13 @@ async function runCodexSessionTurn(options: CodexServerOptions & { prompt: strin
+   let live = session.resume && session.id ? sessions.get(session.id) : null
+   if (live?.closed) { sessions.delete(session.id as string); live = null }
+   if (live?.busy) throw new Error('The Codex session is still running an earlier turn')
++  const opened = !live
+   if (!live) live = await openCodexSession(options, session, helpers)
+   // The thread is known before the turn starts: a turn Orbit cuts off can still be resumed in it (runtime turn.mts).
+   if (live.threadId) { try { options.onEvent?.({ providerId: 'codex', kind: 'session', sessionId: live.threadId }) } catch { /* UI observers do not control the provider. */ } }
++  // Cancelled by now (the runtime stops a turn whose server opened another thread than the one to resume, on that event):
++  // a session this call opened ends with it, since nothing reached its thread and nobody comes back to it.
++  if (options.signal?.aborted) { if (opened) await live.close(); throw cancelledError() }
+   const result = await live.turn(options.prompt, {
+     onEvent: options.onEvent, onApproval: options.onApproval, signal: options.signal,
+     timeoutMs: options.timeoutMs ?? null, inactivityMs: options.inactivityMs, isBusy: helpers.busyCheck?.(session), reasoningEffort: options.reasoningEffort,
+diff --git a/scratchpad/i21/base/providers-session.test.cjs b/tests/providers-session.test.cjs
+index 09f4c03..1f96518 100644
+--- a/scratchpad/i21/base/providers-session.test.cjs
++++ b/tests/providers-session.test.cjs
+@@ -522,11 +522,19 @@ const appServerFixture = `
+   let turns = 0;
+   require('node:readline').createInterface({ input: process.stdin }).on('line', line => {
+     const m = JSON.parse(line);
++    // A request the test holds: the fixture writes its pid to FIXTURE_MARK when it arrives and answers it 400 ms later.
++    if (process.env.FIXTURE_HOLD && m.method === process.env.FIXTURE_HOLD) {
++      require('node:fs').writeFileSync(process.env.FIXTURE_MARK, String(process.pid));
++      const result = m.method === 'initialize' ? {} : { thread: { id: m.params.threadId || 'thread-' + process.pid }, model: 'fixture-model' };
++      return setTimeout(() => send({ id: m.id, result }), 400);
++    }
+     if (m.method === 'initialize') return send({ id: m.id, result: {} });
+     if (m.method === 'thread/resume') return send({ id: m.id, error: { code: -32602, message: 'unknown thread' } });
+     if (m.method === 'thread/start') {
+       if (m.params.ephemeral !== false || m.params.approvalPolicy !== 'on-request') throw new Error('session threads persist and ask');
+-      return send({ id: m.id, result: { thread: { id: 'thread-' + process.pid }, model: 'fixture-model' } });
++      const answer = JSON.stringify({ id: m.id, result: { thread: { id: 'thread-' + process.pid }, model: 'fixture-model' } });
++      // FIXTURE_TRAIL: a rate-limit notice follows the answer in the same write, so Orbit reads both at once.
++      return process.stdout.write(answer + '\\n' + (process.env.FIXTURE_TRAIL ? JSON.stringify({ method: 'account/rateLimits/updated', params: { rateLimits: {} } }) + '\\n' : ''));
+     }
+     if (m.method === 'turn/start') {
+       turns++;
+@@ -545,8 +553,8 @@ const appServerFixture = `
+     }
+   });
+ `
+-const helpers = launches => ({
+-  resolveLaunch: (_command, args) => { launches.push(args); return { executable: process.execPath, args: ['-e', appServerFixture], env: process.env } },
++const helpers = (launches, env = {}) => ({
++  resolveLaunch: (_command, args) => { launches.push(args); return { executable: process.execPath, args: ['-e', appServerFixture], env: { ...process.env, ...env } } },
+   terminateProcess, createLineReader: _testing.createLineReader, busyCheck: () => () => false,
+ })
+ 
+@@ -608,6 +616,56 @@ test('Codex App Server session: a dying process fails the turn and forgets the s
+   assert.equal(codexServer.sessions.size, 0)
+ })
+ 
++test('Codex App Server session: a cancellation while the session opens kills the process and keeps no session; one at the thread\'s event closes only a session the call opened', async t => {
++  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'orbit-open-cancel-'))
++  // Fixture processes not yet shown to be gone: a failed assertion leaves none running. One shown gone is dropped, as
++  // Windows reuses pids.
++  const unproven = new Set()
++  t.after(async () => {
++    for (const pid of unproven) { try { process.kill(pid) } catch { /* Already gone. */ } }
++    for (const id of [...codexServer.sessions.keys()]) await codexServer.closeSession(id)
++    fs.rmSync(directory, { recursive: true, force: true })
++  })
++  const gone = (pid, message) => { assert.throws(() => process.kill(pid, 0), { code: 'ESRCH' }, message); unproven.delete(pid) }
++  const launches = []
++  const base = { workspace: process.cwd(), accessMode: 'workspace-write', approvalPolicy: 'on-request', inactivityMs: 3000 }
++  const session = { id: null, resume: false, token: 't', mcpUrl: 'http://127.0.0.1:9/mcp' }
++  const pidIn = file => { try { return Number(fs.readFileSync(file, 'utf8')) } catch { return 0 } }
++  for (const [hold, opening] of [['initialize', session], ['thread/start', session], ['thread/resume', { ...session, id: 'thread-gone', resume: true }]]) {
++    const mark = path.join(directory, hold.replace('/', '-'))
++    const controller = new AbortController(), events = []
++    const pending = codexServer.runCodexSessionTurn({ ...base, prompt: 'one', signal: controller.signal, onEvent: event => events.push(event) }, opening, helpers(launches, { FIXTURE_HOLD: hold, FIXTURE_MARK: mark }))
++    await until(() => pidIn(mark) > 0)
++    const pid = pidIn(mark); unproven.add(pid)
++    controller.abort()
++    await assert.rejects(pending, { name: 'AbortError' }, `cancelled during ${hold}`)
++    gone(pid, `the open fails once the process tree is gone (${hold})`)
++    assert.equal(codexServer.sessions.size, 0, `no session is kept (${hold})`)
++    assert.ok(!events.some(event => event.kind === 'session'), `no thread is named (${hold})`)
++  }
++  const started = launches.length
++  await assert.rejects(codexServer.openCodexSession({ ...base, signal: AbortSignal.abort() }, session, helpers(launches)), { name: 'AbortError' })
++  assert.equal(launches.length, started, 'a cancelled open starts nothing')
++  // Cancelled in the same read as the thread's answer (by the rate-limit notice that follows it): nothing is kept either.
++  const sameRead = new AbortController()
++  await assert.rejects(codexServer.runCodexSessionTurn({ ...base, prompt: 'one', signal: sameRead.signal, onEvent: event => { if (event.kind === 'quota') sameRead.abort() } }, session, helpers(launches, { FIXTURE_TRAIL: '1' })), { name: 'AbortError' })
++  assert.equal(codexServer.sessions.size, 0, 'no session is kept after a cancellation in the same read')
++  // The runtime stops the turn on the thread's event when the server opened another thread than the one to resume: the
++  // session this call opened is closed; a live session the call reused stays for the next turn.
++  const stray = new AbortController()
++  let strayPid = 0
++  const strayed = codexServer.runCodexSessionTurn({ ...base, prompt: 'one', signal: stray.signal, onEvent: event => { if (event.kind === 'session') { strayPid = Number(event.sessionId.replace('thread-', '')); unproven.add(strayPid); stray.abort() } } }, { ...session, id: 'thread-gone', resume: true }, helpers(launches))
++  await assert.rejects(strayed, { name: 'AbortError' })
++  gone(strayPid, 'the opened session is closed')
++  assert.equal(codexServer.sessions.size, 0)
++  const live = await codexServer.runCodexSessionTurn({ ...base, prompt: 'one' }, session, helpers(launches))
++  const livePid = Number(live.sessionId.replace('thread-', ''))
++  const reused = new AbortController()
++  await assert.rejects(codexServer.runCodexSessionTurn({ ...base, prompt: 'two', signal: reused.signal, onEvent: event => { if (event.kind === 'session') reused.abort() } }, { ...session, id: live.sessionId, resume: true }, helpers(launches)), { name: 'AbortError' })
++  assert.ok(codexServer.sessions.has(live.sessionId), 'the reused session stays')
++  assert.doesNotThrow(() => process.kill(livePid, 0))
++})
++
+ test('extraEnv reaches every CLI process Orbit starts, and Orbit\'s own transport variables win over it', async t => {
+   withEnv(t, { ORBIT_LEGACY_ENVELOPE: undefined })
+   const extraEnv = { ORBIT_RUN_ID: 'run-x', ORBIT_TEST_EXTRA: 'extra', ORBIT_MCP_TOKEN: 'must-not-win', 'BAD=KEY': 'dropped', ORBIT_NOT_TEXT: 5 }
+diff --git a/scratchpad/i21/base/CHANGELOG.md b/docs/CHANGELOG.md
+index e534138..4bc5a89 100644
+--- a/scratchpad/i21/base/CHANGELOG.md
++++ b/docs/CHANGELOG.md
+@@ -4,6 +4,8 @@
+ 
+ ## Не выпущено (после 0.5.0)
+ 
++- **Codex: отмена хода, пока открывается сессия App Server, сразу завершает процесс Codex.** В режиме доступа «Ask — спрашивать» агент на Codex работает через App Server. Orbit запускает процесс `codex app-server`, открывает в нём тред (`initialize`, затем `thread/start` или `thread/resume`) и только после этого начинает ход. Пока тред открывался, Orbit не следил за отменой. Если ход прерывали в этот момент (пауза, ваше сообщение, остановка задачи, сторож тишины), открытие доходило до конца, ход отклонялся, а процесс с пустым тредом жил до таймаута простоя, 30 минут. Если Codex на этом шаге не отвечал вовсе, отмена не действовала совсем. Вызов провайдера не завершался, и ход держал свой слот. После остановки задачи чат оставался занятым, а новые задачи с правом записи в том же проекте не запускались до перезапуска Orbit: их отклоняла «очистка процессов». Теперь отмена во время открытия сразу завершает процесс, и вызов кончается ошибкой отмены, когда дерево процессов уже остановлено, как при отмене хода. Заодно запрос, отправленный после закрытия соединения (например, `thread/start` после неудачного `thread/resume`), теперь завершается той ошибкой, которая соединение закрыла: отменой или сообщением Codex при завершении процесса, где бывает и текст об исчерпанной квоте. Раньше это было общее «Codex connection closed», по которому квоту не распознать. Так же закрывается сессия, которую вызов только что открыл, если ход остановили на событии с id треда. Это делает сам Orbit, когда Codex не нашёл тред для продолжения и молча открыл новый. Уже открытая сессия, которую ход взял повторно, после такой отмены остаётся для следующего хода. Код: `electron/codex-server.mts` (`openCodexSession`, `runCodexSessionTurn`). Тесты: `tests/providers-session.test.cjs` (+1: отмена во время `initialize`, `thread/start` и `thread/resume`, в одном чтении с ответом, на событии треда; фикстура App Server умеет придержать ответ).
++
+ - **Перезапуск в первом ходе агента на Codex, Cursor или Antigravity продолжает его сессию.** Когда корневой агент применяет правку Orbit (`restart_orbit`), Orbit перезапускается и продолжает задачу новым запуском в том же чате. Если у агента уже была сессия CLI, продолжение возобновляет её, и модель помнит, что делала до перезапуска. Но если перезапуск приходился на первый ход агента на Codex, Cursor или Antigravity, продолжение начиналось в новой сессии. Модель получала только заметку о перезапуске с последним текстом и действиями, а контекст сессии (прочитанные файлы, результаты команд, рассуждения) пропадал. Эти CLI сами называют свою сессию: её id приходит в потоке, а итога хода, где он тоже есть, у оборванного хода нет. Запись хода хранила то id из потока, то id, который предлагал Orbit, и отличить одно от другого было нельзя. Поэтому продолжение верило записи хода только у Claude, чью сессию Orbit называет сам. Теперь запись хода у этих CLI не называет сессию, пока её не назовёт CLI, и продолжение после перезапуска возобновляет сессию из записи у любого провайдера. Возобновляется только ход, который успел вызвать инструмент: ход, попросивший перезапуск, его вызвал (`restart_orbit` или самообновление в оболочке), и его запрос уже есть в сессии. Если поток не успел назвать сессию, продолжение, как и раньше, начинается заново. Если CLI не найдёт сессию, продолжение тоже начнётся заново с полным запросом: Claude сообщает об ошибке, а Codex молча открывает другую сессию, и такой ход останавливается раньше, чем модель начнёт действовать. Подсказка «Сессия …» в истории агента у первого хода этих CLI больше не показывает id, предложенный Orbit. Возобновление разговора Antigravity после обрыва проверено живьём раньше; у Codex и Cursor живой проверки нет, пока у них кончилась квота. Код: `electron/runtime/turn.mts` (`providerTurn`), `electron/resume.mts` (`rootSession`). Тесты: `tests/restart-orbit.test.cjs` (+3 сквозных: поток назвал сессию, не назвал, CLI ответил в чужой; сохранённые записи Codex: названная сессия и ход без инструментов). Закрывает остаток пункта 14 в `docs/TECH-DEBT.md`.
+ 
+ - **Cursor: прочитанные и изменённые файлы видны во вкладке «Файлы» и в «Изменениях», а неудачная правка не считается правкой.** Cursor по умолчанию работает в режиме конверта: режим сессии у него только в «Полном доступе» и по явному включению (`ORBIT_CURSOR_SESSION=1`). В режиме конверта Orbit записывал вызовы инструментов Cursor сырым JSON и не знал, какой файл тот прочитал или изменил. Поэтому правки, которые Cursor в «Полном доступе» делает своими инструментами, не попадали ни во вкладку «Файлы», ни в карту файлов других агентов, ни в «Изменения». Теперь режим конверта разбирает инструменты Cursor так же, как режим сессии: в истории видна команда, путь или шаблон поиска вместо JSON, а чтения и правки файлов учитываются, как у других CLI. Заодно исправлено, что считать неудачей. Cursor сообщает о ней не только словами `error`, `failure` и `rejected`, но и `fileNotFound`, `writePermissionDenied`, `timeout` и другими. Раньше такие ответы считались успехом, и в режиме сессии правка, которую Cursor не смог записать, попадала в «Изменения» с чужим диффом из git. Теперь успехом считается только вариант успеха (`success` и немногие похожие). И страховка: если у вызова нет `call_id`, Orbit связывает его начало и конец по собственному id вызова (`toolCallId`), а не по всему тексту, к которому в конце добавляется результат. Иначе такой вызов считался бы идущим до конца хода: сторож тишины молчал бы, а ваше сообщение ждало бы конца хода. Нынешний Cursor CLI (2026.09.26) `call_id` присылает, так что это защита на будущее. Проверено тестом на событиях в форме записей реального Cursor. Живьём не проверено: на подписке Cursor Free исчерпан лимит.
+diff --git a/scratchpad/i21/base/SESSION-MODE.md b/docs/SESSION-MODE.md
+index 77c5d2f..c5ef256 100644
+--- a/scratchpad/i21/base/SESSION-MODE.md
++++ b/docs/SESSION-MODE.md
+@@ -80,7 +80,12 @@ with `ORBIT_MCP_TOKEN` in the child environment. **No `--ephemeral`.** The threa
+ comes from the `thread.started` JSON event; follow-ups use `codex exec resume <id> -`.
+ The App Server transport keeps its thread alive for the agent's life and sends one
+ `turn/start` per Orbit turn. No process is killed at a tool call any more; the
+-`TOOL_HANDOFF` path stays only for envelope providers.
++`TOOL_HANDOFF` path stays only for envelope providers. A cancellation while the session
++opens (`initialize`, `thread/resume` or `thread/start` unanswered) kills the process at once
++and fails the open after the tree is gone; a session the call itself opened is also closed
++when the turn is stopped on its `session` event (the stray-session check below). Before
++2026-10-01 such a process waited for the 30-minute idle close, or, with a server that never
++answered, the provider call never settled.
+ Both Codex transports also get `-c mcp_servers.orbit.tool_timeout_sec=3600` (added
+ 2026-09-30): Codex otherwise ends an MCP tool call after 60 s.
+ 

@@ -51,6 +51,8 @@ export type TurnTiming = {
   nativeToolCalls?: number
   orbitToolCalls?: number
   sessionId?: string | null
+  // While the model thinks (Claude): the CLI's estimate of the thinking block so far, in tokens; gone when it ends.
+  thinking?: number
 }
 // The root agent's answer while it is still being written: kept in the live run only, never in the saved chat or run file.
 export type StreamingMessage = { messageId: string; agentId: string; content: string; startedAt: string; updatedAt: string }

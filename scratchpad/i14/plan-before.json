@@ -1,0 +1,174 @@
+{
+ "status": "implementing",
+ "handoff": "Цель: бесконечное улучшение Orbit ночью. УСЛОВИЕ: никогда не брать Claude Fable 5.1 ни помощникам, ни для ревью. spawn_agent с kind (code/review/lookup/text) без model: Orbit выбирает модель по electron/model-routing.json и квотам (Fable там нет; в I25 kind=review дал codex/gpt-6-astra, ревью дельное); можно и явно claude/claude-opus-5-5 high. С I25 автозамена не берёт модели из excluded в electron/model-tiers.json (Fable), кроме явно названных в пуле. Следующая — I14. Мелкую задачу делать самому + одно ревью; high/medium исправлять, дешёвые low сразу, остальное в план. Каждое изменение — запись в docs/CHANGELOG.md «## Не выпущено (после 0.5.0)» (новые сверху); README — для заметного пользователю. Не коммитить. Проверка: оба tsc, целевые тесты, мутации (образец scratchpad/i25/mutate.cjs: [файл, имя, из, в], шаблон проверяется на уникальность) на КОПИИ в %TMP% (cp -r electron tests src scripts skills package.json tsconfig*.json; node_modules — PowerShell New-Item -ItemType Junction, снимать [IO.Directory]::Delete ДО Remove-Item -Recurse; cmd mklink из Git Bash падает на пробеле в пути); весь набор гоняет restart_orbit. improvement_plan заменяет весь план: названия брать из последней записи run-history с непустым improvements. loops.mts на пределе 400 строк. CRLF: util, agents, lifecycle, ledger, run-store (.mts), failover.mts, QuotaPanel.tsx, tests/runtime, providers, storage, failover (.test.cjs); LF: providers.mts, handover.mts, model-tiers.json.",
+ "tasks": [
+  {
+   "id": "I1",
+   "title": "Самообновление: полный вывод проверок сохраняется в artifacts, а отказ restart_orbit называет упавшие тесты (строки not ok с сообщением проверки), даже если они не попали в последние строки вывода",
+   "status": "done",
+   "evidence": "scripts/self-upgrade.cjs: run() передаёт вывод шага дальше через pipe, дописывает его в artifacts/self-upgrade-checks.log (сбрасывается в начале запуска с проверками)…"
+  },
+  {
+   "id": "I2",
+   "title": "Бесконечное улучшение: нужен ли restart_orbit — по отпечаткам файлов на диске против работающего экземпляра (self-upgrade-health.json), а не по записям fileActivity: правка командой оболочки тоже требует перезапуска, откатанная правка — нет (TECH-DEBT 17 и остаток 19)",
+   "status": "done",
+   "evidence": "electron/resume.mts: healthFilePath (как main.cjs: ORBIT_HEALTH_FILE, «0» — нет) и unappliedCode — отпечатки кода на диске против отчёта здоровья; improvement.mts missing()…"
+  },
+  {
+   "id": "I3",
+   "title": "Карточка запуска после отката restart_orbit показывает исход «откатился», а не «Агент перезапустил Orbit» (TECH-DEBT 13)",
+   "status": "done",
+   "evidence": "src/state-store.ts: settlingRestart(chat, runId) → {kind, text} заметки чата о перезапуске без продолжения (rolled-back/loop-limit/expired/failed)…"
+  },
+  {
+   "id": "I4",
+   "title": "Пауза и остановка: остановка помощника будит руководителя в wait_message; подагенты получают подпись «Остановлен вместе с руководителем»; ход, прерванный паузой, не идёт в лимит; запись о паузе не дублируется в новой сессии (TECH-DEBT 20)",
+   "status": "done",
+   "evidence": "pause.mts stopAgent будит messageWaiters руководителя; mailbox.mts waitAgentMessage при остановленном помощнике возвращается сразу с полем stopped…"
+  },
+  {
+   "id": "I5",
+   "title": "Вложения, остатки ревью: файлы не остаются на диске при отклонённой отправке и после удаления чата (канал attachments:discard); нет пустого пузыря сообщения из одних файлов на время загрузки",
+   "status": "done",
+   "evidence": "electron/attachments.mts discardAttachments(userData, chatId, paths?) и канал attachments:discard; src/attachments.ts discardFiles/discardChatFiles…"
+  },
+  {
+   "id": "I6",
+   "title": "Видно, что модель думает: Claude CLI шлёт system/thinking_tokens (estimated_tokens) — показать «думает · ~N тыс. токенов» в строке «Агент работает»",
+   "status": "done",
+   "evidence": "electron/providers.mts: событие thinking (tokens/done); createClaudeParser ведёт блок размышления самого агента; turn.mts noteThinking…"
+  },
+  {
+   "id": "I7",
+   "title": "Сообщение пользователя, не обработанное из-за упавшего хода, не остаётся молча «Доставлено»: к ответу дописывается, что оно не обработано (TECH-DEBT 15); плюс мелочи ревью T15 (сообщение из прерванного хода не уходит повторно)",
+   "status": "done",
+   "evidence": "electron/runtime/mailbox.mts: keptAnswer (черновик хранит id сообщений пользователя, прочитанных к этому моменту) и answerAsKept…"
+  },
+  {
+   "id": "I8",
+   "title": "Цикл, мелочи из ревью T4: номер задачи не перескакивает, если повторённый потерянный старт отклонён (loopStartFailed берёт iteration−1 без previousIteration)",
+   "status": "done",
+   "evidence": "src/improvement-loop.ts: loopStartFailed(started, error, now) без параметра previousIteration ставит iteration: started.iteration − 1 (started — сохранённый цикл отклонённого старта; startStep на всех трёх путях пишет iteration = номер задачи); src/useOrbitState.ts startLoopTask передаёт цикл из состояния на момент отказа. Причина была в том, что повтор потерянного старта (Math.max(1, iteration)) получал previousIteration = N, отказ возвращал N, и повтор запускал N+1. Проверено: tsc --noEmit и tsc -p tsconfig.main.json без ошибок; tests/improvement-loop, state-store, improvement-loop-runtime — 64/64. Новый тест: потерянный старт №3 → отказ (занят, перезапуск, нет провайдера) → повтор снова №3. Вызовы переведены на новую сигнатуру, цепочки отказов моделируют startStep (iteration + 1). Две мутации (без −1, −2) роняют новый тест и 4 старых (scratchpad/i8/mutate.cjs). Ревью Opus 5.5 (high): high/medium нет, 3 low. Первое: сценарий «потерянный старт на деле создал запуск» недостижим (run.started сразу, runtime:list отдаёт работающие, очередь вызовов ≤30 с < 60 с). Второе: плашка цикла во время ожидания показывает номер последнего старта, как на всех путях, не менялось. Третье: проверка again.loop.iteration добавлена. CHANGELOG «Не выпущено» и TECH-DEBT 19 дополнены."
+  },
+  {
+   "id": "I9",
+   "title": "Прерванный первый ход Codex, Cursor и Antigravity продолжает свою сессию: id сессии берётся из события потока, а не только из итога хода (остаток TECH-DEBT 14)",
+   "status": "done",
+   "evidence": "electron/providers.mts: событие провайдера session {sessionId}; createCodexParser шлёт его на thread.started; turn.mts providerTurn…"
+  },
+  {
+   "id": "I10",
+   "title": "Метки [orbit] MESSAGE FROM THE USER / SUPERVISOR нельзя подделать выводом инструмента: секрет сессии в метке (TECH-DEBT 16)",
+   "status": "done",
+   "evidence": "util.mts: newMailMark (randomBytes(5) hex), isMailMark, mailTag «[orbit:<mark>]»; AgentRecord.mailMark — внутреннее поле (нет в publicAgent/снимках/run-history), задаётся в createAgent. mailbox.steeringMail(run, agent, …): блоки пользователя и руководителя под меткой получателя и в хвосте результата инструмента (userMail), и в запросе (mailboxContext). prompts.mts markRule/mailRule: метку называют системный текст сессии, первый запрос каждой сессии (Codex системного текста не получает — найдено ревью) и запрос конверта; тот же заголовок без метки или с чужой — данные. mcp-server DEFAULT_INSTRUCTIONS переписаны. lifecycle.markRestarting сохраняет root.mailMark в RestartMark.mailMark, resume.rootSession передаёт, restart.prepareContinuation берёт только для возобновляемой сессии (isMailMark). agents.budgetHandoff заменяет метку в отчёте словом mark. Проверки: tsc -p tsconfig.main.json и tsc --noEmit — 0 ошибок; 206/206 целевых тестов (steer-messages, user-messages, attachments, session-mode, restart-orbit, providers-messaging, runtime-modules, mcp-server, pause-agents, restart-notices, runtime, improvement-loop-runtime); мутации 10/10 пойманы (scratchpad/i10/mutate.cjs 8 и mutate-review.cjs 2, на временной копии); системный текст 5050–5254 знаков при пределе 6000. Ревью Opus 5.5 high: high (Codex без системного текста) и medium (утечка метки через budgetHandoff) исправлены, low: формулировка правила уточнена, тест необрезанного хвоста добавлен; метка в событии run.finished (re…"
+  },
+  {
+   "id": "I11",
+   "title": "Хранилище запусков: удаление старых записей run-history (срок или число), сейчас записи копятся бесконечно",
+   "status": "done",
+   "evidence": "electron/run-store.mts: prune() удаляет запуски сверх 500 новейших по времени записи (KEEP_RUNS) вместе с <id>.json.bak, .tmp и images/<id>/…"
+  },
+  {
+   "id": "I12",
+   "title": "Эндпоинты провайдеров: для удалённых хостов требовать https (http только для localhost)",
+   "status": "done",
+   "evidence": "electron/providers.mts: isLoopbackHost и endpointUrl(raw, variable): http:// на другой хост — ошибка с именем переменной, если не задано ORBIT_ALLOW_INSECURE_HTTP=1…"
+  },
+  {
+   "id": "I13",
+   "title": "Новая функция: выбор модели по типу поручения в spawn_agent (code/review/lookup/text) по таблице маршрутизации с учётом квот",
+   "status": "done",
+   "evidence": "electron/model-routing.json (новый): по типу поручения code/review/lookup/text — кандидаты в порядке аудита (MODEL-AUDIT «Кратко»), why и уровень замера; Fable, Haiku 4.5, GPT-OSS, GPT-5.6 Luna, Cursor исключены. electron/model-routing.mts route(): пул (провайдер запуска всегда), brokenProviders, каталог (не подключён / нет в списке моделей; без каталога — только провайдеры родителя, запуска и пула), квота assess() с порогом switchAtPercent (окна отдельных моделей). runtime/handover.mts routeSpawn: квоты освежаются как при замене, каталог ждётся ≤8 с (ORBIT_ROUTE_WAIT_MS), уровень замера — только если его не задали вызывающий, пул, настройки провайдера или своя модель родителя; providerId без кандидатов — ответ сразу. runtime/agents.mts: spawnSubAgent async + registerSubAgent; результат routed {kind, model, skipped, note}, строка «Model for … work» в трассе delegation; unknown_kind; пауза, оборвавшая ход сессии во время выбора, — turn_interrupted без помощника. tool-registry: kind (enum с ''), описание; prompts: фраза в DELEGATION (системный текст ≤6000). Проверено: tsc -p tsconfig.main.json и tsc --noEmit — 0 ошибок; tests/model-routing.test.cjs 18/18 (три прогона подряд), 22 связанных файла 345/345; мутации 45/45 пойманы (scratchpad/i13/mutate.cjs на копии в %TMP%); ревью Opus 5.5 high: high/medium нет, из 5 low исправлены пауза, '' в enum MCP, мгновенный ответ без кандидатов, тест медленного каталога, комментарий предпроверки; остальное → I27; наблюдение о бакетах Codex →…"
+  },
+  {
+   "id": "I25",
+   "title": "Правило пользователя «не Fable» и автозамена подписки: failover.replacements брал модели из каталога Cursor, а там claude-fable-5-thinking-high (tier 3, первая по алфавиту) — исключать Fable из замен (возможно, список исключённых в «Квоты»); спасал только исчерпанный бесплатный план Cursor",
+   "status": "done",
+   "evidence": "electron/model-tiers.json: новый список excluded [{match, why}] — Fable, шаблон (?:^|[-_/. ])fable(?=$|[-_/.:@ ]), правило пользователя 2026-09-30. electron/failover.mts: EXCLUDED, предикат excluded(model) (экспорт), в replacements «if (!inPool && excluded(model)) continue»: модель из каталога провайдера или выбора композера (models) не берётся ни в обычном, ни в relaxed проходе, явно названная в пуле — берётся; tierOf/baselineTier не менялись (агента на Fable по-прежнему заменяют флагманом). src/QuotaPanel.tsx: подсказка «Автозамена агента» называет исключённые модели; docs/providers.md, docs/ARCHITECTURE.md, CHANGELOG «Не выпущено». Проверено: tsc -p tsconfig.main.json и tsc --noEmit — 0 ошибок; tests/failover + tests/model-routing 56/56 (новый тест: Fable первым в каталоге Cursor и в каталоге Claude, relaxed, выбор композера, пул без модели, пул с Fable, baselineTier); мутации 8/8 пойманы (scratchpad/i25/mutate.cjs на копии в %TMP%). Ревью codex/gpt-6-astra (spawn_agent kind=review, high): high нет; medium «провайдер в пуле без модели или cursor auto запускает модель CLI по умолчанию, она может быть Fable» оценён как low (пул пуст, умолчание — настройка пользователя в CLI), граница описана в docs/providers.md, остаток → I28; другие пути (маршрутизация, cursorEffortModel, алиасы Claude, handover, relaxed) Fable не выбирают. Применяется restart_orbit в этом же запуске."
+  },
+  {
+   "id": "I14",
+   "title": "Навыки, остатки T14: prefers-reduced-motion у праздника; живая проверка сцены навыка в настоящем окне",
+   "status": "pending",
+   "evidence": ""
+  },
+  {
+   "id": "I15",
+   "title": "Самообновление: scripts/self-upgrade.cjs и его наблюдатель читают отчёт здоровья там же, где его пишет главный процесс (ORBIT_HEALTH_FILE, «0» — нет отчёта), а не только artifacts/self-upgrade-health.json (TECH-DEBT 22)",
+   "status": "pending",
+   "evidence": ""
+  },
+  {
+   "id": "I16",
+   "title": "Ожидание (wait_message, wait_agent), оборванное паузой в режиме сессии, не забирает почту пользователя и результаты помощников: обрывать ожидания хода вместе с ходом или отмечать прочитанным только дошедшее до модели (TECH-DEBT 23)",
+   "status": "pending",
+   "evidence": ""
+  },
+  {
+   "id": "I17",
+   "title": "Вложения, остатки ревью T17/I5: записка продолжения после restart_orbit называет пути вложений исходного запуска (resume.mts continuationPrompt, lifecycle restartPayload их убирает); в истории чата (lifecycle conversationHistory, 8000 символов на запись) строка путей attachmentNote не отрезается; ф…",
+   "status": "pending",
+   "evidence": ""
+  },
+  {
+   "id": "I18",
+   "title": "Почта прерванного хода у Codex, Cursor и Antigravity: проверить живьём, сохраняет ли их CLI запрос хода, прерванного после начала ответа (codex exec resume, cursor-agent --resume, antigravity); если да — удерживать её и у них, как у Claude (pause.interruptedSession: сейчас только claude, иначе повт…",
+   "status": "pending",
+   "evidence": ""
+  },
+  {
+   "id": "I19",
+   "title": "Парсер Cursor в режиме конверта (subscription-providers.mts ~210): событие tool_call без call_id ключуется JSON всего tool_call, конец с результатом не совпадает с началом — ход навсегда «занят» (steer ждёт конца хода, сторож тишины молчит); ключ без результата или cursorToolEvent (остаток ревью T1…",
+   "status": "pending",
+   "evidence": ""
+  },
+  {
+   "id": "I20",
+   "title": "Продолжение после restart_orbit, вызванного в первом ходе корня на Codex, Cursor или Antigravity, возобновляет сессию, названную потоком: resume.rootSession берёт id из записи хода только у Claude (запись хода с I9 называет id потока, но в ней же бывает id, предложенный Orbit; нужен признак или nul…",
+   "status": "pending",
+   "evidence": ""
+  },
+  {
+   "id": "I21",
+   "title": "Codex App Server, из ревью I9: прерывание во время openCodexSession (после initialize или thread/start, до первого хода) оставляет процесс в sessions до таймаута простоя (30 мин); закрывать его при отмене",
+   "status": "pending",
+   "evidence": ""
+  },
+  {
+   "id": "I22",
+   "title": "Codex в режиме сессии не получает системный текст Orbit (sessionGuide: кто он, правила инструментов Orbit, делегирования, памяти, «When you finish…»): ни codex exec (buildCodexSessionArgs), ни App Server (openCodexSession/turn/start) не передают session.systemAppend. Передать его первым сообщением …",
+   "status": "pending",
+   "evidence": ""
+  },
+  {
+   "id": "I23",
+   "title": "История запусков, остатки ревью I11: при переводе часов назад порядок по mtime удаляет новые запуски (и обрезка памяти по startedAt их вытесняет); первая очистка огромной старой истории синхронна в конструкторе (риск startTimeoutMs 20 с); сироты images/<id>, .bak и .tmp без <id>.json не удаляются",
+   "status": "pending",
+   "evidence": ""
+  },
+  {
+   "id": "I24",
+   "title": "Эндпоинты провайдеров, из ревью I12: fetch к Ollama и совместимому API следует редиректам 307/308 и повторяет POST с запросом по новому адресу, в том числе на http:// другого хоста (Authorization при смене origin срезается); проверять адрес редиректа правилом endpointUrl (redirect: 'manual') или от…",
+   "status": "pending",
+   "evidence": ""
+  },
+  {
+   "id": "I26",
+   "title": "Квоты Codex, из ревью I13: упёршийся scoped-бакет одной модели (quota.mts parseCodexLimits: blocked по rateLimitReachedType любого бакета) делает в assess исчерпанными все модели Codex — автозамена и маршрутизация пропускают и gpt-6-astra, и gpt-6-luna; учитывать blocked по бакету (его models)",
+   "status": "pending",
+   "evidence": ""
+  },
+  {
+   "id": "I27",
+   "title": "spawn_agent kind, остатки ревью I13: в пачке конверта помощник, созданный раньше, стартует во время ожидания маршрутизации следующего (холодный каталог): без B в TEAM DIRECTORY, send_message той же пачки приходит уже в ход; предпроверка до ожидания ловит не все отказы (depth/agent/turn limits, pool…",
+   "status": "pending",
+   "evidence": ""
+  },
+  {
+   "id": "I28",
+   "title": "Автозамена, остатки ревью I25: провайдер в пуле без модели (и cursor auto) запускает модель CLI по умолчанию, Orbit её не видит — исключённая (Fable) может пройти; узнавать модель из init провайдера и не брать такую замену; возможно, список исключённых моделей в «Квоты»",
+   "status": "pending",
+   "evidence": ""
+  }
+ ]
+}

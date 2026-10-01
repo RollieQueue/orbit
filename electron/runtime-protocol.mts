@@ -27,7 +27,7 @@ const RUNTIME_CHANNELS: readonly string[] = [
   'state:load', 'state:save', 'project-index:status',
   'memory:list', 'memory:save', 'memory:remove', 'memory:pin', 'memory:sharing', 'memory:forget-chat', 'memory:stats',
   'capabilities:list', 'capabilities:pin', 'capabilities:enable', 'capabilities:params', 'capabilities:read', 'capabilities:install', 'capabilities:remove', 'capabilities:restore',
-  'attachments:save', 'attachments:image',
+  'attachments:save', 'attachments:image', 'attachments:discard',
   'providers:health', 'quota:get', 'artifact:apply',
 ]
 // Call channels main answers itself: dialogs, `shell`, `app`, health and restarts.

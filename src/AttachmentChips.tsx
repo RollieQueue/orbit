@@ -34,7 +34,7 @@ function useThumbnail(attachment: Attachment): string | null {
   useEffect(() => {
     let current = true
     setUrl(null)
-    if (isImage(attachment)) void thumbnail(attachment.path).then(value => { if (current) setUrl(value) })
+    if (attachment.path && isImage(attachment)) void thumbnail(attachment.path).then(value => { if (current) setUrl(value) })
     return () => { current = false }
   }, [attachment.path])
   return url
@@ -68,6 +68,14 @@ export function ComposerAttachments({ files, onRemove }: { files: File[]; onRemo
 function MessageAttachment({ attachment }: { attachment: Attachment }) {
   const url = useThumbnail(attachment)
   const open = () => { void window.orbit?.openPath(attachment.path).catch(() => undefined) }
+  // Not saved yet (the message is being sent): the chip only names the file.
+  if (!attachment.path) return <li>
+    <span className="attachment-chip message-attachment pending" title={`${attachment.name}: ещё не сохранён`}>
+      <span className="attachment-thumb"><Icon name={isImage(attachment) ? 'image' : 'paperclip'} size={15} /></span>
+      <span className="attachment-name">{attachment.name}</span>
+      <small>{formatSize(attachment.size)}</small>
+    </span>
+  </li>
   return <li>
     <button type="button" className={`attachment-chip message-attachment ${url ? 'has-image' : ''}`} onClick={open} title={`Открыть: ${attachment.name}`}>
       <span className="attachment-thumb">{url ? <img src={url} alt="" /> : <Icon name={isImage(attachment) ? 'image' : 'paperclip'} size={15} />}</span>

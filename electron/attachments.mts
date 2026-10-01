@@ -11,6 +11,12 @@ const ATTACHMENTS_DIR = 'attachments'
 const MAX_FILES = 10
 const MAX_FILE_BYTES = 20 * 1024 * 1024
 const MAX_TOTAL_BYTES = 50 * 1024 * 1024
+// The files of a run (its first message and the messages written to its agents) it keeps for the continuation after a
+// restart (resume.mts names them again): the newest ones.
+const MAX_RUN_FILES = 20
+// A chat folder its deletion could not remove at once (Windows does not delete a file another program holds open, a PDF
+// in a viewer) keeps this mark next to it, `<folder>.discard`, and sweepDiscarded deletes it later.
+const DISCARD_MARK = '.discard'
 // A thumbnail travels as a data URL and stays in the window's cache, so only small images get one; a bigger one shows as a file.
 const MAX_IMAGE_BYTES = 2 * 1024 * 1024
 const MAX_NAME_CHARS = 100
@@ -89,6 +95,68 @@ async function saveAttachments(userData: string, chatId: string, uploads: unknow
   return saved
 }
 
+// Deletes saved files that no message will carry. With `paths`, those files of the chat's folder: a send or a message
+// that was refused keeps its files in the composer, and the next try saves them again. Without (null or undefined: the
+// JSON of a child runtime turns a missing argument into null), the chat's whole folder: the chat was deleted. Only what
+// saveAttachments wrote there can go; a link is removed, not followed. Answers how many entries were removed.
+async function discardAttachments(userData: string, chatId: string, paths?: unknown): Promise<number> {
+  if (!chatId) return 0
+  const folder = path.join(attachmentsRoot(userData), safeFolder(chatId))
+  if (paths === undefined || paths === null) {
+    let entries: string[] | null = null
+    try { entries = await fs.promises.readdir(folder) } catch { /* the chat has no files */ }
+    let count = entries?.length ?? 0
+    if (entries) {
+      // Marked before anything else: what of it a program still holds open goes at a later sweep, even if Orbit quits
+      // in between.
+      await fs.promises.writeFile(`${folder}${DISCARD_MARK}`, '').catch(() => undefined)
+      if (!await removeFolder(folder)) { try { count -= (await fs.promises.readdir(folder)).length } catch { /* gone after all */ } }
+    }
+    // Then the folders earlier deletions had to leave (this one was just tried).
+    await sweepDiscarded(userData, safeFolder(chatId))
+    return count
+  }
+  if (!Array.isArray(paths)) return 0
+  let removed = 0
+  for (const item of paths.slice(0, MAX_FILES)) {
+    if (typeof item !== 'string' || !path.isAbsolute(item)) continue
+    const name = path.relative(folder, path.resolve(item))
+    if (name !== path.basename(name) || !/^[0-9a-f]{8}-/.test(name)) continue
+    // The file checked is the file removed: the name joined to the folder, not the path as the window wrote it.
+    const file = path.join(folder, name)
+    try {
+      if ((await fs.promises.lstat(file)).isDirectory()) continue
+      await fs.promises.unlink(file)
+      removed++
+    } catch { /* already gone */ }
+  }
+  return removed
+}
+// A chat folder, then its mark; false while a file of it is held (the mark stays for the next sweep).
+async function removeFolder(folder: string): Promise<boolean> {
+  try {
+    // A file Windows holds for a moment (an antivirus scan, the indexer) is tried again.
+    await fs.promises.rm(folder, { recursive: true, force: true, maxRetries: 3 })
+    await fs.promises.rm(`${folder}${DISCARD_MARK}`, { force: true })
+    return true
+  } catch { return false }
+}
+// Deletes the marked folders of deleted chats (but `skip`); the runtime host sweeps at its start, discardAttachments at
+// every chat deletion. A mark is a file, and only a name safeFolder gives is a chat's folder: a stray mark never reaches
+// the attachments folder itself or above it, and the folder of a chat whose id ends in `.discard` is no mark. Answers how
+// many folders went.
+async function sweepDiscarded(userData: string, skip = ''): Promise<number> {
+  const root = attachmentsRoot(userData)
+  let entries: fs.Dirent[] = []
+  try { entries = await fs.promises.readdir(root, { withFileTypes: true }) } catch { return 0 }
+  let removed = 0
+  for (const entry of entries) {
+    const chat = entry.isFile() && entry.name.endsWith(DISCARD_MARK) ? entry.name.slice(0, -DISCARD_MARK.length) : ''
+    if (chat && chat !== skip && safeFolder(chat) === chat && await removeFolder(path.join(root, chat))) removed++
+  }
+  return removed
+}
+
 // An image of the attachments folder as a data URL for the window's thumbnail; null for anything else (another folder, a
 // missing file, not an image, over MAX_IMAGE_BYTES).
 async function readAttachmentImage(userData: string, target: unknown): Promise<string | null> {
@@ -104,13 +172,13 @@ async function readAttachmentImage(userData: string, target: unknown): Promise<s
   } catch { return null }
 }
 
-// What the runtime may hand to an agent from the window's list: the attachments that exist as files of the attachments
-// folder. Name, type and size are taken from the file, not from what the window said.
-function trustedAttachments(userData: string, value: unknown): Attachment[] {
+// What the runtime may hand to an agent from the window's list (or a saved run's, at most `max`): the attachments that
+// exist as files of the attachments folder. Name, type and size are taken from the file, not from what the list said.
+function trustedAttachments(userData: string, value: unknown, max = MAX_FILES): Attachment[] {
   if (!Array.isArray(value)) return []
   const root = attachmentsRoot(userData)
   const kept: Attachment[] = []
-  for (const item of value.slice(0, MAX_FILES) as Partial<Attachment>[]) {
+  for (const item of value.slice(0, max) as Partial<Attachment>[]) {
     if (typeof item?.path !== 'string' || !path.isAbsolute(item.path) || !inside(root, item.path)) continue
     try {
       const stat = fs.statSync(item.path)
@@ -128,4 +196,4 @@ const ATTACHMENTS_HEADER = 'ATTACHMENTS FROM THE USER (files attached to this me
 const attachmentLines = (attachments: Attachment[] | undefined): string => (attachments || []).map(item => `- ${item.path} (${item.type}, ${sizeText(item.size)})`).join('\n')
 const attachmentBlock = (attachments: Attachment[] | undefined): string => attachments?.length ? `${ATTACHMENTS_HEADER}\n${attachmentLines(attachments)}` : ''
 
-export { ATTACHMENTS_DIR, ATTACHMENTS_HEADER, MAX_FILES, MAX_FILE_BYTES, MAX_TOTAL_BYTES, MAX_IMAGE_BYTES, attachmentsRoot, configureAttachments, attachmentsFolder, safeName, saveAttachments, readAttachmentImage, trustedAttachments, attachmentLines, attachmentBlock }
+export { ATTACHMENTS_DIR, ATTACHMENTS_HEADER, MAX_FILES, MAX_FILE_BYTES, MAX_TOTAL_BYTES, MAX_IMAGE_BYTES, MAX_RUN_FILES, attachmentsRoot, configureAttachments, attachmentsFolder, safeName, saveAttachments, discardAttachments, sweepDiscarded, readAttachmentImage, trustedAttachments, attachmentLines, attachmentBlock }

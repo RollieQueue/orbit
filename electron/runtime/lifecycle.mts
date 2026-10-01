@@ -15,7 +15,7 @@ import { ToolProtocolError, parseResponse } from './envelope.mts'
 import { TOOL_GUIDE } from './prompts.mts'
 import { restartNote, prepareContinuation } from './restart.mts'
 import { loadPlan } from './improvement.mts'
-import { attachmentBlock } from '../attachments.mts'
+import { MAX_RUN_FILES, attachmentBlock } from '../attachments.mts'
 
 const DEFAULT_LIMITS: Readonly<RunLimits> = Object.freeze({ maxAgents: null, maxDepth: null, maxConcurrent: null, maxTurns: null, maxTotalTurns: null, maxMessages: null, maxToolCalls: null, maxOutputChars: 12000, maxContextChars: 120000, timeoutMs: null, runTimeoutMs: null })
 // Shared (cross-project) housekeeping looks at every project, so it runs at most this often.
@@ -61,7 +61,7 @@ function conversationHistory(entries: HistoryInput[]): HistoryEntry[] {
 // with, as plain data, without the message and the chat history (the continuation brings its own message, and the chat
 // reaches it through the digest of earlier turns).
 function restartPayload(payload: StartPayload): StartPayload | undefined {
-  const { prompt, history, attachments, resumedFrom, resumeChain, restartNote, resumeSession, ...settings } = payload
+  const { prompt, history, attachments, resumedFrom, resumeChain, restartNote, resumeSession, resumeAttachments, ...settings } = payload
   try { return JSON.parse(JSON.stringify(settings)) as StartPayload } catch { return undefined }
 }
 async function start(runtime: OrbitRuntimeLike, payload: StartPayload = {}): Promise<string> {
@@ -113,6 +113,9 @@ async function start(runtime: OrbitRuntimeLike, payload: StartPayload = {}): Pro
     router: null!,
   }
   run.startPayload = restartPayload(payload)
+  // The files the user attached in this run; a continuation starts with those of the run it continues (checked there).
+  const resumeAttachments = Array.isArray(payload.resumeAttachments) ? payload.resumeAttachments : []
+  run.attachments = [...resumeAttachments, ...attachments].slice(-MAX_RUN_FILES)
   if (typeof payload.resumedFrom === 'string' && /^[\w-]+$/.test(payload.resumedFrom)) run.resumedFrom = payload.resumedFrom
   if (Number.isSafeInteger(payload.resumeChain) && Number(payload.resumeChain) >= 0) run.resumeChain = payload.resumeChain
   if (Number.isSafeInteger(payload.loopTask) && Number(payload.loopTask) >= 1) run.loopTask = payload.loopTask
@@ -132,7 +135,7 @@ async function start(runtime: OrbitRuntimeLike, payload: StartPayload = {}): Pro
   setMaxListeners(0, run.controller.signal)
   runtime.runs.set(run.runId, run)
   const root = runtime.createAgent(run, null, { id: 'root', name: 'Orbit', task: [run.prompt, attachmentBlock(attachments)].filter(Boolean).join('\n\n'), reason: 'User message', providerId: run.providerId, model: run.model })
-  if (typeof payload.restartNote === 'string' && payload.restartNote) prepareContinuation(runtime, run, root, bounded(payload.restartNote, 6000), payload.resumeSession)
+  if (typeof payload.restartNote === 'string' && payload.restartNote) prepareContinuation(runtime, run, root, bounded(payload.restartNote, 6000), payload.resumeSession, resumeAttachments)
   runtime.emit(run, 'run.started', { prompt: run.prompt, workspace: run.workspace, providerId: run.providerId, model: run.model, accessMode, access: accessMode, approvalPolicy: run.approvalPolicy, memoryEnabled: run.memoryEnabled, limits: run.limits, status: run.status, ...(run.resumedFrom ? { resumedFrom: run.resumedFrom, resumeChain: run.resumeChain } : {}),
     ...(run.loopTask ? { loopTask: run.loopTask } : {}),
     ...(run.improvementMode ? { improvements: run.improvements, improvementStatus: run.improvementStatus, ...(run.improvementHandoff ? { improvementHandoff: run.improvementHandoff } : {}) } : {}) })
@@ -217,7 +220,8 @@ function markRestarting(runtime: OrbitRuntimeLike, runId: string, mark: RestartM
   // The note is written first: the root's work log and a turn the restart cuts off are known only until the abort below.
   const root = run.agentNodes.get('root')
   const note = root ? restartNote(runtime, run, root) : undefined
-  clearTimeout(run.timer); run.status = 'restarting'; run.finishedAt = new Date().toISOString(); run.restart = { ...mark, ...(note ? { note } : {}) }
+  // The root's mail mark goes with the note: a continuation that resumes its session keeps it (restart.prepareContinuation).
+  clearTimeout(run.timer); run.status = 'restarting'; run.finishedAt = new Date().toISOString(); run.restart = { ...mark, ...(note ? { note } : {}), ...(root ? { mailMark: root.mailMark } : {}) }
   run.controller.abort(); runtime.cancelAgents(run, RESTART_DETAIL)
   runtime.emit(run, 'run.finished', { status: run.status, restart: run.restart })
   runtime.closeSessions(run)

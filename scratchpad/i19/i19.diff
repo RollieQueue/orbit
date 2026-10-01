@@ -1,0 +1,137 @@
+diff --git a/scratchpad/i19/base/subscription-providers.mts b/electron/subscription-providers.mts
+index a1e29b4..e4bc078 100644
+--- a/scratchpad/i19/base/subscription-providers.mts
++++ b/electron/subscription-providers.mts
+@@ -207,7 +207,7 @@ function createParser(id: SubscriptionId, onEvent: ProviderEventListener | null
+           const output = Array.isArray(content) ? content.filter(block => block.type === 'text').map(block => block.text).join('') : ''
+           if (output) onEvent?.({ providerId: id, kind: 'output', text: output, partial: true })
+         }
+-        if (event.type === 'tool_call') onEvent?.({ providerId: id, kind: 'tool', native: true, text: JSON.stringify(event.tool_call || {}), status: event.subtype, ...(typeof event.call_id === 'string' ? { toolId: event.call_id } : {}) })
++        if (event.type === 'tool_call') onEvent?.(cursorToolEvent(event, false))
+         if (event.type === 'result') {
+           result = event
+           if (event.is_error || event.subtype !== 'success') failure = typeof event.result === 'string' ? event.result : 'Cursor request failed'
+@@ -225,23 +225,33 @@ function createParser(id: SubscriptionId, onEvent: ProviderEventListener | null
+     },
+   }
+ }
+-// Cursor names a tool call by the key inside `tool_call` (`readToolCall`, `shellToolCall`, `mcpToolCall`, …). An MCP
+-// call to Orbit's server is an Orbit tool event (the runtime records it where it is dispatched); file tools are named
++// Cursor names a tool call by the key inside `tool_call` (`readToolCall`, `shellToolCall`, `mcpToolCall`, …), in both
++// transports. In a session an MCP call to Orbit's server is an Orbit tool event (the runtime records it where it is
++// dispatched); the envelope transport gives Cursor no such server, so there every call is native. File tools are named
+ // as file-activity reads them.
+ const CURSOR_FILE_TOOLS: Record<string, string> = { readToolCall: 'read', writeToolCall: 'write', editToolCall: 'edit' }
+-function cursorToolEvent(event: SubscriptionEvent): ToolEvent {
++// A finished call failed unless its result is a success variant: `success`, in a few tools `approved`, `complete`,
++// `stillRunning`, `accepted`, `modified` or `…Success`. The failures are many (`error`, `rejected`, `fileNotFound`,
++// `writePermissionDenied`, `timeout`, `spawnError`, …; CLI 2026.09.26), and a failed edit must not count as a write.
++const CURSOR_DONE = /^(?:success|approved|complete|stillRunning|accepted|modified|\w+Success)$/
++function cursorToolEvent(event: SubscriptionEvent, orbitServer = true): ToolEvent {
+   const [kind = 'tool', body] = isRecord(event.tool_call) ? Object.entries(event.tool_call)[0] || [] : []
+   const call = isRecord(body) ? body : {}
+   const args: Record<string, unknown> = isRecord(call.args) ? call.args : {}
+   const done = event.subtype === 'completed'
+-  const status = done && isRecord(call.result) && ['error', 'failure', 'rejected'].some(key => key in (call.result as object)) ? 'failed' : done ? 'completed' : String(event.subtype || 'started')
++  const status = done && isRecord(call.result) && !Object.keys(call.result).some(key => CURSOR_DONE.test(key)) ? 'failed' : done ? 'completed' : String(event.subtype || 'started')
+   const output = call.result === undefined ? undefined : typeof call.result === 'string' ? call.result : JSON.stringify(call.result)
+-  const toolId = typeof event.call_id === 'string' ? event.call_id : undefined
++  // The start and the end of a call must share a key (the watchdog and steering wait for the end): `call_id`, else the
++  // id the call carries itself (`toolCallId`, CLI 2026.09.26), else its text, which comes from the arguments and leaves
++  // out the result the end adds (two identical calls at once then share it).
++  const ids = [event.call_id, isRecord(event.tool_call) ? event.tool_call.toolCallId : undefined]
++  const toolId = ids.find((value): value is string => typeof value === 'string' && value !== '')
+   const named = typeof args.toolName === 'string' ? args.toolName : typeof args.name === 'string' ? args.name : ''
+-  const orbitTool = kind === 'mcpToolCall' && ORBIT_SERVER.test(String(args.providerIdentifier || args.serverIdentifier || '')) ? named.replace(/^(?:mcp_+)?(?:plugin-orbit-)?orbit(?:__|[-_:.])/, '') : ''
++  const orbitTool = orbitServer && kind === 'mcpToolCall' && ORBIT_SERVER.test(String(args.providerIdentifier || args.serverIdentifier || '')) ? named.replace(/^(?:mcp_+)?(?:plugin-orbit-)?orbit(?:__|[-_:.])/, '') : ''
+   if (orbitTool) return { providerId: 'cursor', kind: 'tool', tool: `mcp__orbit__${orbitTool}`, toolId, status, input: args.args, output, text: `${orbitTool} ${JSON.stringify(args.args ?? {}).slice(0, 200)}`, native: false, mcp: true, server: 'orbit', orbitTool }
+   const target = typeof args.path === 'string' ? args.path : undefined
+-  const text = [args.command, args.path, args.pattern, args.globPattern, args.query, named].find((value): value is string => typeof value === 'string' && value !== '')
++  // A search names what it looks for (grep and glob also carry the folder they search in).
++  const text = [args.command, args.pattern, args.globPattern, args.query, args.path, named].find((value): value is string => typeof value === 'string' && value !== '')
+   return { providerId: 'cursor', kind: 'tool', tool: (target && CURSOR_FILE_TOOLS[kind]) || kind, toolId, status, input: target ? { path: target } : args, output, text: text || kind, native: true }
+ }
+ // Antigravity's tool steps: `call_mcp_tool` on Orbit's plugin server is an Orbit tool event; file tools carry their path
+diff --git a/scratchpad/i19/base/subscription-providers.test.cjs b/tests/subscription-providers.test.cjs
+index d55e25f..f6e3fbe 100644
+--- a/scratchpad/i19/base/subscription-providers.test.cjs
++++ b/tests/subscription-providers.test.cjs
+@@ -264,6 +264,52 @@ test('Cursor session parser: chat id, Orbit MCP calls apart from native tools, m
+   assert.deepEqual(streamed.finish(), { text: 'All tests pass.', model: '', sessionId: 'chat-2' })
+ })
+ 
++// Shaped like Cursor CLI 2026.09.26 output (run records of 2026-09-28): the call carries its own `toolCallId`, and its
++// end repeats the arguments and adds `result` and `completedAtMs`. That CLI also sends `call_id`; the first two calls
++// leave it out on purpose, to check the fallbacks.
++test('Cursor envelope parser names tool calls as the session parser does: start and end share a key, a failed edit is no write', () => {
++  const { watchTurn } = require('../electron/runtime/watchdog.mts')
++  const { FileActivity } = require('../electron/file-activity.mts')
++  const events = [], parser = createParser('cursor', event => events.push(event), 'auto', ORBIT_RESPONSE_SCHEMA)
++  const call = (subtype, toolCall, extra = {}) => parser.line(JSON.stringify({ type: 'tool_call', subtype, ...extra, tool_call: toolCall, session_id: 'chat-1' }))
++  const shell = { args: { command: 'npm test', toolCallId: 'call-1\nfc_1' } }
++  call('started', { shellToolCall: shell, hookAdditionalContexts: [], toolCallId: 'call-1\nfc_1', startedAtMs: '1' })
++  call('completed', { shellToolCall: { ...shell, result: { success: { exitCode: 0, stdout: 'ok' } } }, hookAdditionalContexts: [], toolCallId: 'call-1\nfc_1', startedAtMs: '1', completedAtMs: '2' })
++  // Without either id the arguments key the call; `call_id` comes before the call's own id.
++  call('started', { readToolCall: { args: { path: 'README.md' } } })
++  call('completed', { readToolCall: { args: { path: 'README.md' }, result: { success: { content: 'hello' } } } })
++  call('started', { editToolCall: { args: { path: 'a.txt' } }, toolCallId: 'inner' }, { call_id: 'c3' })
++  call('completed', { editToolCall: { args: { path: 'a.txt' }, result: { writePermissionDenied: { path: 'a.txt' } } }, toolCallId: 'inner' }, { call_id: 'c3' })
++  call('started', { editToolCall: { args: { path: 'b.txt' } } }, { call_id: 'c4' })
++  call('completed', { editToolCall: { args: { path: 'b.txt' }, result: { success: { path: 'b.txt', linesAdded: 1 } } } }, { call_id: 'c4' })
++  call('started', { grepToolCall: { args: { pattern: 'TODO', path: 'D:\\project' } } }, { call_id: 'g' })
++  call('completed', { grepToolCall: { args: { pattern: 'TODO', path: 'D:\\project' }, result: { success: {} } } }, { call_id: 'g' })
++  // Orbit gives Cursor no MCP server in the envelope transport: a server of the user's that ends in "orbit" is not Orbit's.
++  const mcp = { args: { toolName: 'list_agents', providerIdentifier: 'plugin-orbit-orbit' } }
++  call('started', { mcpToolCall: mcp }, { call_id: 'm' })
++  call('completed', { mcpToolCall: { ...mcp, result: { success: { content: [] } } } }, { call_id: 'm' })
++  const tools = events.filter(event => event.kind === 'tool')
++  assert.deepEqual(tools.map(event => [event.toolId, event.tool, event.status, event.text, event.native]), [
++    ['call-1\nfc_1', 'shellToolCall', 'started', 'npm test', true], ['call-1\nfc_1', 'shellToolCall', 'completed', 'npm test', true],
++    [undefined, 'read', 'started', 'README.md', true], [undefined, 'read', 'completed', 'README.md', true],
++    ['c3', 'edit', 'started', 'a.txt', true], ['c3', 'edit', 'failed', 'a.txt', true],
++    ['c4', 'edit', 'started', 'b.txt', true], ['c4', 'edit', 'completed', 'b.txt', true],
++    ['g', 'grepToolCall', 'started', 'TODO', true], ['g', 'grepToolCall', 'completed', 'TODO', true],
++    ['m', 'mcpToolCall', 'started', 'list_agents', true], ['m', 'mcpToolCall', 'completed', 'list_agents', true],
++  ])
++  assert.match(tools[1].output, /"stdout":"ok"/)
++  // A call that ended no longer holds the turn: the watchdog counts silence again and steering may cut between steps.
++  const watch = watchTurn({ providerId: 'cursor', model: 'auto' }, null, () => {})
++  try {
++    tools.forEach((event, index) => { watch.note(event); assert.equal(watch.busy(), index % 2 === 0, `busy after event ${index}`) })
++    assert.equal(watch.calling(), false)
++  } finally { watch.stop() }
++  // The file record takes the read and the edit that succeeded, not the one Cursor could not write.
++  const activity = new FileActivity(os.tmpdir())
++  for (const event of tools) activity.nativeEvent('cursor-agent', event)
++  assert.deepEqual(activity.forAgent('cursor-agent'), { read: ['README.md'], wrote: ['b.txt'] })
++})
++
+ test('session parsers take a session id only as a plain token: an object, a number or a flag-like string is ignored and reported once', () => {
+   const shapes = { antigravity: value => ({ event: 'init', conversation_id: value }), cursor: value => ({ type: 'system', subtype: 'init', session_id: value }) }
+   const done = { antigravity: { event: 'result', result: { status: 'SUCCESS', response: 'hi' } }, cursor: { type: 'result', subtype: 'success', result: 'hi' } }
+diff --git a/scratchpad/i19/base/CHANGELOG.md b/docs/CHANGELOG.md
+index 62f4184..5042577 100644
+--- a/scratchpad/i19/base/CHANGELOG.md
++++ b/docs/CHANGELOG.md
+@@ -4,6 +4,8 @@
+ 
+ ## Не выпущено (после 0.5.0)
+ 
++- **Cursor: прочитанные и изменённые файлы видны во вкладке «Файлы» и в «Изменениях», а неудачная правка не считается правкой.** Cursor по умолчанию работает в режиме конверта: режим сессии у него только в «Полном доступе» и по явному включению (`ORBIT_CURSOR_SESSION=1`). В режиме конверта Orbit записывал вызовы инструментов Cursor сырым JSON и не знал, какой файл тот прочитал или изменил. Поэтому правки, которые Cursor в «Полном доступе» делает своими инструментами, не попадали ни во вкладку «Файлы», ни в карту файлов других агентов, ни в «Изменения». Теперь режим конверта разбирает инструменты Cursor так же, как режим сессии: в истории видна команда, путь или шаблон поиска вместо JSON, а чтения и правки файлов учитываются, как у других CLI. Заодно исправлено, что считать неудачей. Cursor сообщает о ней не только словами `error`, `failure` и `rejected`, но и `fileNotFound`, `writePermissionDenied`, `timeout` и другими. Раньше такие ответы считались успехом, и в режиме сессии правка, которую Cursor не смог записать, попадала в «Изменения» с чужим диффом из git. Теперь успехом считается только вариант успеха (`success` и немногие похожие). И страховка: если у вызова нет `call_id`, Orbit связывает его начало и конец по собственному id вызова (`toolCallId`), а не по всему тексту, к которому в конце добавляется результат. Иначе такой вызов считался бы идущим до конца хода: сторож тишины молчал бы, а ваше сообщение ждало бы конца хода. Нынешний Cursor CLI (2026.09.26) `call_id` присылает, так что это защита на будущее. Проверено тестом на событиях в форме записей реального Cursor. Живьём не проверено: на подписке Cursor Free исчерпан лимит.
++
+ - **Агент на Antigravity не получает одно и то же сообщение дважды после прерванного хода.** Если ваше сообщение или пауза прерывает ход, Orbit продолжает ту же сессию CLI. Почту, которую нёс запрос прерванного хода, у Claude он второй раз не передавал: известно, что Claude Code записывает запрос в сессию в начале хода. Остальным CLI почту передавали повторно, потому что не было проверено, сохраняют ли они такой запрос, а лишняя копия лучше потерянного сообщения. Теперь проверено живьём, что Antigravity сохраняет: запрос пользователя он записывает первым шагом хода, ещё до ответа модели. Проверка вызывала провайдера так же, как ход агента (`runProvider` Orbit), с секретным кодом в запросе и обрывала вызов его сигналом отмены, как это делает пауза. Обрыв приходился на 5–17 мс после первого текста модели или после начала её команды (`ping`). Проверены первые ходы (продолжение шло уже из новой папки) и продолжения сессии. Следующий ход начинался сразу, как в Orbit, или через 3 с. Во всех 6 случаях продолжение назвало код. Поэтому у Antigravity, как у Claude, такое сообщение больше не повторяется. Новая сессия (после смены подписки или если прежнюю нельзя продолжить) получает его снова. А если ход оборван до того, как модель начала отвечать, сообщение передаётся повторно, как раньше. Gemini в Antigravity отклонялся по региону, поэтому проверка шла на Claude Sonnet 4.6. Запрос записывает сам CLI, поэтому от модели это, скорее всего, не зависит, но Gemini не проверялся. Codex и Cursor пока не проверены (у обеих подписок кончилась квота), им сообщение по-прежнему передаётся повторно. Сценарий проверки: `scratchpad/i18/live.cjs`. Код: `electron/runtime/pause.mts` (`KEEPS_CUT_PROMPT`). Тесты: `tests/steer-messages.test.cjs` (проверка «почта передаётся снова» стала парой: Antigravity её удерживает, Codex получает повторно; +1: ход, оборванный паузой до ответа модели, получает почту снова). Тесты ловят все 5 намеренно внесённых ошибок.
+ 
+ - **Пути вложений не теряются после перезапуска и в длинном сообщении, а папка удалённого чата не остаётся из-за открытого файла.** Это три остатка ревью вложений. Первое: если агент перезапускал Orbit (`restart_orbit`), продолжение задачи не получало путей прикреплённых к ней файлов. Записка продолжения их не называла. Агент, начавший новую сессию (Codex, Cursor, Antigravity, смена подписки или неудачное возобновление), узнавал о файлах, только если пути случайно попали в дайджест прошлых ходов. Теперь запуск хранит файлы своего первого сообщения и сообщений агентам (последние 20). Записка продолжения перечисляет те из них, что ещё лежат в папке вложений, а продолжение хранит этот список на случай следующего перезапуска. Второе: в истории чата, которую получает следующая задача, строка путей стояла после текста сообщения, а запись обрезается с конца (до 8000 символов, в подсказке бывает меньше). У длинного сообщения пути пропадали. Теперь они идут перед текстом. Третье: если при удалении чата его файл был открыт в другой программе (например, PDF в просмотрщике), Windows не давала удалить этот файл, и папка чата оставалась навсегда. Теперь Orbit помечает такую папку и удаляет её позже: при следующем удалении чата или при запуске. Код: `electron/attachments.mts` (`sweepDiscarded`, `MAX_RUN_FILES`, предел у `trustedAttachments`), `electron/runtime/lifecycle.mts`, `electron/runtime/mailbox.mts`, `electron/runtime/restart.mts` (`prepareContinuation`), `electron/runtime/store.mts`, `electron/resume.mts`, `electron/runtime-api.mts`, `electron/runtime-host.mts`, `electron/types.mts`, `src/state-store.ts`. Тесты: `tests/attachments.test.cjs` (+2, уборка при старте runtime и проверка списка от окна), `tests/restart-orbit.test.cjs` (+1), `tests/state-store.test.cjs` (+1).
+diff --git a/scratchpad/i19/base/providers.md b/docs/providers.md
+index e360fc4..09ed0fa 100644
+--- a/scratchpad/i19/base/providers.md
++++ b/docs/providers.md
+@@ -463,7 +463,7 @@ Google CLI по умолчанию получает системный HTTP-пр
+ 
+ Путь к CLI настраивается в интерфейсе или через `ORBIT_ANTIGRAVITY_COMMAND` / `ORBIT_CURSOR_COMMAND`. Приложение запускает команду без shell, передаёт запрос через stdin и завершает дерево процессов при отмене. Для Cursor Windows поддерживаются native executable, стандартные npm-shim и официальный пакет с `versions/<version>/node.exe` + `index.js`.
+ 
+-Cursor в Full access запускается в Agent (без `--mode ask`), с `--force --sandbox disabled`. В режимах Ask, чтения и доступа к проекту native-инструменты остаются read-only, а разрешённые записи выполняются через Orbit. Antigravity использует временный custom agent `tools: []`; все действия выполняет Orbit с выбранными правами. Политика и способ выполнения разрешённых записей явно указаны агентам в контексте. Завершённый шаг Antigravity (`agent_response`, `state: DONE`) с целым ответом по схеме Orbit сразу передаёт управление рантайму; дерево CLI останавливается до повторной генерации или исправления схемы. Частичные сообщения, текст инструментов и невалидный JSON этого не делают. Без такой передачи управления обязателен успешный terminal result. Всё это — режим конверта; в Full access Antigravity (и Cursor, если включён `ORBIT_CURSOR_SESSION=1`) работает в сессионном режиме с инструментами Orbit по MCP, см. «Cursor and Antigravity sessions» выше.
++Cursor в Full access запускается в Agent (без `--mode ask`), с `--force --sandbox disabled`. В режимах Ask, чтения и доступа к проекту native-инструменты остаются read-only, а разрешённые записи выполняются через Orbit. Antigravity использует временный custom agent `tools: []`; все действия выполняет Orbit с выбранными правами. Политика и способ выполнения разрешённых записей явно указаны агентам в контексте. Завершённый шаг Antigravity (`agent_response`, `state: DONE`) с целым ответом по схеме Orbit сразу передаёт управление рантайму; дерево CLI останавливается до повторной генерации или исправления схемы. Частичные сообщения, текст инструментов и невалидный JSON этого не делают. Без такой передачи управления обязателен успешный terminal result. Всё это — режим конверта; в Full access Antigravity (и Cursor, если включён `ORBIT_CURSOR_SESSION=1`) работает в сессионном режиме с инструментами Orbit по MCP, см. «Cursor and Antigravity sessions» выше. Native-инструменты Cursor оба режима разбирают одинаково (`cursorToolEvent`). Инструмент называется по ключу внутри `tool_call`. Начало и конец вызова связываются по `call_id`, без него по `tool_call.toolCallId`, без обоих по тексту из аргументов (тогда два одинаковых одновременных вызова делят ключ). Законченный вызов, чей результат не вариант успеха (`success`, у немногих инструментов `approved`, `complete` и т. п.), считается неудачным: `error`, `rejected`, `fileNotFound`, `writePermissionDenied`, `timeout` и другие. Чтения и удачные правки попадают в учёт файлов агентов и в записи изменений. В режиме конверта MCP-вызов Cursor всегда native: сервера Orbit у него там нет.
+ 
+ Потоковые сообщения обновляют одну запись по идентификатору сообщения, участнику и ходу. Интервал обновления интерфейса больше не разрезает текст на отдельные записи, а длинные сообщения не обрезаются до 6000 символов. В панели агента показывается текст `content`, итоговый ответ публикуется в чате после обработки инструментов Orbit.
+ 

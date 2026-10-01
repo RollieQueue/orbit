@@ -4,8 +4,9 @@ import { randomUUID } from 'node:crypto'
 import { setMaxListeners } from 'node:events'
 import { saveNote } from '../shared-context.mts'
 import * as chatMemory from '../chat-memory.mts'
-import type { AgentDirectoryEntry, AgentRecord, AgentResult, ChildResultEntry, FollowupResult, ModelTarget, OrbitRuntimeLike, PublicAgent, RunRecord, SpawnResult, TeamDigest, ToolArgs, TurnWaiter, WorkedModel } from '../types.mts'
-import { TERMINAL, AGENT_TERMINAL, ceiling, USER, withoutGoogleReasoning, answerLimit, publicAgent, bounded, clip, abortError } from './util.mts'
+import { ROUTING_KINDS } from '../model-routing.mts'
+import type { AgentDirectoryEntry, AgentRecord, AgentResult, ChildResultEntry, FollowupResult, ModelTarget, OrbitRuntimeLike, PublicAgent, RoutedSpawn, RunRecord, SpawnResult, TeamDigest, ToolArgs, TurnWaiter, WorkedModel } from '../types.mts'
+import { TERMINAL, AGENT_TERMINAL, ceiling, USER, newMailMark, withoutGoogleReasoning, answerLimit, publicAgent, bounded, clip, abortError } from './util.mts'
 
 function createAgent(runtime: OrbitRuntimeLike, run: RunRecord, parent: AgentRecord | null, spec: ToolArgs): AgentRecord {
   const sameProvider = !spec.providerId || spec.providerId === (parent?.providerId || run.providerId)
@@ -28,6 +29,7 @@ function createAgent(runtime: OrbitRuntimeLike, run: RunRecord, parent: AgentRec
     handovers: [], failedCandidates: new Set(), trial: null, partialTurn: null, quotaWarned: '',
     // session: one CLI process resumed turn after turn, Orbit tools over MCP; envelope: the JSON protocol, one process per turn.
     transport: runtime.decideTransport(run, providerId, model), sessionId: null, sessionToken: null, sessionCursor: 0, turnTimings: [], activeTurn: null, stream: null,
+    mailMark: newMailMark(),
   }
   run.agentNodes.set(agent.id, agent)
   run.agentOperations.set(agent.id, new Set())
@@ -50,13 +52,34 @@ function scheduleAgent(runtime: OrbitRuntimeLike, run: RunRecord, agent: AgentRe
   run.tasks.set(agent.id, task)
   return task
 }
-function spawnSubAgent(runtime: OrbitRuntimeLike, runId: string, parentId: string, spec: ToolArgs = {}): SpawnResult {
+// spawn_agent. With a kind and no model Orbit first picks the model for that work (handover.mts routeSpawn); that waits
+// for the provider list and the quotas, so a call refused for an ended run or parent or a missing task or reason, or one
+// that reuses a helper by its name, skips it (registerSubAgent checks everything again afterwards).
+async function spawnSubAgent(runtime: OrbitRuntimeLike, runId: string, parentId: string, spec: ToolArgs = {}): Promise<SpawnResult> {
+  const run = runtime.runs.get(runId)
+  const parent = run?.agentNodes.get(parentId)
+  if (!run || !parent || !ROUTING_KINDS.includes(String(spec.kind)) || spec.model || TERMINAL.has(run.status) || ['done', 'error', 'cancelled'].includes(parent.status)
+    || !String(spec.task || '').trim() || !String(spec.reason || '').trim() || (spec.name && [...run.agentNodes.values()].some(agent => agent.name === bounded(spec.name, 80)))) return registerSubAgent(runtime, runId, parentId, spec)
+  // A session call runs inside its caller's turn. A pause that cut the turn meanwhile lost this call's result for the
+  // model, so no helper is made behind its back: the resumed model decides again.
+  const turn = parent.activeTurn
+  const { spec: routedSpec, routed } = await runtime.routeSpawn(run, parent, spec)
+  if (turn && parent.activeTurn !== turn) return { ok: false, reason: 'turn_interrupted', instruction: 'Your turn was cut off (a pause) while the helper\'s model was being chosen, so no helper was created; spawn it again if it is still needed.' }
+  const result = registerSubAgent(runtime, runId, parentId, routedSpec, routed)
+  return result.ok && !result.reused ? { ...result, routed } : result
+}
+// "Model for review work: claude/opus (passed over codex/gpt-6-astra: quota 93% used)", for the delegation trace.
+function routedLine({ kind, model, skipped }: RoutedSpawn): string {
+  return `Model for ${kind} work: ${model || 'none of the routing table can take it now, so the usual one'}${skipped?.length ? ` (passed over ${skipped.join('; ')})` : ''}`
+}
+function registerSubAgent(runtime: OrbitRuntimeLike, runId: string, parentId: string, spec: ToolArgs, routed: RoutedSpawn | null = null): SpawnResult {
   const run = runtime.runs.get(runId)
   if (!run || TERMINAL.has(run.status)) return { ok: false, reason: 'run_not_active' }
   const parent = run.agentNodes.get(parentId)
   if (!parent || ['done', 'error', 'cancelled'].includes(parent.status)) return { ok: false, reason: 'parent_not_active' }
   if (!String(spec.task || '').trim() || !String(spec.reason || '').trim()) return { ok: false, reason: 'task_and_delegation_reason_required' }
   if (spec.reasoningEffort && !['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra', 'enabled'].includes(spec.reasoningEffort)) return { ok: false, reason: 'invalid_reasoning_effort' }
+  if (spec.kind && !ROUTING_KINDS.includes(String(spec.kind))) return { ok: false, reason: 'unknown_kind', instruction: `kind is one of: ${ROUTING_KINDS.join(', ')}` }
   let prior: PublicAgent | null = null
   if (spec.continueFrom) {
     // priorRuns are chatMemory.view() results over live AgentRecords and saved snapshots, so a found agent is a
@@ -74,7 +97,7 @@ function spawnSubAgent(runtime: OrbitRuntimeLike, runId: string, parentId: strin
   if (run.usage.workerTurns >= ceiling(run.limits, 'maxTotalTurns')) return { ok: false, reason: 'worker_turn_budget_exhausted', instruction: 'Integrate the existing findings. The root agent has no turn limit.' }
   const agent = runtime.createAgent(run, parent, spec)
   if (prior) agent.previousWork.push({ generation: prior.generation ?? 0, task: prior.task, result: prior.result, error: prior.error, files: prior.files })
-  runtime.trace(run, parent.id, 'delegation', `${agent.name}: ${agent.task}\nReason: ${agent.reason}`)
+  runtime.trace(run, parent.id, 'delegation', `${agent.name}: ${agent.task}\nReason: ${agent.reason}${routed ? `\n${routedLine(routed)}` : ''}`)
   runtime.scheduleAgent(run, agent)
   return { ok: true, agentId: agent.id, agent: runtime.snapshot(run).agents.find((item) => item.id === agent.id) }
 }
@@ -210,7 +233,8 @@ function completeAgent(runtime: OrbitRuntimeLike, run: RunRecord, agent: AgentRe
 }
 function budgetHandoff(runtime: OrbitRuntimeLike, run: RunRecord, agent: AgentRecord): AgentResult {
   const evidence = agent.transcript.filter(entry => ['tool_result', 'child_result', 'assistant_final'].includes(entry.type)).slice(-5)
-  const content = `Достигнут лимит работы помощника ${agent.name}. Задача может быть не завершена.\n${agent.result ? `Последний результат:\n${agent.result}\n` : ''}${evidence.length ? `Сохранённые результаты и наблюдения:\n${bounded(evidence, run.limits.maxOutputChars - 1000)}` : 'Подтверждённых результатов пока нет.'}`
+  // Mail riding on a result carries the helper's secret mark (util.mailTag), which only its own prompts may show.
+  const content = `Достигнут лимит работы помощника ${agent.name}. Задача может быть не завершена.\n${agent.result ? `Последний результат:\n${agent.result}\n` : ''}${evidence.length ? `Сохранённые результаты и наблюдения:\n${bounded(evidence, run.limits.maxOutputChars - 1000).replaceAll(agent.mailMark, 'mark')}` : 'Подтверждённых результатов пока нет.'}`
   runtime.trace(run, agent.id, 'budget', 'Worker turn limit reached; handing available evidence to the team')
   return runtime.completeAgent(run, agent, content, true)
 }

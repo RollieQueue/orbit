@@ -21,11 +21,14 @@ import type { SubscriptionId } from './subscription-providers.mts'
 
 type AccessMode = 'read-only' | 'workspace-write' | 'danger-full-access'
 type Transport = 'session' | 'envelope'
-type ProviderEventKind = 'output' | 'reasoning' | 'tool' | 'observation' | 'quota'
+type ProviderEventKind = 'output' | 'reasoning' | 'thinking' | 'tool' | 'observation' | 'quota' | 'session'
 interface ProviderEventBase { providerId: string; kind: ProviderEventKind }
 // A text delta of the assistant's answer; `replace` rewrites the message instead of appending.
 interface OutputEvent extends ProviderEventBase { kind: 'output'; text: string; messageId?: string; partial?: boolean; replace?: boolean; parentToolId?: string | null }
 interface ReasoningEvent extends ProviderEventBase { kind: 'reasoning'; text: string; messageId?: string; partial?: boolean; parentToolId?: string | null }
+// The model thinks (Claude, whose thinking text the stream leaves empty): `tokens` is the CLI's estimate of the thinking
+// block so far (0 when it begins), `done` ends the block.
+interface ThinkingEvent extends ProviderEventBase { kind: 'thinking'; tokens?: number; done?: boolean }
 // A native CLI tool call, or an Orbit tool reached over MCP (`mcp: true`, `orbitTool` names it).
 interface ToolEvent extends ProviderEventBase { kind: 'tool'; text: string; tool?: string; toolId?: string; parentToolId?: string | null; status?: string; input?: unknown; output?: string; exitCode?: number | null; changes?: unknown; native: boolean; mcp?: boolean; server?: string; orbitTool?: string; images?: ToolImage[] }
 // An image a tool result carried (a screenshot the agent read): base64 bytes and the media type.
@@ -33,7 +36,10 @@ interface ToolImage { mediaType: string; data: string }
 interface ObservationEvent extends ProviderEventBase { kind: 'observation'; text: string; source?: string; status?: string; usage?: unknown }
 // Account figures seen in the stream; the runtime feeds them to the quota monitor.
 interface QuotaEvent extends ProviderEventBase { kind: 'quota'; quota: QuotaPartial }
-type ProviderEvent = OutputEvent | ReasoningEvent | ToolEvent | ObservationEvent | QuotaEvent
+// The CLI named its session as the turn began (a Codex thread, a Cursor chat, an Antigravity conversation): a turn Orbit
+// cuts off before its result can still be resumed in it (runtime turn.mts).
+interface SessionEvent extends ProviderEventBase { kind: 'session'; sessionId: string }
+type ProviderEvent = OutputEvent | ReasoningEvent | ThinkingEvent | ToolEvent | ObservationEvent | QuotaEvent | SessionEvent
 // The same union with `providerId` removed from every member (a plain Omit would collapse the union).
 type WithoutProvider<E> = E extends ProviderEvent ? Omit<E, 'providerId'> : never
 type ParserEvent = WithoutProvider<ProviderEvent>
@@ -139,7 +145,8 @@ interface ClaudeResultEvent extends ClaudeEventBase { type: 'result'; subtype?: 
 interface ClaudeStreamEvent extends ClaudeEventBase { type: 'stream_event'; event?: ClaudeStreamPart }
 interface ClaudeAssistantEvent extends ClaudeEventBase { type: 'assistant' }
 interface ClaudeUserEvent extends ClaudeEventBase { type: 'user' }
-interface ClaudeSystemEvent extends ClaudeEventBase { type: 'system'; subtype?: string }
+// subtype thinking_tokens: `estimated_tokens` is the CLI's running estimate of the thinking block in progress.
+interface ClaudeSystemEvent extends ClaudeEventBase { type: 'system'; subtype?: string; estimated_tokens?: unknown }
 type ClaudeEvent = ClaudeRateLimitEvent | ClaudeErrorEvent | ClaudeResultEvent | ClaudeStreamEvent | ClaudeAssistantEvent | ClaudeUserEvent | ClaudeSystemEvent
 
 // Ollama `/api/generate` NDJSON, `/api/tags` and `/api/show`.
@@ -504,7 +511,7 @@ function createCodexParser(onEvent: ProviderEventListener | null | undefined, re
       try { event = JSON.parse(line) } catch { dispatch({ kind: 'observation', text: line, source: 'diagnostic' }); return }
       if (!isCodexEvent(event)) return
       model = event.model || event.thread?.model || event.metadata?.model || model
-      if (event.type === 'thread.started' && typeof event.thread_id === 'string' && SESSION_ID.test(event.thread_id)) sessionId = event.thread_id
+      if (event.type === 'thread.started' && typeof event.thread_id === 'string' && SESSION_ID.test(event.thread_id)) { sessionId = event.thread_id; dispatch({ kind: 'session', sessionId }) }
       if (event.type === 'turn.failed') failure = errorText(event.error)
       if (event.type === 'error') { lastError = errorText(event.message || event.error); dispatch({ kind: 'observation', text: lastError, status: 'error' }) }
       if (event.type === 'turn.completed') { completed = true; dispatch({ kind: 'observation', text: 'Codex turn completed', usage: event.usage, status: 'completed' }) }
@@ -568,6 +575,10 @@ function createClaudeParser(onEvent: ProviderEventListener | null | undefined, r
   // Tool id → name, so the result of an Orbit MCP call is labelled like the call that made it.
   const toolNames = new Map<string, string>()
   const dispatch = (event: ParserEvent) => emit(onEvent, { providerId: 'claude', ...event })
+  // The index of the agent's own thinking block in progress. The CLI's system/thinking_tokens events estimate it; they
+  // name no parent tool, so one outside such a block (a native subagent thinking) is not taken for the agent's own.
+  let thinkingBlock: number | null = null
+  const endThinking = () => { if (thinkingBlock !== null) { thinkingBlock = null; dispatch({ kind: 'thinking', done: true }) } }
   // A refusal that the stream itself announced as a rejected rate limit is typed, so the runtime need not guess from prose.
   const failed = (message: string): QuotaTaggedError => {
     const error: QuotaTaggedError = new Error(message)
@@ -608,6 +619,12 @@ function createClaudeParser(onEvent: ProviderEventListener | null | undefined, r
           dispatch({ kind: 'output', text: part.delta.text, messageId: current.id, parentToolId, partial: true })
         }
         if (part.type === 'content_block_delta' && part.delta?.type === 'thinking_delta') dispatch({ kind: 'reasoning', text: part.delta.thinking, messageId: `${current.id}:thinking:${part.index}`, parentToolId, partial: true })
+        // A message that begins anew (the CLI retried the request) leaves no thinking block open.
+        if (!parentToolId && (part.type === 'message_start' || (part.type === 'content_block_stop' && part.index === thinkingBlock))) endThinking()
+        if (!parentToolId && part.type === 'content_block_start' && (part.content_block?.type === 'thinking' || part.content_block?.type === 'redacted_thinking')) {
+          thinkingBlock = part.index ?? 0
+          dispatch({ kind: 'thinking', tokens: 0 })
+        }
         if (part.type === 'content_block_start' && part.content_block?.type === 'tool_use') {
           const tool = part.content_block
           toolIds.add(tool.id); toolNames.set(tool.id, tool.name)
@@ -641,6 +658,10 @@ function createClaudeParser(onEvent: ProviderEventListener | null | undefined, r
         }
       }
       if (event.type === 'system' && event.subtype === 'permission_denied') dispatch({ kind: 'observation', text: errorText(event.message || 'Claude denied a tool permission'), status: 'denied' })
+      if (event.type === 'system' && event.subtype === 'thinking_tokens' && thinkingBlock !== null) {
+        const tokens = event.estimated_tokens
+        if (typeof tokens === 'number' && Number.isFinite(tokens) && tokens >= 0) dispatch({ kind: 'thinking', tokens: Math.round(tokens) })
+      }
     },
     finish() {
       if (handoffText !== undefined) return { text: handoffText, model, ...(sessionId ? { sessionId } : {}) }
@@ -745,14 +766,30 @@ function codexMcpArgs(session: Pick<NormalizedSession, 'mcpUrl' | 'token'> | nul
   return ['-c', `mcp_servers.orbit.url=${JSON.stringify(session.mcpUrl)}`, '-c', 'mcp_servers.orbit.bearer_token_env_var="ORBIT_MCP_TOKEN"', '-c', `mcp_servers.orbit.tool_timeout_sec=${CODEX_MCP_TOOL_TIMEOUT_SEC}`]
 }
 
+// A lone surrogate (a string bounded inside an emoji, such as an agent's name) as U+FFFD: JSON.stringify writes it as an
+// escape like \ud83d, which neither TOML nor Codex's JSON-RPC parser accepts.
+function wellFormed(text: string): string {
+  return text.replace(/[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/g, '�')
+}
+
+// A `-c key=value` value as a TOML basic string. JSON's escapes are TOML's, except for a lone surrogate's (above) and a
+// raw DEL, which TOML wants escaped; Codex would take a value TOML refuses as raw text, escapes and all.
+function tomlString(text: string): string {
+  return JSON.stringify(wellFormed(text)).replace(/\x7f/g, '\\u007f')
+}
+
 // `codex exec resume` takes neither -C nor --sandbox nor --approve-for-me (checked against 0.155): the process cwd is
 // the workspace and the sandbox travels as a config override; an auto-review resume keeps the thread's own policy.
-function buildCodexSessionArgs(options: LaunchOptions & { workspace: string }, session: Pick<NormalizedSession, 'id' | 'resume' | 'mcpUrl' | 'token'>): string[] {
+// The stable Orbit block is the thread's developer instructions (Codex has no system-prompt file option). A resumed
+// thread keeps the block it started with (exec and App Server, checked against 0.155); a resume passes it all the same,
+// so no Codex process of a session runs without it.
+function buildCodexSessionArgs(options: LaunchOptions & { workspace: string }, session: Pick<NormalizedSession, 'id' | 'resume' | 'mcpUrl' | 'token' | 'systemAppend'>): string[] {
   const access = selectedAccess(options)
   const args = session.resume
     ? ['exec', 'resume', '--json', '--skip-git-repo-check', '-c', `sandbox_mode=${JSON.stringify(access)}`]
     : ['exec', '--json', '--skip-git-repo-check', '-C', options.workspace, '--sandbox', access]
   args.push('-c', 'features.multi_agent=false', ...codexMcpArgs(session))
+  if (session.systemAppend) args.push('-c', `developer_instructions=${tomlString(session.systemAppend)}`)
   if (options.approvalPolicy === 'auto-review' && access === 'workspace-write') { if (!session.resume) args.push('--approve-for-me') }
   else args.push('-c', 'approval_policy="never"')
   if (options.model) args.push('--model', options.model)
@@ -913,14 +950,27 @@ function requestSignal(parent: AbortSignal | null | undefined, timeoutMs: number
   return { signal: controller.signal, dispose: () => { clearTimeout(timer ?? undefined); parent?.removeEventListener('abort', abort) } }
 }
 
-function endpointUrl(raw: string): URL {
-  const url = new URL(raw)
-  if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password) throw new Error('Provider endpoint must be an HTTP(S) URL without embedded credentials')
+// URL has already canonicalized the host: lower case, IPv4 as four decimals (127.1 and 2130706433 become 127.0.0.1),
+// IPv6 compressed in brackets.
+function isLoopbackHost(hostname: string): boolean {
+  return hostname === 'localhost' || hostname === '[::1]' || /^127\.\d+\.\d+\.\d+$/.test(hostname)
+}
+
+// Plain HTTP carries the prompt (and ORBIT_OPENAI_API_KEY) over the network unencrypted, so it is accepted only for this
+// machine; a trusted network (say, Ollama on another computer at home) opts in with ORBIT_ALLOW_INSECURE_HTTP=1.
+function endpointUrl(raw: string, variable: string): URL {
+  let url: URL
+  try { url = new URL(raw) } catch { throw new Error(`${variable}: это не адрес URL. Укажите его полностью, начиная с https://.`) }
+  if (!['http:', 'https:'].includes(url.protocol)) throw new Error(`${variable}: адрес должен начинаться с https:// (http:// — только для этого компьютера).`)
+  if (url.username || url.password) throw new Error(`${variable}: уберите из адреса имя пользователя и пароль.`)
+  if (url.protocol === 'http:' && !isLoopbackHost(url.hostname) && process.env.ORBIT_ALLOW_INSECURE_HTTP !== '1') {
+    throw new Error(`${variable} (${url.origin}): по http:// запросы идут по сети незашифрованными, поэтому такой адрес разрешён только для этого компьютера (localhost, 127.0.0.1, [::1]). Укажите https:// или, если сеть доверенная, задайте ORBIT_ALLOW_INSECURE_HTTP=1.`)
+  }
   return url
 }
 
 function ollamaUrl(endpoint: string): string {
-  const url = endpointUrl(process.env.ORBIT_OLLAMA_URL || 'http://127.0.0.1:11434')
+  const url = endpointUrl(process.env.ORBIT_OLLAMA_URL || 'http://127.0.0.1:11434', 'ORBIT_OLLAMA_URL')
   url.pathname = `${url.pathname.replace(/\/api\/(generate|chat|tags|show)\/?$/, '').replace(/\/$/, '')}/api/${endpoint}`
   return url.toString()
 }
@@ -1044,9 +1094,9 @@ async function runOllama(options: ProviderRunOptions): Promise<ProviderResult> {
 async function runCompatible(options: ProviderRunOptions): Promise<ProviderResult> {
   const base = process.env.ORBIT_OPENAI_BASE_URL
   if (!base) throw new Error('ORBIT_OPENAI_BASE_URL is not configured')
+  const url = endpointUrl(base, 'ORBIT_OPENAI_BASE_URL')
   const model = options.model || process.env.ORBIT_OPENAI_MODEL
   if (!model) throw new Error('Select an endpoint model or set ORBIT_OPENAI_MODEL')
-  const url = endpointUrl(base)
   if (!url.pathname.endsWith('/chat/completions')) url.pathname = `${url.pathname.replace(/\/$/, '')}/chat/completions`
   const request = requestSignal(options.signal, timeoutValue(options.timeoutMs))
   try {
@@ -1137,6 +1187,8 @@ async function ollamaReasoningLevels(model: string, signal: AbortSignal): Promis
 }
 
 async function inspectOllama(): Promise<ProviderHealth> {
+  // A refused address says why, instead of «not reachable».
+  try { ollamaUrl('tags') } catch (error) { return { id: 'ollama', supported: true, available: false, detail: (error as Error).message } }
   const request = requestSignal(null, 2500)
   try {
     const models = await listOllamaModels(request.signal)
@@ -1149,9 +1201,14 @@ async function inspectOllama(): Promise<ProviderHealth> {
 async function inspectProviders(options: InspectOptions = {}): Promise<ProviderHealth[]> {
   pathLookups.clear()
   const native = await Promise.all([inspectNative('codex', options.codex), inspectNative('claude', options.claude), inspectOllama(), ...(['antigravity', 'cursor'] as const).map(id => subscriptions.inspect(id, { runCli }, options[id]))])
+  return [...native, inspectCustom()]
+}
+
+function inspectCustom(): ProviderHealth {
   let configured = false
-  try { if (process.env.ORBIT_OPENAI_BASE_URL) { endpointUrl(process.env.ORBIT_OPENAI_BASE_URL); configured = true } } catch (error) { report('providers: ORBIT_OPENAI_BASE_URL is not a valid endpoint (reported as not configured)', error) }
-  return [...native, { id: 'custom', supported: true, available: configured, authenticated: null, detail: configured ? 'Endpoint configured; connection checked when used' : 'Set ORBIT_OPENAI_BASE_URL', model: process.env.ORBIT_OPENAI_MODEL || '' }]
+  let detail = 'Set ORBIT_OPENAI_BASE_URL'
+  try { if (process.env.ORBIT_OPENAI_BASE_URL) { endpointUrl(process.env.ORBIT_OPENAI_BASE_URL, 'ORBIT_OPENAI_BASE_URL'); configured = true; detail = 'Endpoint configured; connection checked when used' } } catch (error) { detail = (error as Error).message; report('providers: ORBIT_OPENAI_BASE_URL is refused (the provider list shows why)', error) }
+  return { id: 'custom', supported: true, available: configured, authenticated: null, detail, model: process.env.ORBIT_OPENAI_MODEL || '' }
 }
 
 async function runProvider(options: ProviderRunOptions): Promise<ProviderResult> {
@@ -1173,5 +1230,5 @@ export type {
   ApprovalRequest, ApprovalHandler, ProviderOptions, SessionActivity, SessionActivityCheck, SessionOptions, NormalizedSession, LaunchOptions, ProviderRunOptions, NativeRunOptions,
   ProviderResult, ProviderHealth, InspectOptions, CliLaunch, CliResult, LineReader, RunCliOptions, RunCli, CliHelpers, SessionHelpers, ParsedTurn, StreamParser,
 }
-export const _testing = { createCodexParser, createClaudeParser, createLineReader, buildCodexArgs, buildClaudeArgs, buildClaudeSessionArgs, buildCodexSessionArgs, claudeAttachmentArgs, claudeMcpConfig, normalizeSession, inactivityValue, runCli, resolveLaunch, requestSignal }
-export { loopbackNoProxy, codexMcpArgs, inspectProviders, runProvider, transportFor, mcpCallLimit, closeSession, resolveLaunch, terminateProcess, runCli, createLineReader }
+export const _testing = { createCodexParser, createClaudeParser, createLineReader, buildCodexArgs, buildClaudeArgs, buildClaudeSessionArgs, buildCodexSessionArgs, claudeAttachmentArgs, claudeMcpConfig, normalizeSession, inactivityValue, runCli, resolveLaunch, requestSignal, endpointUrl, inspectOllama, inspectCustom }
+export { loopbackNoProxy, codexMcpArgs, wellFormed, inspectProviders, runProvider, transportFor, mcpCallLimit, closeSession, resolveLaunch, terminateProcess, runCli, createLineReader }

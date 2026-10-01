@@ -154,8 +154,10 @@
     var fit = function () { flyer.style.fontSize = Math.max(24, Math.min(window.innerWidth * 0.11, (window.innerWidth * 0.36) / (longest * 0.6))) + 'px' }
     fit()
     window.addEventListener('resize', fit)
+    stops.push(function () { window.removeEventListener('resize', fit) })
+    if (reduced) { holdText(flyer); return }
 
-    var speed = Math.max(0.15, window.innerWidth / 8000) * (reduced ? 0.5 : 1)
+    var speed = Math.max(0.15, window.innerWidth / 8000)
     var angle = (20 + Math.random() * 50) * (Math.PI / 180)
     var x = Math.random() * window.innerWidth * 0.4
     var y = Math.random() * window.innerHeight * 0.3
@@ -191,7 +193,20 @@
     }
     step(0)
     frameId = requestAnimationFrame(tick)
-    stops.push(function () { cancelAnimationFrame(frameId); window.removeEventListener('resize', fit) })
+    stops.push(function () { cancelAnimationFrame(frameId) })
+  }
+
+  // Reduced motion: the text stands still in the middle of the window (celebration.css stops its turn and pulse).
+  function holdText(flyer) {
+    function centre() {
+      var x = Math.max(0, (window.innerWidth - flyer.offsetWidth) / 2)
+      var y = Math.max(0, (window.innerHeight - flyer.offsetHeight) / 2)
+      flyer.style.transform = 'translate3d(' + x + 'px,' + y + 'px,0)'
+      state.textX = Math.round(x); state.textY = Math.round(y)
+    }
+    centre()
+    window.addEventListener('resize', centre)
+    stops.push(function () { window.removeEventListener('resize', centre) })
   }
 
   // ---- confetti ---------------------------------------------------------------------------------------------------
@@ -201,12 +216,11 @@
     if (!context) return
     var COLORS = ['#ff3b6b', '#ffb400', '#2ee6a6', '#39a0ff', '#b45cff', '#ff7a2f', '#f5ff3d', '#ffffff']
     var EMOJI = ['🎉', '🥳', '🦆', '🍕', '🌈', '⭐', '💾', '🚀', '🎊', '🐸', '🍩', '🦄', '💃', '🔥', '👾']
-    var MAX_PIECES = reduced ? 160 : 420
-    var BURST_PIECES = reduced ? 60 : 180
-    var RAIN_PER_SECOND = reduced ? 25 : 70
+    var MAX_PIECES = 420
+    var BURST_PIECES = 180
+    var RAIN_PER_SECOND = 70
     var GRAVITY = 0.00042
     var DRAG = 0.0012
-    var calm = reduced ? 0.5 : 1
     var width = 0, height = 0, ratio = 1
 
     var between = function (low, high) { return low + Math.random() * (high - low) }
@@ -226,10 +240,32 @@
     function makePiece(px, py, pvx, pvy) {
       var emoji = Math.random() < 0.28 ? pick(EMOJI) : undefined
       return {
-        x: px, y: py, vx: pvx * calm, vy: pvy * calm, angle: between(0, Math.PI * 2), spin: between(-0.012, 0.012) * calm,
-        phase: between(0, Math.PI * 2), flutter: between(0.004, 0.009) * calm, emoji: emoji, color: pick(COLORS),
+        x: px, y: py, vx: pvx, vy: pvy, angle: between(0, Math.PI * 2), spin: between(-0.012, 0.012),
+        phase: between(0, Math.PI * 2), flutter: between(0.004, 0.009), emoji: emoji, color: pick(COLORS),
         size: (emoji ? between(22, 40) : between(8, 16)) * scale(), shape: pick(['rect', 'rect', 'strip', 'circle']),
       }
+    }
+
+    // Reduced motion: no burst and no rain. The pieces lie still along the edges of the window, drawn once (and again when
+    // it is resized), so the middle and the video stay clear.
+    if (reduced) {
+      var lay = function () {
+        context.setTransform(ratio, 0, 0, ratio, 0, 0)
+        context.clearRect(0, 0, width, height)
+        var band = Math.min(width, height) * 0.14
+        var count = Math.round(Math.min(200, Math.max(40, (width + height) / 20)))
+        for (var n = 0; n < count; n++) {
+          var across = Math.random() < width / (width + height)
+          var px = across ? between(0, width) : Math.random() < 0.5 ? between(0, band) : between(width - band, width)
+          var py = !across ? between(0, height) : Math.random() < 0.5 ? between(0, band) : between(height - band, height)
+          draw(makePiece(px, py, 0, 0))
+        }
+        state.pieces = count
+      }
+      lay()
+      window.addEventListener('resize', lay)
+      stops.push(function () { window.removeEventListener('resize', resize); window.removeEventListener('resize', lay) })
+      return
     }
 
     // Two cannons in the bottom corners and one in the middle shoot the first pieces up and inwards.
@@ -282,7 +318,7 @@
         piece.vx -= piece.vx * DRAG * dt
         piece.vy -= Math.max(0, piece.vy - 0.16) * DRAG * 6 * dt
         piece.phase += piece.flutter * dt * 2.4
-        piece.x += (piece.vx + Math.sin(piece.phase) * 0.05 * calm) * dt
+        piece.x += (piece.vx + Math.sin(piece.phase) * 0.05) * dt
         piece.y += piece.vy * dt
         piece.angle += piece.spin * dt
         draw(piece)

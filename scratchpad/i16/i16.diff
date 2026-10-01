@@ -1,0 +1,541 @@
+diff --git a/electron/runtime/turn.mts b/electron/runtime/turn.mts
+index 6c7db80..0e22b8f 100644
+--- a/electron/runtime/turn.mts
++++ b/electron/runtime/turn.mts
+@@ -201,9 +201,10 @@ async function providerTurn(runtime: OrbitRuntimeLike, run: RunRecord, agent: Ag
+     timing = { turn: agent.turns, transport: agent.transport, startedAt: new Date().toISOString(), firstEventAt: null, endedAt: null, promptChars: 0, nativeToolCalls: 0, orbitToolCalls: 0, sessionId: session?.id || null }
+     agent.turnTimings.push(timing)
+     runtime.updateAgent(run, agent, { status: 'working', detail: 'Provider is executing', startedAt: agent.startedAt || new Date().toISOString() })
+     // `delivered`: the mail this turn's prompt carries; during a session turn it is no longer pending (see pendingMail).
+-    agent.activeTurn = { slot, timing, changed: false, nativeSeen: new Set(), stream: null, delivered: new Set(),
++    // `signal`: aborted when the turn ends, however it ends; an Orbit wait the turn called ends with it (dispatchMcp).
++    agent.activeTurn = { slot, timing, changed: false, nativeSeen: new Set(), stream: null, delivered: new Set(), signal: controller.signal,
+       interrupt: (reason: InterruptReason = 'pause') => { interrupted = reason; pauseHolder = pausedBy(run, agent); controller.abort() } }
+     const resolvedPrompt = typeof prompt === 'function' ? prompt() : prompt
+     run.usage.promptChars = (run.usage.promptChars || 0) + resolvedPrompt.length
+     agent.promptChars = (agent.promptChars || 0) + resolvedPrompt.length
+diff --git a/electron/types.mts b/electron/types.mts
+index bd4c2cb..abd7432 100644
+--- a/electron/types.mts
++++ b/electron/types.mts
+@@ -158,9 +158,9 @@ export interface WorkedModel { label: string; providerId: string; model: string;
+ export interface InterruptedTurn { text: string; actions: string[] }
+ export interface PartialTurn { messages: Map<string, string>; tools: Map<string, string> }
+ export interface StreamState { messageId: string; parts: Map<string, string>; lastAt: number; timer: ReturnType<typeof setTimeout> | null; dirty: boolean }
+ export interface TurnSlot { held: boolean }
+-export interface ActiveTurn { slot: TurnSlot; timing: TurnTiming; changed: boolean; nativeSeen: Set<string>; stream: StreamState | null; delivered: Set<string>; interrupt: (reason?: import('./runtime/pause.mts').InterruptReason) => void; watch?: import('./runtime/watchdog.mts').TurnWatch | null }
++export interface ActiveTurn { slot: TurnSlot; timing: TurnTiming; changed: boolean; nativeSeen: Set<string>; stream: StreamState | null; delivered: Set<string>; signal: AbortSignal; interrupt: (reason?: import('./runtime/pause.mts').InterruptReason) => void; watch?: import('./runtime/watchdog.mts').TurnWatch | null }
+ // An answer kept while an optional extra turn runs, and the ids of the user's messages the model had read when it wrote it.
+ export interface DraftAnswer { text: string; read: Set<string> }
+ export interface AgentRecord {
+   paused?: boolean; pausedAt?: string | null; stoppedByUser?: boolean; pausedSession?: string | null
+@@ -584,10 +584,10 @@ export interface OrbitRuntimeLike {
+   markCommunications(run: RunRecord, ids: string[], status: CommunicationStatus, delivery: CommunicationDelivery): void
+   sendAgentMessage(run: RunRecord, sender: AgentRecord, args: ToolArgs): SendResult
+   recordCommunication(run: RunRecord, sender: AgentRef, target: AgentRef, text: string, extra?: Partial<Communication>): Communication
+   readAgentMessages(run: RunRecord, agent: AgentRecord, args?: ToolArgs): ReadMessagesResult
+-  waitForTeam(run: RunRecord, agent: AgentRecord, participants: { id: string }[], timeout?: number): Promise<string>
+-  waitAgentMessage(run: RunRecord, agent: AgentRecord, args: ToolArgs): Promise<ReadMessagesResult>
++  waitForTeam(run: RunRecord, agent: AgentRecord, participants: { id: string }[], timeout?: number, signal?: AbortSignal): Promise<string>
++  waitAgentMessage(run: RunRecord, agent: AgentRecord, args: ToolArgs, signal?: AbortSignal, ready?: () => Promise<void>): Promise<ReadMessagesResult>
+   mailboxContext(run: RunRecord, agent: AgentRecord, held?: ReadonlySet<string>): MailboxContext
+   askTeam(run: RunRecord, sender: AgentRecord, args: ToolArgs): AskTeamResult
+   postUserMessage(runId: string, agentId: string, text: unknown): SendResult
+   userMail(run: RunRecord, agent: AgentRecord): string
+@@ -610,9 +610,9 @@ export interface OrbitRuntimeLike {
+   trackWorkspaceTool(run: RunRecord, agent: AgentRecord, name: string, args: ToolArgs, result: unknown): Promise<unknown>
+   runTrackedCommand(run: RunRecord, agent: AgentRecord, args: ToolArgs, context: WorkspaceContext): Promise<unknown>
+   // tools and knowledge
+   approve(run: RunRecord, agent: AgentRecord, request: ApprovalRequest, signal?: AbortSignal): Promise<boolean>
+-  executeTool(run: RunRecord, agent: AgentRecord, name: string, args: ToolArgs, signal?: AbortSignal): Promise<Observation>
++  executeTool(run: RunRecord, agent: AgentRecord, name: string, args: ToolArgs, signal?: AbortSignal, ready?: () => Promise<void>): Promise<Observation>
+   markMemoryUse(run: RunRecord, entries: MemoryEntry[]): void
+   // ledger
+   recordLedger(agent: AgentRecord, name: string, text: string): void
+   workLog(agent: AgentRecord): string
+diff --git a/electron/runtime.mts b/electron/runtime.mts
+index 40635f2..5d19573 100644
+--- a/electron/runtime.mts
++++ b/electron/runtime.mts
+@@ -146,10 +146,10 @@ class OrbitRuntime implements OrbitRuntimeLike {
+   markCommunications(run: RunRecord, ids: string[], status: CommunicationStatus, delivery: CommunicationDelivery) { return mailbox.markCommunications(this, run, ids, status, delivery) }
+   sendAgentMessage(run: RunRecord, sender: AgentRecord, args: ToolArgs) { return mailbox.sendAgentMessage(this, run, sender, args) }
+   recordCommunication(run: RunRecord, sender: AgentRef, target: AgentRef, text: string, extra?: Partial<Communication>) { return mailbox.recordCommunication(this, run, sender, target, text, extra) }
+   readAgentMessages(run: RunRecord, agent: AgentRecord, args?: ToolArgs) { return mailbox.readAgentMessages(this, run, agent, args) }
+-  waitForTeam(run: RunRecord, agent: AgentRecord, participants: { id: string }[], timeout?: number) { return mailbox.waitForTeam(this, run, agent, participants, timeout) }
+-  waitAgentMessage(run: RunRecord, agent: AgentRecord, args: ToolArgs) { return mailbox.waitAgentMessage(this, run, agent, args) }
++  waitForTeam(run: RunRecord, agent: AgentRecord, participants: { id: string }[], timeout?: number, signal?: AbortSignal) { return mailbox.waitForTeam(this, run, agent, participants, timeout, signal) }
++  waitAgentMessage(run: RunRecord, agent: AgentRecord, args: ToolArgs, signal?: AbortSignal, ready?: () => Promise<void>) { return mailbox.waitAgentMessage(this, run, agent, args, signal, ready) }
+   mailboxContext(run: RunRecord, agent: AgentRecord, held?: ReadonlySet<string>) { return mailbox.mailboxContext(this, run, agent, held) }
+   askTeam(run: RunRecord, sender: AgentRecord, args: ToolArgs) { return mailbox.askTeam(this, run, sender, args) }
+   postUserMessage(runId: string, agentId: string, text: unknown, attachments?: Attachment[]) { return mailbox.postUserMessage(this, runId, agentId, text, attachments) }
+   userMail(run: RunRecord, agent: AgentRecord) { return mailbox.userMail(this, run, agent) }
+@@ -172,9 +172,9 @@ class OrbitRuntime implements OrbitRuntimeLike {
+   trackWorkspaceTool(run: RunRecord, agent: AgentRecord, name: string, args: ToolArgs, result: unknown) { return changes.trackWorkspaceTool(this, run, agent, name, args, result) }
+   runTrackedCommand(run: RunRecord, agent: AgentRecord, args: ToolArgs, context: WorkspaceContext) { return changes.runTrackedCommand(this, run, agent, args, context) }
+   // ---- tools and knowledge: Orbit tool execution ----
+   approve(run: RunRecord, agent: AgentRecord, request: ApprovalRequest, signal?: AbortSignal) { return tools.approve(this, run, agent, request, signal) }
+-  executeTool(run: RunRecord, agent: AgentRecord, name: string, args: ToolArgs, signal?: AbortSignal) { return tools.executeTool(this, run, agent, name, args, signal) }
++  executeTool(run: RunRecord, agent: AgentRecord, name: string, args: ToolArgs, signal?: AbortSignal, ready?: () => Promise<void>) { return tools.executeTool(this, run, agent, name, args, signal, ready) }
+   markMemoryUse(run: RunRecord, entries: MemoryEntry[]) { return knowledge.markMemoryUse(this, run, entries) }
+   // ---- ledger: transcript and work log ----
+   recordLedger(agent: AgentRecord, name: string, text: string) { return ledger.recordLedger(this, agent, name, text) }
+   workLog(agent: AgentRecord) { return ledger.workLog(this, agent) }
+diff --git a/electron/runtime/tools.mts b/electron/runtime/tools.mts
+index be8fb4e..864a2e8 100644
+--- a/electron/runtime/tools.mts
++++ b/electron/runtime/tools.mts
+@@ -21,9 +21,10 @@ async function approve(runtime: OrbitRuntimeLike, run: RunRecord, agent: AgentRe
+     runtime.trace(run, agent.id, 'observation', `${approved ? 'Approved' : 'Declined'}: ${request.tool}`)
+     return approved === true
+   } finally { if (!signal.aborted) runtime.updateAgent(run, agent, { status: 'working', detail: 'Resuming task' }) }
+ }
+-async function executeTool(runtime: OrbitRuntimeLike, run: RunRecord, agent: AgentRecord, name: string, args: ToolArgs, signal: AbortSignal = runtime.agentSignal(run, agent)): Promise<Observation> {
++// `ready` (session.dispatchMcp, waits only): awaited before a wait takes what it found (mail read, helper results seen).
++async function executeTool(runtime: OrbitRuntimeLike, run: RunRecord, agent: AgentRecord, name: string, args: ToolArgs, signal: AbortSignal = runtime.agentSignal(run, agent), ready?: () => Promise<void>): Promise<Observation> {
+   if (name === 'context_read') {
+     const packet = projectPacket(runtime.contextStore, run.workspace, run.sharedContext)
+     if (args.key === undefined) {
+       // The overview and the newest notes are already in every prompt; the tool lists keys and short summaries.
+@@ -96,17 +97,18 @@ async function executeTool(runtime: OrbitRuntimeLike, run: RunRecord, agent: Age
+     }
+     return { messages, nextCursor: messages.at(-1)?.id || args.afterId || null, hasMore: records.length > messages.length }
+   }
+   if (name === 'read_messages') return runtime.readAgentMessages(run, agent, args)
+-  if (name === 'wait_message') return runtime.waitAgentMessage(run, agent, args)
++  if (name === 'wait_message') return runtime.waitAgentMessage(run, agent, args, signal, ready)
+   if (name === 'followup_agent') return runtime.followupAgent(run, agent, args)
+   if (name === 'wait_agent') {
+     const target = args.agentId ? runtime.resolveAgent(run, args.agentId) : null
+     const children = [...run.agentNodes.values()].filter((child) => child.parentId === agent.id && (!target || child.id === target.id))
+     if (args.agentId && !children.length) throw new Error('Only direct children may be waited on; ancestor waits would deadlock')
+     const timeout = args.timeout_ms === undefined ? 0 : Math.max(10, Math.min(Number(args.timeout_ms) || 30000, ceiling(run.limits, 'runTimeoutMs')))
+     runtime.updateAgent(run, agent, { status: 'waiting', detail: 'Waiting for delegated results' })
+-    await runtime.waitForTeam(run, agent, children, timeout)
++    await runtime.waitForTeam(run, agent, children, timeout, signal)
++    await ready?.()
+     return children.map((child) => {
+       if (['done', 'error', 'cancelled'].includes(child.status)) agent.seenChildren.add(runtime.resultKey(child))
+       // The model fields come before the result: a long result is cut at its end.
+       return { agentId: child.id, generation: child.generation, status: child.status, providerId: child.providerId, model: child.model, ...ranOnFields(child), result: child.result, error: child.error }
+diff --git a/electron/runtime/session.mts b/electron/runtime/session.mts
+index 5b1269c..eaa07c3 100644
+--- a/electron/runtime/session.mts
++++ b/electron/runtime/session.mts
+@@ -10,17 +10,23 @@ type SessionToken = string | SessionRef | null | undefined
+ // without them still works; `runProvider` is captured at load, as the facade captures its default.
+ import * as providers from '../providers.mts'
+ // Used only for an identity check against the runtime's runProvider.
+ const defaultRunProvider: unknown = providers.runProvider
+-import { TERMINAL, AGENT_TERMINAL, WORK_TOOLS, MUTATING_TOOLS, SKILL_READ_CHARS, bounded, clip, diagnostics } from './util.mts'
++import { TERMINAL, AGENT_TERMINAL, WORK_TOOLS, MUTATING_TOOLS, SKILL_READ_CHARS, abortable, bounded, clip, diagnostics } from './util.mts'
+ import { describeCall } from './ledger.mts'
+ import { restartOffered } from './restart.mts'
+ // Type only: the module itself (with the MCP SDK and zod, most of the runtime's load time) is imported by ensureMcp on
+ // the first session, so a runtime that never opens one never loads it.
+ import type { createMcpServer } from '../mcp-server.mts'
+ import * as toolRegistry from '../tool-registry.mts'
+ // Session mode: tools that block on the team release the agent's model slot while they wait.
+ const WAIT_TOOLS = new Set(['wait_agent', 'wait_message', 'followup_agent'])
++// A wait serves the turn that called it: it ends with that turn (finished, cut off, failed), and takes what it found
++// (mail marked read, helper results marked seen) only while that turn still runs and has its model slot back (a provider
++// whose client ends calls on its own clock goes on without it once the grace runs out, see slotBack). A wait the turn
++// left behind takes nothing: the next turn gets that mail and those results.
++const TURN_WAITS = new Set(['wait_agent', 'wait_message'])
++const TURN_ENDED = 'Your turn ended before this wait could answer (it was interrupted or failed): the wait took nothing. Unread mail comes with your next prompt; call wait_agent again for helpers\' results.'
+ // Some providers' MCP clients end a tool call on their own clock (Cursor: 60 s, without a progress token), so a session
+ // agent of such a provider is answered before that (providers.mcpCallLimit): a wait is cut at the limit and answers
+ // "still running, call again"; any other call that outlives it keeps running and the agent's next identical call
+ // collects its result instead of starting it again.
+@@ -244,13 +250,33 @@ async function dispatchMcp(runtime: OrbitRuntimeLike, token: SessionToken, name:
+   if (signal.aborted) return refuse('Run cancelled')
+   const raw = args && typeof args === 'object' && !Array.isArray(args) ? args : null
+   const call: ToolCall = { id: randomUUID(), name: String(name || ''), arguments: raw ? Object.fromEntries(Object.entries(raw).filter(([, value]) => value !== null)) : { __invalidArguments: true } }
+   const turn = agent.activeTurn
++  // Without a running turn no model would read a wait's answer.
++  if (!turn && TURN_WAITS.has(call.name)) return refuse(TURN_ENDED)
+   if (turn) { turn.timing.orbitToolCalls++; publishProgress(runtime, run, agent) }
+   runtime.trace(run, agent.id, 'tool', `${call.name} ${bounded(call.arguments, 1200)}`)
+   const waits = WAIT_TOOLS.has(call.name)
+   const limit = callLimit(agent), calledAt = Date.now()
+   if (waits && turn?.slot.held) { turn.slot.held = false; runtime.releaseTurn(run) }
++  // The slot is taken back before the result goes to the model, once: by a wait before it takes what it found (`ready`),
++  // else after the call. A provider whose client ends a call on its own clock is not kept waiting past it for a busy
++  // slot: the slot comes back in the background, the turn goes on meanwhile. A turn that ended takes no slot back.
++  let back: Promise<void> | undefined
++  const slotBack = (): Promise<void> => back ??= (async () => {
++    if (!waits || !turn || turn.slot.held || turn.signal.aborted) return
++    const retake = abortable(retakeSlot(runtime, run, agent, turn), turn.signal)
++    // What is left of the limit, or a tenth of it (at most 5 s) when the wait used it all: Cursor's 60 s outlast 50 s + 5 s.
++    const grace = Math.max(Math.min(5000, Math.ceil(limit / 10)), limit - (Date.now() - calledAt))
++    if (!limit) await retake
++    else if (await withinLimit(retake, grace) === STILL_RUNNING && agent.activeTurn === turn) runtime.updateAgent(run, agent, { status: 'working', detail: 'Provider is executing' })
++  })()
++  const turnWait = turn && TURN_WAITS.has(call.name) ? turn : null
++  const bound = turnWait ? turnWait.signal : signal
++  const ready = turnWait ? async (): Promise<void> => {
++    await slotBack().catch(() => {})
++    if (agent.activeTurn !== turnWait || turnWait.signal.aborted) throw new Error(TURN_ENDED)
++  } : undefined
+   // `joined`: when the call found its own run under way (or finished), the time that run started.
+   let observation: Observation, failure: string | null = null, cut = false, parked = 0, joined: number | null = null
+   try {
+     if (call.arguments.__invalidArguments) throw new Error('Tool arguments must be a JSON object')
+@@ -258,9 +284,9 @@ async function dispatchMcp(runtime: OrbitRuntimeLike, token: SessionToken, name:
+     if (check && check.ok === false) throw new Error(check.error || 'Invalid tool arguments')
+     if (limit && Object.hasOwn(TIMED_WAITS, call.name)) {
+       const asked = call.arguments.timeout_ms === undefined ? TIMED_WAITS[call.name] : Number(call.arguments.timeout_ms) || 30000
+       cut = asked > limit
+-      observation = await runtime.trackOperation(run, runtime.executeTool(run, agent, call.name, cut ? { ...call.arguments, timeout_ms: limit } : call.arguments), agent)
++      observation = await runtime.trackOperation(run, runtime.executeTool(run, agent, call.name, cut ? { ...call.arguments, timeout_ms: limit } : call.arguments, bound, ready), agent)
+     } else if (limit && !waits) {
+       // The call is registered before anything is awaited, so an identical one made meanwhile joins it. A run begun
+       // before files changed is not handed out: it is stopped and the call starts afresh.
+       const key = callKey(call), state = agentCalls(agent)
+@@ -282,22 +308,15 @@ async function dispatchMcp(runtime: OrbitRuntimeLike, token: SessionToken, name:
+       } else {
+         forget()
+         observation = joined === null ? outcome : collectedResult(outcome, joined)
+       }
+-    } else observation = await runtime.trackOperation(run, runtime.executeTool(run, agent, call.name, call.arguments), agent)
++    } else observation = await runtime.trackOperation(run, runtime.executeTool(run, agent, call.name, call.arguments, bound, ready), agent)
+   } catch (error) {
+-    failure = (error as Error).message
++    // A wait its turn left behind was aborted with the turn (abortable says "Run cancelled"), the run itself goes on.
++    failure = turnWait?.signal.aborted && !signal.aborted ? TURN_ENDED : (error as Error).message
+     observation = joined === null ? { ok: false, error: failure } : collectedResult({ ok: false, error: failure }, joined)
+   } finally {
+-    // The slot is taken back before the result goes to the model. A provider whose client ends a call on its own clock
+-    // is not kept waiting past it for a busy slot: the slot comes back in the background, the turn goes on meanwhile.
+-    if (waits && turn && !turn.slot.held && !signal.aborted) {
+-      const retake = retakeSlot(runtime, run, agent, turn)
+-      // What is left of the limit, or a tenth of it (at most 5 s) when the wait used it all: Cursor's 60 s outlast 50 s + 5 s.
+-      const grace = Math.max(Math.min(5000, Math.ceil(limit / 10)), limit - (Date.now() - calledAt))
+-      if (!limit) await retake
+-      else if (await withinLimit(retake, grace) === STILL_RUNNING && agent.activeTurn === turn) runtime.updateAgent(run, agent, { status: 'working', detail: 'Provider is executing' })
+-    }
++    await slotBack().catch(() => {})
+   }
+   if (!failure && !parked && (observation as { ok?: unknown } | null | undefined)?.ok !== false && MUTATING_TOOLS.has(call.name)) {
+     if (turn) turn.changed = true
+     if (WORK_TOOLS.has(call.name)) agent.workDone++
+diff --git a/electron/runtime/loops.mts b/electron/runtime/loops.mts
+index 98fc404..68ba524 100644
+--- a/electron/runtime/loops.mts
++++ b/electron/runtime/loops.mts
+@@ -301,10 +301,10 @@ async function sessionLoop(runtime: OrbitRuntimeLike, run: RunRecord, agent: Age
+         }, session)
+         agent.pausedSession = null
+         break
+       } catch (error) {
+-        // A pause or a message cut the turn off: the same session goes on with the note (pause.interruptedSession).
+-        if (error instanceof PauseInterrupt) { instruction = interruptedSession(runtime, agent, error, cursorBeforeTurn, mailbox.deliveredIds, held); continue }
++        // Cut off by a pause or a message: the session goes on with the note and the results of helpers finished by now.
++        if (error instanceof PauseInterrupt) { instruction = interruptedSession(runtime, agent, error, cursorBeforeTurn, mailbox.deliveredIds, held); runtime.collectChildren(run, agent, transcript); continue }
+         // A killed CLI may leave its session unreadable. Try that session once, then carry the note into a fresh one: the
+         // failed resume's prompt already put it in the transcript, which the fresh session's full prompt carries.
+         if (resume && agent.pausedSession && agent.pausedSession === agent.sessionId && !signal.aborted) {
+           agent.pausedSession = null; agent.sessionId = null
+diff --git a/electron/runtime/mailbox.mts b/electron/runtime/mailbox.mts
+index b115b3b..3f442de 100644
+--- a/electron/runtime/mailbox.mts
++++ b/electron/runtime/mailbox.mts
+@@ -170,18 +170,19 @@ function readAgentMessages(runtime: OrbitRuntimeLike, run: RunRecord, agent: Age
+   }
+   runtime.markCommunications(run, selected.map((message) => message.id), 'read', 'mailbox')
+   return { messages: structuredClone(selected), remainingUnread: runtime.communicationsFor(run, agent, true).length }
+ }
+-async function waitForTeam(runtime: OrbitRuntimeLike, run: RunRecord, agent: AgentRecord, participants: { id: string }[], timeout = 0): Promise<string> {
++// `signal`: what ends the wait early; a session turn's wait ends with its turn (session.dispatchMcp).
++async function waitForTeam(runtime: OrbitRuntimeLike, run: RunRecord, agent: AgentRecord, participants: { id: string }[], timeout = 0, signal = runtime.agentSignal(run, agent)): Promise<string> {
+   if (runtime.pendingMail(run, agent).length) return 'message'
+   // Assigned by the Promise executor, which runs synchronously.
+   let wake!: () => void
+   const incoming = new Promise<string>(resolve => { wake = () => resolve('message') })
+   if (!run.messageWaiters.has(agent.id)) run.messageWaiters.set(agent.id, new Set())
+   // Created on the line above when missing.
+   run.messageWaiters.get(agent.id)!.add(wake)
+   try {
+-    return await abortable(Promise.race([incoming, Promise.all(participants.map(member => run.tasks.get(member.id))).then(() => 'results')]), runtime.agentSignal(run, agent), timeout, 'wait_timeout')
++    return await abortable(Promise.race([incoming, Promise.all(participants.map(member => run.tasks.get(member.id))).then(() => 'results')]), signal, timeout, 'wait_timeout')
+   } catch (error) {
+     // abortable rejects with Errors (a timeout, an abort, or a failed task).
+     if ((error as Error).message === 'wait_timeout') return 'timeout'
+     throw error
+@@ -206,33 +207,37 @@ function mailArrived(runtime: OrbitRuntimeLike, run: RunRecord, agent: AgentReco
+   const stopped = agent.activeTurn === turn ? stoppedHelpers(runtime, run, agent) : []
+   if (stopped.length) stopsNamed.set(agent, new Set([...stopsNamed.get(agent) || [], ...stopped.map(child => child.id)]))
+   return { ...(stopped.length ? { stopped: stopped.map(child => ({ agentId: child.id, name: child.name, status: child.status })), note: STOP_NOTE } : {}), ...runtime.readAgentMessages(run, agent), timedOut: false }
+ }
+-async function waitAgentMessage(runtime: OrbitRuntimeLike, run: RunRecord, agent: AgentRecord, args: ToolArgs): Promise<ReadMessagesResult> {
++// `signal`: what ends the wait early (a session turn's wait ends with its turn). `ready`: awaited before the wait takes
++// what it found from the mailbox; it rejects, and nothing is taken, when the result could no longer reach the model
++// (session.dispatchMcp: the turn ended before it had its model slot back).
++async function waitAgentMessage(runtime: OrbitRuntimeLike, run: RunRecord, agent: AgentRecord, args: ToolArgs, signal = runtime.agentSignal(run, agent), ready?: () => Promise<void>): Promise<ReadMessagesResult> {
+   const turn = agent.activeTurn
+-  if (runtime.pendingMail(run, agent).length || stoppedHelpers(runtime, run, agent).length) return mailArrived(runtime, run, agent, turn)
+-  const signal = runtime.agentSignal(run, agent)
+-  if (signal.aborted) throw abortError()
+-  const timeout = Math.max(10, Math.min(Number(args.timeout_ms) || 30000, 60000))
+-  // Assigned by the Promise executor, which runs synchronously.
+-  let wake!: () => void
+-  const incoming = new Promise<void>((resolve) => { wake = resolve })
+-  if (!run.messageWaiters.has(agent.id)) run.messageWaiters.set(agent.id, new Set())
+-  // Created on the line above when missing.
+-  run.messageWaiters.get(agent.id)!.add(wake)
+-  runtime.updateAgent(run, agent, { status: 'waiting', detail: 'Waiting for a message' })
+-  try {
+-    await abortable(incoming, signal, timeout, 'mailbox_timeout')
+-    return mailArrived(runtime, run, agent, turn)
+-  } catch (error) {
+-    // abortable rejects with Errors (a timeout or an abort).
+-    if ((error as Error).message === 'mailbox_timeout') return { messages: [], timedOut: true, remainingUnread: 0 }
+-    throw error
+-  } finally {
+-    const waiters = run.messageWaiters.get(agent.id)
+-    waiters?.delete(wake)
+-    if (!waiters?.size) run.messageWaiters.delete(agent.id)
++  if (!runtime.pendingMail(run, agent).length && !stoppedHelpers(runtime, run, agent).length) {
++    if (signal.aborted) throw abortError()
++    const timeout = Math.max(10, Math.min(Number(args.timeout_ms) || 30000, 60000))
++    // Assigned by the Promise executor, which runs synchronously.
++    let wake!: () => void
++    const incoming = new Promise<void>((resolve) => { wake = resolve })
++    if (!run.messageWaiters.has(agent.id)) run.messageWaiters.set(agent.id, new Set())
++    // Created on the line above when missing.
++    run.messageWaiters.get(agent.id)!.add(wake)
++    runtime.updateAgent(run, agent, { status: 'waiting', detail: 'Waiting for a message' })
++    try {
++      await abortable(incoming, signal, timeout, 'mailbox_timeout')
++    } catch (error) {
++      // abortable rejects with Errors (a timeout or an abort).
++      if ((error as Error).message === 'mailbox_timeout') return { messages: [], timedOut: true, remainingUnread: 0 }
++      throw error
++    } finally {
++      const waiters = run.messageWaiters.get(agent.id)
++      waiters?.delete(wake)
++      if (!waiters?.size) run.messageWaiters.delete(agent.id)
++    }
+   }
++  await ready?.()
++  return mailArrived(runtime, run, agent, turn)
+ }
+ // `held`: unread mail the agent's session already holds (the prompt of a turn cut off after its provider spoke carried it,
+ // loops.sessionLoop); it is not carried again.
+ function mailboxContext(runtime: OrbitRuntimeLike, run: RunRecord, agent: AgentRecord, held: ReadonlySet<string> = new Set()): MailboxContext {
+diff --git a/tests/pause-agents.test.cjs b/tests/pause-agents.test.cjs
+index 8a7d3e6..36963e5 100644
+--- a/tests/pause-agents.test.cjs
++++ b/tests/pause-agents.test.cjs
+@@ -213,8 +213,211 @@ test('a wait for mail left behind by a pause names no helper stopped meanwhile;
+   await completed(runtime, run)
+   assert.ok(calls.slice(2).some(call => call.prompt.includes(STOPPED_BY_USER)), 'the resumed session learns what the stopped helper did')
+ })
+ 
++// The answer of a wait the test started without awaiting it; until() fails in 4 s if the wait outlives its turn.
++async function settled(pending) {
++  let answer
++  pending.then(result => { answer = result })
++  await until(() => answer, 'the wait ends with its turn')
++  return answer
++}
++
++test('a session wait for mail cut off by a pause takes nothing: a message written during the pause comes as the user\'s words', async t => {
++  const calls = []
++  let run, wait
++  const runtime = new OrbitRuntime({ mcp: fakeMcp(), transportFor: () => 'session', runProvider: async options => {
++    calls.push(options)
++    if (calls.length === 1) {
++      runtime.postUserMessage(run.runId, 'root', 'KEEP_GOING')
++      return { text: 'Premature answer', sessionId: 'kept-session-id' }
++    }
++    if (calls.length === 2) {
++      wait = runtime.dispatchMcp(options.session.token, 'wait_message', { timeout_ms: 20000 })
++      return aborts(options)
++    }
++    return { text: 'FINAL_ANSWER', sessionId: options.session.id }
++  } })
++  run = await start(t, runtime)
++  const root = run.agentNodes.get('root')
++  await until(() => root.detail === 'Waiting for a message')
++  runtime.pauseAgent(run.runId, 'root')
++  const left = await settled(wait)
++  assert.equal(left.ok, false)
++  assert.match(left.error, /^Your turn ended before this wait could answer/)
++  runtime.postUserMessage(run.runId, 'root', 'WRITTEN_DURING_PAUSE')
++  await sleep(50)
++  const message = run.communications.find(item => item.text === 'WRITTEN_DURING_PAUSE')
++  assert.equal(message.readAt, undefined, 'no wait left behind takes it')
++  runtime.resumeAgent(run.runId, 'root')
++  await completed(runtime, run)
++  assert.equal(calls.length, 3)
++  assert.match(calls[2].prompt, /MESSAGE FROM THE USER/)
++  assert.ok(calls[2].prompt.includes('] WRITTEN_DURING_PAUSE'), 'the resumed turn reads it as the user\'s words, not as a past record')
++  assert.equal(message.delivery, 'next-turn')
++})
++
++test('a session wait for helpers cut off by a pause marks no result seen: a helper that finishes later comes as a helper result', async t => {
++  const calls = [], helperCalls = [], finish = deferred()
++  let wait
++  const runtime = new OrbitRuntime({ mcp: fakeMcp(), transportFor: () => 'session', runProvider: async options => {
++    if (!options.session.token.startsWith('token-root-')) {
++      helperCalls.push(options)
++      if (helperCalls.length === 1) return aborts(options)
++      await finish.promise
++      return { text: 'HELPER_FINDINGS', sessionId: options.session.id }
++    }
++    calls.push(options)
++    if (calls.length === 1) {
++      await runtime.dispatchMcp(options.session.token, 'spawn_agent', { name: 'Helper', task: 'Check one thing', reason: 'Independent check' })
++      wait = runtime.dispatchMcp(options.session.token, 'wait_agent', {})
++      return aborts(options)
++    }
++    if (calls.length === 2) return { text: 'Answer before the helper', sessionId: options.session.id }
++    return { text: 'FINAL_ANSWER', sessionId: options.session.id }
++  } })
++  const run = await start(t, runtime)
++  const root = run.agentNodes.get('root')
++  await until(() => helperCalls.length === 1 && root.detail === 'Waiting for delegated results')
++  runtime.pauseAgent(run.runId, 'root')
++  const left = await settled(wait)
++  assert.equal(left.ok, false)
++  assert.match(left.error, /^Your turn ended before this wait could answer/)
++  runtime.resumeAgent(run.runId, 'root')
++  await until(() => helperCalls.length === 2 && calls.length === 2)
++  finish.resolve()
++  await completed(runtime, run)
++  assert.ok(calls.slice(2).some(call => call.prompt.includes('HELPER RESULT — Helper (done)') && call.prompt.includes('HELPER_FINDINGS')), 'the root gets the helper result')
++})
++
++test('a wait that found mail while its turn waited for the model slot takes nothing when a pause cuts the turn off first', async t => {
++  const calls = [], helperCalls = []
++  let run, wait
++  const runtime = new OrbitRuntime({ mcp: fakeMcp(), transportFor: () => 'session', runProvider: async options => {
++    if (!options.session.token.startsWith('token-root-')) {
++      helperCalls.push(options)
++      // The helper holds the only slot until the pause cuts it off, then finishes at once.
++      return helperCalls.length === 1 ? aborts(options) : { text: 'HELPER_DONE', sessionId: options.session.id }
++    }
++    calls.push(options)
++    if (calls.length === 1) {
++      await runtime.dispatchMcp(options.session.token, 'spawn_agent', { name: 'Helper', task: 'Check one thing', reason: 'Independent check' })
++      wait = runtime.dispatchMcp(options.session.token, 'wait_message', { timeout_ms: 20000 })
++      return aborts(options)
++    }
++    return { text: 'FINAL_ANSWER', sessionId: options.session.id }
++  } })
++  run = await start(t, runtime, { limits: { maxConcurrent: 1 } })
++  const root = run.agentNodes.get('root')
++  await until(() => helperCalls.length === 1 && root.detail === 'Waiting for a message')
++  runtime.postUserMessage(run.runId, 'root', 'WRITTEN_WHILE_WAITING')
++  await until(() => run.turnQueue.length === 1, 'the woken wait waits for the slot the helper holds')
++  runtime.pauseAgent(run.runId, 'root')
++  const left = await settled(wait)
++  assert.equal(left.ok, false)
++  assert.match(left.error, /^Your turn ended before this wait could answer/)
++  const message = run.communications.find(item => item.text === 'WRITTEN_WHILE_WAITING')
++  assert.equal(message.readAt, undefined, 'the wait took nothing it could not hand over')
++  runtime.resumeAgent(run.runId, 'root')
++  await completed(runtime, run)
++  assert.ok(calls.slice(1).some(call => call.prompt.includes('] WRITTEN_WHILE_WAITING')), 'a later turn reads it as the user\'s words')
++  assert.equal(message.delivery, 'next-turn')
++})
++
++test('a wait for a helper that finished while its turn waited for the model slot marks nothing seen when a pause cuts the turn off', async t => {
++  const calls = [], seconds = []
++  let run, wait
++  const nameOf = options => /running as agent "([^"]+)"/.exec(options.session.systemAppend)[1]
++  const runtime = new OrbitRuntime({ mcp: fakeMcp(), transportFor: () => 'session', runProvider: async options => {
++    if (nameOf(options) === 'First') return { text: 'FIRST_FINDINGS', sessionId: options.session.id }
++    // Second takes the only slot when First is done and holds it until the pause cuts it off.
++    if (nameOf(options) === 'Second') { seconds.push(options); return seconds.length === 1 ? aborts(options) : { text: 'SECOND_DONE', sessionId: options.session.id } }
++    calls.push(options)
++    if (calls.length === 1) {
++      // First queues for the slot ahead of Second, so it runs first when the wait gives the slot away.
++      const first = JSON.parse((await runtime.dispatchMcp(options.session.token, 'spawn_agent', { name: 'First', task: 'Check one thing', reason: 'Independent check' })).text)
++      await until(() => run.turnQueue.length === 1)
++      await runtime.dispatchMcp(options.session.token, 'spawn_agent', { name: 'Second', task: 'Check another thing', reason: 'Independent check' })
++      await until(() => run.turnQueue.length === 2)
++      wait = runtime.dispatchMcp(options.session.token, 'wait_agent', { agentId: first.agentId })
++      return aborts(options)
++    }
++    return { text: 'FINAL_ANSWER', sessionId: options.session.id }
++  } })
++  run = await start(t, runtime, { limits: { maxConcurrent: 1 } })
++  await until(() => seconds.length === 1 && run.turnQueue.length === 1, 'the woken wait waits for the slot Second holds')
++  runtime.pauseAgent(run.runId, 'root')
++  const left = await settled(wait)
++  assert.equal(left.ok, false)
++  assert.match(left.error, /^Your turn ended before this wait could answer/)
++  runtime.resumeAgent(run.runId, 'root')
++  await completed(runtime, run)
++  // A wait that took the result would have marked it seen: then no helper result would join the root's record.
++  const root = run.agentNodes.get('root'), first = [...run.agentNodes.values()].find(agent => agent.name === 'First')
++  assert.ok(root.transcript.some(entry => entry.type === 'child_result' && entry.agentId === first.id && entry.result === 'FIRST_FINDINGS'), 'the root gets the result the cut-off wait found')
++})
++
++test('a wait outside a running turn is refused: no model would read its answer', async t => {
++  let token
++  const helper = deferred()
++  const runtime = new OrbitRuntime({ mcp: fakeMcp(), transportFor: () => 'session', runProvider: async options => {
++    if (!options.session.token.startsWith('token-root-')) { await helper.promise; return { text: 'HELPER_DONE', sessionId: options.session.id } }
++    if (token) return { text: 'FINAL_ANSWER', sessionId: options.session.id }
++    token = options.session.token
++    await runtime.dispatchMcp(token, 'spawn_agent', { name: 'Helper', task: 'Check one thing', reason: 'Independent check' })
++    return { text: 'Answer before the helper', sessionId: options.session.id }
++  } })
++  const run = await start(t, runtime)
++  const root = run.agentNodes.get('root')
++  await until(() => root.detail === 'Waiting for delegated results' && !root.activeTurn)
++  for (const name of ['wait_message', 'wait_agent']) {
++    const refused = await runtime.dispatchMcp(token, name, { timeout_ms: 50 })
++    assert.equal(refused.ok, false, name)
++    assert.match(refused.error, /^Your turn ended before this wait could answer/, name)
++  }
++  helper.resolve()
++  await completed(runtime, run)
++})
++
++test('a session turn cut off by a pause is repeated with the results of helpers that finished before the cut', async t => {
++  const calls = []
++  let run
++  const runtime = new OrbitRuntime({ mcp: fakeMcp(), transportFor: () => 'session', runProvider: async options => {
++    if (!options.session.token.startsWith('token-root-')) return { text: 'HELPER_FINDINGS', sessionId: options.session.id }
++    calls.push(options)
++    if (calls.length === 1) {
++      runtime.postUserMessage(run.runId, 'root', 'KEEP_GOING')
++      return { text: 'Premature answer', sessionId: 'kept-session-id' }
++    }
++    if (calls.length === 2) {
++      await runtime.dispatchMcp(options.session.token, 'spawn_agent', { name: 'Helper', task: 'Check one thing', reason: 'Independent check' })
++      return aborts(options)
++    }
++    return { text: 'FINAL_ANSWER', sessionId: options.session.id }
++  } })
++  run = await start(t, runtime)
++  await until(() => [...run.agentNodes.values()].some(agent => agent.name === 'Helper' && agent.status === 'done'))
++  runtime.pauseAgent(run.runId, 'root')
++  await until(() => run.agentNodes.get('root').status === 'paused')
++  runtime.resumeAgent(run.runId, 'root')
++  await completed(runtime, run)
++  assert.match(calls[2].prompt, /^PAUSED BY THE USER/)
++  assert.ok(calls[2].prompt.includes('HELPER RESULT — Helper (done)') && calls[2].prompt.includes('HELPER_FINDINGS'), 'the repeated turn gets the result at once')
++  assert.equal(calls.length, 3, 'no extra turn just for the result')
++})
++
++test('a session wait that times out takes its model slot back before the turn goes on', async t => {
++  let after
++  const runtime = new OrbitRuntime({ mcp: fakeMcp(), transportFor: () => 'session', runProvider: async options => {
++    const live = [...runtime.runs.values()][0]
++    const waited = JSON.parse((await runtime.dispatchMcp(options.session.token, 'wait_message', { timeout_ms: 20 })).text)
++    after = { timedOut: waited.timedOut, activeTurns: live.activeTurns, held: live.agentNodes.get('root').activeTurn.slot.held }
++    return { text: 'FINAL_ANSWER', sessionId: options.session.id }
++  } })
++  const run = await start(t, runtime)
++  await completed(runtime, run)
++  assert.deepEqual(after, { timedOut: true, activeTurns: 1, held: true })
++})
+ 
+ test('pausing the root interrupts working descendants, while a direct helper pause survives root resume', async t => {
+   const calls = { root: [], Helper: [] }
+   const runtime = new OrbitRuntime({ runProvider: async options => {

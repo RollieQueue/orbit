@@ -264,6 +264,52 @@ test('Cursor session parser: chat id, Orbit MCP calls apart from native tools, m
   assert.deepEqual(streamed.finish(), { text: 'All tests pass.', model: '', sessionId: 'chat-2' })
 })
 
+// Shaped like Cursor CLI 2026.09.26 output (run records of 2026-09-28): the call carries its own `toolCallId`, and its
+// end repeats the arguments and adds `result` and `completedAtMs`. That CLI also sends `call_id`; the first two calls
+// leave it out on purpose, to check the fallbacks.
+test('Cursor envelope parser names tool calls as the session parser does: start and end share a key, a failed edit is no write', () => {
+  const { watchTurn } = require('../electron/runtime/watchdog.mts')
+  const { FileActivity } = require('../electron/file-activity.mts')
+  const events = [], parser = createParser('cursor', event => events.push(event), 'auto', ORBIT_RESPONSE_SCHEMA)
+  const call = (subtype, toolCall, extra = {}) => parser.line(JSON.stringify({ type: 'tool_call', subtype, ...extra, tool_call: toolCall, session_id: 'chat-1' }))
+  const shell = { args: { command: 'npm test', toolCallId: 'call-1\nfc_1' } }
+  call('started', { shellToolCall: shell, hookAdditionalContexts: [], toolCallId: 'call-1\nfc_1', startedAtMs: '1' })
+  call('completed', { shellToolCall: { ...shell, result: { success: { exitCode: 0, stdout: 'ok' } } }, hookAdditionalContexts: [], toolCallId: 'call-1\nfc_1', startedAtMs: '1', completedAtMs: '2' })
+  // Without either id the arguments key the call; `call_id` comes before the call's own id.
+  call('started', { readToolCall: { args: { path: 'README.md' } } })
+  call('completed', { readToolCall: { args: { path: 'README.md' }, result: { success: { content: 'hello' } } } })
+  call('started', { editToolCall: { args: { path: 'a.txt' } }, toolCallId: 'inner' }, { call_id: 'c3' })
+  call('completed', { editToolCall: { args: { path: 'a.txt' }, result: { writePermissionDenied: { path: 'a.txt' } } }, toolCallId: 'inner' }, { call_id: 'c3' })
+  call('started', { editToolCall: { args: { path: 'b.txt' } } }, { call_id: 'c4' })
+  call('completed', { editToolCall: { args: { path: 'b.txt' }, result: { success: { path: 'b.txt', linesAdded: 1 } } } }, { call_id: 'c4' })
+  call('started', { grepToolCall: { args: { pattern: 'TODO', path: 'D:\\project' } } }, { call_id: 'g' })
+  call('completed', { grepToolCall: { args: { pattern: 'TODO', path: 'D:\\project' }, result: { success: {} } } }, { call_id: 'g' })
+  // Orbit gives Cursor no MCP server in the envelope transport: a server of the user's that ends in "orbit" is not Orbit's.
+  const mcp = { args: { toolName: 'list_agents', providerIdentifier: 'plugin-orbit-orbit' } }
+  call('started', { mcpToolCall: mcp }, { call_id: 'm' })
+  call('completed', { mcpToolCall: { ...mcp, result: { success: { content: [] } } } }, { call_id: 'm' })
+  const tools = events.filter(event => event.kind === 'tool')
+  assert.deepEqual(tools.map(event => [event.toolId, event.tool, event.status, event.text, event.native]), [
+    ['call-1\nfc_1', 'shellToolCall', 'started', 'npm test', true], ['call-1\nfc_1', 'shellToolCall', 'completed', 'npm test', true],
+    [undefined, 'read', 'started', 'README.md', true], [undefined, 'read', 'completed', 'README.md', true],
+    ['c3', 'edit', 'started', 'a.txt', true], ['c3', 'edit', 'failed', 'a.txt', true],
+    ['c4', 'edit', 'started', 'b.txt', true], ['c4', 'edit', 'completed', 'b.txt', true],
+    ['g', 'grepToolCall', 'started', 'TODO', true], ['g', 'grepToolCall', 'completed', 'TODO', true],
+    ['m', 'mcpToolCall', 'started', 'list_agents', true], ['m', 'mcpToolCall', 'completed', 'list_agents', true],
+  ])
+  assert.match(tools[1].output, /"stdout":"ok"/)
+  // A call that ended no longer holds the turn: the watchdog counts silence again and steering may cut between steps.
+  const watch = watchTurn({ providerId: 'cursor', model: 'auto' }, null, () => {})
+  try {
+    tools.forEach((event, index) => { watch.note(event); assert.equal(watch.busy(), index % 2 === 0, `busy after event ${index}`) })
+    assert.equal(watch.calling(), false)
+  } finally { watch.stop() }
+  // The file record takes the read and the edit that succeeded, not the one Cursor could not write.
+  const activity = new FileActivity(os.tmpdir())
+  for (const event of tools) activity.nativeEvent('cursor-agent', event)
+  assert.deepEqual(activity.forAgent('cursor-agent'), { read: ['README.md'], wrote: ['b.txt'] })
+})
+
 test('session parsers take a session id only as a plain token: an object, a number or a flag-like string is ignored and reported once', () => {
   const shapes = { antigravity: value => ({ event: 'init', conversation_id: value }), cursor: value => ({ type: 'system', subtype: 'init', session_id: value }) }
   const done = { antigravity: { event: 'result', result: { status: 'SUCCESS', response: 'hi' } }, cursor: { type: 'result', subtype: 'success', result: 'hi' } }
@@ -273,8 +319,10 @@ test('session parsers take a session id only as a plain token: an object, a numb
     parser.line(JSON.stringify(done[id]))
     assert.deepEqual(parser.finish(), { text: 'hi', model: '', sessionId: undefined }, id)
     assert.equal(events.filter(event => event.source === 'diagnostic' && /malformed session id/.test(event.text)).length, 1, id)
-    const valid = createSessionParser(id)
-    for (const value of ['conv-1.2:3', '--later-junk']) valid.line(JSON.stringify(shape(value)))
+    assert.equal(events.filter(event => event.kind === 'session').length, 0, `${id}: a malformed id is never announced`)
+    const named = [], valid = createSessionParser(id, event => { if (event.kind === 'session') named.push(event) })
+    for (const value of ['conv-1.2:3', '--later-junk', 'conv-1.2:3']) valid.line(JSON.stringify(shape(value)))
+    assert.deepEqual(named, [{ providerId: id, kind: 'session', sessionId: 'conv-1.2:3' }], `${id}: the session is announced once, as the stream names it`)
     valid.line(JSON.stringify(done[id]))
     assert.equal(valid.finish().sessionId, 'conv-1.2:3', `${id}: a valid id is kept when junk follows`)
   }

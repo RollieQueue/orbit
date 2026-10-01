@@ -3,7 +3,7 @@ import { isOrbitToolEnvelope } from './tool-schema.mts'
 import { codexUpdateLimit } from './quota.mts'
 import type { CodexRateLimitBucket, QuotaTaggedError } from './quota.mts'
 // providers.mts imports this file as well; both sides use the other only inside functions, so the ESM cycle is harmless.
-import { codexMcpArgs, loopbackNoProxy } from './providers.mts'
+import { codexMcpArgs, loopbackNoProxy, wellFormed } from './providers.mts'
 import type { ApprovalHandler, CliHelpers, NormalizedSession, ParserEvent, ProviderEventListener, ProviderResult, ProviderRunOptions } from './providers.mts'
 
 // ---- App Server protocol (JSON-RPC over stdio) ------------------------------------------------------------------
@@ -41,6 +41,10 @@ const DEFAULT_SESSION_IDLE_MS = 30 * 60 * 1000
 const DEFAULT_INACTIVITY_MS = 15 * 60 * 1000
 const cancelledError = (): Error => { const error = new Error('Codex request cancelled'); error.name = 'AbortError'; return error }
 
+// One JSON-RPC line. Codex drops a line whose JSON has an escaped lone surrogate and never answers it, so every string
+// goes out well-formed (a chat message or an agent's name bounded inside an emoji).
+const rpcLine = (message: CodexClientMessage): string => JSON.stringify(message, (_key, value: unknown) => typeof value === 'string' ? wellFormed(value) : value) + '\n'
+
 // Codex exec cannot answer native approval requests; Ask uses the stdio App Server.
 async function runCodexServer(options: CodexServerOptions, helpers: CliHelpers): Promise<ProviderResult> {
   const { resolveLaunch, terminateProcess, createLineReader } = helpers
@@ -61,7 +65,7 @@ async function runCodexServer(options: CodexServerOptions, helpers: CliHelpers):
     requests.clear()
     rejectDone(error)
   }
-  const send = (message: CodexClientMessage) => { if (!closed && !child.stdin.destroyed) child.stdin.write(JSON.stringify(message) + '\n') }
+  const send = (message: CodexClientMessage) => { if (!closed && !child.stdin.destroyed) child.stdin.write(rpcLine(message)) }
   const request = <T = unknown,>(method: string, params?: unknown) => new Promise<T>((resolve, reject) => {
     if (closed) return reject(new Error('Codex connection closed'))
     const id = ++sequence
@@ -166,16 +170,18 @@ function mcpOverrides(session: Pick<NormalizedSession, 'mcpUrl' | 'token'> | nul
 
 async function openCodexSession(options: CodexServerOptions, session: NormalizedSession, helpers: CliHelpers): Promise<CodexSessionApi> {
   const { resolveLaunch, terminateProcess, createLineReader } = helpers
+  if (options.signal?.aborted) throw cancelledError()
   const launch = resolveLaunch(options.providerOptions?.command || process.env.ORBIT_CODEX_COMMAND || 'codex', ['app-server', '-c', 'features.multi_agent=false', ...mcpOverrides(session)])
   const child = spawn(launch.executable, launch.args, { cwd: options.workspace, env: { ...launch.env, ...(session?.token ? { ORBIT_MCP_TOKEN: session.token, ...loopbackNoProxy() } : {}) }, windowsHide: true, shell: false, detached: process.platform !== 'win32', stdio: ['pipe', 'pipe', 'pipe'] })
   const requests = new Map<number | string, PendingRequest>(), items = new Map<string | undefined, CodexServerItem>()
   let sequence = 0, closed = false, stderr = '', bytes = 0, threadId: string | null = null, actualModel = options.model || ''
-  let turn: TurnState | null = null, idleTimer: NodeJS.Timeout | null = null
+  let turn: TurnState | null = null, idleTimer: NodeJS.Timeout | null = null, failure: Error | null = null
   let onEvent = options.onEvent, onApproval = options.onApproval
   const emit = (event: ParserEvent) => { try { onEvent?.({ providerId: 'codex', ...event }) } catch { /* UI observers do not control the provider. */ } }
-  const send = (message: CodexClientMessage) => { if (!closed && !child.stdin.destroyed) child.stdin.write(JSON.stringify(message) + '\n') }
+  const send = (message: CodexClientMessage) => { if (!closed && !child.stdin.destroyed) child.stdin.write(rpcLine(message)) }
+  // A request after the connection closed fails with what closed it (the cancellation, the process's end).
   const request = <T = unknown,>(method: string, params?: unknown) => new Promise<T>((resolve, reject) => {
-    if (closed) return reject(new Error('Codex connection closed'))
+    if (closed) return reject(failure || new Error('Codex connection closed'))
     const id = ++sequence
     requests.set(id, { resolve, reject })
     send({ id, method, params })
@@ -195,6 +201,7 @@ async function openCodexSession(options: CodexServerOptions, session: Normalized
   const fail = (error: Error) => {
     if (closed) return termination
     closed = true
+    failure = error
     clearTimeout(idleTimer ?? undefined)
     for (const pending of requests.values()) pending.reject(error)
     requests.clear()
@@ -305,24 +312,35 @@ async function openCodexSession(options: CodexServerOptions, session: Normalized
       })
     },
   }
+  // Cancelled while the session opens (initialize, thread/resume or thread/start unanswered): the process is killed now,
+  // not left to the idle timer or to a server that never answers, and the open fails once its tree is gone, as a turn does.
+  const cancelOpen = () => { fail(cancelledError()) }
+  options.signal?.addEventListener('abort', cancelOpen, { once: true })
   try {
     await request('initialize', { clientInfo: { name: 'orbit', title: 'Orbit', version: '0.3.1' } })
     send({ method: 'initialized', params: {} })
     const sandbox = options.accessMode === 'read-only' ? 'read-only' : 'workspace-write'
+    // The stable Orbit block is the thread's developer instructions, as with exec (providers.buildCodexSessionArgs).
+    const instructions = session?.systemAppend ? { developerInstructions: session.systemAppend } : {}
     let thread: CodexThreadResult | null = null
     if (session?.resume && session.id) {
       // The earlier process is gone (a relaunch, an idle close); the recorded thread may still be resumable.
-      try { thread = await request<CodexThreadResult>('thread/resume', { threadId: session.id, cwd: options.workspace, ...(options.model ? { model: options.model } : {}), approvalPolicy: 'on-request', sandbox }) } catch { thread = null }
+      try { thread = await request<CodexThreadResult>('thread/resume', { threadId: session.id, cwd: options.workspace, ...(options.model ? { model: options.model } : {}), approvalPolicy: 'on-request', sandbox, ...instructions }) } catch { thread = null }
     }
-    if (!thread?.thread?.id) thread = await request<CodexThreadResult>('thread/start', { cwd: options.workspace, ...(options.model ? { model: options.model } : {}), approvalPolicy: 'on-request', sandbox, ephemeral: false })
+    if (!thread?.thread?.id) thread = await request<CodexThreadResult>('thread/start', { cwd: options.workspace, ...(options.model ? { model: options.model } : {}), approvalPolicy: 'on-request', sandbox, ephemeral: false, ...instructions })
+    // The process can end, or the open be cancelled, between that answer and here: such a session is not kept, and the
+    // open fails with what closed it (fail() has set `failure`).
+    if (closed) throw failure
     threadId = thread.thread.id
     actualModel = thread.model || thread.thread?.model || actualModel
     sessions.set(threadId, api)
     armSessionIdle()
     return api
   } catch (error) {
-    fail(error as Error)
+    await fail(error as Error)
     throw error
+  } finally {
+    options.signal?.removeEventListener('abort', cancelOpen)
   }
 }
 
@@ -332,7 +350,13 @@ async function runCodexSessionTurn(options: CodexServerOptions & { prompt: strin
   let live = session.resume && session.id ? sessions.get(session.id) : null
   if (live?.closed) { sessions.delete(session.id as string); live = null }
   if (live?.busy) throw new Error('The Codex session is still running an earlier turn')
+  const opened = !live
   if (!live) live = await openCodexSession(options, session, helpers)
+  // The thread is known before the turn starts: a turn Orbit cuts off can still be resumed in it (runtime turn.mts).
+  if (live.threadId) { try { options.onEvent?.({ providerId: 'codex', kind: 'session', sessionId: live.threadId }) } catch { /* UI observers do not control the provider. */ } }
+  // Cancelled by now (the runtime stops a turn whose server opened another thread than the one to resume, on that event):
+  // a session this call opened ends with it, since nothing reached its thread and nobody comes back to it.
+  if (options.signal?.aborted) { if (opened) await live.close(); throw cancelledError() }
   const result = await live.turn(options.prompt, {
     onEvent: options.onEvent, onApproval: options.onApproval, signal: options.signal,
     timeoutMs: options.timeoutMs ?? null, inactivityMs: options.inactivityMs, isBusy: helpers.busyCheck?.(session), reasoningEffort: options.reasoningEffort,

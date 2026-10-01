@@ -269,4 +269,13 @@ export function formatDuration(ms: number) {
   if (seconds < 3600) return `${Math.floor(seconds / 60)} мин ${seconds % 60} с`
   return `${Math.floor(seconds / 3600)} ч ${Math.floor(seconds % 3600 / 60)} мин`
 }
+// The model's thinking in progress, from the provider's estimate of the thinking block so far: «думает» until the first
+// estimate, then a rounded figure («думает · ~220 токенов», «~4,2 тыс. токенов», «~18 тыс. токенов»); '' — not thinking.
+export function thinkingText(tokens?: number | null): string {
+  if (typeof tokens !== 'number' || !(tokens >= 0)) return ''
+  if (tokens < 5) return 'думает'
+  const tens = Math.round(tokens / 10) * 10
+  const amount = tens < 1000 ? `${tens} токенов` : `${tokens < 9950 ? String(Math.round(tokens / 100) / 10).replace('.', ',') : Math.round(tokens / 1000)} тыс. токенов`
+  return `думает · ~${amount}`
+}
 export const transportLabel = (transport?: string) => transport === 'session' ? 'сессия' : transport === 'envelope' ? 'конверт' : transport || ''

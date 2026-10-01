@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import type { Agent, Handover, QuotaFailover, QuotaSnapshot, QuotaState, QuotaWindow } from './types'
+import { shownStatus } from './run-events'
 
 type ProviderInfo = { id: string; name: string; description: string }
 
@@ -89,7 +90,7 @@ function Card({ provider, snapshot, connected, agents, at, current }: CardProps)
     {!!agents.length && <div className="quota-agents">
       <span>Агенты запуска</span>
       {agents.map(agent => <span key={agent.id} className="quota-agent" title={`${agent.name}${agent.model ? ` · ${agent.model}` : ''}`}>
-        <span className={`status-dot ${agent.status}`} />{agent.name}{!!agent.handovers?.length && <b title="Агент менял подписку">⇄</b>}
+        <span className={`status-dot ${shownStatus(agent)}`} />{agent.name}{!!agent.handovers?.length && <b title="Агент менял подписку">⇄</b>}
       </span>)}
     </div>}
     {snapshot?.fetchedAt && <footer>{snapshot.stale ? 'Данные устарели · ' : ''}обновлено {clock(snapshot.fetchedAt)}</footer>}
@@ -135,8 +136,8 @@ export function QuotaPanel({ providers, connected, quotas, busy, onRefresh, fail
       </label>
       <p className="field-hint">
         Замена выбирается из подключённых подписок: сначала ваш пул моделей, затем модель того же уровня и с наибольшим запасом квоты. Уровень
-        модели берётся из замера (аудит моделей), для остальных — по названию (файл electron/model-tiers.json); неизвестные и ненадёжные модели
-        берутся только из пула. Новый агент получает журнал
+        модели берётся из замера (аудит моделей), для остальных — по названию (файл electron/model-tiers.json); неизвестные, ненадёжные и
+        исключённые там модели (Claude Fable: расходует гораздо больше квоты, а пишет не лучше Opus) берутся только из пула. Новый агент получает журнал
         действий, файлы, состояние команды и незавершённый ход прежнего. Порог и разрешения действуют для новых задач.
       </p>
     </section>

@@ -183,9 +183,23 @@ export function restartNote(notice: RestartNotice): Message {
   if (notice.kind === 'resumed' && notice.resumedRunId) note.runId = notice.resumedRunId
   return note
 }
-// The note of a restart about `runId` that started no continuation, when the chat has one.
-export const settlingRestartText = (chat: ChatThread, runId: string) =>
-  chat.messages.find(m => settlingKinds.some(kind => m.id === restartNoteId({ kind, runId, time: '' })))?.text
+// The note of a restart about `runId` that started no continuation, when the chat has one: how it ended and its text.
+export function settlingRestart(chat: ChatThread, runId: string): { kind: RestartNoticeKind; text: string } | undefined {
+  for (const message of chat.messages) {
+    const kind = settlingKinds.find(item => message.id === restartNoteId({ kind: item, runId, time: '' }))
+    if (kind) return { kind, text: message.text }
+  }
+  return undefined
+}
+export const settlingRestartText = (chat: ChatThread, runId: string) => settlingRestart(chat, runId)?.text
+// The chat card of a run that ended by restarting Orbit, after «Перезапуск Orbit»: why the agent restarted it and, once
+// the chat has the note of a restart that started no continuation, how that ended. Under a rollback note the card no
+// longer says the agent restarted Orbit.
+export function restartCardDetail(run: Pick<RunSnapshot, 'restart'>, outcome?: RestartNoticeKind): string {
+  const reason = run.restart?.reason ? `: ${run.restart.reason}` : ''
+  if (outcome === 'rolled-back') return ` не удался и откатился, работает прежний код. Агент перезапускал Orbit${reason}.`
+  return `. Агент перезапустил Orbit${reason}.${outcome && outcome !== 'resumed' ? ' Продолжение не запущено.' : ''}`
+}
 // The note a saved continuation gets when its live notice never reached this window (or before it does).
 function resumedNote(run: RunSnapshot, snapshots: RunSnapshot[]): Message {
   const reason = snapshots.find(item => item.runId === run.resumedFrom)?.restart?.reason
@@ -232,8 +246,7 @@ export function restartWaits(state: AppState, runs: RunMap, at = Date.now()): Ma
     if (!chat) continue
     const later = list.some(other => other.runId !== run.runId && other.projectId === run.projectId && other.chatId === run.chatId
       && (other.resumedFrom === run.runId || String(other.startedAt) > String(run.startedAt)))
-    const settled = settlingKinds.some(kind => chat.messages.some(m => m.id === restartNoteId({ kind, runId: run.runId, time: '' })))
-    if (!later && !settled) waits.set(`${run.projectId}/${run.chatId}`, ended + RESTART_WAIT_MS)
+    if (!later && !settlingRestart(chat, run.runId)) waits.set(`${run.projectId}/${run.chatId}`, ended + RESTART_WAIT_MS)
   }
   return waits
 }
@@ -334,8 +347,9 @@ export function addWorkspace(state: AppState, workspace: Workspace, chat: () => 
 
 // ---- Views of the settings the composer and the settings panel share ----
 
+// The paths of a message's files come before its text: the runtime and the prompt cut a long entry at its end.
 export const chatHistory = (chat: ChatThread) => chat.messages.filter(m => m.author === 'user' || m.author === 'orbit').slice(-40)
-  .map(m => ({ role: m.author === 'user' ? 'user' as const : 'assistant' as const, content: [m.text, attachmentNote(m.attachments)].filter(Boolean).join('\n\n') }))
+  .map(m => ({ role: m.author === 'user' ? 'user' as const : 'assistant' as const, content: [attachmentNote(m.attachments), m.text].filter(Boolean).join('\n\n') }))
 // Ask mode is on-request approval over workspace-write; every other choice is an access mode with no approval prompts.
 export const accessChoice = (settings: Settings) => settings.approvalPolicy === 'on-request' ? 'ask' : settings.accessMode
 export const accessPatch = (value: string): Partial<Settings> =>

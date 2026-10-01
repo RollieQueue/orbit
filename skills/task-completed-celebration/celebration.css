@@ -34,9 +34,8 @@ html,body{margin:0;height:100%;overflow:hidden;background:#000}
   text-shadow:0 1px 4px #000;pointer-events:none;animation:hint-out .6s ease 5s forwards}
 @keyframes hint-out{to{opacity:0}}
 
-/* Gentler motion: a slower turn, no pulse and no spinning backdrop. */
+/* Reduced motion: nothing moves but the video. The text stands still in the middle and the confetti lies along the edges
+   (celebration.js); here the text's turn and pulse and the backdrop's spin stop. */
 @media (prefers-reduced-motion:reduce){
-  #spin{animation-duration:9s}
-  #words{animation:none}
-  #backdrop{animation:none}
+  #spin,#words,#backdrop{animation:none}
 }

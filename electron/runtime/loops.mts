@@ -9,6 +9,7 @@ import { sessionGuide, evaluationReminder, skillReminder } from './prompts.mts'
 import * as improvement from './improvement.mts'
 import { describeCall } from './ledger.mts'
 import { PauseInterrupt, pauseGate, interruptedSession, STOPPED_BY_USER } from './pause.mts'
+import { keptAnswer, answerAsKept } from './mailbox.mts'
 import type { AgentRecord, AgentResult, MailboxContext, McpServerLike, OrbitRuntimeLike, PromptBase, ProviderResult, RunRecord, SessionInfo, TranscriptEntry } from '../types.mts'
 // Consecutive turns made only of identical repeats: warn, then stop the agent honestly.
 const STALL_WARN_TURNS = 2
@@ -71,9 +72,11 @@ async function executeAgent(runtime: OrbitRuntimeLike, run: RunRecord, agent: Ag
     if (agent.draftAnswer && !signal.aborted && !TERMINAL.has(run.status)) {
       // Only an optional extra turn (a reminder, or a session resume after the answer) failed; the answer was complete.
       runtime.trace(run, agent.id, 'budget', `The turn after the answer failed (${(error as Error).message}); the drafted answer is delivered`)
-      return runtime.completeAgent(run, agent, agent.draftAnswer)
+      return runtime.completeAgent(run, agent, answerAsKept(runtime, run, agent, agent.draftAnswer, (error as Error).message))
     }
-    runtime.updateAgent(run, agent, { status: signal.aborted ? 'cancelled' : 'error', error: (error as Error).message, detail: (error as Error).message, finishedAt: new Date().toISOString() })
+    // An agent already cancelled with a reason (its supervisor was stopped, the whole run was) keeps that reason.
+    const marked = signal.aborted && agent.status === 'cancelled'
+    runtime.updateAgent(run, agent, { status: signal.aborted ? 'cancelled' : 'error', error: (error as Error).message, detail: marked && agent.detail ? agent.detail : (error as Error).message, finishedAt: marked && agent.finishedAt ? agent.finishedAt : new Date().toISOString() })
     // A failed parent must never leave its descendants executing unowned work.
     run.agentControllers.get(agent.id)?.controller.abort()
     throw error
@@ -180,7 +183,7 @@ async function envelopeLoop(runtime: OrbitRuntimeLike, run: RunRecord, agent: Ag
             run.skillReminded = true
             // The answer is ready. The next turn is a fresh inference, so it sees the draft in the transcript, and if that
             // optional turn fails or comes back empty the draft is what the user gets (see the catch below).
-            agent.draftAnswer = response.content
+            agent.draftAnswer = keptAnswer(runtime, run, agent, response.content)
             runtime.remember(agent, { type: 'assistant', content: response.content, tool_calls: [] })
             runtime.remember(agent, { type: 'instruction', content: skillReminder(unrated) })
             continue
@@ -260,6 +263,8 @@ async function sessionLoop(runtime: OrbitRuntimeLike, run: RunRecord, agent: Age
   const transcript = agent.transcript
   const guard = { improvementReminders: 0, evaluationsAsked: new Set<string>() }
   let instruction: string | null = null
+  // Mail a cut-off turn carried into the session that goes on (pause.interruptedSession): only a fresh session gets it again.
+  const held = new Set<string>()
   while (agent.id === 'root' || agent.turns < ceiling(run.limits, 'maxTurns')) {
     await new Promise(resolve => setImmediate(resolve))
     if (signal.aborted) throw abortError()
@@ -280,9 +285,10 @@ async function sessionLoop(runtime: OrbitRuntimeLike, run: RunRecord, agent: Age
       try {
         result = await runtime.providerTurn(run, agent, () => {
           lastWorkerTurn = agent.id !== 'root' && (agent.turns >= ceiling(run.limits, 'maxTurns') || run.usage.workerTurns >= ceiling(run.limits, 'maxTotalTurns'))
-          mailbox = runtime.mailboxContext(run, agent)
+          if (!resume) held.clear()
+          mailbox = runtime.mailboxContext(run, agent, held)
           runtime.markCommunications(run, mailbox.deliveredIds, 'delivered', 'next-turn')
-          for (const id of mailbox.deliveredIds) agent.activeTurn?.delivered.add(id)
+          for (const id of [...mailbox.deliveredIds, ...held]) agent.activeTurn?.delivered.add(id)
           let text
           if (resume) {
             const pending = transcript.slice(agent.sessionCursor)
@@ -296,12 +302,12 @@ async function sessionLoop(runtime: OrbitRuntimeLike, run: RunRecord, agent: Age
         agent.pausedSession = null
         break
       } catch (error) {
-        // A pause or a message cut the turn off: the same session goes on with the note (pause.interruptedSession).
-        if (error instanceof PauseInterrupt) { instruction = interruptedSession(runtime, agent, error, cursorBeforeTurn); continue }
-        // A killed CLI may leave its session unreadable. Try that session once, then carry the note into a fresh one.
+        // Cut off by a pause or a message: the session goes on with the note and the results of helpers finished by now.
+        if (error instanceof PauseInterrupt) { instruction = interruptedSession(runtime, agent, error, cursorBeforeTurn, mailbox.deliveredIds, held); runtime.collectChildren(run, agent, transcript); continue }
+        // A killed CLI may leave its session unreadable. Try that session once, then carry the note into a fresh one: the
+        // failed resume's prompt already put it in the transcript, which the fresh session's full prompt carries.
         if (resume && agent.pausedSession && agent.pausedSession === agent.sessionId && !signal.aborted) {
           agent.pausedSession = null; agent.sessionId = null
-          if (instruction) runtime.remember(agent, { type: 'instruction', content: instruction })
           runtime.trace(run, agent.id, 'transport', `The session from before the pause could not be resumed (${(error as Error)?.message || error}); starting a fresh one with the pause note`)
           continue
         }
@@ -332,7 +338,7 @@ async function sessionLoop(runtime: OrbitRuntimeLike, run: RunRecord, agent: Age
     // names its sessions (Cursor, Antigravity, Codex) says null when its stream carried no id: the next turn starts fresh
     // instead of "resuming" the id Orbit proposed, which that CLI never saw.
     agent.sessionId = typeof result?.sessionId === 'string' && result.sessionId ? result.sessionId : result?.sessionId === null ? null : session.id
-    runtime.markCommunications(run, mailbox.deliveredIds, 'read', 'next-turn')
+    runtime.markCommunications(run, [...mailbox.deliveredIds, ...held], 'read', 'next-turn'); held.clear()
     const timing = agent.turnTimings.at(-1)
     if (timing) timing.sessionId = agent.sessionId
     if (timing?.orbitToolCalls) guard.improvementReminders = 0
@@ -340,7 +346,7 @@ async function sessionLoop(runtime: OrbitRuntimeLike, run: RunRecord, agent: Age
     if (lastWorkerTurn) return candidate ? runtime.completeAgent(run, agent, candidate, true) : runtime.budgetHandoff(run, agent)
     // Post-answer checks, each at most once per candidate, each a resume of the same session. Whatever the extra turn
     // brings, the candidate is what the user gets if that turn fails.
-    if (candidate) agent.draftAnswer = candidate
+    if (candidate) agent.draftAnswer = keptAnswer(runtime, run, agent, candidate)
     const participants = [...run.agentNodes.values()].filter(child => child.id !== agent.id && (agent.id === 'root' || child.parentId === agent.id))
     const pending = participants.filter(child => !AGENT_TERMINAL.has(child.status))
     const unseen = participants.some(child => !agent.seenChildren.has(runtime.resultKey(child)))

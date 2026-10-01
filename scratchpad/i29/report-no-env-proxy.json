@@ -1,0 +1,48 @@
+{
+ "mode": "no-env-proxy",
+ "envProxy": "http://127.0.0.1:12334",
+ "packageId": "12362acc-d7e9-44f9-8b13-c0bc9c71e4bc",
+ "steps": [
+  {
+   "step": "routes",
+   "window": "DIRECT",
+   "windowHttp": "DIRECT",
+   "windowLoopback": "DIRECT",
+   "windowLocalhost": "DIRECT",
+   "system": "DIRECT",
+   "app": "DIRECT"
+  },
+  {
+   "step": "stage",
+   "closedAfterMs": 27040,
+   "states": [
+    {
+     "atMs": 28,
+     "state": {
+      "video": "loading",
+      "time": null,
+      "playerState": null
+     }
+    },
+    {
+     "atMs": 15035,
+     "state": {
+      "video": "none",
+      "time": null,
+      "issue": "the player did not start",
+      "playerState": null
+     }
+    }
+   ]
+  },
+  {
+   "step": "main console",
+   "rendererFailures": [],
+   "frameFailures": [
+    "warn: [orbit] a frame of the window failed to load (-105): ERR_NAME_NOT_RESOLVED — https://www.youtube.com/embed/6-8E4Nirh9s?autoplay=1&start=42&end=47&controls=0&rel=0&playsinline=1&iv_load_policy=3&disablekb=1&fs=0&modestbranding=1&enablejsapi=1"
+   ],
+   "proxyLines": []
+  }
+ ],
+ "ok": true
+}

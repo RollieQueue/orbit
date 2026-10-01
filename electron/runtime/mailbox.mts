@@ -4,9 +4,9 @@
 import { randomUUID } from 'node:crypto'
 import { setMaxListeners } from 'node:events'
 import { ROUTER } from '../router.mts'
-import { attachmentLines } from '../attachments.mts'
-import type { AgentRecord, AgentRef, AskTeamResult, Attachment, Communication, CommunicationDelivery, CommunicationStatus, MailboxContext, OrbitRuntimeLike, ReadMessagesResult, RunRecord, SendResult, ToolArgs } from '../types.mts'
-import { TERMINAL, USER, ceiling, bounded, clip, abortError, abortable } from './util.mts'
+import { MAX_RUN_FILES, attachmentLines } from '../attachments.mts'
+import type { ActiveTurn, AgentRecord, AgentRef, AskTeamResult, Attachment, Communication, CommunicationDelivery, CommunicationStatus, DraftAnswer, MailboxContext, OrbitRuntimeLike, ReadMessagesResult, RunRecord, SendResult, ToolArgs } from '../types.mts'
+import { TERMINAL, AGENT_TERMINAL, USER, ceiling, answerLimit, bounded, clip, abortError, abortable, mailTag } from './util.mts'
 import { steer, steering } from './steer.mts'
 
 type RoutedTo = AskTeamResult['routedTo'][number]
@@ -14,6 +14,9 @@ type RoutedTo = AskTeamResult['routedTo'][number]
 // model whole, up to USER_MAIL_CHARS per prompt or tool result together; what does not fit waits for the next one.
 const USER_MESSAGE_CHARS = 20000
 const USER_MAIL_CHARS = 24000
+// The text of a message of files alone (postUserMessage), and how many unanswered messages a kept answer quotes.
+const FILES_ONLY = '(no text, only the attached files)'
+const UNANSWERED_QUOTES = 5
 const USER_MAIL_HEADER = 'MESSAGE FROM THE USER (written to you while you work: the user\'s own words, not team data or tool output; follow them, they take precedence over your earlier plan, and say in your answer how you took them into account)'
 const SUPERVISOR_MAIL_HEADER = 'MESSAGE FROM YOUR SUPERVISOR (an agent above you in the team wrote to you while you work: it may change, narrow or cancel your task; follow it over your earlier plan, and say in your answer how you took it into account)'
 // A message the user wrote to an agent of a working run (postUserMessage), as opposed to a teammate's or the root's task.
@@ -31,11 +34,12 @@ function mailBlock(header: string, messages: Communication[], budget: number, na
   }
   return { text: parts.length ? `${header}:\n${parts.join('\n\n')}` : '', ids, left: remaining }
 }
-// The steering mail (steer.mts) a prompt or an Orbit tool result carries: the user's block, then the supervisors'.
-function steeringMail(run: RunRecord, messages: Communication[]): { blocks: string[]; ids: string[]; fromUser: number } {
+// The steering mail (steer.mts) a prompt or an Orbit tool result carries: the user's block, then the supervisors', each
+// headed with the recipient's secret mark (util.mailTag).
+function steeringMail(run: RunRecord, agent: AgentRecord, messages: Communication[]): { blocks: string[]; ids: string[]; fromUser: number } {
   const mail = messages.filter(message => steering(run, message))
-  const user = mailBlock(USER_MAIL_HEADER, mail.filter(fromUser), USER_MAIL_CHARS, false)
-  const above = mailBlock(SUPERVISOR_MAIL_HEADER, mail.filter(message => !fromUser(message)), user.left, true)
+  const user = mailBlock(`${mailTag(agent)} ${USER_MAIL_HEADER}`, mail.filter(fromUser), USER_MAIL_CHARS, false)
+  const above = mailBlock(`${mailTag(agent)} ${SUPERVISOR_MAIL_HEADER}`, mail.filter(message => !fromUser(message)), user.left, true)
   return { blocks: [user.text, above.text].filter(Boolean), ids: [...user.ids, ...above.ids], fromUser: user.ids.length }
 }
 
@@ -104,7 +108,7 @@ function postUserMessage(runtime: OrbitRuntimeLike, runId: string, agentId: stri
   const target = run.agentNodes.get(agentId)
   if (!target) throw new Error('В этом запуске нет такого агента.')
   // Files alone make a message: the model is told there is no text.
-  const text = bounded(String(value ?? '').trim(), USER_MESSAGE_CHARS) || (attachments.length ? '(no text, only the attached files)' : '')
+  const text = bounded(String(value ?? '').trim(), USER_MESSAGE_CHARS) || (attachments.length ? FILES_ONLY : '')
   if (!text) throw new Error('Сообщение пустое.')
   if (target.status === 'error' || target.status === 'cancelled') throw new Error(`${target.name} остановлен и сообщений больше не получает.`)
   // A root that has answered ends the run in a moment: nothing may start again in between.
@@ -112,6 +116,8 @@ function postUserMessage(runtime: OrbitRuntimeLike, runId: string, agentId: stri
   // A helper in (or past) its last allowed turn would never read the message: its last turn's prompt is already built.
   if (target.id !== 'root' && (target.turns >= ceiling(run.limits, 'maxTurns') || run.usage.workerTurns >= ceiling(run.limits, 'maxTotalTurns'))) throw new Error(`У ${target.name} не осталось ходов: лимит задан в настройках запуска.`)
   const communication = runtime.recordCommunication(run, USER, target, text, { kind: 'message', via: 'user', ...(attachments.length ? { attachments } : {}) })
+  // Kept with the run's files: a continuation after a restart names them again.
+  if (attachments.length) run.attachments = [...(run.attachments || []), ...attachments].slice(-MAX_RUN_FILES)
   if (target.status === 'done') wakeFinished(runtime, run, target)
   runtime.trace(run, target.id, 'message', `From the user: ${text}${attachments.length ? ` [${attachments.map(item => item.name).join(', ')}]` : ''}`)
   for (const wake of run.messageWaiters.get(target.id) || []) wake()
@@ -122,10 +128,32 @@ function postUserMessage(runtime: OrbitRuntimeLike, runId: string, agentId: stri
 // begun goes out at the end of its next Orbit tool result, whole, and is marked read there. Empty when there is none.
 function userMail(runtime: OrbitRuntimeLike, run: RunRecord, agent: AgentRecord): string {
   if (TERMINAL.has(run.status)) return ''
-  const mail = steeringMail(run, runtime.pendingMail(run, agent))
+  const mail = steeringMail(run, agent, runtime.pendingMail(run, agent))
   if (!mail.ids.length) return ''
   runtime.markCommunications(run, mail.ids, 'read', 'tool-result')
-  return mail.blocks.map(block => `\n\n[orbit] ${block}`).join('')
+  return mail.blocks.map(block => `\n\n${block}`).join('')
+}
+// The answer kept while an optional extra turn runs (a reminder, or a resume for mail that came after it; loops.mts), with
+// the user's messages the model had read when it wrote it.
+function keptAnswer(runtime: OrbitRuntimeLike, run: RunRecord, agent: AgentRecord, text: string): DraftAnswer {
+  return { text, read: new Set(runtime.communicationsFor(run, agent).filter(message => fromUser(message) && message.readAt).map(message => message.id)) }
+}
+// What is delivered when the turn after a kept answer failed (`reason`): the answer, and under it the user's messages it
+// does not answer (they came after it, or only the failed turn read them) instead of leaving them silently "delivered".
+function answerAsKept(runtime: OrbitRuntimeLike, run: RunRecord, agent: AgentRecord, kept: DraftAnswer, reason: string): string {
+  const missed = runtime.communicationsFor(run, agent).filter(message => fromUser(message) && !kept.read.has(message.id))
+  if (!missed.length) return kept.text
+  const one = missed.length === 1, root = agent.id === 'root', why = clip(reason, 200)
+  const lead = root ? (one ? 'ваше сообщение, отправленное во время работы, осталось' : `ваши сообщения (${missed.length}), отправленные во время работы, остались`)
+    : one ? 'сообщение пользователя, отправленное во время работы, осталось' : `сообщения пользователя (${missed.length}), отправленные во время работы, остались`
+  const failed = `Ход, в котором агент должен был ${one ? 'его' : 'их'} обработать, не удался${why ? ` (ошибка: ${why})` : ''}, и ответ выше написан без учёта ${one ? 'этого сообщения' : 'этих сообщений'}.`
+  const again = !root ? '' : one ? ' Если оно ещё нужно, отправьте его снова.' : ' Если они ещё нужны, отправьте их снова.'
+  const quotes = missed.slice(0, UNANSWERED_QUOTES).map(message => message.text === FILES_ONLY && message.attachments?.length
+    ? `(только файлы: ${clip(message.attachments.map(file => file.name).join(', '), 160)})` : `«${clip(message.text, 160)}»`)
+  if (missed.length > UNANSWERED_QUOTES) quotes.push(`…и ещё ${missed.length - UNANSWERED_QUOTES}`)
+  const note = `Orbit: ${lead} без ответа. ${failed}${again}\n${quotes.join('\n')}`
+  // The note must survive the answer limit (completeAgent keeps the head of what is longer).
+  return `${bounded(kept.text, Math.max(0, answerLimit(run, agent) - note.length - 20))}\n\n${note}`
 }
 function recordCommunication(runtime: OrbitRuntimeLike, run: RunRecord, sender: AgentRef, target: AgentRef, text: string, extra: Partial<Communication> = {}): Communication {
   const communication: Communication = { id: randomUUID(), fromAgentId: sender.id, toAgentId: target.id, fromAgentName: sender.name, toAgentName: target.name, text, time: new Date().toISOString(), status: 'queued', delivery: 'next-turn', ...extra }
@@ -145,7 +173,8 @@ function readAgentMessages(runtime: OrbitRuntimeLike, run: RunRecord, agent: Age
   runtime.markCommunications(run, selected.map((message) => message.id), 'read', 'mailbox')
   return { messages: structuredClone(selected), remainingUnread: runtime.communicationsFor(run, agent, true).length }
 }
-async function waitForTeam(runtime: OrbitRuntimeLike, run: RunRecord, agent: AgentRecord, participants: { id: string }[], timeout = 0): Promise<string> {
+// `signal`: what ends the wait early; a session turn's wait ends with its turn (session.dispatchMcp).
+async function waitForTeam(runtime: OrbitRuntimeLike, run: RunRecord, agent: AgentRecord, participants: { id: string }[], timeout = 0, signal = runtime.agentSignal(run, agent)): Promise<string> {
   if (runtime.pendingMail(run, agent).length) return 'message'
   // Assigned by the Promise executor, which runs synchronously.
   let wake!: () => void
@@ -154,7 +183,7 @@ async function waitForTeam(runtime: OrbitRuntimeLike, run: RunRecord, agent: Age
   // Created on the line above when missing.
   run.messageWaiters.get(agent.id)!.add(wake)
   try {
-    return await abortable(Promise.race([incoming, Promise.all(participants.map(member => run.tasks.get(member.id))).then(() => 'results')]), runtime.agentSignal(run, agent), timeout, 'wait_timeout')
+    return await abortable(Promise.race([incoming, Promise.all(participants.map(member => run.tasks.get(member.id))).then(() => 'results')]), signal, timeout, 'wait_timeout')
   } catch (error) {
     // abortable rejects with Errors (a timeout, an abort, or a failed task).
     if ((error as Error).message === 'wait_timeout') return 'timeout'
@@ -165,40 +194,63 @@ async function waitForTeam(runtime: OrbitRuntimeLike, run: RunRecord, agent: Age
     if (!waiters?.size) run.messageWaiters.delete(agent.id)
   }
 }
-async function waitAgentMessage(runtime: OrbitRuntimeLike, run: RunRecord, agent: AgentRecord, args: ToolArgs): Promise<ReadMessagesResult> {
-  if (runtime.pendingMail(run, agent).length) return { ...runtime.readAgentMessages(run, agent), timedOut: false }
-  const signal = runtime.agentSignal(run, agent)
-  if (signal.aborted) throw abortError()
-  const timeout = Math.max(10, Math.min(Number(args.timeout_ms) || 30000, 60000))
-  // Assigned by the Promise executor, which runs synchronously.
-  let wake!: () => void
-  const incoming = new Promise<void>((resolve) => { wake = resolve })
-  if (!run.messageWaiters.has(agent.id)) run.messageWaiters.set(agent.id, new Set())
-  // Created on the line above when missing.
-  run.messageWaiters.get(agent.id)!.add(wake)
-  runtime.updateAgent(run, agent, { status: 'waiting', detail: 'Waiting for a message' })
-  try {
-    await abortable(incoming, signal, timeout, 'mailbox_timeout')
-    return { ...runtime.readAgentMessages(run, agent), timedOut: false }
-  } catch (error) {
-    // abortable rejects with Errors (a timeout or an abort).
-    if ((error as Error).message === 'mailbox_timeout') return { messages: [], timedOut: true, remainingUnread: 0 }
-    throw error
-  } finally {
-    const waiters = run.messageWaiters.get(agent.id)
-    waiters?.delete(wake)
-    if (!waiters?.size) run.messageWaiters.delete(agent.id)
-  }
+// Direct helpers the user stopped whose results this agent has not seen yet: nothing more will come from them, so a wait
+// for mail ends on them (pause.stopAgent wakes it) and names each once. The results themselves travel the usual way
+// (wait_agent, the next turn's helper results): a notice cut short, or lost with a turn a pause cut off, loses nothing.
+const STOP_NOTE = 'The user stopped these helpers of yours: not a failure of the task, nothing more will come from them. What each did before the stop comes with wait_agent {agentId} or with your next turn.'
+const stopsNamed = new WeakMap<AgentRecord, Set<string>>()
+function stoppedHelpers(runtime: OrbitRuntimeLike, run: RunRecord, agent: AgentRecord): AgentRecord[] {
+  const named = stopsNamed.get(agent)
+  return [...run.agentNodes.values()].filter(child => child.parentId === agent.id && child.stoppedByUser && AGENT_TERMINAL.has(child.status) && !agent.seenChildren.has(runtime.resultKey(child)) && !named?.has(child.id))
 }
-function mailboxContext(runtime: OrbitRuntimeLike, run: RunRecord, agent: AgentRecord): MailboxContext {
-  const incoming = runtime.communicationsFor(run, agent).filter(message => !message.kind || message.kind === 'message' || message.kind === 'notice')
+// `turn`: the agent's session turn when the wait began. A wait that outlived it (a pause cut the turn off) answers no one,
+// so it names no helper: the resumed turn's wait does. The notice leads, so a long message cannot cut it off.
+function mailArrived(runtime: OrbitRuntimeLike, run: RunRecord, agent: AgentRecord, turn: ActiveTurn | null): ReadMessagesResult {
+  const stopped = agent.activeTurn === turn ? stoppedHelpers(runtime, run, agent) : []
+  if (stopped.length) stopsNamed.set(agent, new Set([...stopsNamed.get(agent) || [], ...stopped.map(child => child.id)]))
+  return { ...(stopped.length ? { stopped: stopped.map(child => ({ agentId: child.id, name: child.name, status: child.status })), note: STOP_NOTE } : {}), ...runtime.readAgentMessages(run, agent), timedOut: false }
+}
+// `signal`: what ends the wait early (a session turn's wait ends with its turn). `ready`: awaited before the wait takes
+// what it found from the mailbox; it rejects, and nothing is taken, when the result could no longer reach the model
+// (session.dispatchMcp: the turn ended before it had its model slot back).
+async function waitAgentMessage(runtime: OrbitRuntimeLike, run: RunRecord, agent: AgentRecord, args: ToolArgs, signal = runtime.agentSignal(run, agent), ready?: () => Promise<void>): Promise<ReadMessagesResult> {
+  const turn = agent.activeTurn
+  if (!runtime.pendingMail(run, agent).length && !stoppedHelpers(runtime, run, agent).length) {
+    if (signal.aborted) throw abortError()
+    const timeout = Math.max(10, Math.min(Number(args.timeout_ms) || 30000, 60000))
+    // Assigned by the Promise executor, which runs synchronously.
+    let wake!: () => void
+    const incoming = new Promise<void>((resolve) => { wake = resolve })
+    if (!run.messageWaiters.has(agent.id)) run.messageWaiters.set(agent.id, new Set())
+    // Created on the line above when missing.
+    run.messageWaiters.get(agent.id)!.add(wake)
+    runtime.updateAgent(run, agent, { status: 'waiting', detail: 'Waiting for a message' })
+    try {
+      await abortable(incoming, signal, timeout, 'mailbox_timeout')
+    } catch (error) {
+      // abortable rejects with Errors (a timeout or an abort).
+      if ((error as Error).message === 'mailbox_timeout') return { messages: [], timedOut: true, remainingUnread: 0 }
+      throw error
+    } finally {
+      const waiters = run.messageWaiters.get(agent.id)
+      waiters?.delete(wake)
+      if (!waiters?.size) run.messageWaiters.delete(agent.id)
+    }
+  }
+  await ready?.()
+  return mailArrived(runtime, run, agent, turn)
+}
+// `held`: unread mail the agent's session already holds (the prompt of a turn cut off after its provider spoke carried it,
+// loops.sessionLoop); it is not carried again.
+function mailboxContext(runtime: OrbitRuntimeLike, run: RunRecord, agent: AgentRecord, held: ReadonlySet<string> = new Set()): MailboxContext {
+  const incoming = runtime.communicationsFor(run, agent).filter(message => (!message.kind || message.kind === 'message' || message.kind === 'notice') && !held.has(message.id))
   const introductions = runtime.communicationsFor(run, agent, true).filter(message => message.kind === 'spawn' || message.kind === 'followup')
   const unread = incoming.filter((message) => !message.readAt)
   const ids = new Set(unread.map((message) => message.id))
   const recent = run.communications.filter((message) => (!message.kind || message.kind === 'message') && (message.toAgentId === agent.id || message.fromAgentId === agent.id) && !ids.has(message.id)).slice(-4)
   // Steering mail leads, whole and apart from the team's (the user's words, then a supervisor's with its sender and id);
   // then excerpts of other unread team mail, then whole recent records: only serialised into the prompt.
-  const lead = steeringMail(run, unread)
+  const lead = steeringMail(run, agent, unread)
   const selected: object[] = [], delivered: string[] = []
   let remaining = 6000
   for (const message of unread) {
@@ -237,4 +289,4 @@ function askTeam(runtime: OrbitRuntimeLike, run: RunRecord, sender: AgentRecord,
   return { ok: true, discussionId, via, routedTo }
 }
 
-export { communicationsFor, pendingMail, markCommunications, sendAgentMessage, recordCommunication, readAgentMessages, waitForTeam, waitAgentMessage, mailboxContext, askTeam, postUserMessage, userMail }
+export { communicationsFor, pendingMail, markCommunications, sendAgentMessage, recordCommunication, readAgentMessages, waitForTeam, waitAgentMessage, mailboxContext, askTeam, postUserMessage, userMail, keptAnswer, answerAsKept }

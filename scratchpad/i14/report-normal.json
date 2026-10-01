@@ -1,0 +1,87 @@
+{
+ "mode": "normal",
+ "packageId": "fb934d38-8a70-40e1-9f40-ece5a44f24c5",
+ "steps": [
+  {
+   "step": "stage opened",
+   "runId": "7f713454-f96d-44bb-aeaf-afac926602c5",
+   "src": "orbit-skill://fb934d38-8a70-40e1-9f40-ece5a44f24c5/page.html?video=https%3A%2F%2Fwww.youtube.com%2Fwatch%3Fv%3D6-8E4Nirh9s&start=42&end=47&text=TASK+COMPLETED&confetti=true&orbit_event=task-completed&orbit_run=7f713454-f96d-44bb-aeaf-afac926602c5",
+   "fullScreen": true
+  },
+  {
+   "step": "motion",
+   "reduce": false,
+   "spin": "word-spin",
+   "pulse": "word-pulse",
+   "backdrop": "backdrop-turn",
+   "words": 2,
+   "size": [
+    1536,
+    864
+   ],
+   "textMoved": true,
+   "transforms": [
+    "translate3d(250.27px, 307.308px, 0px)",
+    "translate3d(437.638px, 225.093px, 0px)"
+   ],
+   "text": [
+    286,
+    116
+   ],
+   "centre": [
+    436,
+    328
+   ],
+   "confettiChanged": true,
+   "canvases": [
+    "0f2fa8579d",
+    "3bca5cd658"
+   ],
+   "pieces": [
+    394,
+    420
+   ]
+  },
+  {
+   "step": "closed by itself",
+   "afterMs": 22428,
+   "lastState": {
+    "video": "none",
+    "time": null,
+    "playerState": null,
+    "closed": false,
+    "hits": 16,
+    "textX": 25,
+    "textY": 30,
+    "pieces": 330,
+    "videoIssue": "the player did not start"
+   }
+  },
+  {
+   "step": "closed by Esc",
+   "fullScreen": false
+  },
+  {
+   "step": "closed by ×",
+   "at": [
+    1495,
+    37
+   ]
+  },
+  {
+   "step": "reload while shown",
+   "fullScreen": false,
+   "stage": false
+  },
+  {
+   "step": "switched off",
+   "stage": false
+  },
+  {
+   "step": "console errors",
+   "all": 0,
+   "relevant": []
+  }
+ ],
+ "ok": true
+}

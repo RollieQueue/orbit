@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { Attachment, ChatThread, ImprovementLoop, Message, Project, RestartNotice, RuntimeStatus, Settings, Workspace } from './types'
-import { addFiles, saveFiles } from './attachments'
+import { addFiles, discardChatFiles, discardFiles, pendingAttachments, saveFiles } from './attachments'
 import { errorText, remoteErrorText } from './format'
 import { closedKeysOf, loopNote, loopPrompt, loopStartFailed, loopView, newestPlanRun, nextLoopStep } from './improvement-loop'
 import { providers } from './providers'
@@ -209,8 +209,9 @@ export function useOrbitState() {
     setState(previous => removeChat(previous, project.id, chatId))
     setDrafts(previous => { const next = { ...previous }; delete next[`${project.id}/${chatId}`]; return next })
     setChosen(previous => { const next = { ...previous }; delete next[`${project.id}/${chatId}`]; return next })
-    // A deleted chat takes its working notes with it (what proved durable was already moved to the project).
+    // A deleted chat takes its working notes (what proved durable was already moved to the project) and its files with it.
     if (window.orbit && project.workspace.path) void window.orbit.forgetChatMemory(project.workspace.path, chatId).catch(() => undefined)
+    discardChatFiles(chatId)
   }
   // Picks a folder or clones a repository; true when a project is now selected.
   async function addProject(kind: 'local' | 'git', remote: string) {
@@ -264,7 +265,8 @@ export function useOrbitState() {
   function detachFile(index: number) { setChosen(previous => ({ ...previous, [chatKey]: (previous[chatKey] || noFiles).filter((_, at) => at !== index) })) }
   // Sends the current chat's draft: to the working run's root agent while one works (steer), else as a new run. False
   // when nothing was sent (no project, nothing written or attached, a start in progress or awaited after a restart, not ready).
-  // The attached files are saved by the desktop first, in the start's own pending step, and ride with the message.
+  // The attached files are saved by the desktop first, in the start's own pending step, and ride with the message; until
+  // then the message names them, and a refused start deletes the saved copies (the files go back to the composer).
   // `onStarted` runs as soon as the desktop has given the run its id, before the user's message is tagged with it. With
   // the improvement switch on, the started run begins (or continues) the chat's endless-improvement loop.
   function send(onStarted?: (runId: string) => void): boolean {
@@ -275,11 +277,13 @@ export function useOrbitState() {
     const targetProject = project.id, targetChat = chat.id, key = chatKey
     const userMessage: Message = { id: uid(), author: 'user', text: prompt, time: now() }
     const task = taskPayload(project, targetChat, prompt, chatHistory(chat))
-    let saved: Attachment[] = []
+    let saved: Attachment[] = [], started = false
     setDrafts(previous => ({ ...previous, [key]: '' }))
     setChosen(previous => ({ ...previous, [key]: noFiles }))
-    setState(previous => titleChat(addChatMessage(previous, targetProject, targetChat, userMessage), targetProject, targetChat, prompt || attached[0]?.name || ''))
+    const shown: Message = attached.length ? { ...userMessage, attachments: pendingAttachments(attached) } : userMessage
+    setState(previous => titleChat(addChatMessage(previous, targetProject, targetChat, shown), targetProject, targetChat, prompt || attached[0]?.name || ''))
     launch(task, runId => {
+      started = true
       onStarted?.(runId)
       setState(previous => addChatMessage(previous, targetProject, targetChat, { ...userMessage, runId, ...(saved.length ? { attachments: saved } : {}) }))
       if (task.improvementMode) {
@@ -289,6 +293,8 @@ export function useOrbitState() {
       }
     }, error => {
       setState(previous => dropMessage(previous, targetProject, targetChat, userMessage.id))
+      // Only a refused start frees the files: a run that did start (a step after it threw) still has them.
+      if (!started) discardFiles(targetChat, saved)
       const warning: Message = { id: uid(), author: 'system', text: `Не удалось запустить агента: ${errorText(error)}`, time: now(), kind: 'warning' }
       setState(previous => addChatMessage(previous, targetProject, targetChat, warning))
       setDrafts(previous => ({ ...previous, [key]: previous[key] || prompt }))
@@ -334,7 +340,6 @@ export function useOrbitState() {
   function startLoopTask(target: Project, loopChat: ChatThread, loop: ImprovementLoop, taskNumber: number, outcome?: string) {
     const key = `${target.id}/${loopChat.id}`
     if (pendingRef.current.has(key)) return
-    const previousIteration = loopChat.loop?.iteration ?? 1
     const prompt = loopPrompt(loop, loopChat.messages, taskNumber, outcome)
     const task = taskPayload(target, loopChat.id, prompt, [], { improvementMode: true, loopTask: taskNumber })
     setState(previous => setChatLoop(previous, target.id, loopChat.id, loop))
@@ -344,7 +349,7 @@ export function useOrbitState() {
       setState(previous => {
         const current = previous.projects.find(p => p.id === target.id)?.chats.find(c => c.id === loopChat.id)?.loop
         if (!current?.active) return previous
-        const failed = loopStartFailed(current, previousIteration, errorText(error), Date.now())
+        const failed = loopStartFailed(current, errorText(error), Date.now())
         const next = setChatLoop(previous, target.id, loopChat.id, failed.loop)
         if (!failed.note) return next
         const warning: Message = { id: uid(), author: 'system', kind: 'warning', text: failed.note, time: now() }
@@ -365,7 +370,8 @@ export function useOrbitState() {
   }
   // Sends an extra message to an agent of a working run; rejects with the runtime's reason. A message to the root agent
   // shows in the run's chat at once and is taken back when refused; one to a helper shows only in the inspector.
-  // `files` are saved first and go with the message (the composer's attachments; the inspector's box sends none).
+  // `files` are saved first and go with the message (the composer's attachments; the inspector's box sends none); a
+  // refused message deletes the saved copies.
   async function messageAgent(runId: string, agentId: string, text: string, files: File[] = []): Promise<void> {
     const run = runs[runId]
     if (!window.orbit || !run) throw new Error('Запуск не найден')
@@ -375,6 +381,7 @@ export function useOrbitState() {
     if (message) setState(previous => addChatMessage(previous, run.projectId, run.chatId, message))
     try { await window.orbit.messageAgent(runId, agentId, text, attachments.length ? attachments : undefined) } catch (error) {
       if (message) setState(previous => dropMessage(previous, run.projectId, run.chatId, message.id))
+      discardFiles(run.chatId, attachments)
       throw new Error(remoteErrorText(error))
     }
   }

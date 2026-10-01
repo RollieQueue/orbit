@@ -25,6 +25,47 @@ test('Claude hands validated Orbit calls back only from a completed main assista
   assert.equal(events.find(event => event.kind === 'reasoning').text, 'Checking')
 })
 
+// Shaped like a stream recorded from Claude Code 2.1.284 (stream-json with partial messages, Sonnet 5.5, high effort):
+// the thinking text streams empty, and system/thinking_tokens events estimate the thinking block in progress.
+test('Claude reports thinking in progress from system/thinking_tokens, only inside the agent\'s own thinking block', () => {
+  const stream = (event, parent = null) => ({ type: 'stream_event', event, session_id: 's', parent_tool_use_id: parent })
+  const estimate = (tokens, delta) => ({ type: 'system', subtype: 'thinking_tokens', estimated_tokens: tokens, estimated_tokens_delta: delta, session_id: 's' })
+  const thinking = events => events.filter(event => event.kind === 'thinking').map(({ tokens, done }) => ({ tokens, done }))
+  const events = [], parser = createClaudeParser(event => events.push(event), 'sonnet')
+  feed(parser, [
+    { type: 'system', subtype: 'init', session_id: 's', model: 'claude-sonnet-5-5' },
+    estimate(10, 10),
+    stream({ type: 'message_start', message: { id: 'm1', model: 'claude-sonnet-5-5' } }),
+    stream({ type: 'content_block_start', index: 0, content_block: { type: 'thinking', thinking: '', signature: '' } }),
+    estimate(50, 50),
+    stream({ type: 'content_block_delta', index: 0, delta: { type: 'thinking_delta', thinking: '', estimated_tokens: 50 } }),
+    estimate(null, 0),
+    estimate(219, 169),
+    stream({ type: 'content_block_delta', index: 0, delta: { type: 'signature_delta', signature: 'sig' } }),
+    stream({ type: 'content_block_stop', index: 0 }),
+    // A native subagent thinks: its block names the parent tool, the estimate does not.
+    stream({ type: 'content_block_start', index: 0, content_block: { type: 'thinking', thinking: '', signature: '' } }, 'task-1'),
+    estimate(80, 80),
+    stream({ type: 'content_block_stop', index: 0 }, 'task-1'),
+    stream({ type: 'content_block_start', index: 1, content_block: { type: 'text', text: '' } }),
+    stream({ type: 'content_block_delta', index: 1, delta: { type: 'text_delta', text: '119' } }),
+    stream({ type: 'content_block_stop', index: 1 }),
+    { type: 'result', subtype: 'success', result: '119', session_id: 's' },
+  ])
+  assert.deepEqual(thinking(events), [{ tokens: 0, done: undefined }, { tokens: 50, done: undefined }, { tokens: 219, done: undefined }, { tokens: undefined, done: true }])
+  assert.equal(parser.finish().text, '119')
+  // A request the CLI starts anew (a retry) leaves no thinking block open.
+  const retried = [], again = createClaudeParser(event => retried.push(event))
+  feed(again, [
+    stream({ type: 'message_start', message: { id: 'm1' } }),
+    stream({ type: 'content_block_start', index: 0, content_block: { type: 'thinking' } }),
+    estimate(120, 120),
+    stream({ type: 'message_start', message: { id: 'm2' } }),
+    estimate(40, 40),
+  ])
+  assert.deepEqual(thinking(retried), [{ tokens: 0, done: undefined }, { tokens: 120, done: undefined }, { tokens: undefined, done: true }])
+})
+
 test('Claude reads structured results and falls back to the completed assistant for an empty result', () => {
   const parser = createClaudeParser()
   feed(parser, [{ type: 'result', subtype: 'success', result: '', structured_output: { content: 'Answer', tool_calls: [] } }])
@@ -355,6 +396,58 @@ test('HTTP requests honor abort signals even while waiting for response headers'
     setTimeout(() => controller.abort(), 50)
     await assert.rejects(pending, { name: 'AbortError' })
   })
+})
+
+test('an endpoint on another host needs HTTPS; plain HTTP stays for this machine or a deliberate opt-in', async t => {
+  const { endpointUrl, inspectOllama, inspectCustom } = _testing
+  const keys = ['ORBIT_OPENAI_BASE_URL', 'ORBIT_OPENAI_MODEL', 'ORBIT_OPENAI_API_KEY', 'ORBIT_OLLAMA_URL', 'ORBIT_ALLOW_INSECURE_HTTP']
+  const previous = Object.fromEntries(keys.map(key => [key, process.env[key]]))
+  t.after(() => { for (const [key, value] of Object.entries(previous)) { if (value === undefined) delete process.env[key]; else process.env[key] = value } })
+  delete process.env.ORBIT_ALLOW_INSECURE_HTTP
+  // A refused address must stop before any request, so neither the prompt nor the key leaves the machine.
+  const fetched = []
+  t.mock.method(globalThis, 'fetch', async url => { fetched.push(String(url)); throw new Error('the network must not be reached') })
+
+  for (const url of ['http://localhost:1234/v1', 'http://LOCALHOST:1234', 'http://127.0.0.1:11434', 'http://127.1:11434', 'http://2130706433/', 'http://[::1]:11434', 'http://[0:0:0:0:0:0:0:1]/', 'https://api.example.com/v1', 'https://192.168.1.5:11434']) {
+    assert.doesNotThrow(() => endpointUrl(url, 'ORBIT_OLLAMA_URL'), url)
+  }
+  for (const url of ['http://192.168.1.5:11434', 'http://api.example.com/v1', 'http://localhost.example.com/', 'http://127.0.0.1.nip.io/', 'http://0.0.0.0:11434', 'http://[fe80::1]/']) {
+    assert.throws(() => endpointUrl(url, 'ORBIT_OLLAMA_URL'), /^Error: ORBIT_OLLAMA_URL \(http:.*https:\/\/.*ORBIT_ALLOW_INSECURE_HTTP=1/, url)
+  }
+  // Every refusal names the variable, so the user knows which one to fix.
+  assert.throws(() => endpointUrl('https://user:secret@api.example.com/v1', 'ORBIT_OPENAI_BASE_URL'), /^Error: ORBIT_OPENAI_BASE_URL: уберите из адреса имя пользователя и пароль/)
+  assert.throws(() => endpointUrl('foo', 'ORBIT_OLLAMA_URL'), /^Error: ORBIT_OLLAMA_URL: это не адрес URL/)
+  assert.throws(() => endpointUrl('localhost:11434', 'ORBIT_OLLAMA_URL'), /^Error: ORBIT_OLLAMA_URL: адрес должен начинаться с https:\/\//)
+
+  process.env.ORBIT_OPENAI_BASE_URL = 'http://192.0.2.10/v1'
+  process.env.ORBIT_OPENAI_MODEL = 'fixture-model'
+  process.env.ORBIT_OPENAI_API_KEY = 'fixture-secret'
+  process.env.ORBIT_OLLAMA_URL = 'http://192.0.2.10:11434'
+  await assert.rejects(runProvider({ providerId: 'custom', prompt: 'private prompt' }), /ORBIT_OPENAI_BASE_URL \(http:\/\/192\.0\.2\.10\)/)
+  await assert.rejects(runProvider({ providerId: 'ollama', model: 'fixture', prompt: 'private prompt' }), /ORBIT_OLLAMA_URL \(http:\/\/192\.0\.2\.10:11434\)/)
+  // The provider list names the reason instead of «Set ORBIT_OPENAI_BASE_URL» or «not reachable».
+  const custom = inspectCustom(), ollama = await inspectOllama()
+  assert.equal(custom.available, false)
+  assert.match(custom.detail, /^ORBIT_OPENAI_BASE_URL \(http:\/\/192\.0\.2\.10\).*ORBIT_ALLOW_INSECURE_HTTP=1/)
+  assert.equal(ollama.available, false)
+  assert.match(ollama.detail, /^ORBIT_OLLAMA_URL \(http:\/\/192\.0\.2\.10:11434\)/)
+  assert.deepEqual(fetched, [])
+
+  // The address is checked before the model, so a missing model does not hide the refusal.
+  delete process.env.ORBIT_OPENAI_MODEL
+  await assert.rejects(runProvider({ providerId: 'custom', prompt: 'private prompt' }), /ORBIT_OPENAI_BASE_URL \(http:\/\/192\.0\.2\.10\)/)
+  process.env.ORBIT_OPENAI_BASE_URL = 'foo'
+  assert.match(inspectCustom().detail, /^ORBIT_OPENAI_BASE_URL: это не адрес URL/)
+  assert.deepEqual(fetched, [])
+
+  process.env.ORBIT_OPENAI_BASE_URL = 'https://api.example.com/v1'
+  assert.deepEqual([inspectCustom().available, inspectCustom().detail], [true, 'Endpoint configured; connection checked when used'])
+  process.env.ORBIT_OPENAI_BASE_URL = 'http://192.0.2.10/v1'
+  process.env.ORBIT_ALLOW_INSECURE_HTTP = '1'
+  assert.equal(inspectCustom().available, true)
+  assert.doesNotThrow(() => endpointUrl('http://192.168.1.5:11434', 'ORBIT_OLLAMA_URL'))
+  process.env.ORBIT_ALLOW_INSECURE_HTTP = 'true'
+  assert.throws(() => endpointUrl('http://192.168.1.5:11434', 'ORBIT_OLLAMA_URL'), /ORBIT_ALLOW_INSECURE_HTTP=1/)
 })
 
 test('Ollama selects an installed model without downloading and streams generated text', async () => {

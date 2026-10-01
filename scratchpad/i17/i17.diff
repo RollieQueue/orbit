@@ -1,0 +1,595 @@
+diff --git a/electron/attachments.mts b/electron/attachments.mts
+index 635ee09..8b79c7d 100644
+--- a/electron/attachments.mts
++++ b/electron/attachments.mts
+@@ -11,6 +11,12 @@ const ATTACHMENTS_DIR = 'attachments'
+ const MAX_FILES = 10
+ const MAX_FILE_BYTES = 20 * 1024 * 1024
+ const MAX_TOTAL_BYTES = 50 * 1024 * 1024
++// The files of a run (its first message and the messages written to its agents) it keeps for the continuation after a
++// restart (resume.mts names them again): the newest ones.
++const MAX_RUN_FILES = 20
++// A chat folder its deletion could not remove at once (Windows does not delete a file another program holds open, a PDF
++// in a viewer) keeps this mark next to it, `<folder>.discard`, and sweepDiscarded deletes it later.
++const DISCARD_MARK = '.discard'
+ // A thumbnail travels as a data URL and stays in the window's cache, so only small images get one; a bigger one shows as a file.
+ const MAX_IMAGE_BYTES = 2 * 1024 * 1024
+ const MAX_NAME_CHARS = 100
+@@ -97,10 +103,17 @@ async function discardAttachments(userData: string, chatId: string, paths?: unkn
+   if (!chatId) return 0
+   const folder = path.join(attachmentsRoot(userData), safeFolder(chatId))
+   if (paths === undefined || paths === null) {
+-    let count = 0
+-    try { count = (await fs.promises.readdir(folder)).length } catch { return 0 }
+-    // A file Windows holds for a moment (an antivirus scan, the indexer) is tried again.
+-    await fs.promises.rm(folder, { recursive: true, force: true, maxRetries: 3 })
++    let entries: string[] | null = null
++    try { entries = await fs.promises.readdir(folder) } catch { /* the chat has no files */ }
++    let count = entries?.length ?? 0
++    if (entries) {
++      // Marked before anything else: what of it a program still holds open goes at a later sweep, even if Orbit quits
++      // in between.
++      await fs.promises.writeFile(`${folder}${DISCARD_MARK}`, '').catch(() => undefined)
++      if (!await removeFolder(folder)) { try { count -= (await fs.promises.readdir(folder)).length } catch { /* gone after all */ } }
++    }
++    // Then the folders earlier deletions had to leave (this one was just tried).
++    await sweepDiscarded(userData, safeFolder(chatId))
+     return count
+   }
+   if (!Array.isArray(paths)) return 0
+@@ -119,6 +132,30 @@ async function discardAttachments(userData: string, chatId: string, paths?: unkn
+   }
+   return removed
+ }
++// A chat folder, then its mark; false while a file of it is held (the mark stays for the next sweep).
++async function removeFolder(folder: string): Promise<boolean> {
++  try {
++    // A file Windows holds for a moment (an antivirus scan, the indexer) is tried again.
++    await fs.promises.rm(folder, { recursive: true, force: true, maxRetries: 3 })
++    await fs.promises.rm(`${folder}${DISCARD_MARK}`, { force: true })
++    return true
++  } catch { return false }
++}
++// Deletes the marked folders of deleted chats (but `skip`); the runtime host sweeps at its start, discardAttachments at
++// every chat deletion. A mark is a file, and only a name safeFolder gives is a chat's folder: a stray mark never reaches
++// the attachments folder itself or above it, and the folder of a chat whose id ends in `.discard` is no mark. Answers how
++// many folders went.
++async function sweepDiscarded(userData: string, skip = ''): Promise<number> {
++  const root = attachmentsRoot(userData)
++  let entries: fs.Dirent[] = []
++  try { entries = await fs.promises.readdir(root, { withFileTypes: true }) } catch { return 0 }
++  let removed = 0
++  for (const entry of entries) {
++    const chat = entry.isFile() && entry.name.endsWith(DISCARD_MARK) ? entry.name.slice(0, -DISCARD_MARK.length) : ''
++    if (chat && chat !== skip && safeFolder(chat) === chat && await removeFolder(path.join(root, chat))) removed++
++  }
++  return removed
++}
+ 
+ // An image of the attachments folder as a data URL for the window's thumbnail; null for anything else (another folder, a
+ // missing file, not an image, over MAX_IMAGE_BYTES).
+@@ -135,13 +172,13 @@ async function readAttachmentImage(userData: string, target: unknown): Promise<s
+   } catch { return null }
+ }
+ 
+-// What the runtime may hand to an agent from the window's list: the attachments that exist as files of the attachments
+-// folder. Name, type and size are taken from the file, not from what the window said.
+-function trustedAttachments(userData: string, value: unknown): Attachment[] {
++// What the runtime may hand to an agent from the window's list (or a saved run's, at most `max`): the attachments that
++// exist as files of the attachments folder. Name, type and size are taken from the file, not from what the list said.
++function trustedAttachments(userData: string, value: unknown, max = MAX_FILES): Attachment[] {
+   if (!Array.isArray(value)) return []
+   const root = attachmentsRoot(userData)
+   const kept: Attachment[] = []
+-  for (const item of value.slice(0, MAX_FILES) as Partial<Attachment>[]) {
++  for (const item of value.slice(0, max) as Partial<Attachment>[]) {
+     if (typeof item?.path !== 'string' || !path.isAbsolute(item.path) || !inside(root, item.path)) continue
+     try {
+       const stat = fs.statSync(item.path)
+@@ -159,4 +196,4 @@ const ATTACHMENTS_HEADER = 'ATTACHMENTS FROM THE USER (files attached to this me
+ const attachmentLines = (attachments: Attachment[] | undefined): string => (attachments || []).map(item => `- ${item.path} (${item.type}, ${sizeText(item.size)})`).join('\n')
+ const attachmentBlock = (attachments: Attachment[] | undefined): string => attachments?.length ? `${ATTACHMENTS_HEADER}\n${attachmentLines(attachments)}` : ''
+ 
+-export { ATTACHMENTS_DIR, ATTACHMENTS_HEADER, MAX_FILES, MAX_FILE_BYTES, MAX_TOTAL_BYTES, MAX_IMAGE_BYTES, attachmentsRoot, configureAttachments, attachmentsFolder, safeName, saveAttachments, discardAttachments, readAttachmentImage, trustedAttachments, attachmentLines, attachmentBlock }
++export { ATTACHMENTS_DIR, ATTACHMENTS_HEADER, MAX_FILES, MAX_FILE_BYTES, MAX_TOTAL_BYTES, MAX_IMAGE_BYTES, MAX_RUN_FILES, attachmentsRoot, configureAttachments, attachmentsFolder, safeName, saveAttachments, discardAttachments, sweepDiscarded, readAttachmentImage, trustedAttachments, attachmentLines, attachmentBlock }
+diff --git a/electron/runtime/lifecycle.mts b/electron/runtime/lifecycle.mts
+index 5af9292..c08809f 100644
+--- a/electron/runtime/lifecycle.mts
++++ b/electron/runtime/lifecycle.mts
+@@ -15,7 +15,7 @@ import { ToolProtocolError, parseResponse } from './envelope.mts'
+ import { TOOL_GUIDE } from './prompts.mts'
+ import { restartNote, prepareContinuation } from './restart.mts'
+ import { loadPlan } from './improvement.mts'
+-import { attachmentBlock } from '../attachments.mts'
++import { MAX_RUN_FILES, attachmentBlock } from '../attachments.mts'
+ 
+ const DEFAULT_LIMITS: Readonly<RunLimits> = Object.freeze({ maxAgents: null, maxDepth: null, maxConcurrent: null, maxTurns: null, maxTotalTurns: null, maxMessages: null, maxToolCalls: null, maxOutputChars: 12000, maxContextChars: 120000, timeoutMs: null, runTimeoutMs: null })
+ // Shared (cross-project) housekeeping looks at every project, so it runs at most this often.
+@@ -61,7 +61,7 @@ function conversationHistory(entries: HistoryInput[]): HistoryEntry[] {
+ // with, as plain data, without the message and the chat history (the continuation brings its own message, and the chat
+ // reaches it through the digest of earlier turns).
+ function restartPayload(payload: StartPayload): StartPayload | undefined {
+-  const { prompt, history, attachments, resumedFrom, resumeChain, restartNote, resumeSession, ...settings } = payload
++  const { prompt, history, attachments, resumedFrom, resumeChain, restartNote, resumeSession, resumeAttachments, ...settings } = payload
+   try { return JSON.parse(JSON.stringify(settings)) as StartPayload } catch { return undefined }
+ }
+ async function start(runtime: OrbitRuntimeLike, payload: StartPayload = {}): Promise<string> {
+@@ -113,6 +113,9 @@ async function start(runtime: OrbitRuntimeLike, payload: StartPayload = {}): Pro
+     router: null!,
+   }
+   run.startPayload = restartPayload(payload)
++  // The files the user attached in this run; a continuation starts with those of the run it continues (checked there).
++  const resumeAttachments = Array.isArray(payload.resumeAttachments) ? payload.resumeAttachments : []
++  run.attachments = [...resumeAttachments, ...attachments].slice(-MAX_RUN_FILES)
+   if (typeof payload.resumedFrom === 'string' && /^[\w-]+$/.test(payload.resumedFrom)) run.resumedFrom = payload.resumedFrom
+   if (Number.isSafeInteger(payload.resumeChain) && Number(payload.resumeChain) >= 0) run.resumeChain = payload.resumeChain
+   if (Number.isSafeInteger(payload.loopTask) && Number(payload.loopTask) >= 1) run.loopTask = payload.loopTask
+@@ -132,7 +135,7 @@ async function start(runtime: OrbitRuntimeLike, payload: StartPayload = {}): Pro
+   setMaxListeners(0, run.controller.signal)
+   runtime.runs.set(run.runId, run)
+   const root = runtime.createAgent(run, null, { id: 'root', name: 'Orbit', task: [run.prompt, attachmentBlock(attachments)].filter(Boolean).join('\n\n'), reason: 'User message', providerId: run.providerId, model: run.model })
+-  if (typeof payload.restartNote === 'string' && payload.restartNote) prepareContinuation(runtime, run, root, bounded(payload.restartNote, 6000), payload.resumeSession)
++  if (typeof payload.restartNote === 'string' && payload.restartNote) prepareContinuation(runtime, run, root, bounded(payload.restartNote, 6000), payload.resumeSession, resumeAttachments)
+   runtime.emit(run, 'run.started', { prompt: run.prompt, workspace: run.workspace, providerId: run.providerId, model: run.model, accessMode, access: accessMode, approvalPolicy: run.approvalPolicy, memoryEnabled: run.memoryEnabled, limits: run.limits, status: run.status, ...(run.resumedFrom ? { resumedFrom: run.resumedFrom, resumeChain: run.resumeChain } : {}),
+     ...(run.loopTask ? { loopTask: run.loopTask } : {}),
+     ...(run.improvementMode ? { improvements: run.improvements, improvementStatus: run.improvementStatus, ...(run.improvementHandoff ? { improvementHandoff: run.improvementHandoff } : {}) } : {}) })
+diff --git a/electron/runtime/restart.mts b/electron/runtime/restart.mts
+index 504e569..3409201 100644
+--- a/electron/runtime/restart.mts
++++ b/electron/runtime/restart.mts
+@@ -9,8 +9,9 @@ import fs from 'node:fs'
+ import path from 'node:path'
+ import { restartEnv } from '../resume.mts'
+ import type { RestartHost, RestartLevel, RestartResult, RestartRollback } from '../resume.mts'
++import { attachmentLines } from '../attachments.mts'
+ import { TERMINAL, AGENT_TERMINAL, abortError, bounded, clip, overlappingWorkspaces, isMailMark } from './util.mts'
+-import type { AgentRecord, OrbitRuntimeLike, RunRecord, ToolArgs } from '../types.mts'
++import type { AgentRecord, Attachment, OrbitRuntimeLike, RunRecord, ToolArgs } from '../types.mts'
+ 
+ const REASON_CHARS = 1000
+ const CONTINUE_CHARS = 8000
+@@ -18,6 +19,7 @@ const CONTINUE_CHARS = 8000
+ const TRACE_EVERY_MS = 500
+ const TRACE_CHARS = 6000
+ const NOTE_CHARS = 5000
++const RESUMED_FILES = 'Files the user attached in that run (still in Orbit\'s attachments folder; read them with your file tools when the task needs them):'
+ // What the model learns when the script refused before doing anything (the other statuses get the general advice).
+ const HINTS: Record<string, string> = {
+   'cycle-limit': 'Orbit was restarted too many times in a short while (ORBIT_UPGRADE_MAX_CYCLES); nothing was restarted. Tell the user, or try again later.',
+@@ -86,14 +88,16 @@ function restartNote(runtime: OrbitRuntimeLike, run: RunRecord, agent: AgentReco
+ }
+ // The root of a continuation after a restart. When it keeps the old root's provider on the session transport, the old
+ // session is resumed and its first turn carries the continuation's message; otherwise, or when that resume fails
+-// (loops.mts drops the id once), the root starts fresh. Either way its transcript begins with the restart note. A resumed
+-// session keeps the mark of the old root's mail: the messages it already holds carry that mark, and Cursor would not hear
+-// of a new one (it reads its instructions only in a session's first message).
+-function prepareContinuation(runtime: OrbitRuntimeLike, run: RunRecord, root: AgentRecord, note: string, session?: { id: string; providerId: string; mailMark?: string }): void {
++// (loops.mts drops the id once), the root starts fresh. Either way its transcript begins with the restart note, followed
++// by the files the user attached in the run it continues (a fresh root has never seen their paths). A resumed session
++// keeps the mark of the old root's mail: the messages it already holds carry that mark, and Cursor would not hear of a
++// new one (it reads its instructions only in a session's first message).
++function prepareContinuation(runtime: OrbitRuntimeLike, run: RunRecord, root: AgentRecord, note: string, session?: { id: string; providerId: string; mailMark?: string }, files: Attachment[] = []): void {
+   const resumable = !!session?.id && root.transport === 'session' && root.providerId === session.providerId
+   if (resumable) { root.sessionId = session.id; run.resumeSession = session.id }
+   if (resumable && isMailMark(session.mailMark)) root.mailMark = session.mailMark
+-  runtime.remember(root, { type: 'instruction', content: resumable ? `${run.prompt}\n\n${note}` : note })
++  const attached = files.length ? `\n${RESUMED_FILES}\n${attachmentLines(files)}` : ''
++  runtime.remember(root, { type: 'instruction', content: `${resumable ? `${run.prompt}\n\n` : ''}${note}${attached}` })
+ }
+ 
+ function checkedText(value: unknown, label: string, limit: number): string {
+diff --git a/electron/runtime/mailbox.mts b/electron/runtime/mailbox.mts
+index 3f442de..3be8bfe 100644
+--- a/electron/runtime/mailbox.mts
++++ b/electron/runtime/mailbox.mts
+@@ -4,7 +4,7 @@
+ import { randomUUID } from 'node:crypto'
+ import { setMaxListeners } from 'node:events'
+ import { ROUTER } from '../router.mts'
+-import { attachmentLines } from '../attachments.mts'
++import { MAX_RUN_FILES, attachmentLines } from '../attachments.mts'
+ import type { ActiveTurn, AgentRecord, AgentRef, AskTeamResult, Attachment, Communication, CommunicationDelivery, CommunicationStatus, DraftAnswer, MailboxContext, OrbitRuntimeLike, ReadMessagesResult, RunRecord, SendResult, ToolArgs } from '../types.mts'
+ import { TERMINAL, AGENT_TERMINAL, USER, ceiling, answerLimit, bounded, clip, abortError, abortable, mailTag } from './util.mts'
+ import { steer, steering } from './steer.mts'
+@@ -116,6 +116,8 @@ function postUserMessage(runtime: OrbitRuntimeLike, runId: string, agentId: stri
+   // A helper in (or past) its last allowed turn would never read the message: its last turn's prompt is already built.
+   if (target.id !== 'root' && (target.turns >= ceiling(run.limits, 'maxTurns') || run.usage.workerTurns >= ceiling(run.limits, 'maxTotalTurns'))) throw new Error(`У ${target.name} не осталось ходов: лимит задан в настройках запуска.`)
+   const communication = runtime.recordCommunication(run, USER, target, text, { kind: 'message', via: 'user', ...(attachments.length ? { attachments } : {}) })
++  // Kept with the run's files: a continuation after a restart names them again.
++  if (attachments.length) run.attachments = [...(run.attachments || []), ...attachments].slice(-MAX_RUN_FILES)
+   if (target.status === 'done') wakeFinished(runtime, run, target)
+   runtime.trace(run, target.id, 'message', `From the user: ${text}${attachments.length ? ` [${attachments.map(item => item.name).join(', ')}]` : ''}`)
+   for (const wake of run.messageWaiters.get(target.id) || []) wake()
+diff --git a/electron/runtime/store.mts b/electron/runtime/store.mts
+index 1df5f6d..b5b9350 100644
+--- a/electron/runtime/store.mts
++++ b/electron/runtime/store.mts
+@@ -20,8 +20,9 @@ function snapshot(runtime: OrbitRuntimeLike, run: RunRecord): RunSnapshot {
+     agents: [...run.agentNodes.values()].map(publicAgent),
+     traces: run.traces, messages: run.messages, communications: run.communications, summary: run.summary, error: run.error,
+     files: run.fileActivity.snapshot(), changes: run.changes.snapshot(), router: { ...run.router.stats },
+-    // Restarts: what a continuation starts again from, the link to the run a continuation continues, and the restart mark.
+-    ...(run.startPayload ? { startPayload: run.startPayload } : {}),
++    // Restarts: what a continuation starts again from (with the files the user attached in the run), the link to the run a
++    // continuation continues, and the restart mark.
++    ...(run.startPayload ? { startPayload: run.startPayload } : {}), ...(run.attachments?.length ? { attachments: run.attachments } : {}),
+     ...(run.resumedFrom ? { resumedFrom: run.resumedFrom } : {}), ...(run.resumeChain !== undefined ? { resumeChain: run.resumeChain } : {}),
+     ...(run.restart ? { restart: run.restart } : {}),
+     // The improvement loop: the task number of this run and what the next task must know.
+diff --git a/electron/resume.mts b/electron/resume.mts
+index cb200d7..f5c11b0 100644
+--- a/electron/resume.mts
++++ b/electron/resume.mts
+@@ -16,6 +16,7 @@ import { spawn as spawnProcess } from 'node:child_process'
+ import type { SpawnOptions } from 'node:child_process'
+ import { fingerprints, rendererHash } from './fingerprint.cjs'
+ import { clip } from './text.mts'
++import { MAX_RUN_FILES, trustedAttachments } from './attachments.mts'
+ import type { OrbitRuntimeLike, RestartMark, RunStoreLike, StoredRun } from './types.mts'
+ 
+ const RESUME_FILE = 'pending-resume.json'
+@@ -519,7 +520,7 @@ function resumePending(options: ResumeOptions): Promise<RestartNotice | null> {
+   resuming.set(file, task)
+   return task
+ }
+-async function resumeOnce(file: string, { runtime, runStore = runtime.runStore, notify, now = Date.now, maxChain = defaultMaxChain(), info = null, verdictWaitMs = VERDICT_WAIT_MS, pollMs = VERDICT_POLL_MS }: ResumeOptions): Promise<RestartNotice | null> {
++async function resumeOnce(file: string, { runtime, userData, runStore = runtime.runStore, notify, now = Date.now, maxChain = defaultMaxChain(), info = null, verdictWaitMs = VERDICT_WAIT_MS, pollMs = VERDICT_POLL_MS }: ResumeOptions): Promise<RestartNotice | null> {
+   let loaded = loadIntent(file)
+   for (let attempt = 0; !loaded.intent && !loaded.missing && attempt < 10; attempt++) { await pause(pollMs); loaded = loadIntent(file) }
+   const first = loaded.intent
+@@ -563,11 +564,14 @@ async function resumeOnce(file: string, { runtime, runStore = runtime.runStore,
+   if (!intent.id || old.restart?.intentId !== intent.id) return refuse('failed', `Продолжение не запущено: запуск не был завершён этим перезапуском (намерение ${intent.id || 'без идентификатора'})`)
+   if (!deleteResumeIntent(file)) return notice('failed', 'Продолжение не запущено: файл намерения не удалось удалить, и задача могла бы продолжиться дважды', { error: `Could not remove ${file}` })
+   const session = rootSession(old)
++  // The files the user attached in that run, those still in Orbit's attachments folder: the note names them again. Only
++  // these: a damaged record's start payload brings no files of its own.
++  const files = trustedAttachments(userData, Array.isArray(old.attachments) ? old.attachments.slice(-MAX_RUN_FILES) : [], MAX_RUN_FILES)
+   try {
+     const resumedRunId = await runtime.start({
+       ...old.startPayload, projectId: old.projectId || old.startPayload.projectId, chatId: old.chatId || old.startPayload.chatId,
+       prompt: continuationPrompt(intent, info), resumedFrom: old.runId, resumeChain: chain,
+-      restartNote: old.restart?.note || storedNote(old), ...(session ? { resumeSession: session } : {}),
++      restartNote: old.restart?.note || storedNote(old), ...(session ? { resumeSession: session } : {}), attachments: [], resumeAttachments: files,
+     })
+     return notice('resumed', `Orbit перезапущен по запросу агента, задача продолжена${intent.reason ? ` (причина: ${intent.reason})` : ''}`, { resumedRunId })
+   } catch (error) {
+diff --git a/electron/runtime-api.mts b/electron/runtime-api.mts
+index 7e79860..74ed417 100644
+--- a/electron/runtime-api.mts
++++ b/electron/runtime-api.mts
+@@ -10,7 +10,7 @@ import { PROVIDER_IDS } from './quota.mts'
+ import { applyPatch, removeWorktree } from './worktree.mts'
+ import { runGit } from './git.mts'
+ import { workspaceKey } from './storage.mts'
+-import { discardAttachments, readAttachmentImage, saveAttachments, trustedAttachments } from './attachments.mts'
++import { MAX_RUN_FILES, discardAttachments, readAttachmentImage, saveAttachments, trustedAttachments } from './attachments.mts'
+ import { RUNTIME_CHANNELS } from './runtime-protocol.mts'
+ import type { OrbitRuntime } from './runtime.mts'
+ import type { QuotaMonitor, QuotaReaderOptions } from './quota.mts'
+@@ -89,7 +89,7 @@ function createRuntimeApi(ctx: RuntimeApiContext): Map<string, RuntimeHandler> {
+     const workspace = validateWorkspace(payload?.workspace)
+     if (!payload?.projectId || !payload?.chatId) throw new Error('Project and chat are required')
+     const request: StartPayload & { artifactRoot: string } = {
+-      ...payload, workspace, attachments: trustedAttachments(userData, payload.attachments),
++      ...payload, workspace, attachments: trustedAttachments(userData, payload.attachments), resumeAttachments: trustedAttachments(userData, payload.resumeAttachments, MAX_RUN_FILES),
+       memoryContext: payload.memoryEnabled ? stores.memoryStore.search(payload.prompt, workspace, 6, payload.globalMemoryEnabled !== false, payload.chatId) : [],
+       artifactRoot,
+     }
+diff --git a/electron/runtime-host.mts b/electron/runtime-host.mts
+index ceaa56e..0647c08 100644
+--- a/electron/runtime-host.mts
++++ b/electron/runtime-host.mts
+@@ -16,7 +16,7 @@ import { RunStore, StateStore } from './run-store.mts'
+ import * as providers from './providers.mts'
+ import { QuotaMonitor, readers as quotaReaders } from './quota.mts'
+ import { createRuntimeApi } from './runtime-api.mts'
+-import { configureAttachments } from './attachments.mts'
++import { configureAttachments, sweepDiscarded } from './attachments.mts'
+ import { createRestartHost, markRestartingRuns, resumePending } from './resume.mts'
+ import { codedError, ERROR_CODES } from './runtime-protocol.mts'
+ import type { ApprovalWire, LogLevel, RendererHealthyInfo, ShutdownMode, SpawnedProcess } from './runtime-protocol.mts'
+@@ -123,8 +123,10 @@ const messageOf = (error: unknown): string => error instanceof Error ? error.mes
+ 
+ function createRuntimeService(options: RuntimeServiceOptions): RuntimeService {
+   const { userData, repoRoot, emit, overrides = {} } = options
+-  // Claude may read the attachments folder outside the workspace (providers.mts asks attachments.mts for it).
++  // Claude may read the attachments folder outside the workspace (providers.mts asks attachments.mts for it). Folders of
++  // deleted chats that a program still held open then go now.
+   configureAttachments(userData)
++  void sweepDiscarded(userData)
+   const log = (level: LogLevel, text: string): void => {
+     try { if (options.log) options.log(level, text); else console[level](`[orbit] ${text}`) } catch { /* Logging never breaks the runtime. */ }
+   }
+diff --git a/electron/types.mts b/electron/types.mts
+index abd7432..68c5b2f 100644
+--- a/electron/types.mts
++++ b/electron/types.mts
+@@ -228,7 +228,8 @@ export interface RunRecord {
+   // Restarts (resume.mts): what a continuation starts again from, the run this one continues and how many restarts in a
+   // row led here, and for a run that ended `restarting`, why and when the restart was asked for. `resumeSession`: the
+   // old root's provider session a continuation is resuming, until its first turn answers (runtime/restart.mts).
+-  startPayload?: StartPayload; resumedFrom?: string; resumeChain?: number; restart?: RestartMark; resumeSession?: string
++  // `attachments`: the files the user attached in this run (and in the runs it continues), named to its continuation.
++  startPayload?: StartPayload; resumedFrom?: string; resumeChain?: number; restart?: RestartMark; resumeSession?: string; attachments?: Attachment[]
+   // The improvement loop (runtime/improvement.mts): the loop's task number the renderer gave this run, what the next task
+   // must know, the closed task keys (`id|title`) the run started with, and whether restart_orbit applied this run's change
+   // or was refused in a way the next task's restart resolves (cycle limit, other chats working, declined).
+@@ -245,7 +246,7 @@ export interface RunSnapshot {
+   startedAt: string; finishedAt: string | null; limits: RunLimits; usage: Usage; agents: PublicAgent[]
+   traces: Trace[]; messages: Message[]; communications: Communication[]; summary: RunSummary | null; error: string | null
+   files: FileActivitySnapshot[]; changes: FileChange[]; router: RouterStats
+-  startPayload?: StartPayload; resumedFrom?: string; resumeChain?: number; restart?: RestartMark
++  startPayload?: StartPayload; resumedFrom?: string; resumeChain?: number; restart?: RestartMark; attachments?: Attachment[]
+   loopTask?: number; improvementHandoff?: string
+ }
+ // An earlier turn of the chat as chat-memory presents it (a live run or a saved snapshot): chat-memory's own RunView.
+@@ -258,6 +259,8 @@ export interface StoredRun {
+   startedAt?: string; finishedAt?: string | null; updatedAt?: string; error?: string | null
+   agents?: StoredAgent[]; changes?: FileChange[]
+   startPayload?: StartPayload; resumedFrom?: string; resumeChain?: number; restart?: RestartMark
++  // The run's attached files as saved (checked again before a continuation names them: resume.mts).
++  attachments?: unknown
+   // The improvement plan an improvement-mode run left (read back by runtime/improvement.mts loadPlan).
+   improvements?: unknown; improvementStatus?: unknown; improvementHandoff?: unknown; loopTask?: number
+ }
+@@ -271,9 +274,10 @@ export interface StartPayload {
+   // Files the user attached to the message that starts the run (saved first with attachments:save).
+   attachments?: Attachment[]
+   // A continuation after a restart (resume.mts): the run it continues, how many restarts in a row led to it, the note its
+-  // root starts with, and the old root's provider session (with the mark of its mail) to resume when the root keeps that
+-  // provider.
++  // root starts with, the old root's provider session (with the mark of its mail) to resume when the root keeps that
++  // provider, and the files the user attached in the run it continues (the note names them).
+   resumedFrom?: string; resumeChain?: number; restartNote?: string; resumeSession?: { id: string; providerId: string; mailMark?: string }
++  resumeAttachments?: Attachment[]
+ }
+ export type RuntimeEventData = Record<string, unknown>
+ export interface RuntimeEvent { type: string; runId: string; projectId: string; chatId: string; [extra: string]: unknown }
+diff --git a/src/state-store.ts b/src/state-store.ts
+index 22e4d1a..a61300f 100644
+--- a/src/state-store.ts
++++ b/src/state-store.ts
+@@ -347,8 +347,9 @@ export function addWorkspace(state: AppState, workspace: Workspace, chat: () =>
+ 
+ // ---- Views of the settings the composer and the settings panel share ----
+ 
++// The paths of a message's files come before its text: the runtime and the prompt cut a long entry at its end.
+ export const chatHistory = (chat: ChatThread) => chat.messages.filter(m => m.author === 'user' || m.author === 'orbit').slice(-40)
+-  .map(m => ({ role: m.author === 'user' ? 'user' as const : 'assistant' as const, content: [m.text, attachmentNote(m.attachments)].filter(Boolean).join('\n\n') }))
++  .map(m => ({ role: m.author === 'user' ? 'user' as const : 'assistant' as const, content: [attachmentNote(m.attachments), m.text].filter(Boolean).join('\n\n') }))
+ // Ask mode is on-request approval over workspace-write; every other choice is an access mode with no approval prompts.
+ export const accessChoice = (settings: Settings) => settings.approvalPolicy === 'on-request' ? 'ask' : settings.accessMode
+ export const accessPatch = (value: string): Partial<Settings> =>
+diff --git a/tests/attachments.test.cjs b/tests/attachments.test.cjs
+index 0118019..d6b6118 100644
+--- a/tests/attachments.test.cjs
++++ b/tests/attachments.test.cjs
+@@ -3,7 +3,7 @@ const assert = require('node:assert/strict')
+ const fs = require('node:fs')
+ const os = require('node:os')
+ const path = require('node:path')
+-const { configureAttachments, saveAttachments, discardAttachments, readAttachmentImage, trustedAttachments, attachmentBlock, safeName, attachmentsRoot, MAX_FILES, MAX_FILE_BYTES, MAX_TOTAL_BYTES } = require('../electron/attachments.mts')
++const { configureAttachments, saveAttachments, discardAttachments, sweepDiscarded, readAttachmentImage, trustedAttachments, attachmentBlock, safeName, attachmentsRoot, MAX_FILES, MAX_FILE_BYTES, MAX_TOTAL_BYTES } = require('../electron/attachments.mts')
+ const { OrbitRuntime } = require('../electron/runtime.mts')
+ const { _testing } = require('../electron/providers.mts')
+ 
+@@ -140,6 +140,49 @@ test('discard: a deleted chat takes its whole folder, another chat keeps its fil
+   assert.ok(fs.existsSync(attachmentsRoot(userData)))
+ })
+ 
++test('discard: a folder Windows cannot delete yet (a file open in another program) stays marked and goes at a later sweep or chat deletion', async t => {
++  const userData = folder(t)
++  const root = attachmentsRoot(userData)
++  const [held] = await saveAttachments(userData, 'chat-1', [upload('open.pdf', '%PDF', 'application/pdf'), upload('b.txt', 'b', 'text/plain')])
++  const chatFolder = path.dirname(held.path)
++  // What Windows does while a viewer holds the PDF: the other files go, that one does not (EBUSY), and so neither does the folder.
++  const rm = fs.promises.rm
++  const removals = []
++  let holding = true
++  fs.promises.rm = async (target, options) => {
++    removals.push(path.resolve(String(target)))
++    if (!holding || path.resolve(String(target)) !== chatFolder) return rm(target, options)
++    for (const name of fs.readdirSync(chatFolder)) if (path.join(chatFolder, name) !== held.path) fs.rmSync(path.join(chatFolder, name))
++    throw Object.assign(new Error(`EBUSY: resource busy or locked, unlink '${held.path}'`), { code: 'EBUSY' })
++  }
++  t.after(() => { fs.promises.rm = rm })
++  assert.equal(await discardAttachments(userData, 'chat-1'), 1, 'what could go went')
++  assert.deepEqual(fs.readdirSync(chatFolder), [path.basename(held.path)])
++  assert.ok(fs.existsSync(`${chatFolder}.discard`), 'the folder is marked for later')
++  assert.equal(await sweepDiscarded(userData), 0, 'still held: it stays marked')
++  assert.ok(fs.existsSync(`${chatFolder}.discard`))
++  // Another chat deleted meanwhile goes first, before the held one is tried again (an Orbit that quits during those
++  // retries must not leave it unmarked).
++  const [other] = await saveAttachments(userData, 'chat-2', [upload('c.txt', 'c', 'text/plain')])
++  removals.length = 0
++  assert.equal(await discardAttachments(userData, 'chat-2'), 1)
++  assert.equal(removals[0], path.dirname(other.path), 'its own folder is removed before the others are tried')
++  assert.deepEqual(fs.readdirSync(root).sort(), ['chat-1', 'chat-1.discard'])
++  // The viewer is closed; the next chat deletion, even of a chat without files, takes the earlier folder along.
++  holding = false
++  assert.equal(await discardAttachments(userData, 'chat-3'), 0)
++  assert.deepEqual(fs.readdirSync(root), [], 'the folder and its mark are gone')
++  // Only a file named after a chat folder is a mark: a stray mark reaches neither the attachments folder nor anything
++  // above it, the folder of a chat whose id ends in .discard is no mark, and a mark whose folder is gone goes.
++  fs.mkdirSync(path.join(root, 'keep')); fs.writeFileSync(path.join(root, 'keep', 'deadbeef-x.txt'), 'x')
++  fs.mkdirSync(path.join(root, 'keep.discard'))
++  for (const name of ['.discard', '..discard', '...discard', 'a b.discard', 'gone.discard']) fs.writeFileSync(path.join(root, name), '')
++  assert.equal(await sweepDiscarded(userData), 1)
++  assert.deepEqual(fs.readdirSync(root).sort(), ['...discard', '..discard', '.discard', 'a b.discard', 'keep', 'keep.discard'])
++  assert.equal(fs.readFileSync(path.join(root, 'keep', 'deadbeef-x.txt'), 'utf8'), 'x')
++  assert.equal(await sweepDiscarded(folder(t)), 0, 'no attachments folder yet')
++})
++
+ // ---- The prompts ----
+ const payload = (workspace, extra = {}) => ({ workspace, projectId: 'project-1', chatId: 'chat-1', providerId: 'test', prompt: 'Look at my files', ...extra })
+ async function finished(runtime, start) {
+@@ -207,6 +250,22 @@ test('steering mail (envelope): a message with attachments lists the files under
+   assert.ok(snapshot.traces.some(trace => trace.kind === 'message' && trace.text === 'From the user: see the log [log.txt]'))
+ })
+ 
++test('a run keeps the newest 20 files attached in it (its first message, then messages to its agents) for its continuation', async t => {
++  const workspace = folder(t)
++  const file = id => ({ id, name: `${id}.txt`, type: 'text/plain', size: 1, path: path.join(os.tmpdir(), `${id}.txt`) })
++  const runtime = new OrbitRuntime({ runProvider: async () => {
++    const [runId] = runtime.runs.keys()
++    if (runtime.runs.get(runId).communications.some(item => item.fromAgentId === 'user' && item.kind === 'message')) return { text: 'FINAL' }
++    runtime.postUserMessage(runId, 'root', 'two more', [file('m1'), file('m2')])
++    return { text: 'Premature' }
++  } })
++  const snapshot = await finished(runtime, payload(workspace, { attachments: Array.from({ length: 22 }, (_, index) => file(`f${index + 1}`)) }))
++  assert.equal(snapshot.status, 'completed', snapshot.error)
++  const kept = snapshot.attachments.map(item => item.id)
++  assert.equal(kept.length, 20)
++  assert.deepEqual([kept[0], kept.at(-3), kept.at(-1)], ['f5', 'f22', 'm2'], 'the oldest go first')
++})
++
+ test('steering mail (session): files alone ride on the next Orbit tool result; no text and no files is refused', async t => {
+   const userData = folder(t), workspace = folder(t)
+   const files = await saveAttachments(userData, 'chat-1', [upload('data.csv', 'a,b', 'text/csv')])
+@@ -254,14 +313,24 @@ test('the runtime host configures the attachments folder: Claude args get --add-
+   const { buildClaudeArgs, buildClaudeSessionArgs } = _testing
+   const session = { id: '7d3b2a64-2d63-4c7b-8c3e-0f7d43bd4d11', resume: true, mcpUrl: 'http://127.0.0.1:1/mcp', token: 't' }
+   assert.ok(!buildClaudeArgs({ accessMode: 'read-only' }).includes('--add-dir'), 'nothing before a host exists')
++  // A deleted chat's folder an earlier Orbit could not remove (a file was held open) goes when the runtime starts.
++  const leftover = path.join(attachmentsRoot(userData), 'old-chat')
++  fs.mkdirSync(leftover, { recursive: true }); fs.writeFileSync(path.join(leftover, 'deadbeef-a.txt'), 'a'); fs.writeFileSync(`${leftover}.discard`, '')
+   const { createRuntimeService } = require('../electron/runtime-host.mts')
+   const service = createRuntimeService({ userData, repoRoot: path.join(__dirname, '..'), emit() {}, requestApproval: async () => false, log() {}, overrides: { runProvider: async () => ({ text: 'x' }), inspectProviders: async () => [] } })
+   t.after(() => service.shutdown('quit'))
++  for (const deadline = Date.now() + 4000; fs.existsSync(`${leftover}.discard`) && Date.now() < deadline;) await new Promise(resolve => setTimeout(resolve, 10))
++  assert.ok(!fs.existsSync(leftover) && !fs.existsSync(`${leftover}.discard`), 'swept at the start')
+   const expected = path.join(userData, 'attachments')
+   for (const args of [buildClaudeArgs({ accessMode: 'read-only' }), buildClaudeSessionArgs({ accessMode: 'workspace-write' }, session)]) assert.equal(args[args.indexOf('--add-dir') + 1], expected)
+   const [saved] = await service.call('attachments:save', ['chat-9', [upload('a.txt', 'hello', 'text/plain')]])
+   assert.equal(path.dirname(path.dirname(saved.path)), expected)
+   assert.equal((await service.call('attachments:image', [saved.path])), null)
++  // The files a continuation names are trusted from the window only inside the attachments folder, like its attachments.
++  const outside = path.join(userData, 'deadbeef-outside.txt')
++  fs.writeFileSync(outside, 'x')
++  const runId = await service.call('runtime:start', [{ workspace: folder(t), projectId: 'p', chatId: 'chat-9', providerId: 'test', prompt: 'hi', resumeAttachments: [{ ...saved, path: outside }, saved] }])
++  assert.deepEqual((await service.call('runtime:get', [runId])).attachments.map(item => item.path), [saved.path])
+   assert.equal(await service.call('attachments:discard', ['chat-9', [saved.path]]), 1)
+   assert.ok(!fs.existsSync(saved.path))
+ })
+diff --git a/tests/restart-orbit.test.cjs b/tests/restart-orbit.test.cjs
+index 856c744..8bc4e53 100644
+--- a/tests/restart-orbit.test.cjs
++++ b/tests/restart-orbit.test.cjs
+@@ -466,6 +466,54 @@ test('a continuation resumes the old root session when it keeps the provider, an
+   assert.ok(!calls[0].prompt.includes('a1b2c3d4e5'), 'a root that does not resume the session gets a mark of its own')
+ })
+ 
++test('a continuation names the files the user attached in the run it continues, those still saved, and keeps them for the next restart', async t => {
++  const userData = folder(t), workspace = folder(t)
++  const { saveAttachments } = require('../electron/attachments.mts')
++  const upload = (name, text, type) => ({ name, type, data: Buffer.from(text).toString('base64') })
++  const [shot, spec] = await saveAttachments(userData, 'chat-a', [upload('shot.png', 'png', 'image/png'), upload('spec.pdf', '%PDF', 'application/pdf')])
++  // More files than one message may carry (10): a run's list is checked whole.
++  const extra = await saveAttachments(userData, 'chat-a', Array.from({ length: 9 }, (_, index) => upload(`e${index}.txt`, 'e', 'text/plain')))
++  const [log] = await saveAttachments(userData, 'chat-a', [upload('log.txt', 'boom', 'text/plain')])
++  const before = runtimeWith({ runStore: new RunStore(userData), runProvider: blocking })
++  const oldRunId = await before.start(payload(workspace, { chatId: 'chat-a', attachments: [shot, spec, ...extra] }))
++  t.after(() => before.stop(oldRunId))
++  await waitFor(() => before.runs.get(oldRunId).agentNodes.get('root').activeTurn)
++  assert.equal(before.postUserMessage(oldRunId, 'root', 'and the log', [log]).ok, true)
++  assert.deepEqual(before.getRun(oldRunId).attachments.map(item => item.path), [shot, spec, ...extra, log].map(item => item.path), 'the first message\'s files, then a message\'s')
++  writeIntent(userData, { runId: oldRunId, chatId: 'chat-a' })
++  assert.deepEqual(resume.markRestartingRuns({ runtime: before, userData }), [oldRunId])
++  // A file deleted since then is not named.
++  fs.rmSync(spec.path)
++  const prompts = []
++  const store = new RunStore(userData)
++  const after = runtimeWith({ runStore: store, runProvider: async options => { prompts.push(options.prompt); return { text: 'Continued' } } })
++  const continuation = await continuationOf(after, await resume.resumePending({ runtime: after, userData }))
++  assert.equal(continuation.status, 'completed')
++  // The envelope transcript holds the note as JSON text: the paths are escaped there.
++  const listed = item => JSON.stringify(`- ${item.path} (${item.type}, `).slice(1, -1)
++  assert.match(prompts[0], /AGENT TRANSCRIPT[\s\S]*RESTART NOTE: Orbit restarted with new code[\s\S]*Check the real state[^\n]*\\nFiles the user attached in that run \(still in Orbit's attachments folder; read them with your file tools when the task needs them\):\\n- /)
++  for (const item of [shot, ...extra, log]) assert.ok(prompts[0].includes(listed(item)), `${item.name} is named`)
++  assert.ok(!prompts[0].includes(path.basename(spec.path)), 'the deleted file is not')
++  assert.doesNotMatch(prompts[0], /ATTACHMENTS FROM THE USER/, 'the continuation\'s own message carries no files')
++  assert.deepEqual(continuation.attachments.map(item => item.path), [shot, ...extra, log].map(item => item.path), 'kept for a restart of the continuation')
++  assert.equal(continuation.startPayload.resumeAttachments, undefined, 'not a setting a later continuation starts again from')
++  // A damaged or forged record brings no file from outside the attachments folder, not even through its start payload.
++  const outside = path.join(userData, 'deadbeef-secret.txt')
++  fs.writeFileSync(outside, 'x')
++  const forged = { id: 'x', name: 'secret.txt', type: 'text/plain', size: 1, path: outside }
++  store.save({
++    runId: 'forged-run', status: 'restarting', projectId: 'project-1', chatId: 'chat-f', workspace, startedAt: new Date().toISOString(), attachments: [forged],
++    startPayload: { workspace, providerId: 'test', projectId: 'project-1', chatId: 'chat-f', attachments: [forged], resumeAttachments: [forged] }, restart: marked({ note: 'RESTART NOTE: forged' }),
++  })
++  writeIntent(userData, { runId: 'forged-run', chatId: 'chat-f' })
++  prompts.length = 0
++  const second = await continuationOf(after, await resume.resumePending({ runtime: after, userData }))
++  assert.equal(second.status, 'completed')
++  assert.match(prompts[0], /RESTART NOTE: forged/)
++  assert.ok(!prompts[0].includes('secret.txt'), 'no file outside the attachments folder is named')
++  assert.equal(second.attachments, undefined)
++})
++
+ test('the continuation waits for the watcher: a verdict continues, a rollback does not, an unconfirmed intent only while young', async t => {
+   const userData = folder(t), workspace = folder(t)
+   const runStore = new RunStore(userData)
+diff --git a/tests/state-store.test.cjs b/tests/state-store.test.cjs
+index 1b2d96a..30cee21 100644
+--- a/tests/state-store.test.cjs
++++ b/tests/state-store.test.cjs
+@@ -209,6 +209,19 @@ test('chatHistory sends the last 40 user and assistant turns', () => {
+   assert.deepEqual(history.at(-1), { role: 'assistant', content: '43' }, '44 is a system message; 43 is an assistant turn')
+ })
+ 
++test('chatHistory puts the paths of a message\'s files before its text, so that cutting a long entry at its end keeps them', () => {
++  const file = { id: '1', name: 'a.png', type: 'image/png', size: 1, path: 'C:\\o\\a.png' }
++  const long = 'x'.repeat(9000)
++  const history = store.chatHistory(chat('c', [
++    { id: '1', author: 'user', text: long, time: T0, attachments: [file] },
++    { id: '2', author: 'user', text: '', time: T0, attachments: [file] },
++    { id: '3', author: 'user', text: 'pending', time: T0, attachments: [{ ...file, path: '' }] },
++  ]))
++  assert.equal(history[0].content, `[Вложения этого сообщения: C:\\o\\a.png (image/png)]\n\n${long}`)
++  assert.equal(history[0].content.slice(0, 8000).includes('C:\\o\\a.png'), true)
++  assert.deepEqual(history.slice(1).map(entry => entry.content), ['[Вложения этого сообщения: C:\\o\\a.png (image/png)]', 'pending'], 'files alone; a file not saved yet is not named')
++})
++
+ test('access, model and reasoning patches', () => {
+   const settings = { ...store.defaults, providerId: 'claude', models: { codex: 'gpt' }, providerOptions: { claude: { command: 'c' } } }
+   assert.equal(store.accessChoice(settings), 'ask')
+diff --git a/docs/CHANGELOG.md b/docs/CHANGELOG.md
+index 33c456e..0f0087f 100644
+--- a/docs/CHANGELOG.md
++++ b/docs/CHANGELOG.md
+@@ -4,6 +4,8 @@
+ 
+ ## Не выпущено (после 0.5.0)
+ 
++- **Пути вложений не теряются после перезапуска и в длинном сообщении, а папка удалённого чата не остаётся из-за открытого файла.** Это три остатка ревью вложений. Первое: если агент перезапускал Orbit (`restart_orbit`), продолжение задачи не получало путей прикреплённых к ней файлов. Записка продолжения их не называла. Агент, начавший новую сессию (Codex, Cursor, Antigravity, смена подписки или неудачное возобновление), узнавал о файлах, только если пути случайно попали в дайджест прошлых ходов. Теперь запуск хранит файлы своего первого сообщения и сообщений агентам (последние 20). Записка продолжения перечисляет те из них, что ещё лежат в папке вложений, а продолжение хранит этот список на случай следующего перезапуска. Второе: в истории чата, которую получает следующая задача, строка путей стояла после текста сообщения, а запись обрезается с конца (до 8000 символов, в подсказке бывает меньше). У длинного сообщения пути пропадали. Теперь они идут перед текстом. Третье: если при удалении чата его файл был открыт в другой программе (например, PDF в просмотрщике), Windows не давала удалить этот файл, и папка чата оставалась навсегда. Теперь Orbit помечает такую папку и удаляет её позже: при следующем удалении чата или при запуске. Код: `electron/attachments.mts` (`sweepDiscarded`, `MAX_RUN_FILES`, предел у `trustedAttachments`), `electron/runtime/lifecycle.mts`, `electron/runtime/mailbox.mts`, `electron/runtime/restart.mts` (`prepareContinuation`), `electron/runtime/store.mts`, `electron/resume.mts`, `electron/runtime-api.mts`, `electron/runtime-host.mts`, `electron/types.mts`, `src/state-store.ts`. Тесты: `tests/attachments.test.cjs` (+2, уборка при старте runtime и проверка списка от окна), `tests/restart-orbit.test.cjs` (+1), `tests/state-store.test.cjs` (+1).
++
+ - **Сообщение, написанное агенту на паузе, доходит до него как ваше.** В режиме сессии агент на паузе мог как раз ждать сообщения или помощников (`wait_message`, `wait_agent`). Пауза обрывала ход, но само ожидание внутри Orbit продолжалось. Сообщение, написанное во время паузы, будило это брошенное ожидание и помечалось прочитанным, а ответ уходил в уже остановленный CLI. После «Продолжить» агент видел его только среди прошлых записей переписки, а не блоком `MESSAGE FROM THE USER`, то есть не как ваше указание. Так же брошенное `wait_agent` отмечало полученными результаты помощников, и агент мог закончить, не увидев их. Теперь ожидание заканчивается вместе со своим ходом. Найденное оно забирает (помечает сообщения прочитанными, результаты полученными), только когда ход вернул себе слот модели и ещё идёт. После «Продолжить» сообщение приходит блоком `MESSAGE FROM THE USER`, а результат помощника — как результат помощника. Это закрывает и редкий случай: ожидание уже нашло сообщение, но стояло в очереди за слотом (все слоты заняты другими агентами), и тут пришла пауза. Ожидание без идущего хода Orbit отклоняет: его ответ некому прочитать. Заодно ход, прерванный паузой или сообщением, повторяется сразу с результатами помощников, закончивших к этому моменту. Раньше они приходили лишним ходом после ответа. В режиме конверта ничего не меняется. Код: `electron/runtime/session.mts`, `electron/runtime/mailbox.mts`, `electron/runtime/tools.mts`, `electron/runtime/turn.mts`, `electron/runtime/loops.mts`, `electron/types.mts`, `electron/runtime.mts`. Тесты: `tests/pause-agents.test.cjs` (+7). Тесты ловят 16 из 18 намеренно внесённых ошибок. Две непойманные влияют только на задержку и на запасную проверку.
+ - **Самообновление ищет отчёт здоровья там, куда его пишет Orbit.** Переменная `ORBIT_HEALTH_FILE` задаёт главному процессу файл отчёта здоровья, а `0` отключает отчёт: так запускают проверки и копии Orbit во временном профиле. Скрипт самообновления (`npm run self-upgrade` и `restart_orbit`) раньше всегда читал `artifacts/self-upgrade-health.json`. Если переменная называла другой файл, скрипт не видел отчёт работающего Orbit и выбирал полный перезапуск, а после перезапуска 15 с ждал отчёт не в том файле и откатывал исправный код. Теперь скрипт и его наблюдатель берут файл из `ORBIT_HEALTH_FILE` по тому же правилу, что главный процесс и runtime. Относительный путь все трое считают от папки репозитория; раньше главный процесс считал его от папки, из которой запущен Orbit. При `ORBIT_HEALTH_FILE=0` проверить перезапуск нечем, поэтому скрипт ничего не перезапускает: статус `no-health-report`, код выхода 2. `restart_orbit` тогда советует агенту не повторять вызов, а попросить пользователя перезапустить Orbit, и бесконечное улучшение принимает ответ без перезапуска, как при пределе перезапусков. Запуски без перезапуска (`--dry-run`, `--no-relaunch`, `--verify-only`) работают как раньше. В обычной работе переменная не задана, и для неё ничего не меняется. Код: `scripts/self-upgrade.cjs`, `electron/main.cjs`, `electron/resume.mts`, `electron/runtime/restart.mts`. Тесты: `tests/self-upgrade.test.cjs` (+1), `tests/main-load.test.cjs` (+1), `tests/improvement-loop-runtime.test.cjs` (+1), `tests/restart-orbit.test.cjs` (+1 проверка). Тесты ловят все 19 намеренно внесённых ошибок.
+ - **Видео праздника играет, когда YouTube доступен только через прокси из переменных среды.** Окно Orbit (Chromium) берёт прокси только из настроек Windows и не читает `HTTP_PROXY` и `HTTPS_PROXY`. А агенты (Claude Code, Codex и другие CLI) ходят в сеть как раз через прокси из этих переменных. Поэтому там, где системный прокси выключен, а YouTube открывается только через такой прокси (на машине пользователя `http://127.0.0.1:12334`, без него DNS не знает youtube.com), агенты работали, а видео праздника не загружалось. Кадр YouTube падал с `ERR_NAME_NOT_RESOLVED`, оставались конфетти и надпись, страница закрывалась через 27 с. Теперь, пока Windows отправляет адреса плеера YouTube напрямую (системный прокси выключен), окно ходит через прокси из `HTTPS_PROXY`, `HTTP_PROXY` или `ALL_PROXY`, а адреса из `NO_PROXY` открывает напрямую. Если прокси не отвечает, соединение идёт напрямую, как раньше. Системный прокси по-прежнему главнее. Если системные настройки, в том числе PAC-файл, ведут через прокси хотя бы один адрес плеера (страницу, картинки, видеопоток), окно остаётся на системных. Orbit проверяет это при запуске и затем каждые 30 с, поэтому замечает, когда системный прокси включают или выключают. Прокси с логином и паролем в адресе окно не берёт: Chromium запросил бы их, а окна для ввода у Orbit нет. Агентам Orbit по-прежнему передаёт системный прокси, а не прокси окна: Antigravity в режиме «системный» получает тот же маршрут, что и раньше. Заодно: если не загрузился кадр внутри страницы (страница навыка, плеер YouTube), Orbit больше не выводит своё окно поверх других. В журнал это пишется предупреждением `a frame of the window failed to load`, а не `Orbit renderer failed to load`. Сбой загрузки самой страницы обрабатывается как раньше. Проверено в настоящем окне Orbit (временный профиль, пакет праздника из репозитория): окно ходит в YouTube через `127.0.0.1:12334`, `localhost` и `127.0.0.1` открываются напрямую, системные настройки по-прежнему отвечают DIRECT. Видео сыграло отрезок с 42-й по 47-ю секунду, и страница закрылась сама через 7–8 с (два прогона). Без прокси в переменных всё как раньше: `ERR_NAME_NOT_RESOLVED`, видео нет, закрытие через 27 с, только теперь это предупреждение о кадре. Код: `electron/window-proxy.cjs` (новый), `electron/main.cjs`, `electron/runtime-client.cjs`, `electron/fingerprint.cjs`. Тесты: `tests/window-proxy.test.cjs` (новый, 3), `tests/main-load.test.cjs` (+1), `tests/runtime-client.test.cjs` (+1). Тесты ловят все 29 намеренно внесённых ошибок.
+diff --git a/docs/ARCHITECTURE.md b/docs/ARCHITECTURE.md
+index e788c97..b735a9b 100644
+--- a/docs/ARCHITECTURE.md
++++ b/docs/ARCHITECTURE.md
+@@ -177,7 +177,7 @@ skills   procedures worked out in a task: per project or global, with a track re
+ 
+ **Skills as add-ons (packages).** A skill is any add-on Orbit builds for itself, not only a procedure: besides the text it may carry a package of files (pages, scripts, assets; `<userData>/skills/<package id>/`, `electron/skill-files.mts` keeps every path inside it, `electron/skill-packages.mts` validates and writes) and three generic mechanisms: `params` (typed values the user sets in the Skills panel, `capabilities:params`; an update by an agent keeps the user's value of a parameter whose key and type stay), `triggers` (today `task-completed` → `show` one of the package's `.html` files) and `commands` (named shell commands an agent runs in the package folder with its ordinary, approved tools). `capability_install` takes `files`, `removeFiles`, `fromDir` (a folder, for an agent inside the project or the temp folder, whose `skill.json` fills the fields the call omits), `params`, `triggers` and `commands`; it validates everything before it writes and puts the files back if the commit fails. `capability_read` returns `package.dir`, files, params with their values, triggers and commands, and refuses a switched-off skill. A skill with files, triggers or commands is protected like a pinned one (never expired, evicted or merged); prompt suggestions skip skills that only have a trigger. Revisions keep the text; the package is current state. Nothing in a skill runs by itself in the runtime: a trigger only makes the window show a page. Main serves `orbit-skill://<package id>/<file>` (a standard, secure scheme registered before the app is ready, read-only, 404 outside a package) with a Content-Security-Policy that allows the package itself, inline code, data:/blob: media and the YouTube player frame and no other host, and it keeps a skill frame from navigating outside its package (`will-frame-navigate`), so a page an agent wrote cannot send what it read anywhere; and `src/SkillStage.tsx` shows the page of each enabled skill with a `task-completed` trigger when a run of its project completes (after a `restart_orbit` restart, when the continuation completes; completions missed while the window reloaded are caught up once), one page at a time, full screen, in an iframe sandboxed to scripts and its own origin, with the parameter values in the address. The page closes itself with `parent.postMessage({ type: 'orbit-skill:close' }, '*')`; the stage also closes on Esc, its × button and after 10 minutes. A skill page that embeds YouTube gets a web Referer from main (`allowVideoEmbeds`), without which the player refuses to play. The first such skill is the celebration in `skills/task-completed-celebration/`.
+ 
+-**Attachments.** The composer attaches documents and images (the paperclip, drag and drop, paste). The window sends them as base64 to `attachments:save`; the runtime (`electron/attachments.mts`) writes them under `<userData>/attachments/<chat>/` (at most 10 files of 20 MB, 50 MB per message) and answers `{id, name, type, size, path}`. `runtime:start` and `runtime:message` accept attachments only inside that folder (`trustedAttachments`: name, type and size come from the disk). The root's task and a steering message list them as `ATTACHMENTS FROM THE USER`, one absolute path per line; the model reads them with its file tools (Claude sees an image it reads). Claude gets `--add-dir <userData>/attachments`, so the folder is readable in every access mode. The chat shows image thumbnails through `attachments:image` and opens a file through `shell:open-path`, which main allows only inside the attachments and skills folders. Until `attachments:save` answers, the message shows the chosen files without a path (nothing to open). `attachments:discard` deletes what no message will carry: the saved copies of a send or a message the runtime refused (the files go back to the composer), or a deleted chat's whole folder; only files `saveAttachments` wrote in that chat's folder can go, and a link inside is removed, not followed.
++**Attachments.** The composer attaches documents and images (the paperclip, drag and drop, paste). The window sends them as base64 to `attachments:save`; the runtime (`electron/attachments.mts`) writes them under `<userData>/attachments/<chat>/` (at most 10 files of 20 MB, 50 MB per message) and answers `{id, name, type, size, path}`. `runtime:start` and `runtime:message` accept attachments only inside that folder (`trustedAttachments`: name, type and size come from the disk). The root's task and a steering message list them as `ATTACHMENTS FROM THE USER`, one absolute path per line; the model reads them with its file tools (Claude sees an image it reads). Claude gets `--add-dir <userData>/attachments`, so the folder is readable in every access mode. The chat shows image thumbnails through `attachments:image` and opens a file through `shell:open-path`, which main allows only inside the attachments and skills folders. Until `attachments:save` answers, the message shows the chosen files without a path (nothing to open). `attachments:discard` deletes what no message will carry: the saved copies of a send or a message the runtime refused (the files go back to the composer), or a deleted chat's whole folder; only files `saveAttachments` wrote in that chat's folder can go, and a link inside is removed, not followed. A chat folder the deletion cannot remove at once (Windows refuses to delete a file another program holds open) keeps a mark `<chat>.discard` next to it (written before the folder is tried); `sweepDiscarded` deletes the marked folders when the runtime host starts and at every later chat deletion, after that chat's own folder (a mark is a file named after a folder `safeFolder` could give). A run keeps the files attached in it (its first message and messages to its agents, the newest `MAX_RUN_FILES` = 20) as `attachments` in its record; the continuation after `restart_orbit` gets those still in the folder (`resumeAttachments`, checked by `trustedAttachments`), its restart note lists them for a root that starts fresh, and it keeps them for the next restart. In the chat history sent with a new task, a message's paths (`attachmentNote`) come before its text, so that the bound of an entry (8000 characters, less in the prompt) cuts the text, not the paths.
+ 
+ **Shared project notes.** `context_save` notes remain the project's code-knowledge cache with dependency hashes (see above); `project-context.json` holds per workspace only the notes (the Git fingerprint and folder counts an older version stored beside them are dropped on load), and what agents receive is the notes with their staleness plus the folder overview. The notes agents leave automatically (`agent:<chat>:<name>`, `progress:<chat>`) are working state of a chat that happens to live in the project's file, so they are budgeted per chat: 30 per chat, the four most recently active chats, 14 days. A busy chat cannot push out another chat's notes, and notes saved on purpose are never touched.
+ 
+diff --git a/README.md b/README.md
+index 9694e4d..b34a24c 100644
+--- a/README.md
++++ b/README.md
+@@ -39,7 +39,7 @@
+ 
+ ### Файлы и изображения в чате
+ 
+-Кнопка со скрепкой у поля сообщения прикрепляет документы и изображения. Файлы можно также перетащить на поле или вставить из буфера обмена (Ctrl+V). За одно сообщение — до 10 файлов, каждый до 20 МБ, всего до 50 МБ. Orbit сохраняет их в папке `attachments/` своих данных. Агент получает пути к файлам и читает их своими инструментами; Claude видит изображение, когда читает файл, в любом режиме доступа. Файлы можно прикрепить и к первому сообщению задачи, и к сообщению работающему агенту. Сообщение может состоять из одних файлов. В чате они показаны под сообщением: изображения до 2 МБ миниатюрами, по щелчку файл открывается. Пока файлы сохраняются, под сообщением видны их названия. Если Orbit отклонил отправку, сохранённые копии удаляются, а файлы возвращаются в поле сообщения. Удалённый чат забирает с собой свою папку вложений.
++Кнопка со скрепкой у поля сообщения прикрепляет документы и изображения. Файлы можно также перетащить на поле или вставить из буфера обмена (Ctrl+V). За одно сообщение — до 10 файлов, каждый до 20 МБ, всего до 50 МБ. Orbit сохраняет их в папке `attachments/` своих данных. Агент получает пути к файлам и читает их своими инструментами; Claude видит изображение, когда читает файл, в любом режиме доступа. Файлы можно прикрепить и к первому сообщению задачи, и к сообщению работающему агенту. Сообщение может состоять из одних файлов. В чате они показаны под сообщением: изображения до 2 МБ миниатюрами, по щелчку файл открывается. Пока файлы сохраняются, под сообщением видны их названия. Если Orbit отклонил отправку, сохранённые копии удаляются, а файлы возвращаются в поле сообщения. Удалённый чат забирает с собой свою папку вложений. Файл, открытый в этот момент в другой программе (например, PDF в просмотрщике), Windows удалить не даёт: Orbit удалит его позже, при следующем удалении чата или при запуске. Когда агент перезапускает Orbit, чтобы применить свои изменения, продолжение задачи снова получает пути её файлов.
+ 
+ ## Бесконечное улучшение
+ 

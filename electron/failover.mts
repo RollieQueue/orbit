@@ -6,9 +6,9 @@ import REASONING from './reasoning-defaults.json' with { type: 'json' }
 // Replacing an agent whose subscription is running out: which model may take over, and what the newcomer is told.
 // Pure functions; the runtime decides when to call them and applies the result.
 
-// Shape of model-tiers.json: ordered name patterns giving a quality tier, and the tier assumed per provider when the
-// model being replaced is not known by name.
-interface ModelTiers { rules: { tier: number; match: string }[]; baseline: Record<string, number | undefined> }
+// Shape of model-tiers.json: ordered name patterns giving a quality tier, the tier assumed per provider when the
+// model being replaced is not known by name, and the models that are taken only from the user's pool.
+interface ModelTiers { rules: { tier: number; match: string }[]; baseline: Record<string, number | undefined>; excluded?: { match: string }[] }
 interface FailoverConfig { enabled: boolean; switchAtPercent: number; allowWeaker: boolean }
 // One provider of the health list (`inspectProviders`), as far as failover reads it.
 interface CatalogEntry { id: string; available?: boolean; models?: string[]; reasoningLevels?: Record<string, string[] | undefined> }
@@ -38,6 +38,7 @@ interface HandoverNoteInput extends HandoverReasonInput {
 const tiers: ModelTiers = TIERS
 const reasoningLevels: Record<string, string[] | undefined> = REASONING
 const RULES = tiers.rules.map(rule => ({ tier: rule.tier, pattern: new RegExp(rule.match, 'i') }))
+const EXCLUDED = (tiers.excluded || []).map(rule => new RegExp(rule.match, 'i'))
 // Local models and arbitrary endpoints have no comparable quality; they are replacements only when the user listed them.
 const LOCAL = new Set(['ollama', 'custom'])
 const MAX_CATALOG_MODELS = 40
@@ -60,6 +61,8 @@ function tierOf(model: unknown): number {
   for (const rule of RULES) if (rule.pattern.test(name)) return rule.tier
   return 0
 }
+// A model the user ruled out (model-tiers.json `excluded`, such as Claude Fable): a replacement only from their own pool.
+const excluded = (model: unknown): boolean => { const name = String(model || '').toLowerCase(); return !!name && EXCLUDED.some(pattern => pattern.test(name)) }
 // The tier the agent being replaced is judged by.
 const baselineTier = (providerId: string, model: unknown): number => tierOf(model) || tiers.baseline[providerId] || 2
 const targetKey = (providerId: string, model: unknown): string => `${providerId}:${String(model || '').toLowerCase()}`
@@ -95,6 +98,7 @@ function replacements({ agent, catalog = [], pool = [], models = {}, quota, conf
       const key = targetKey(providerId, model)
       if (own.has(key) || agent.failedCandidates?.has(key)) continue
       const inPool = members.some(member => (member.model || '') === model)
+      if (!inPool && excluded(model)) continue
       const tier = tierOf(model)
       if (tier ? tier < floor : !inPool) continue
       const level = assess(quota?.peek(providerId), { model, threshold: config.switchAtPercent, now })
@@ -151,4 +155,4 @@ function handoverNote({ agent, from, to, reason, level, error, interrupted, team
 }
 
 export type { ModelTiers, FailoverConfig, CatalogEntry, PoolMember, FailoverAgent, QuotaPeeker, ReplacementsInput, Replacement, Target, HandoverReason, HandoverLevel, HandoverNoteInput, InterruptedTurn }
-export { normalizeFailover, tierOf, baselineTier, replacements, handoverNote, reasonText, unreachable, targetKey, targetLabel, DEFAULTS, LOCAL }
+export { normalizeFailover, tierOf, baselineTier, excluded, replacements, effortFor, handoverNote, reasonText, unreachable, targetKey, targetLabel, DEFAULTS, LOCAL }

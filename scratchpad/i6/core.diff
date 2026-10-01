@@ -1,0 +1,150 @@
+diff --git a/electron/providers.mts b/electron/providers.mts
+index fa0719a..9229a72 100644
+--- a/electron/providers.mts
++++ b/electron/providers.mts
+@@ -21,11 +21,14 @@ import type { SubscriptionId } from './subscription-providers.mts'
+ 
+ type AccessMode = 'read-only' | 'workspace-write' | 'danger-full-access'
+ type Transport = 'session' | 'envelope'
+-type ProviderEventKind = 'output' | 'reasoning' | 'tool' | 'observation' | 'quota'
++type ProviderEventKind = 'output' | 'reasoning' | 'thinking' | 'tool' | 'observation' | 'quota'
+ interface ProviderEventBase { providerId: string; kind: ProviderEventKind }
+ // A text delta of the assistant's answer; `replace` rewrites the message instead of appending.
+ interface OutputEvent extends ProviderEventBase { kind: 'output'; text: string; messageId?: string; partial?: boolean; replace?: boolean; parentToolId?: string | null }
+ interface ReasoningEvent extends ProviderEventBase { kind: 'reasoning'; text: string; messageId?: string; partial?: boolean; parentToolId?: string | null }
++// The model thinks (Claude, whose thinking text the stream leaves empty): `tokens` is the CLI's estimate of the thinking
++// block so far (0 when it begins), `done` ends the block.
++interface ThinkingEvent extends ProviderEventBase { kind: 'thinking'; tokens?: number; done?: boolean }
+ // A native CLI tool call, or an Orbit tool reached over MCP (`mcp: true`, `orbitTool` names it).
+ interface ToolEvent extends ProviderEventBase { kind: 'tool'; text: string; tool?: string; toolId?: string; parentToolId?: string | null; status?: string; input?: unknown; output?: string; exitCode?: number | null; changes?: unknown; native: boolean; mcp?: boolean; server?: string; orbitTool?: string; images?: ToolImage[] }
+ // An image a tool result carried (a screenshot the agent read): base64 bytes and the media type.
+@@ -33,7 +36,7 @@ interface ToolImage { mediaType: string; data: string }
+ interface ObservationEvent extends ProviderEventBase { kind: 'observation'; text: string; source?: string; status?: string; usage?: unknown }
+ // Account figures seen in the stream; the runtime feeds them to the quota monitor.
+ interface QuotaEvent extends ProviderEventBase { kind: 'quota'; quota: QuotaPartial }
+-type ProviderEvent = OutputEvent | ReasoningEvent | ToolEvent | ObservationEvent | QuotaEvent
++type ProviderEvent = OutputEvent | ReasoningEvent | ThinkingEvent | ToolEvent | ObservationEvent | QuotaEvent
+ // The same union with `providerId` removed from every member (a plain Omit would collapse the union).
+ type WithoutProvider<E> = E extends ProviderEvent ? Omit<E, 'providerId'> : never
+ type ParserEvent = WithoutProvider<ProviderEvent>
+@@ -139,7 +142,8 @@ interface ClaudeResultEvent extends ClaudeEventBase { type: 'result'; subtype?:
+ interface ClaudeStreamEvent extends ClaudeEventBase { type: 'stream_event'; event?: ClaudeStreamPart }
+ interface ClaudeAssistantEvent extends ClaudeEventBase { type: 'assistant' }
+ interface ClaudeUserEvent extends ClaudeEventBase { type: 'user' }
+-interface ClaudeSystemEvent extends ClaudeEventBase { type: 'system'; subtype?: string }
++// subtype thinking_tokens: `estimated_tokens` is the CLI's running estimate of the thinking block in progress.
++interface ClaudeSystemEvent extends ClaudeEventBase { type: 'system'; subtype?: string; estimated_tokens?: unknown }
+ type ClaudeEvent = ClaudeRateLimitEvent | ClaudeErrorEvent | ClaudeResultEvent | ClaudeStreamEvent | ClaudeAssistantEvent | ClaudeUserEvent | ClaudeSystemEvent
+ 
+ // Ollama `/api/generate` NDJSON, `/api/tags` and `/api/show`.
+@@ -568,6 +572,10 @@ function createClaudeParser(onEvent: ProviderEventListener | null | undefined, r
+   // Tool id → name, so the result of an Orbit MCP call is labelled like the call that made it.
+   const toolNames = new Map<string, string>()
+   const dispatch = (event: ParserEvent) => emit(onEvent, { providerId: 'claude', ...event })
++  // The index of the agent's own thinking block in progress. The CLI's system/thinking_tokens events estimate it; they
++  // name no parent tool, so one outside such a block (a native subagent thinking) is not taken for the agent's own.
++  let thinkingBlock: number | null = null
++  const endThinking = () => { if (thinkingBlock !== null) { thinkingBlock = null; dispatch({ kind: 'thinking', done: true }) } }
+   // A refusal that the stream itself announced as a rejected rate limit is typed, so the runtime need not guess from prose.
+   const failed = (message: string): QuotaTaggedError => {
+     const error: QuotaTaggedError = new Error(message)
+@@ -608,6 +616,12 @@ function createClaudeParser(onEvent: ProviderEventListener | null | undefined, r
+           dispatch({ kind: 'output', text: part.delta.text, messageId: current.id, parentToolId, partial: true })
+         }
+         if (part.type === 'content_block_delta' && part.delta?.type === 'thinking_delta') dispatch({ kind: 'reasoning', text: part.delta.thinking, messageId: `${current.id}:thinking:${part.index}`, parentToolId, partial: true })
++        // A message that begins anew (the CLI retried the request) leaves no thinking block open.
++        if (!parentToolId && (part.type === 'message_start' || (part.type === 'content_block_stop' && part.index === thinkingBlock))) endThinking()
++        if (!parentToolId && part.type === 'content_block_start' && (part.content_block?.type === 'thinking' || part.content_block?.type === 'redacted_thinking')) {
++          thinkingBlock = part.index ?? 0
++          dispatch({ kind: 'thinking', tokens: 0 })
++        }
+         if (part.type === 'content_block_start' && part.content_block?.type === 'tool_use') {
+           const tool = part.content_block
+           toolIds.add(tool.id); toolNames.set(tool.id, tool.name)
+@@ -641,6 +655,10 @@ function createClaudeParser(onEvent: ProviderEventListener | null | undefined, r
+         }
+       }
+       if (event.type === 'system' && event.subtype === 'permission_denied') dispatch({ kind: 'observation', text: errorText(event.message || 'Claude denied a tool permission'), status: 'denied' })
++      if (event.type === 'system' && event.subtype === 'thinking_tokens' && thinkingBlock !== null) {
++        const tokens = event.estimated_tokens
++        if (typeof tokens === 'number' && Number.isFinite(tokens) && tokens >= 0) dispatch({ kind: 'thinking', tokens: Math.round(tokens) })
++      }
+     },
+     finish() {
+       if (handoffText !== undefined) return { text: handoffText, model, ...(sessionId ? { sessionId } : {}) }
+diff --git a/electron/runtime/turn.mts b/electron/runtime/turn.mts
+index 980a491..ef10079 100644
+--- a/electron/runtime/turn.mts
++++ b/electron/runtime/turn.mts
+@@ -12,8 +12,8 @@ import { messageNote, stopSteer } from './steer.mts'
+ import type { AgentRecord, OrbitRuntimeLike, ProviderEvent, ProviderResult, RunRecord, SessionInfo, StreamState, ToolImage, TraceImage, TurnTiming, UsageFigures } from '../types.mts'
+ // The root agent's answer in progress is published at most four times a second.
+ const STREAM_INTERVAL_MS = 250
+-// A session turn can hold the whole task, so the window counts the agent's actions (tool calls) while the turn runs:
+-// a changed count is published at most once a second, and the delayed update carries the latest one.
++// A session turn can hold the whole task, so the window counts the agent's actions (tool calls) and shows its thinking
++// while the turn runs: a change is published at most once a second, and the delayed update carries the latest state.
+ const PROGRESS_INTERVAL_MS = 1000
+ const progressTimers = new WeakMap<AgentRecord, ReturnType<typeof setTimeout>>()
+ function publishProgress(runtime: OrbitRuntimeLike, run: RunRecord, agent: AgentRecord): void {
+@@ -25,6 +25,22 @@ function publishProgress(runtime: OrbitRuntimeLike, run: RunRecord, agent: Agent
+   timer.unref?.()
+   progressTimers.set(agent, timer)
+ }
++// A turn that ends with a change still unpublished sends it at once, with the turn closed: the window must not keep
++// showing the thinking (or an old count) of a turn that is over until the agent's next update.
++function flushProgress(runtime: OrbitRuntimeLike, run: RunRecord, agent: AgentRecord): void {
++  const timer = progressTimers.get(agent)
++  if (timer === undefined) return
++  clearTimeout(timer); progressTimers.delete(agent)
++  if (!TERMINAL.has(run.status)) runtime.updateAgent(run, agent, {}, false)
++}
++// The model's thinking in progress, which the window shows as «думает · ~N тыс. токенов»: the provider's estimate of the
++// thinking block so far. A text or a tool call of the agent itself (not of a native subagent) means the block is over.
++function noteThinking(timing: TurnTiming, event: ProviderEvent): void {
++  if (event.kind === 'thinking') {
++    if (event.done) delete timing.thinking
++    else timing.thinking = Math.max(0, Math.round(Number(event.tokens) || 0))
++  } else if (((event.kind === 'output' && event.text) || event.kind === 'tool') && !event.parentToolId) delete timing.thinking
++}
+ 
+ // What a turn had produced when the provider cut it off: the last streamed message and the native tool actions.
+ function notePartialTurn(runtime: OrbitRuntimeLike, agent: AgentRecord, event: ProviderEvent): void {
+@@ -52,9 +68,11 @@ function providerEvent(runtime: OrbitRuntimeLike, run: RunRecord, agent: AgentRe
+     return
+   }
+   runtime.notePartialTurn(agent, event)
+-  const counted = agent.activeTurn?.timing.nativeToolCalls
++  const counted = agent.activeTurn?.timing.nativeToolCalls, thinking = agent.activeTurn?.timing.thinking
+   runtime.noteTurnEvent(agent, event)
+-  if (agent.activeTurn && agent.activeTurn.timing.nativeToolCalls !== counted) publishProgress(runtime, run, agent)
++  if (agent.activeTurn && (agent.activeTurn.timing.nativeToolCalls !== counted || agent.activeTurn.timing.thinking !== thinking)) publishProgress(runtime, run, agent)
++  // The thinking estimate lives in the turn's record for the window; it is no trace.
++  if (event?.kind === 'thinking') return
+   // Bookkeeping about touched files must never break the provider stream it is read from.
+   if (event?.native) { try { runtime.trackNativeFiles(run, agent, event) } catch (error) { diagnostics(runtime, run, 'trackNativeFiles', error, agent.id) } }
+   if (event?.usage) runtime.recordUsage(run, event.usage)
+@@ -101,6 +119,7 @@ function noteTurnEvent(runtime: OrbitRuntimeLike, agent: AgentRecord, event: Pro
+   if (!turn) return
+   turn.watch?.note(event)
+   if (!turn.timing.firstEventAt) turn.timing.firstEventAt = new Date().toISOString()
++  if (event) noteThinking(turn.timing, event)
+   if (event?.kind !== 'tool' || !event.native || String(event.tool || '').startsWith(MCP_TOOL_PREFIX)) return
+   const key = event.toolId || `${event.tool || 'tool'}:${turn.nativeSeen.size}`
+   if (turn.nativeSeen.has(key)) return
+@@ -206,11 +225,11 @@ async function providerTurn(runtime: OrbitRuntimeLike, run: RunRecord, agent: Ag
+     runtime.emit(run, 'run.info', { agentId: agent.id, providerId: agent.providerId, model: agent.model, usage: { ...run.usage }, timing: { ...timing } })
+     return result
+   } catch (caught) {
+-    // A turn that is repeated at once (after a silence, on another subscription, or with a message the agent is to read
+-    // now) was never taken: it must not eat the turn budgets.
++    // A turn that is repeated (after a silence, on another subscription, with a message the agent is to read now, or
++    // after the user's pause) was never taken: it must not eat the turn budgets.
+     const refund = () => { if (counted) { run.usage.providerTurns--; agent.turns--; if (agent.id !== 'root') run.usage.workerTurns-- } }
+     if (interrupted && !signal.aborted) {
+-      if (interrupted === 'message') refund()
++      refund()
+       // The model itself spoke (a stderr line or a note from before the CLI started does not count): its session holds
+       // the turn's prompt. A first session turn of Claude that spoke has its session under Orbit's id (--session-id),
+       // which the repeat resumes, as a restart's continuation does (resume.rootSession).
+@@ -229,6 +248,9 @@ async function providerTurn(runtime: OrbitRuntimeLike, run: RunRecord, agent: Ag

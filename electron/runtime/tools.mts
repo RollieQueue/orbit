@@ -22,7 +22,8 @@ async function approve(runtime: OrbitRuntimeLike, run: RunRecord, agent: AgentRe
     return approved === true
   } finally { if (!signal.aborted) runtime.updateAgent(run, agent, { status: 'working', detail: 'Resuming task' }) }
 }
-async function executeTool(runtime: OrbitRuntimeLike, run: RunRecord, agent: AgentRecord, name: string, args: ToolArgs, signal: AbortSignal = runtime.agentSignal(run, agent)): Promise<Observation> {
+// `ready` (session.dispatchMcp, waits only): awaited before a wait takes what it found (mail read, helper results seen).
+async function executeTool(runtime: OrbitRuntimeLike, run: RunRecord, agent: AgentRecord, name: string, args: ToolArgs, signal: AbortSignal = runtime.agentSignal(run, agent), ready?: () => Promise<void>): Promise<Observation> {
   if (name === 'context_read') {
     const packet = projectPacket(runtime.contextStore, run.workspace, run.sharedContext)
     if (args.key === undefined) {
@@ -97,7 +98,7 @@ async function executeTool(runtime: OrbitRuntimeLike, run: RunRecord, agent: Age
     return { messages, nextCursor: messages.at(-1)?.id || args.afterId || null, hasMore: records.length > messages.length }
   }
   if (name === 'read_messages') return runtime.readAgentMessages(run, agent, args)
-  if (name === 'wait_message') return runtime.waitAgentMessage(run, agent, args)
+  if (name === 'wait_message') return runtime.waitAgentMessage(run, agent, args, signal, ready)
   if (name === 'followup_agent') return runtime.followupAgent(run, agent, args)
   if (name === 'wait_agent') {
     const target = args.agentId ? runtime.resolveAgent(run, args.agentId) : null
@@ -105,7 +106,8 @@ async function executeTool(runtime: OrbitRuntimeLike, run: RunRecord, agent: Age
     if (args.agentId && !children.length) throw new Error('Only direct children may be waited on; ancestor waits would deadlock')
     const timeout = args.timeout_ms === undefined ? 0 : Math.max(10, Math.min(Number(args.timeout_ms) || 30000, ceiling(run.limits, 'runTimeoutMs')))
     runtime.updateAgent(run, agent, { status: 'waiting', detail: 'Waiting for delegated results' })
-    await runtime.waitForTeam(run, agent, children, timeout)
+    await runtime.waitForTeam(run, agent, children, timeout, signal)
+    await ready?.()
     return children.map((child) => {
       if (['done', 'error', 'cancelled'].includes(child.status)) agent.seenChildren.add(runtime.resultKey(child))
       // The model fields come before the result: a long result is cut at its end.

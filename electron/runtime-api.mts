@@ -10,7 +10,7 @@ import { PROVIDER_IDS } from './quota.mts'
 import { applyPatch, removeWorktree } from './worktree.mts'
 import { runGit } from './git.mts'
 import { workspaceKey } from './storage.mts'
-import { readAttachmentImage, saveAttachments, trustedAttachments } from './attachments.mts'
+import { MAX_RUN_FILES, discardAttachments, readAttachmentImage, saveAttachments, trustedAttachments } from './attachments.mts'
 import { RUNTIME_CHANNELS } from './runtime-protocol.mts'
 import type { OrbitRuntime } from './runtime.mts'
 import type { QuotaMonitor, QuotaReaderOptions } from './quota.mts'
@@ -89,7 +89,7 @@ function createRuntimeApi(ctx: RuntimeApiContext): Map<string, RuntimeHandler> {
     const workspace = validateWorkspace(payload?.workspace)
     if (!payload?.projectId || !payload?.chatId) throw new Error('Project and chat are required')
     const request: StartPayload & { artifactRoot: string } = {
-      ...payload, workspace, attachments: trustedAttachments(userData, payload.attachments),
+      ...payload, workspace, attachments: trustedAttachments(userData, payload.attachments), resumeAttachments: trustedAttachments(userData, payload.resumeAttachments, MAX_RUN_FILES),
       memoryContext: payload.memoryEnabled ? stores.memoryStore.search(payload.prompt, workspace, 6, payload.globalMemoryEnabled !== false, payload.chatId) : [],
       artifactRoot,
     }
@@ -102,6 +102,8 @@ function createRuntimeApi(ctx: RuntimeApiContext): Map<string, RuntimeHandler> {
   // Attached files: saved under <userData>/attachments and handed back as paths; the window's own paths are trusted only there.
   handle('attachments:save', (chatId, files) => saveAttachments(userData, text(chatId) ?? '', files))
   handle('attachments:image', (file) => readAttachmentImage(userData, file))
+  // Saved files no message will carry: those of a refused send (the window names them) or a deleted chat's whole folder.
+  handle('attachments:discard', (chatId, paths) => discardAttachments(userData, text(chatId) ?? '', paths))
   handle('runtime:pause', (runId, agentId) => runtime.pauseAgent(text(runId) ?? '', text(agentId) ?? ''))
   handle('runtime:resume', (runId, agentId) => runtime.resumeAgent(text(runId) ?? '', text(agentId) ?? ''))
   handle('runtime:stop-agent', (runId, agentId) => runtime.stopAgent(text(runId) ?? '', text(agentId) ?? ''))

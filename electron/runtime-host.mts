@@ -16,7 +16,7 @@ import { RunStore, StateStore } from './run-store.mts'
 import * as providers from './providers.mts'
 import { QuotaMonitor, readers as quotaReaders } from './quota.mts'
 import { createRuntimeApi } from './runtime-api.mts'
-import { configureAttachments } from './attachments.mts'
+import { configureAttachments, sweepDiscarded } from './attachments.mts'
 import { createRestartHost, markRestartingRuns, resumePending } from './resume.mts'
 import { codedError, ERROR_CODES } from './runtime-protocol.mts'
 import type { ApprovalWire, LogLevel, RendererHealthyInfo, ShutdownMode, SpawnedProcess } from './runtime-protocol.mts'
@@ -123,8 +123,10 @@ const messageOf = (error: unknown): string => error instanceof Error ? error.mes
 
 function createRuntimeService(options: RuntimeServiceOptions): RuntimeService {
   const { userData, repoRoot, emit, overrides = {} } = options
-  // Claude may read the attachments folder outside the workspace (providers.mts asks attachments.mts for it).
+  // Claude may read the attachments folder outside the workspace (providers.mts asks attachments.mts for it). Folders of
+  // deleted chats that a program still held open then go now.
   configureAttachments(userData)
+  void sweepDiscarded(userData)
   const log = (level: LogLevel, text: string): void => {
     try { if (options.log) options.log(level, text); else console[level](`[orbit] ${text}`) } catch { /* Logging never breaks the runtime. */ }
   }

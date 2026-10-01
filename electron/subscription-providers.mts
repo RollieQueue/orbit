@@ -207,7 +207,7 @@ function createParser(id: SubscriptionId, onEvent: ProviderEventListener | null 
           const output = Array.isArray(content) ? content.filter(block => block.type === 'text').map(block => block.text).join('') : ''
           if (output) onEvent?.({ providerId: id, kind: 'output', text: output, partial: true })
         }
-        if (event.type === 'tool_call') onEvent?.({ providerId: id, kind: 'tool', native: true, text: JSON.stringify(event.tool_call || {}), status: event.subtype, ...(typeof event.call_id === 'string' ? { toolId: event.call_id } : {}) })
+        if (event.type === 'tool_call') onEvent?.(cursorToolEvent(event, false))
         if (event.type === 'result') {
           result = event
           if (event.is_error || event.subtype !== 'success') failure = typeof event.result === 'string' ? event.result : 'Cursor request failed'
@@ -225,23 +225,33 @@ function createParser(id: SubscriptionId, onEvent: ProviderEventListener | null 
     },
   }
 }
-// Cursor names a tool call by the key inside `tool_call` (`readToolCall`, `shellToolCall`, `mcpToolCall`, …). An MCP
-// call to Orbit's server is an Orbit tool event (the runtime records it where it is dispatched); file tools are named
+// Cursor names a tool call by the key inside `tool_call` (`readToolCall`, `shellToolCall`, `mcpToolCall`, …), in both
+// transports. In a session an MCP call to Orbit's server is an Orbit tool event (the runtime records it where it is
+// dispatched); the envelope transport gives Cursor no such server, so there every call is native. File tools are named
 // as file-activity reads them.
 const CURSOR_FILE_TOOLS: Record<string, string> = { readToolCall: 'read', writeToolCall: 'write', editToolCall: 'edit' }
-function cursorToolEvent(event: SubscriptionEvent): ToolEvent {
+// A finished call failed unless its result is a success variant: `success`, in a few tools `approved`, `complete`,
+// `stillRunning`, `accepted`, `modified` or `…Success`. The failures are many (`error`, `rejected`, `fileNotFound`,
+// `writePermissionDenied`, `timeout`, `spawnError`, …; CLI 2026.09.26), and a failed edit must not count as a write.
+const CURSOR_DONE = /^(?:success|approved|complete|stillRunning|accepted|modified|\w+Success)$/
+function cursorToolEvent(event: SubscriptionEvent, orbitServer = true): ToolEvent {
   const [kind = 'tool', body] = isRecord(event.tool_call) ? Object.entries(event.tool_call)[0] || [] : []
   const call = isRecord(body) ? body : {}
   const args: Record<string, unknown> = isRecord(call.args) ? call.args : {}
   const done = event.subtype === 'completed'
-  const status = done && isRecord(call.result) && ['error', 'failure', 'rejected'].some(key => key in (call.result as object)) ? 'failed' : done ? 'completed' : String(event.subtype || 'started')
+  const status = done && isRecord(call.result) && !Object.keys(call.result).some(key => CURSOR_DONE.test(key)) ? 'failed' : done ? 'completed' : String(event.subtype || 'started')
   const output = call.result === undefined ? undefined : typeof call.result === 'string' ? call.result : JSON.stringify(call.result)
-  const toolId = typeof event.call_id === 'string' ? event.call_id : undefined
+  // The start and the end of a call must share a key (the watchdog and steering wait for the end): `call_id`, else the
+  // id the call carries itself (`toolCallId`, CLI 2026.09.26), else its text, which comes from the arguments and leaves
+  // out the result the end adds (two identical calls at once then share it).
+  const ids = [event.call_id, isRecord(event.tool_call) ? event.tool_call.toolCallId : undefined]
+  const toolId = ids.find((value): value is string => typeof value === 'string' && value !== '')
   const named = typeof args.toolName === 'string' ? args.toolName : typeof args.name === 'string' ? args.name : ''
-  const orbitTool = kind === 'mcpToolCall' && ORBIT_SERVER.test(String(args.providerIdentifier || args.serverIdentifier || '')) ? named.replace(/^(?:mcp_+)?(?:plugin-orbit-)?orbit(?:__|[-_:.])/, '') : ''
+  const orbitTool = orbitServer && kind === 'mcpToolCall' && ORBIT_SERVER.test(String(args.providerIdentifier || args.serverIdentifier || '')) ? named.replace(/^(?:mcp_+)?(?:plugin-orbit-)?orbit(?:__|[-_:.])/, '') : ''
   if (orbitTool) return { providerId: 'cursor', kind: 'tool', tool: `mcp__orbit__${orbitTool}`, toolId, status, input: args.args, output, text: `${orbitTool} ${JSON.stringify(args.args ?? {}).slice(0, 200)}`, native: false, mcp: true, server: 'orbit', orbitTool }
   const target = typeof args.path === 'string' ? args.path : undefined
-  const text = [args.command, args.path, args.pattern, args.globPattern, args.query, named].find((value): value is string => typeof value === 'string' && value !== '')
+  // A search names what it looks for (grep and glob also carry the folder they search in).
+  const text = [args.command, args.pattern, args.globPattern, args.query, args.path, named].find((value): value is string => typeof value === 'string' && value !== '')
   return { providerId: 'cursor', kind: 'tool', tool: (target && CURSOR_FILE_TOOLS[kind]) || kind, toolId, status, input: target ? { path: target } : args, output, text: text || kind, native: true }
 }
 // Antigravity's tool steps: `call_mcp_tool` on Orbit's plugin server is an Orbit tool event; file tools carry their path
@@ -271,10 +281,11 @@ function createSessionParser(id: SubscriptionId, onEvent: ProviderEventListener 
   const messages = new Map<string, string>()
   const completed = new Set<string>()
   const emit = (event: ProviderEvent) => { try { onEvent?.(event) } catch { /* A UI observer does not control the provider. */ } }
-  // A session id is taken only as a plain token (SESSION_ID); anything else is ignored, and reported once.
+  // A session id is taken only as a plain token (SESSION_ID); anything else is ignored, and reported once. A new one is
+  // announced at once, so a turn cut off before its result still knows its session.
   const takeId = (value: unknown) => {
     if (value === undefined || value === null || value === '') return
-    if (typeof value === 'string' && SESSION_ID.test(value)) { sessionId = value; return }
+    if (typeof value === 'string' && SESSION_ID.test(value)) { if (value !== sessionId) emit({ providerId: id, kind: 'session', sessionId: value }); sessionId = value; return }
     if (!badId) { badId = true; emit({ providerId: id, kind: 'observation', source: 'diagnostic', text: `Ignored a malformed session id: ${String(JSON.stringify(value)).slice(0, 80)}` }) }
   }
   const cursorText = (event: SubscriptionEvent) => {

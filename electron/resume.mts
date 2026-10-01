@@ -14,7 +14,9 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { spawn as spawnProcess } from 'node:child_process'
 import type { SpawnOptions } from 'node:child_process'
+import { fingerprints, rendererHash } from './fingerprint.cjs'
 import { clip } from './text.mts'
+import { MAX_RUN_FILES, trustedAttachments } from './attachments.mts'
 import type { OrbitRuntimeLike, RestartMark, RunStoreLike, StoredRun } from './types.mts'
 
 const RESUME_FILE = 'pending-resume.json'
@@ -50,6 +52,8 @@ const ANSI = /\u001b\[[0-9;?]*[ -/]*[@-~]/g
 type RestartSource = 'tool' | 'script'
 // How much of Orbit a self-upgrade restarted: nothing, the window's renderer, the runtime process, or the whole app.
 type RestartLevel = 'none' | 'renderer' | 'runtime' | 'full'
+// The parts of Orbit's code a restart loads anew (electron/fingerprint.cjs): the main process, the runtime, the window.
+type CodePart = 'shell' | 'runtime' | 'renderer'
 // pending-resume.json as the script writes it (version 1), normalised: every field present, blanks as null. The
 // script's detached watcher adds its verdict: `verdict: 'relaunched'` once the new code is healthy,
 // `outcome: 'rolled-back'` before it starts the restored code, or `verdict: 'failed'` (with the error) when the watcher
@@ -101,6 +105,9 @@ interface RestartHost {
   request(request: RestartRequest): Promise<RestartResult>
   // The run whose restart_orbit request the script serves right now (checks, build, restart), or null.
   inFlight(): RestartRunRef | null
+  // The parts of the code on disk this Orbit does not run yet (unappliedCode), null when it cannot tell; a host without
+  // it cannot tell.
+  unapplied?(): CodePart[] | null
 }
 // The part of a child process the host uses; `spawn` is injectable so tests can script the process.
 interface RestartChild {
@@ -114,6 +121,8 @@ interface RestartChild {
 type SpawnRestart = (command: string, args: string[], options: SpawnOptions) => RestartChild
 interface RestartHostOptions {
   repoRoot: string; userData: string
+  // Main's health report (healthFilePath by default), null when it writes none.
+  healthFile?: string | null
   // The Node binary that runs the script; by default ORBIT_NODE, else Node itself, else `node` on PATH, else Electron as Node.
   nodeCommand?: string | null
   spawn?: SpawnRestart
@@ -283,12 +292,39 @@ function releaseLock(file: string, pid: number | undefined): void {
   } catch { /* No lock, or not one to release. */ }
 }
 
+// Where main writes its health report (main.cjs healthFile): ORBIT_HEALTH_FILE (a relative path from the repository;
+// "0": nowhere), else the repository's artifacts/self-upgrade-health.json.
+function healthFilePath(root: string, env: NodeJS.ProcessEnv = process.env): string | null {
+  const value = env.ORBIT_HEALTH_FILE
+  if (value === undefined) return path.join(root, 'artifacts', 'self-upgrade-health.json')
+  return value && value !== '0' ? path.resolve(root, value) : null
+}
+// The parts of Orbit's code on disk the running Orbit does not run yet, as the self-upgrade tells them to pick its
+// restart level: the code fingerprints of the files against those main's health report gives for the code it runs.
+// Whatever wrote a file (a tool, a shell command, git) counts, and a change undone counts no more. [] when it runs all
+// of it; null when it cannot tell: no report, a failed one, one about another runtime process than `pid` (another
+// Orbit, a restart not reported yet) or older than `since` (a reused pid), or one without fingerprints.
+function unappliedCode({ root, healthFile, pid = process.pid, since = Date.now() - process.uptime() * 1000 }: { root: string; healthFile: string | null; pid?: number; since?: number }): CodePart[] | null {
+  if (!healthFile) return null
+  try {
+    const report: Record<string, unknown> | null = JSON.parse(fs.readFileSync(healthFile, 'utf8'))
+    const hash = (value: unknown): string | null => typeof value === 'string' && value ? value : null
+    const running = { shell: hash(report?.shellHash), runtime: hash(report?.runtimeHash), renderer: hash(report?.rendererHash) }
+    const about = (report?.runtime as { pid?: unknown } | null | undefined)?.pid, writtenAt = report?.writtenAt
+    if (report?.ok !== true || about !== pid || typeof writtenAt !== 'number' || writtenAt < since) return null
+    if (!running.shell || !running.runtime || !running.renderer) return null
+    const disk = { ...fingerprints(root), renderer: rendererHash(root) }
+    return (['shell', 'runtime', 'renderer'] as const).filter(part => disk[part] !== running[part])
+  } catch { return null }
+}
+
 // Runs `node scripts/self-upgrade.cjs [--no-verify] --reason <r> --continue-with <c>` in the repository for restart_orbit.
 // One restart at a time: a second request for the same run (a model retrying after its MCP client gave up waiting)
 // joins the one in flight; a request for another run is refused.
 interface RestartJob { run: RestartRunRef; listeners: Set<(line: string) => void>; promise: Promise<RestartResult>; abort: () => void }
-function createRestartHost({ repoRoot, userData, nodeCommand = null, spawn = defaultSpawn, onLine: hostLine, kill = killTree }: RestartHostOptions): RestartHost {
+function createRestartHost({ repoRoot, userData, healthFile, nodeCommand = null, spawn = defaultSpawn, onLine: hostLine, kill = killTree }: RestartHostOptions): RestartHost {
   const root = path.resolve(repoRoot)
+  const health = healthFile === undefined ? healthFilePath(root) : healthFile
   const script = path.join(root, SCRIPT)
   const available = fs.existsSync(script) && fs.existsSync(path.join(root, '.git'))
   const resumeFile = resumeFilePath(userData)
@@ -378,7 +414,8 @@ function createRestartHost({ repoRoot, userData, nodeCommand = null, spawn = def
     return job
   }
   const inFlight = (): RestartRunRef | null => current ? { ...current.run } : null
-  return { available, repoRoot: root, resumeFile, userData, request, inFlight }
+  const unapplied = (): CodePart[] | null => available ? unappliedCode({ root, healthFile: health }) : null
+  return { available, repoRoot: root, resumeFile, userData, request, inFlight, unapplied }
 }
 
 // Shutting down for a restart: the run the intent names ends with the status `restarting` (not cancelled or
@@ -422,22 +459,26 @@ function storedNote(old: StoredRun): string {
   return lines.join('\n')
 }
 // The old root's provider session, when it had one: the continuation resumes it if its root keeps that provider. A root
-// cut off in its first session turn has no `sessionId` yet (it is recorded when a turn returns); for Claude, whose
-// session Orbit names itself, the record of that turn (turnTimings) holds the id the session was started with — unless
-// the root moved to Claude after that turn started. Codex, Cursor and Antigravity name their own sessions, so the id
-// Orbit proposed for a turn that never returned is not theirs.
-function rootSession(old: StoredRun): { id: string; providerId: string } | undefined {
+// cut off in its first session turn has no `sessionId` yet (it is recorded when a turn returns); the record of that turn
+// (turnTimings) names its session as the provider knows it (turn.mts): Claude's, started under Orbit's id, or the one the
+// stream of Codex, Cursor or Antigravity named (none until it did, as the id Orbit proposed is not theirs) — unless the
+// root moved to its provider after that turn started. Only a turn that called a tool counts: the one that asked for the
+// restart did (restart_orbit, or the self-upgrade in its shell), so its session holds its prompt, which a turn the
+// restart caught before its model acted may not have yet. The mark of the old root's mail (saved with the restart) goes along.
+function rootSession(old: StoredRun): { id: string; providerId: string; mailMark?: string } | undefined {
   const root = (old.agents || []).find(agent => agent.id === 'root')
   if (root?.transport !== 'session' || typeof root.providerId !== 'string') return undefined
-  if (typeof root.sessionId === 'string' && root.sessionId) return { id: root.sessionId, providerId: root.providerId }
-  if (root.providerId !== 'claude' || !Array.isArray(root.turnTimings)) return undefined
+  const mark = typeof old.restart?.mailMark === 'string' ? { mailMark: old.restart.mailMark } : {}
+  if (typeof root.sessionId === 'string' && root.sessionId) return { id: root.sessionId, providerId: root.providerId, ...mark }
+  if (!Array.isArray(root.turnTimings)) return undefined
   const last: unknown = root.turnTimings.at(-1)
-  const timing = last && typeof last === 'object' ? last as Partial<Record<'transport' | 'sessionId' | 'startedAt', unknown>> : null
+  const timing = last && typeof last === 'object' ? last as Partial<Record<'transport' | 'sessionId' | 'startedAt' | 'orbitToolCalls' | 'nativeToolCalls', unknown>> : null
   const handover: unknown = Array.isArray(root.handovers) ? root.handovers.at(-1) : null
   const switchedAt = handover && typeof handover === 'object' ? (handover as { time?: unknown }).time : null
   if (timing?.transport !== 'session' || typeof timing.sessionId !== 'string' || !timing.sessionId) return undefined
+  if (!(Number(timing.orbitToolCalls) > 0 || Number(timing.nativeToolCalls) > 0)) return undefined
   if (typeof switchedAt === 'string' && String(timing.startedAt ?? '') < switchedAt) return undefined
-  return { id: timing.sessionId, providerId: root.providerId }
+  return { id: timing.sessionId, providerId: root.providerId, ...mark }
 }
 // The run that already continues `old`, if any: a live one, or one the run history kept (in the same chat).
 function continuationOf(runtime: ResumeOptions['runtime'], store: ResumeOptions['runStore'], old: StoredRun): string | null {
@@ -481,7 +522,7 @@ function resumePending(options: ResumeOptions): Promise<RestartNotice | null> {
   resuming.set(file, task)
   return task
 }
-async function resumeOnce(file: string, { runtime, runStore = runtime.runStore, notify, now = Date.now, maxChain = defaultMaxChain(), info = null, verdictWaitMs = VERDICT_WAIT_MS, pollMs = VERDICT_POLL_MS }: ResumeOptions): Promise<RestartNotice | null> {
+async function resumeOnce(file: string, { runtime, userData, runStore = runtime.runStore, notify, now = Date.now, maxChain = defaultMaxChain(), info = null, verdictWaitMs = VERDICT_WAIT_MS, pollMs = VERDICT_POLL_MS }: ResumeOptions): Promise<RestartNotice | null> {
   let loaded = loadIntent(file)
   for (let attempt = 0; !loaded.intent && !loaded.missing && attempt < 10; attempt++) { await pause(pollMs); loaded = loadIntent(file) }
   const first = loaded.intent
@@ -525,11 +566,14 @@ async function resumeOnce(file: string, { runtime, runStore = runtime.runStore, 
   if (!intent.id || old.restart?.intentId !== intent.id) return refuse('failed', `Продолжение не запущено: запуск не был завершён этим перезапуском (намерение ${intent.id || 'без идентификатора'})`)
   if (!deleteResumeIntent(file)) return notice('failed', 'Продолжение не запущено: файл намерения не удалось удалить, и задача могла бы продолжиться дважды', { error: `Could not remove ${file}` })
   const session = rootSession(old)
+  // The files the user attached in that run, those still in Orbit's attachments folder: the note names them again. Only
+  // these: a damaged record's start payload brings no files of its own.
+  const files = trustedAttachments(userData, Array.isArray(old.attachments) ? old.attachments.slice(-MAX_RUN_FILES) : [], MAX_RUN_FILES)
   try {
     const resumedRunId = await runtime.start({
       ...old.startPayload, projectId: old.projectId || old.startPayload.projectId, chatId: old.chatId || old.startPayload.chatId,
       prompt: continuationPrompt(intent, info), resumedFrom: old.runId, resumeChain: chain,
-      restartNote: old.restart?.note || storedNote(old), ...(session ? { resumeSession: session } : {}),
+      restartNote: old.restart?.note || storedNote(old), ...(session ? { resumeSession: session } : {}), attachments: [], resumeAttachments: files,
     })
     return notice('resumed', `Orbit перезапущен по запросу агента, задача продолжена${intent.reason ? ` (причина: ${intent.reason})` : ''}`, { resumedRunId })
   } catch (error) {
@@ -538,5 +582,5 @@ async function resumeOnce(file: string, { runtime, runStore = runtime.runStore, 
   }
 }
 
-export { resumeFilePath, readResumeIntent, deleteResumeIntent, restartEnv, createRestartHost, markRestartingRuns, resumePending, continuationPrompt }
-export type { RestartNotice, ResumeIntent, RestartHost, RestartRequest, RestartResult, RestartRollback, RestartLevel, RestartSource, ResumeInfo, RestartRunRef, RestartChild, SpawnRestart, RestartHostOptions, ResumeOptions }
+export { resumeFilePath, readResumeIntent, deleteResumeIntent, restartEnv, createRestartHost, healthFilePath, unappliedCode, markRestartingRuns, resumePending, continuationPrompt }
+export type { RestartNotice, ResumeIntent, RestartHost, RestartRequest, RestartResult, RestartRollback, RestartLevel, CodePart, RestartSource, ResumeInfo, RestartRunRef, RestartChild, SpawnRestart, RestartHostOptions, ResumeOptions }

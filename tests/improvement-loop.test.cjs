@@ -157,7 +157,7 @@ test('a start whose run never came is repeated after 60 s with the same task num
 })
 
 test('loopStartFailed takes the task number back and schedules a retry; a refused start is no failed run', () => {
-  const failed = loop.loopStartFailed(activeLoop({ iteration: 4, startingAt: NOW, failures: 0 }), 3, 'нет провайдера', NOW)
+  const failed = loop.loopStartFailed(activeLoop({ iteration: 4, startingAt: NOW, failures: 0 }), 'нет провайдера', NOW)
   assert.equal(failed.loop.iteration, 3)
   assert.equal(failed.loop.failures, 0, 'a start that never made a run is not a failed attempt')
   assert.equal(failed.loop.startFailures, 1)
@@ -191,7 +191,7 @@ test('loopStartFailed: a busy refusal keeps the task number and the failure coun
   let started = activeLoop({ iteration: 4, startingAt: NOW, failures: 2, startFailures: 1 })
   const delays = []
   for (let n = 1; n <= 4; n++) {
-    const failed = loop.loopStartFailed(started, 3, wrapped(START_REFUSALS.chatBusy), NOW)
+    const failed = loop.loopStartFailed(started, wrapped(START_REFUSALS.chatBusy), NOW)
     assert.equal(failed.loop.iteration, 3)
     assert.equal(failed.loop.busyStarts, n)
     assert.equal(failed.loop.failures, 2, 'unchanged')
@@ -199,23 +199,25 @@ test('loopStartFailed: a busy refusal keeps the task number and the failure coun
     assert.equal(failed.loop.startingAt, undefined)
     assert.equal(failed.note, undefined, 'no warning in the chat for a wait')
     delays.push(failed.loop.retryAt - NOW)
-    started = { ...failed.loop, startingAt: NOW }
+    // The due retry starts task 4 again (startStep: iteration + 1).
+    started = { ...failed.loop, iteration: failed.loop.iteration + 1, startingAt: NOW }
   }
   assert.deepEqual(delays, [5_000, 10_000, 30_000, 30_000])
-  for (const key of ['restarting', 'cleanup']) assert.equal(loop.loopStartFailed(activeLoop({ startingAt: NOW }), 1, START_REFUSALS[key], NOW).loop.busyStarts, 1, key)
+  for (const key of ['restarting', 'cleanup']) assert.equal(loop.loopStartFailed(activeLoop({ startingAt: NOW }), START_REFUSALS[key], NOW).loop.busyStarts, 1, key)
 })
 
 test('loopStartFailed: another refusal backs off 1, 3, 10, 30 minutes on its own counter and clears the busy count', () => {
   let started = activeLoop({ iteration: 4, startingAt: NOW, failures: 1, busyStarts: 2 })
   const delays = []
   for (let n = 1; n <= 5; n++) {
-    const failed = loop.loopStartFailed(started, 3, 'нет провайдера', NOW)
+    const failed = loop.loopStartFailed(started, 'нет провайдера', NOW)
+    assert.equal(failed.loop.iteration, 3)
     assert.equal(failed.loop.startFailures, n)
     assert.equal(failed.loop.failures, 1, 'unchanged')
     assert.equal(failed.loop.busyStarts, undefined)
     assert.match(failed.note, /Не удалось запустить задачу: нет провайдера\. Следующая попытка в \d\d:\d\d\./)
     delays.push(failed.loop.retryAt - NOW)
-    started = { ...failed.loop, startingAt: NOW }
+    started = { ...failed.loop, iteration: failed.loop.iteration + 1, startingAt: NOW }
   }
   assert.deepEqual(delays, [MIN, 3 * MIN, 10 * MIN, 30 * MIN, 30 * MIN])
 })
@@ -244,7 +246,7 @@ test('TECH-DEBT 19: a refused start of the next task is retried as that task, no
     const first = step(before, runs)
     assert.equal(first.kind, 'start')
     assert.equal(first.task, 2)
-    const failed = loop.loopStartFailed(first.loop, before.iteration, error, NOW)
+    const failed = loop.loopStartFailed(first.loop, error, NOW)
     assert.equal(failed.loop.iteration, 1)
     const due = step(failed.loop, runs, { now: failed.loop.retryAt })
     assert.equal(due.kind, 'start', error)
@@ -257,9 +259,27 @@ test('TECH-DEBT 19: a refused start of the next task is retried as that task, no
     const started = step(current, runs, { now: NOW + i * MIN })
     assert.equal(started.kind, 'start')
     assert.equal(started.outcome, undefined, `attempt ${i}`)
-    current = loop.loopStartFailed(started.loop, 1, START_REFUSALS.restarting, NOW + i * MIN).loop
+    current = loop.loopStartFailed(started.loop, START_REFUSALS.restarting, NOW + i * MIN).loop
     assert.equal(current.failures, 0)
     current = { ...current, retryAt: NOW + i * MIN }
+  }
+})
+
+test('a repeated lost start that is refused is retried as the same task: the number does not skip (review T4)', () => {
+  // Task 3 was started (its loop saved with iteration 3) and its run never came: the start is repeated as task 3.
+  const latest = run('r1', 'completed', { improvements: [task('1', 'done'), task('2', 'done')] })
+  const lost = activeLoop({ iteration: 3, lastRunId: 'r1', startingAt: NOW - loop.LOOP_START_TIMEOUT_MS })
+  for (const error of [START_REFUSALS.chatBusy, wrapped(START_REFUSALS.restarting), 'нет провайдера']) {
+    const again = step(lost, [latest])
+    assert.equal(again.kind, 'start')
+    assert.equal(again.task, 3)
+    assert.equal(again.loop.iteration, 3, 'the loop saved before the start already has the number')
+    const failed = loop.loopStartFailed(again.loop, error, NOW)
+    assert.equal(failed.loop.iteration, 2, error)
+    const due = step(failed.loop, [latest], { now: failed.loop.retryAt })
+    assert.equal(due.kind, 'start', error)
+    assert.equal(due.task, 3, error)
+    assert.equal(due.loop.iteration, 3, error)
   }
 })
 
@@ -271,7 +291,7 @@ test('contrast: a completion that moved nothing keeps its no-progress outcome th
   const due = step(first.loop, [latest], { now: first.loop.retryAt })
   assert.equal(due.kind, 'start')
   assert.equal(due.outcome, loop.NO_PROGRESS_TEXT)
-  const failed = loop.loopStartFailed(due.loop, activeLoop().iteration, 'нет провайдера', first.loop.retryAt)
+  const failed = loop.loopStartFailed(due.loop, 'нет провайдера', first.loop.retryAt)
   assert.equal(failed.loop.failures, 1, 'a refused start does not count as another failed run')
   const again = step(failed.loop, [latest], { now: failed.loop.retryAt })
   assert.equal(again.kind, 'start')

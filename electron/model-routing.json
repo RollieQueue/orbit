@@ -1,0 +1,46 @@
+{
+  "notes": [
+    "The model spawn_agent gives a helper when the caller names the kind of work and no model: the candidates of that kind are tried top to bottom, and the first one that is connected, allowed by the user's provider pool and not near its quota limit takes the work.",
+    "The order follows the model audit of 2026-09-30 (docs/MODEL-AUDIT.md, «Кратко: кого звать»): the first choice, then the other subscriptions, as a reserve and to spread the quota. 'why' says what the audit measured.",
+    "reasoningEffort is the level the audit ran at. The helper gets it only when neither the caller, the provider pool nor the provider's own settings name a level and it is not simply its parent's model.",
+    "Left out on purpose: Claude Fable 5.1 (the user's rule of 2026-09-30: it spends far more quota and is not better than Opus), Claude Haiku 4.5 and GPT-OSS 120B (failed the audit), GPT-5.6 Luna (failed the logic part) and Cursor (not measured: its free plan was used up).",
+    "Claude models are named by the CLI aliases the provider list shows (sonnet, opus); an alias follows the newest model of its family."
+  ],
+  "kinds": {
+    "code": {
+      "about": "writing or changing code to a specification",
+      "candidates": [
+        { "providerId": "claude", "model": "sonnet", "reasoningEffort": "high", "why": "Sonnet 5.5: correct code in all three audit runs, 0.7-1.0 min, the fastest; check its structured answers" },
+        { "providerId": "codex", "model": "gpt-6-astra", "reasoningEffort": "high", "why": "GPT-6 Astra: 98.8 of 100, code 10/10 in 1.8 min, compared its fix with an independent implementation" },
+        { "providerId": "codex", "model": "gpt-6-luna", "reasoningEffort": "high", "why": "GPT-6 Luna: code, review, logic and repository questions without a mistake in 2.0 min" },
+        { "providerId": "antigravity", "model": "gemini-3.1-pro-high", "why": "Gemini 3.1 Pro: code 10/10 in 4.1 min, the third subscription" }
+      ]
+    },
+    "review": {
+      "about": "reviewing code: bugs, races, security",
+      "candidates": [
+        { "providerId": "codex", "model": "gpt-6-astra", "reasoningEffort": "high", "why": "GPT-6 Astra: all four planted bugs and the rare race; reports borderline findings too" },
+        { "providerId": "claude", "model": "opus", "reasoningEffort": "high", "why": "Opus 5.5: all planted bugs including the rare race, only confident findings" },
+        { "providerId": "antigravity", "model": "gemini-3.1-pro-high", "why": "Gemini 3.1 Pro: an independent opinion from another model family; missed only the rare race" },
+        { "providerId": "codex", "model": "gpt-6-sol", "reasoningEffort": "high", "why": "GPT-6 Sol: 100 of 100, review 4.5 of 4.5 in 3.1 min" }
+      ]
+    },
+    "lookup": {
+      "about": "finding and reading code, small edits, running checks",
+      "candidates": [
+        { "providerId": "codex", "model": "gpt-6-luna", "reasoningEffort": "high", "why": "GPT-6 Luna: repository questions and the trap question right in 2.0 min" },
+        { "providerId": "codex", "model": "gpt-5.6-terra", "reasoningEffort": "high", "why": "GPT-5.6 Terra: technically without a mistake in 2.4 min" },
+        { "providerId": "antigravity", "model": "gemini-3.8-flash-high", "why": "Gemini 3.8 Flash: repository questions right in 3.3 min; not for review" },
+        { "providerId": "claude", "model": "sonnet", "reasoningEffort": "high", "why": "Sonnet 5.5: fast and right, but spends the Claude Code quota the orchestrator needs" }
+      ]
+    },
+    "text": {
+      "about": "text for the user, especially in Russian",
+      "candidates": [
+        { "providerId": "claude", "model": "opus", "reasoningEffort": "high", "why": "Opus 5.5: the Russian text met every requirement" },
+        { "providerId": "antigravity", "model": "gemini-3.1-pro-high", "why": "Gemini 3.1 Pro: Russian text 4 of 4" },
+        { "providerId": "codex", "model": "gpt-6-sol", "reasoningEffort": "high", "why": "GPT-6 Sol: Russian text 4 of 4 in 3.1 min" }
+      ]
+    }
+  }
+}

@@ -5,7 +5,7 @@ const os = require('node:os')
 const path = require('node:path')
 const quota = require('../electron/quota.mts')
 const { OrbitRuntime } = require('../electron/runtime.mts')
-const { normalizeFailover, tierOf, baselineTier, replacements, handoverNote, unreachable } = require('../electron/failover.mts')
+const { normalizeFailover, tierOf, baselineTier, excluded, replacements, handoverNote, unreachable } = require('../electron/failover.mts')
 
 const w = (used, extra = {}) => ({ kind: 'session', scope: 'all', models: [], usedPercent: used, resetsAt: null, ...extra })
 const CATALOG = [
@@ -127,6 +127,21 @@ test('models of unknown quality and local models count only when the user put th
   assert.ok(!labels(replacements({ ...base, pool: [{ providerId: 'ollama', model: 'llama3' }] })).includes('ollama/llama3'), 'a model known to be weaker is not admitted by the pool alone')
   assert.equal(replacements({ ...base, pool: [{ providerId: 'claude', model: 'sonnet' }] }).some(item => item.model === 'sonnet'), false, 'a known weaker model stays out even when pooled, unless weaker is allowed')
   assert.equal(labels(replacements({ ...base, pool: [{ providerId: 'claude', model: 'opus' }] }))[0], 'claude/opus')
+})
+
+test("Claude Fable is never a replacement on its own (the user's rule), only when the user put it in the pool", () => {
+  for (const model of ['claude-fable-5-1', 'Claude-Fable-5-Thinking-High', 'fable', 'anthropic/claude-fable@2026']) assert.equal(excluded(model), true, model)
+  for (const model of ['opus', 'claude-opus-5-5-high', 'fabled-7b', '']) assert.equal(excluded(model), false, model)
+  // Cursor lists Fable first, and as a flagship it would be the closest match for a flagship agent.
+  const withFable = CATALOG.map(entry => entry.id === 'cursor' ? { ...entry, models: ['claude-fable-5-thinking-high', ...entry.models] } : entry.id === 'claude' ? { ...entry, models: [...entry.models, 'claude-fable-5-1'] } : entry)
+  const base = { agent: agentOf(), catalog: withFable, quota: fakeQuota({}), config: config() }
+  const fable = list => labels(list).filter(label => /fable/.test(label))
+  assert.deepEqual(fable(replacements(base)), [])
+  assert.deepEqual(fable(replacements({ ...base, relaxed: true })), [], 'not even when anything beats stopping')
+  assert.deepEqual(fable(replacements({ ...base, models: { claude: 'claude-fable-5-1' } })), [], 'nor as the model chosen for its provider in the composer')
+  assert.deepEqual(fable(replacements({ ...base, pool: [{ providerId: 'cursor' }] })), [], 'a provider pooled without a model does not name it')
+  assert.equal(labels(replacements({ ...base, pool: [{ providerId: 'cursor', model: 'claude-fable-5-thinking-high' }] }))[0], 'cursor/claude-fable-5-thinking-high', 'named in the pool it is taken first')
+  assert.equal(baselineTier('cursor', 'claude-fable-5-thinking-high'), 3, 'an agent running on Fable is still replaced by flagship models')
 })
 
 test('candidates skip the agent itself, failed replacements and providers that are not connected', () => {

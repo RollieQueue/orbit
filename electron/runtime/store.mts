@@ -20,8 +20,9 @@ function snapshot(runtime: OrbitRuntimeLike, run: RunRecord): RunSnapshot {
     agents: [...run.agentNodes.values()].map(publicAgent),
     traces: run.traces, messages: run.messages, communications: run.communications, summary: run.summary, error: run.error,
     files: run.fileActivity.snapshot(), changes: run.changes.snapshot(), router: { ...run.router.stats },
-    // Restarts: what a continuation starts again from, the link to the run a continuation continues, and the restart mark.
-    ...(run.startPayload ? { startPayload: run.startPayload } : {}),
+    // Restarts: what a continuation starts again from (with the files the user attached in the run), the link to the run a
+    // continuation continues, and the restart mark.
+    ...(run.startPayload ? { startPayload: run.startPayload } : {}), ...(run.attachments?.length ? { attachments: run.attachments } : {}),
     ...(run.resumedFrom ? { resumedFrom: run.resumedFrom } : {}), ...(run.resumeChain !== undefined ? { resumeChain: run.resumeChain } : {}),
     ...(run.restart ? { restart: run.restart } : {}),
     // The improvement loop: the task number of this run and what the next task must know.

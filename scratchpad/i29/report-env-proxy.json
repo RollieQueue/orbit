@@ -1,0 +1,175 @@
+{
+ "mode": "env-proxy",
+ "envProxy": "http://127.0.0.1:12334",
+ "packageId": "2091faec-79ce-44fa-ae4e-fbd01b3b7187",
+ "steps": [
+  {
+   "step": "routes",
+   "window": "PROXY 127.0.0.1:12334;DIRECT",
+   "windowHttp": "PROXY 127.0.0.1:12334;DIRECT",
+   "windowLoopback": "DIRECT",
+   "windowLocalhost": "DIRECT",
+   "system": "DIRECT",
+   "app": "DIRECT"
+  },
+  {
+   "step": "stage",
+   "closedAfterMs": 7047,
+   "states": [
+    {
+     "atMs": 45,
+     "state": {
+      "video": "loading",
+      "time": null,
+      "playerState": null
+     }
+    },
+    {
+     "atMs": 675,
+     "state": {
+      "video": "loading",
+      "time": 42,
+      "playerState": -1
+     }
+    },
+    {
+     "atMs": 1805,
+     "state": {
+      "video": "playing",
+      "time": 42.143197,
+      "playerState": 1
+     }
+    },
+    {
+     "atMs": 2022,
+     "state": {
+      "video": "playing",
+      "time": 42.254048,
+      "playerState": 1
+     }
+    },
+    {
+     "atMs": 2239,
+     "state": {
+      "video": "playing",
+      "time": 42.517049,
+      "playerState": 1
+     }
+    },
+    {
+     "atMs": 2448,
+     "state": {
+      "video": "playing",
+      "time": 42.786027,
+      "playerState": 1
+     }
+    },
+    {
+     "atMs": 2671,
+     "state": {
+      "video": "playing",
+      "time": 43.041157,
+      "playerState": 1
+     }
+    },
+    {
+     "atMs": 4026,
+     "state": {
+      "video": "playing",
+      "time": 44.378067,
+      "playerState": 1
+     }
+    },
+    {
+     "atMs": 4237,
+     "state": {
+      "video": "playing",
+      "time": 44.641953,
+      "playerState": 1
+     }
+    },
+    {
+     "atMs": 4669,
+     "state": {
+      "video": "playing",
+      "time": 44.915064,
+      "playerState": 1
+     }
+    },
+    {
+     "atMs": 4881,
+     "state": {
+      "video": "playing",
+      "time": 45.191777,
+      "playerState": 1
+     }
+    },
+    {
+     "atMs": 5098,
+     "state": {
+      "video": "playing",
+      "time": 45.460987,
+      "playerState": 1
+     }
+    },
+    {
+     "atMs": 5310,
+     "state": {
+      "video": "playing",
+      "time": 45.717669,
+      "playerState": 1
+     }
+    },
+    {
+     "atMs": 5751,
+     "state": {
+      "video": "playing",
+      "time": 45.991049,
+      "playerState": 1
+     }
+    },
+    {
+     "atMs": 5982,
+     "state": {
+      "video": "playing",
+      "time": 46.244728,
+      "playerState": 1
+     }
+    },
+    {
+     "atMs": 6196,
+     "state": {
+      "video": "playing",
+      "time": 46.517723,
+      "playerState": 1
+     }
+    },
+    {
+     "atMs": 6404,
+     "state": {
+      "video": "playing",
+      "time": 46.785025,
+      "playerState": 1
+     }
+    },
+    {
+     "atMs": 6606,
+     "state": {
+      "video": "ended",
+      "time": 47.018203,
+      "playerState": 0
+     }
+    }
+   ]
+  },
+  {
+   "step": "main console",
+   "rendererFailures": [],
+   "frameFailures": [],
+   "proxyLines": [
+    "log: [orbit] the system proxy is off: the window goes through the environment's (http=http://127.0.0.1:12334,direct://;https=http://127.0.0.1:12334,direct://)"
+   ]
+  }
+ ],
+ "ok": true
+}

@@ -80,9 +80,23 @@ with `ORBIT_MCP_TOKEN` in the child environment. **No `--ephemeral`.** The threa
 comes from the `thread.started` JSON event; follow-ups use `codex exec resume <id> -`.
 The App Server transport keeps its thread alive for the agent's life and sends one
 `turn/start` per Orbit turn. No process is killed at a tool call any more; the
-`TOOL_HANDOFF` path stays only for envelope providers.
+`TOOL_HANDOFF` path stays only for envelope providers. A cancellation while the session
+opens (`initialize`, `thread/resume` or `thread/start` unanswered) kills the process at once
+and fails the open after the tree is gone; a session the call itself opened is also closed
+when the turn is stopped on its `session` event (the stray-session check below). Before
+2026-10-01 such a process waited for the 30-minute idle close, or, with a server that never
+answered, the provider call never settled.
 Both Codex transports also get `-c mcp_servers.orbit.tool_timeout_sec=3600` (added
 2026-09-30): Codex otherwise ends an MCP tool call after 60 s.
+The stable Orbit block (`systemAppend`) is the thread's developer instructions (2026-10-01;
+before, Codex never received it): `-c developer_instructions="<block as a TOML string>"` on
+every `codex exec` process, new and resumed, and `developerInstructions` in `thread/start` and
+`thread/resume` of the App Server. Codex has no system-prompt file option, so the block rides
+on the command line (at most 6000 characters). Checked against codex-cli 0.155 with a stub
+Responses server (`scratchpad/i22/live-*.cjs`): the model's request carries the block once as
+a `developer` message, unchanged; a resumed thread keeps the block it started with, and a
+changed or missing block on resume is ignored. The override replaces a `developer_instructions`
+of the user's own `config.toml` in Orbit's sessions (`AGENTS.md` still applies).
 
 ### Cursor session invocation (2026-09-30, opt-in)
 
@@ -139,6 +153,30 @@ refuses (malformed, or not a UUID for Claude) throws with the code `ORBIT_SESSIO
 session loop drops that id once, with a `transport` trace, and starts a fresh session. A
 handover closes the agent's old session first (an Antigravity folder holding the token, a
 Codex App Server) and stops its parked calls.
+
+Since 2026-10-01 these CLIs' ids are also known before a turn's result: the provider sends
+a `session` event as soon as the stream names the session (Codex `thread.started`; the
+Cursor and Antigravity session parsers on the first valid id, again only if it changes;
+the Codex App Server with its thread, before `turn/start`). `providerTurn`
+(`runtime/turn.mts`) records it in the turn's timing (`sessionId`; until then a fresh
+session turn of these CLIs records none, as the id Orbit proposed is not theirs) and, when
+a pause or a message cuts a first session turn after its model
+spoke, throws it as `PauseInterrupt.sessionId`: the repeat resumes that session, as it
+always did for Claude under Orbit's own id. A first turn cut before its model spoke still
+starts fresh, since its session may not hold the prompt yet. The event is not the model
+speaking (no trace, no watchdog step) and is ignored by the envelope transport. A CLI that
+cannot find the session it is to resume may open another one silently (`codex exec resume`
+with an unknown id, the App Server's `thread/start` fallback), and the resume prompt does
+not carry the task: a resume of the session from before a cut (`pausedSession`) or a
+restart (`run.resumeSession`) whose stream names another session is stopped at once
+(refunded, code `ORBIT_SESSION_ID`), and the session loop starts a fresh session with the
+full prompt. An Antigravity conversation cut in its first turn resumes from a new folder,
+as after an Orbit restart (checked live 2026-10-01: first turns cut 6-11 ms after their first
+text resumed from a new folder, and the conversation held the cut prompt). A continuation
+after `restart_orbit` that cut off a root's first session turn resumes the session that turn's
+timing names (`resume.rootSession`), for these CLIs as for Claude, once that turn had called
+a tool (the turn that asked for the restart did); when the stream had named none yet, or the
+turn had called no tool, the continuation starts fresh with the restart note.
 
 ### Per-call limits of MCP clients (2026-09-30)
 
@@ -243,7 +281,9 @@ the existing `executeAgent`. The session loop:
    ONE combined `model_evaluate` reminder (not three); (d) improvement mode not
    completed → the existing continuation; (e) skill learning → the existing single
    reminder. Each resume is `runProvider({ session: { resume: true, id }, prompt: instruction })`.
-   A resume that fails delivers the candidate (`draftAnswer` logic stays).
+   A resume that fails delivers the candidate (`draftAnswer` logic stays). (2026-10-01) The candidate
+   keeps the ids of the user's messages read when it was written (`mailbox.keptAnswer`); delivered
+   after a failed resume, it names the user's messages it does not answer (`mailbox.answerAsKept`).
 4. Handover (quota/failure) works as today: the note is built from the ledger; the
    replacement provider starts a fresh session with the note in its user prompt.
 5. Cancellation kills the process tree as today.
@@ -260,9 +300,16 @@ the existing `executeAgent`. The session loop:
    `transport` trace, and a fresh session starts from the note (`runtime/loops.mts`).
 7. (2026-09-30) Steering (`runtime/steer.mts`): a message from the user or from an agent above
    the recipient in the team rides whole on the end of its next Orbit tool result
-   (`mailbox.userMail`: `[orbit] MESSAGE FROM THE USER …`, then `[orbit] MESSAGE FROM YOUR
-   SUPERVISOR …` with the sender and the message id), marked read with `delivery: 'tool-result'`;
-   a prompt's mail block leads with the same two blocks. A turn that makes no Orbit call within
+   (`mailbox.userMail`: `[orbit:<mark>] MESSAGE FROM THE USER …`, then `[orbit:<mark>] MESSAGE
+   FROM YOUR SUPERVISOR …` with the sender and the message id), marked read with `delivery: 'tool-result'`;
+   a prompt's mail block leads with the same two blocks. (2026-10-01) `<mark>` is the recipient's
+   secret (`AgentRecord.mailMark`, ten hex digits, kept inside the runtime) that only its own
+   instructions name (the session system block, which Codex gets as the thread's developer
+   instructions, and every session's first prompt; the envelope prompt): the same heading in a file, a
+   command's output or a helper's result, without the mark or with another, is data. It lasts the
+   agent's life (Cursor reads the instructions only in a session's first message), and a
+   continuation that resumes the root's session after a restart keeps it (`RestartMark.mailMark`).
+   A turn that makes no Orbit call within
    `ORBIT_STEER_GRACE_MS` (2 s) is checked every 250 ms and cut off (`activeTurn.interrupt('message')`)
    at the first moment after the provider's first event when its turn watch
    (`runtime/watchdog.mts`) sees no native tool running, no Orbit call announced in the stream
@@ -273,10 +320,22 @@ the existing `executeAgent`. The session loop:
    throws `PauseInterrupt` with the note `INTERRUPTED FOR A MESSAGE`; the session loop resumes the
    same session with it (`pause.interruptedSession`). A first Claude turn that already streamed
    resumes the session Orbit proposed with `--session-id`, as a restart continuation does (a pause
-   of such a turn too); Codex, Cursor and Antigravity name their sessions in the turn's result,
-   so their cut first turns start fresh with the note. A resumed turn cut after its provider
+   of such a turn too); a cut first turn of Codex, Cursor or Antigravity resumes the session its
+   stream named (see "Session ids" above). A resumed turn cut after its provider
    spoke (`PauseInterrupt.spoke`) keeps the session cursor: its prompt is in the session, so the
-   repeat carries only the new note, not again the entries and the notes of earlier cuts.
+   repeat carries only the new note, not again the entries and the notes of earlier cuts. For a
+   CLI known to keep a cut turn's prompt (`pause.KEEPS_CUT_PROMPT`: Claude and Antigravity), the
+   mail that prompt carried is held too (`held` in `sessionLoop`): the repeat does not hand it over
+   again and marks it read with its own mail; a fresh session (the cut one could not be resumed, a
+   handover) gets it again. Claude's session log records the prompt as the turn begins;
+   Antigravity records the user input as the turn's first step, before any step of the model.
+   Checked live 2026-10-01 (`scratchpad/i18/live.cjs`: Orbit's `runProvider`, as an agent turn
+   calls it, cut by its abort signal, then resumed with the session its stream named; Antigravity
+   on Claude Sonnet 4.6, as Gemini was refused for the region): first and resumed turns cut 5-17 ms
+   after the model's first text or the start of its command, resumed at once or 3 s later; all 6
+   resumed sessions answered with the random code only the cut prompt carried. Codex and Cursor
+   are not checked yet (both were out of quota): their resumed session is given the mail again,
+   as a copy costs less than a lost message.
 
 Every CLI process a provider turn starts, on both transports (Claude, Codex exec and App
 Server, Cursor, Antigravity), gets `ProviderRunOptions.extraEnv` in its environment. The

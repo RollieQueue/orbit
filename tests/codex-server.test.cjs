@@ -16,6 +16,8 @@ readline.createInterface({input:process.stdin}).on('line', line => {
   }
   if (m.method === 'turn/start') {
     if(m.params.effort !== 'high') throw Error('Missing effort');
+    // Codex drops a line with an escaped lone surrogate and never answers; the fixture fails loudly instead.
+    if(m.params.input[0].text !== m.params.input[0].text.toWellFormed()) throw Error('Lone surrogate');
     const schema = m.params.outputSchema;
     if (!schema || !schema.required.includes('tool_calls') || schema.additionalProperties !== false) throw Error('Missing strict Orbit output schema');
     const spawn = schema.properties.tool_calls.items.anyOf.find(call => call.properties.name.enum[0] === 'spawn_agent');
@@ -45,6 +47,10 @@ for (const approved of [true, false]) test(`App Server transports effort and ${a
   assert.equal(calls, 1)
   assert.equal(result.text, `Decision: ${approved ? 'accept' : 'decline'}`)
   assert.equal(events.find(event => event.kind === 'reasoning').text, 'Checking permissions')
+})
+test('App Server sends a string bounded inside an emoji well-formed', async () => {
+  const result = await runCodexServer({ workspace: process.cwd(), accessMode: 'workspace-write', responseSchema: ORBIT_RESPONSE_SCHEMA, reasoningEffort: 'high', timeoutMs: 3000, prompt: 'Cut \ud83d', onApproval: async () => true }, helpers(fixture))
+  assert.equal(result.text, 'Decision: accept')
 })
 test('App Server cancellation interrupts an unanswered approval', async () => {
   const controller = new AbortController()

@@ -132,7 +132,7 @@ const REPEATABLE = new Set([
  * @property {(level: LogLevel, text: string) => void} [log]
  * @property {() => void} [beforeFork] called right before each runtime process is forked (main hashes the runtime code
  *   there); when it throws, no process is forked: the runtime is stopped with its message and not restarted on its own
- * @property {(url: string) => Promise<string | null> | string | null} [resolveProxy] the system proxy route for a URL, which the runtime process cannot resolve itself (main: session.defaultSession.resolveProxy)
+ * @property {(url: string) => Promise<string | null> | string | null} [resolveProxy] the system proxy route for a URL, which the runtime process cannot resolve itself (main: a session left on the system's settings); inprocess mode installs it too
  * @property {(pid: number) => Promise<void>} [killTree] default: killProcessTree
  * @property {() => Promise<ProcessRow[] | null>} [listProcesses] the process table the orphans of a runtime that is gone
  *   are found in; null when it cannot be read (then nothing is stopped). Default: listProcessTable
@@ -1091,6 +1091,10 @@ function inprocessClient({ options, settings, log, onEvent, askApproval, status,
   const build = async () => {
     // Loaded only in this mode: a child-mode main never loads the runtime's modules.
     const create = options.createService ?? require('./runtime-host.mts').createRuntimeService
+    // The system proxy as a child process gets it from main (provider-network.mts systemProxy): Electron's default
+    // session is the window's, which may go through the environment's proxy (electron/window-proxy.cjs).
+    const resolve = options.resolveProxy
+    if (resolve) require('./provider-network.mts').setProxyResolver(async (/** @type {string} */ url) => (await resolve(url)) ?? null)
     const overrides = loadFixtures(env.ORBIT_RUNTIME_FIXTURES)
     return create({
       userData: options.userData, repoRoot: options.repoRoot, emit: onEvent, requestApproval, cancelApproval, log,

@@ -1,0 +1,101 @@
+{
+ "improvements": [
+  {
+   "id": "I1",
+   "title": "Самообновление: полный вывод проверок сохраняется в artifacts, а отказ restart_orbit называет упавшие тесты (строки not ok с сообщением проверки), даже если они не попали в последние строки вывода",
+   "status": "done",
+   "evidence": "scripts/self-upgrade.cjs: run() передаёт вывод шага дальше через pipe, дописывает его в artifacts/self-upgrade-checks.log (сбрасывается в начале запуска с проверками/сборкой) и собирает упавшее на лету (failureCollector: TAP not ok с error/location, без subtestsFailed и TODO; ошибки tsc с файлом и без). Ошибка шага: «test exited with 1 (2 failed: inner fails, throws plain)»; failWithReport печатает список последним; отчёт self-upgrade-last.json получает failures/failuresTotal/checksLog. Проверено: 2 новых теста в tests/self-upgrade.test.cjs; self-upgrade + restart-orbit + restart-notices 77/77; живой прогон run() с настоящим node --test (2 падения названы с сообщением и file:line) и tsc 7.0.2 (TS2322/TS2304 с местом); --dry-run скрипта ок. CHANGELOG «Не выпущено (после 0.5.0)», README (раздел самообновления). Применяется этим restart_orbit (уровень renderer: package.json 0.5.0 изменил входы окна)."
+  },
+  {
+   "id": "I2",
+   "title": "Бесконечное улучшение: нужен ли restart_orbit — по отпечаткам файлов на диске против работающего экземпляра (self-upgrade-health.json), а не по записям fileActivity: правка командой оболочки тоже требует перезапуска, откатанная правка — нет (TECH-DEBT 17 и остаток 19)",
+   "status": "done",
+   "evidence": "electron/resume.mts: healthFilePath (как main.cjs: ORBIT_HEALTH_FILE, «0» — нет) и unappliedCode — отпечатки кода на диске (fingerprint.cjs: shell/runtime/renderer) против отчёта здоровья, принятого только при ok, runtime.pid === pid этого процесса runtime, writtenAt ≥ старта процесса и всех трёх хэшах, иначе null; createRestartHost получил unapplied() (опция healthFile). electron/runtime/improvement.mts missing(): [] — перезапуск не нужен (отменённая правка), непусто — напоминание с названием частей, null — прежняя проверка по fileActivity. Проверено: tsc -p tsconfig.main.json и tsc --noEmit чисто; новые тесты (restart-orbit: правка через fs → runtime, откат с CRLF → [], новый файл, src → renderer, package.json → shell+renderer, 9 случаев null; improvement-loop-runtime: правка без fileActivity требует restart_orbit с названием части, отменённая — без напоминания), на старом коде они падают; 7 целевых файлов 119/119; живой прогон на настоящем artifacts/self-upgrade-health.json (runtime pid 15212 у главного 4420) → [runtime] после правок, чужой pid → null. Ревью GPT-6 Astra: pid-проверка верна во всех отчётах и режимах, сравнение как decideLevel; исправлено низкое (Number() на испорченном поле бросал TypeError), среднее старое (скрипт не знает ORBIT_HEALTH_FILE) — TECH-DEBT 22 и задача I15. CHANGELOG, README, TECH-DEBT 17/19. Применяется этим restart_orbit (уровень runtime)."
+  },
+  {
+   "id": "I3",
+   "title": "Карточка запуска после отката restart_orbit показывает исход «откатился», а не «Агент перезапустил Orbit» (TECH-DEBT 13)",
+   "status": "done",
+   "evidence": "src/state-store.ts: settlingRestart(chat, runId) → {kind, text} заметки чата о перезапуске без продолжения (rolled-back/loop-limit/expired/failed; settlingRestartText и restartWaits теперь через неё), restartCardDetail(run, outcome): откат → «Перезапуск Orbit не удался и откатился, работает прежний код. Агент перезапускал Orbit: <причина>.», прочие исходы → «… Продолжение не запущено.», без исхода — как раньше. src/ChatPane.tsx: исход считается только у запуска restarting без продолжения, после отката карточка и точка в тоне failed. Проверено: npx tsc --noEmit чисто; новый тест в tests/restart-notices.test.cjs; restart-notices + state-store + improvement-loop 61/61; ревью GPT-6 Astra (codex) — замечаний нет (runId заметки = intent.runId = id запуска карточки во всех путях: живое уведомление, загрузка, сохранённый чат; restartWaits/settlingRestartText эквивалентны прежним). Окно вживую не смотрелось (нет отката для показа). CHANGELOG «Не выпущено», README (раздел перезапуска), TECH-DEBT 13. Применяется этим restart_orbit (ожидается уровень renderer)."
+  },
+  {
+   "id": "I4",
+   "title": "Пауза и остановка: остановка помощника будит руководителя в wait_message; подагенты получают подпись «Остановлен вместе с руководителем»; ход, прерванный паузой, не идёт в лимит; запись о паузе не дублируется в новой сессии (TECH-DEBT 20)",
+   "status": "done",
+   "evidence": "pause.mts stopAgent будит messageWaiters руководителя; mailbox.mts waitAgentMessage при остановленном помощнике (stoppedByUser, завершён, результат не получен) возвращается сразу с полем stopped [{agentId,name,status}] и note, называет каждого один раз (WeakMap stopsNamed), результат не забирает (идёт обычным путём: wait_agent, child_result/HELPER RESULT следующего хода); ожидание, пережившее свой ход (пауза), никого не называет (activeTurn === turn). loops.mts executeAgent: агент, уже отменённый с причиной, сохраняет detail/finishedAt («Остановлен вместе с руководителем», Stopped by the user, RESTART_DETAIL); sessionLoop: переход к новой сессии после паузы не дублирует запись о паузе. turn.mts providerTurn: ход, прерванный паузой, возвращается в лимиты. src/QuotaPanel.tsx, src/AgentHistory.tsx: точки через shownStatus. Проверено: tests/pause-agents.test.cjs 12/12 (4 новых, 2 уточнены; до правок 4 падали по описанным причинам; тест брошенного ожидания падает без проверки хода); 16 связанных файлов 222/222; tsc main и renderer чисто. Ревью GPT-6 Astra (codex): high нет, 2 medium настоящие (помощник отмечен полученным до доставки ответа при maxConcurrent=1; обрезка stopped длинным сообщением) — исправлены сменой подхода (ожидание только называет помощника), гонка перепроверена пробой: результат приходит следующим возобновлением. Попутно: TECH-DEBT 23 (брошенное паузой ожидание забирает почту пользователя, проверено пробой) → задача I16. CHANGELOG, README (пауза и остановка), T…"
+  },
+  {
+   "id": "I5",
+   "title": "Вложения, остатки ревью: файлы не остаются на диске при отклонённой отправке и после удаления чата (канал attachments:discard); нет пустого пузыря сообщения из одних файлов на время загрузки",
+   "status": "pending",
+   "evidence": ""
+  },
+  {
+   "id": "I6",
+   "title": "Видно, что модель думает: Claude CLI шлёт system/thinking_tokens (estimated_tokens) — показать «думает · ~N тыс. токенов» в строке «Агент работает»",
+   "status": "pending",
+   "evidence": ""
+  },
+  {
+   "id": "I7",
+   "title": "Сообщение пользователя, не обработанное из-за упавшего хода, не остаётся молча «Доставлено»: к ответу дописывается, что оно не обработано (TECH-DEBT 15); плюс мелочи ревью T15 (сообщение из прерванного хода не уходит повторно)",
+   "status": "pending",
+   "evidence": ""
+  },
+  {
+   "id": "I8",
+   "title": "Цикл, мелочи из ревью T4: номер задачи не перескакивает, если повторённый потерянный старт отклонён (loopStartFailed берёт iteration−1 без previousIteration)",
+   "status": "pending",
+   "evidence": ""
+  },
+  {
+   "id": "I9",
+   "title": "Прерванный первый ход Codex, Cursor и Antigravity продолжает свою сессию: id сессии берётся из события потока, а не только из итога хода (остаток TECH-DEBT 14)",
+   "status": "pending",
+   "evidence": ""
+  },
+  {
+   "id": "I10",
+   "title": "Метки [orbit] MESSAGE FROM THE USER / SUPERVISOR нельзя подделать выводом инструмента: секрет сессии в метке (TECH-DEBT 16)",
+   "status": "pending",
+   "evidence": ""
+  },
+  {
+   "id": "I11",
+   "title": "Хранилище запусков: удаление старых записей run-history (срок или число), сейчас записи копятся бесконечно",
+   "status": "pending",
+   "evidence": ""
+  },
+  {
+   "id": "I12",
+   "title": "Эндпоинты провайдеров: для удалённых хостов требовать https (http только для localhost)",
+   "status": "pending",
+   "evidence": ""
+  },
+  {
+   "id": "I13",
+   "title": "Новая функция: выбор модели по типу поручения в spawn_agent (code/review/lookup/text) по таблице маршрутизации с учётом квот",
+   "status": "pending",
+   "evidence": ""
+  },
+  {
+   "id": "I14",
+   "title": "Навыки, остатки T14: prefers-reduced-motion у праздника; живая проверка сцены навыка в настоящем окне",
+   "status": "pending",
+   "evidence": ""
+  },
+  {
+   "id": "I15",
+   "title": "Самообновление: scripts/self-upgrade.cjs и его наблюдатель читают отчёт здоровья там же, где его пишет главный процесс (ORBIT_HEALTH_FILE, «0» — нет отчёта), а не только artifacts/self-upgrade-health.json (TECH-DEBT 22)",
+   "status": "pending",
+   "evidence": ""
+  },
+  {
+   "id": "I16",
+   "title": "Ожидание (wait_message, wait_agent), оборванное паузой в режиме сессии, не забирает почту пользователя и результаты помощников: обрывать ожидания хода вместе с ходом или отмечать прочитанным только дошедшее до модели (TECH-DEBT 23)",
+   "status": "pending",
+   "evidence": ""
+  }
+ ],
+ "handoff": "Цель: бесконечное улучшение Orbit ночью (пользователь спит). УСЛОВИЕ: никогда не использовать Claude Fable 5.1 (claude-fable-5-1) — ни помощникам, ни для ревью; всегда явно передавать model в spawn_agent. Помощники: код claude-sonnet-5-5 (или codex gpt-6-astra), ревью codex gpt-6-astra (I2, I4: только настоящие находки), поиски codex gpt-6-luna. Мелкую задачу делать самому + одно ревью. Каждое изменение — запись в docs/CHANGELOG.md «## Не выпущено (после 0.5.0)» (новые сверху); README — для заметного пользователю; TECH-DEBT — отметить сделанное. Не коммитить. Проверка: tsc -p tsconfig.main.json и tsc --noEmit + целевые тесты + одно ревью; весь набор гоняет restart_orbit (полный вывод — artifacts/self-upgrade-checks.log). improvement_plan заменяет весь план: полные названия и пояснения брать из последней записи %APPDATA%\\orbit-ide\\run-history (память проекта). Цикл требует restart_orbit, если код на диске отличается от работающего (artifacts/self-upgrade-health.json). Окончания строк: большинство LF; electron/runtime/ledger.mts, src/QuotaPanel.tsx, src/AgentHistory.tsx, tests/improvement-loop-runtime.test.cjs — CRLF (Edit сохраняет); проверять tr -cd '\\r'. В тестах режима сессии запрос помощника не содержит «Agent: <имя>;» — отличать по options.session.token (fakeMcp выдаёт token-<agentId>-N). Перед задачей проверить, не сделана ли она уже."
+}

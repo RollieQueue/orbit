@@ -22,6 +22,7 @@ interface OrbitBridge {
   messageAgent: (runId: string, agentId: string, text: string, attachments?: import('./types').Attachment[]) => Promise<import('./types').AgentMessageResult>
   saveAttachments: (chatId: string, files: import('./types').AttachmentUpload[]) => Promise<import('./types').Attachment[]>
   readAttachmentImage: (path: string) => Promise<string | null>
+  discardAttachments: (chatId: string, paths?: string[]) => Promise<number>
   loadState: () => Promise<import('./types').AppState | null>
   saveState: (state: import('./types').AppState) => Promise<unknown>
   projectIndexStatus: (workspace: string, rebuild?: boolean) => Promise<ProjectIndexStatus | null>

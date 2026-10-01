@@ -1,0 +1,240 @@
+diff --git a/scratchpad/i20/base/electron/runtime/turn.mts b/electron/runtime/turn.mts
+index 0e22b8f..c21643f 100644
+--- a/scratchpad/i20/base/electron/runtime/turn.mts
++++ b/electron/runtime/turn.mts
+@@ -198,7 +198,10 @@ async function providerTurn(runtime: OrbitRuntimeLike, run: RunRecord, agent: Ag
+     if (agent.id !== 'root') run.usage.workerTurns++
+     counted = true
+     agent.partialTurn = { messages: new Map(), tools: new Map() }
+-    timing = { turn: agent.turns, transport: agent.transport, startedAt: new Date().toISOString(), firstEventAt: null, endedAt: null, promptChars: 0, nativeToolCalls: 0, orbitToolCalls: 0, sessionId: session?.id || null }
++    // The record names the turn's session as its provider knows it: the one resumed, or Claude's, started under Orbit's id
++    // (--session-id). Codex, Cursor and Antigravity name their own: none until their stream does (below), as the id Orbit
++    // proposes is not theirs. A cut first turn's repeat and a restart's continuation resume it (resume.rootSession).
++    timing = { turn: agent.turns, transport: agent.transport, startedAt: new Date().toISOString(), firstEventAt: null, endedAt: null, promptChars: 0, nativeToolCalls: 0, orbitToolCalls: 0, sessionId: session && (session.resume || agent.providerId === 'claude') ? session.id || null : null }
+     agent.turnTimings.push(timing)
+     runtime.updateAgent(run, agent, { status: 'working', detail: 'Provider is executing', startedAt: agent.startedAt || new Date().toISOString() })
+     // `delivered`: the mail this turn's prompt carries; during a session turn it is no longer pending (see pendingMail).
+@@ -224,8 +227,8 @@ async function providerTurn(runtime: OrbitRuntimeLike, run: RunRecord, agent: Ag
+       signal: controller.signal, timeoutMs: run.limits.timeoutMs,
+       onEvent: (event) => {
+         if (controller.signal.aborted) return
+-        // The stream naming its session is not the model speaking: a cut first turn resumes that session (below), and the
+-        // turn's record names it at once rather than the id Orbit proposed.
++        // The stream naming its session is not the model speaking: the turn's record names that session at once, and a cut
++        // first turn resumes it (below).
+         if (event?.kind !== 'session') return runtime.providerEvent(run, agent, event)
+         if (!session || !event.sessionId || !timing) return
+         timing.sessionId = named = event.sessionId
+@@ -254,11 +257,11 @@ async function providerTurn(runtime: OrbitRuntimeLike, run: RunRecord, agent: Ag
+     if (interrupted && !signal.aborted) {
+       refund()
+       // The model itself spoke (a stderr line or a note from before the CLI started does not count): its session holds
+-      // the turn's prompt. A first session turn that spoke has its session, which the repeat resumes: the one its stream
+-      // named (Codex, Cursor, Antigravity), or Claude's under Orbit's id (--session-id), as a restart's continuation
+-      // resumes it (resume.rootSession).
++      // the turn's prompt. A first session turn that spoke has its session, which the repeat resumes: the one the turn's
++      // record names (named by the stream of Codex, Cursor or Antigravity, or Claude's under Orbit's id), as a restart's
++      // continuation resumes it (resume.rootSession).
+       const spoke = watch ? Number.isFinite(watch.stepAge()) : !!timing?.firstEventAt
+-      const opened = session && !session.resume && spoke ? named || (agent.providerId === 'claude' ? session.id : null) : null
++      const opened = session && !session.resume && spoke ? timing?.sessionId || null : null
+       throw new PauseInterrupt(interrupted === 'message' ? messageNote(agent) : pauseNote(agent, pauseHolder), interrupted, opened, spoke)
+     }
+     if (strayed && !signal.aborted) {
+diff --git a/scratchpad/i20/base/electron/resume.mts b/electron/resume.mts
+index f5c11b0..a010b71 100644
+--- a/scratchpad/i20/base/electron/resume.mts
++++ b/electron/resume.mts
+@@ -459,22 +459,24 @@ function storedNote(old: StoredRun): string {
+   return lines.join('\n')
+ }
+ // The old root's provider session, when it had one: the continuation resumes it if its root keeps that provider. A root
+-// cut off in its first session turn has no `sessionId` yet (it is recorded when a turn returns); for Claude, whose
+-// session Orbit names itself, the record of that turn (turnTimings) holds the id the session was started with — unless
+-// the root moved to Claude after that turn started. Codex, Cursor and Antigravity name their own sessions: their record
+-// holds the id their stream named (turn.mts) or, until it did, the one Orbit proposed, which is not theirs; it is not
+-// used yet (docs/TECH-DEBT.md, item 14). The mark of the old root's mail (saved with the restart) goes along.
++// cut off in its first session turn has no `sessionId` yet (it is recorded when a turn returns); the record of that turn
++// (turnTimings) names its session as the provider knows it (turn.mts): Claude's, started under Orbit's id, or the one the
++// stream of Codex, Cursor or Antigravity named (none until it did, as the id Orbit proposed is not theirs) — unless the
++// root moved to its provider after that turn started. Only a turn that called a tool counts: the one that asked for the
++// restart did (restart_orbit, or the self-upgrade in its shell), so its session holds its prompt, which a turn the
++// restart caught before its model acted may not have yet. The mark of the old root's mail (saved with the restart) goes along.
+ function rootSession(old: StoredRun): { id: string; providerId: string; mailMark?: string } | undefined {
+   const root = (old.agents || []).find(agent => agent.id === 'root')
+   if (root?.transport !== 'session' || typeof root.providerId !== 'string') return undefined
+   const mark = typeof old.restart?.mailMark === 'string' ? { mailMark: old.restart.mailMark } : {}
+   if (typeof root.sessionId === 'string' && root.sessionId) return { id: root.sessionId, providerId: root.providerId, ...mark }
+-  if (root.providerId !== 'claude' || !Array.isArray(root.turnTimings)) return undefined
++  if (!Array.isArray(root.turnTimings)) return undefined
+   const last: unknown = root.turnTimings.at(-1)
+-  const timing = last && typeof last === 'object' ? last as Partial<Record<'transport' | 'sessionId' | 'startedAt', unknown>> : null
++  const timing = last && typeof last === 'object' ? last as Partial<Record<'transport' | 'sessionId' | 'startedAt' | 'orbitToolCalls' | 'nativeToolCalls', unknown>> : null
+   const handover: unknown = Array.isArray(root.handovers) ? root.handovers.at(-1) : null
+   const switchedAt = handover && typeof handover === 'object' ? (handover as { time?: unknown }).time : null
+   if (timing?.transport !== 'session' || typeof timing.sessionId !== 'string' || !timing.sessionId) return undefined
++  if (!(Number(timing.orbitToolCalls) > 0 || Number(timing.nativeToolCalls) > 0)) return undefined
+   if (typeof switchedAt === 'string' && String(timing.startedAt ?? '') < switchedAt) return undefined
+   return { id: timing.sessionId, providerId: root.providerId, ...mark }
+ }
+diff --git a/scratchpad/i20/base/tests/restart-orbit.test.cjs b/tests/restart-orbit.test.cjs
+index 8bc4e53..563378b 100644
+--- a/scratchpad/i20/base/tests/restart-orbit.test.cjs
++++ b/tests/restart-orbit.test.cjs
+@@ -439,16 +439,24 @@ test('a continuation resumes the old root session when it keeps the provider, an
+   writeIntent(userData, { runId: 'first-turn-run', chatId: 'chat-first-turn-run', continueWith: 'Go on with the tool' })
+   assert.equal((await continuationOf(runtime, await resume.resumePending({ runtime, userData }))).status, 'completed')
+   assert.deepEqual(calls.map(call => [call.id, call.resume]), [['first-turn-session', true]], 'the cut-off first turn\'s session is resumed')
+-  // Not for a provider that names its own sessions (the id Orbit proposed is not Codex's thread), nor when the root
+-  // moved to Claude after that turn had started.
+-  oldRun('codex-run', null, { providerId: 'codex', turnTimings: [timing('proposed-by-orbit')] })
++  // So is the session a provider that names its own sessions named in its stream (a Codex thread here).
++  oldRun('codex-run', null, { providerId: 'codex', turnTimings: [timing('thread-named')] })
++  calls.length = 0
++  writeIntent(userData, { runId: 'codex-run', chatId: 'chat-codex-run', continueWith: 'Go on with the tool' })
++  assert.equal((await continuationOf(runtime, await resume.resumePending({ runtime, userData }))).status, 'completed')
++  assert.deepEqual(calls.map(call => [call.id, call.resume]), [['thread-named', true]], 'the session the stream named is resumed')
++  // Not when the stream of such a provider had named none yet (the record then names no session), when the turn had not
++  // called a tool yet (its session may not hold its prompt; the turn that asked for the restart did call one), nor when
++  // the root moved to Claude after that turn had started.
++  oldRun('unnamed-run', null, { providerId: 'codex', turnTimings: [timing(null)] })
++  oldRun('idle-run', null, { providerId: 'codex', turnTimings: [{ ...timing('thread-idle'), orbitToolCalls: 0 }] })
+   oldRun('moved-run', null, { turnTimings: [timing('before-the-handover')], handovers: [{ id: 'h1', time: new Date(Date.now() - 30000).toISOString(), reason: 'exhausted', from: { providerId: 'codex', model: 'm' }, to: { providerId: 'claude', model: 'm' }, fresh: false }] })
+-  for (const runId of ['codex-run', 'moved-run']) {
++  for (const runId of ['unnamed-run', 'idle-run', 'moved-run']) {
+     calls.length = 0
+     writeIntent(userData, { runId, chatId: `chat-${runId}`, continueWith: 'Go on' })
+     await continuationOf(runtime, await resume.resumePending({ runtime, userData }))
+     assert.deepEqual(calls.map(call => call.resume), [false], `${runId}: a fresh session`)
+-    assert.ok(!['proposed-by-orbit', 'before-the-handover'].includes(calls[0].id), runId)
++    assert.ok(!['thread-named', 'thread-idle', 'before-the-handover'].includes(calls[0].id), runId)
+     assert.match(calls[0].system, /"\[orbit:[0-9a-f]{10}\] MESSAGE FROM THE USER"/)
+     assert.ok(!calls[0].system.includes('a1b2c3d4e5'), `${runId}: a fresh session gets a mark of its own`)
+   }
+@@ -466,6 +474,67 @@ test('a continuation resumes the old root session when it keeps the provider, an
+   assert.ok(!calls[0].prompt.includes('a1b2c3d4e5'), 'a root that does not resume the session gets a mark of its own')
+ })
+ 
++// Codex, Cursor and Antigravity name their sessions themselves, in the stream as the turn begins (a `session` event); the
++// id Orbit proposes for a first turn is not theirs. A root the restart cuts off in that turn (after it ran the
++// self-upgrade in its shell) is continued in the session its stream named, which its saved record holds. A CLI that does
++// not find that session and silently opens another one (`codex exec resume`, the App Server) is stopped before its
++// model acts, and the continuation starts afresh with the full prompt.
++for (const variant of ['named', 'unnamed', 'stray']) test(`a root the restart cuts off in its first turn on a CLI that names its sessions: the continuation ${{ named: 'resumes the session its stream named', unnamed: 'starts fresh when the stream had named none', stray: 'starts afresh when the CLI answers the resume in another session' }[variant]}`, async t => {
++  const userData = folder(t), workspace = folder(t)
++  const named = variant !== 'unnamed'
++  const session = { transportFor: () => 'session', mcp: fakeMcp() }
++  const proposed = []
++  const before = runtimeWith({ ...session, runStore: new RunStore(userData), runProvider: options => {
++    proposed.push(options.session.id)
++    if (named) options.onEvent({ kind: 'session', sessionId: 'thread-named' })
++    options.onEvent({ kind: 'output', text: 'Applying the change', partial: true })
++    options.onEvent({ kind: 'tool', native: true, tool: 'shell', toolId: 'upgrade', status: 'started', text: 'npm run self-upgrade' })
++    return blocking(options)
++  } })
++  const runId = await before.start(payload(workspace, { chatId: 'chat-a', accessMode: 'danger-full-access' }))
++  const root = before.runs.get(runId).agentNodes.get('root')
++  await waitFor(() => root.partialTurn?.messages.size && root.turnTimings[0]?.nativeToolCalls)
++  assert.equal(root.turnTimings[0].sessionId, named ? 'thread-named' : null, 'the record names the session the stream named, never the id Orbit proposed')
++  writeIntent(userData, { runId, chatId: 'chat-a', continueWith: 'Check that the change runs' })
++  assert.deepEqual(resume.markRestartingRuns({ runtime: before, userData }), [runId])
++  await waitFor(() => !root.activeTurn)
++  const saved = new RunStore(userData).get(runId)
++  assert.equal(saved.agents.find(agent => agent.id === 'root').turnTimings[0].sessionId, named ? 'thread-named' : null)
++
++  const calls = [], recorded = []
++  const after = runtimeWith({ ...session, runStore: new RunStore(userData), runProvider: options => {
++    calls.push(options)
++    recorded.push([...after.runs.values()].find(run => run.resumedFrom === runId)?.agentNodes.get('root').turnTimings.at(-1)?.sessionId)
++    if (variant === 'stray' && options.session.resume) {
++      options.onEvent({ kind: 'session', sessionId: 'thread-other' })
++      return blocking(options)
++    }
++    return Promise.resolve({ text: 'The change runs', sessionId: options.session.resume ? options.session.id : 'thread-fresh' })
++  } })
++  const continuation = await continuationOf(after, await resume.resumePending({ runtime: after, userData }))
++  assert.equal(continuation.status, 'completed')
++  assert.deepEqual(calls.map(call => call.session.resume), { named: [true], unnamed: [false], stray: [true, false] }[variant])
++  const fresh = calls.at(-1)
++  if (named) {
++    assert.equal(calls[0].session.id, 'thread-named')
++    assert.equal(recorded[0], 'thread-named', 'the record of a resumed turn names its session from the start')
++    assert.match(calls[0].prompt, /Check that the change runs\n\nOrbit перезапущен с новым кодом[\s\S]*RESTART NOTE: Orbit restarted with new code[\s\S]*Applying the change/)
++    assert.doesNotMatch(calls[0].prompt, /YOUR CURRENT TASK/, 'the resumed session holds the task')
++    assert.ok(calls[0].session.systemAppend.includes(`[orbit:${saved.restart.mailMark}]`), 'the resumed session keeps the mark of its mail')
++  }
++  if (variant === 'stray') {
++    assert.equal(calls[0].signal.aborted, true, 'the stray session is stopped before its model acts on a prompt without the task')
++    assert.ok(continuation.traces.some(trace => trace.kind === 'transport' && /could not be resumed \(.*opened session thread-other instead of resuming thread-named/.test(trace.text)))
++    assert.equal(after.runs.get(continuation.runId).resumeSession, undefined)
++  }
++  if (variant !== 'named') {
++    assert.ok(![proposed[0], 'thread-named', 'thread-other'].includes(fresh.session.id))
++    assert.match(fresh.prompt, /YOUR CURRENT TASK:\nCheck that the change runs/)
++    assert.match(fresh.prompt, /RESTART NOTE: Orbit restarted with new code/)
++  }
++  assert.equal(continuation.agents.find(agent => agent.id === 'root').sessionId, variant === 'named' ? 'thread-named' : 'thread-fresh')
++})
++
+ test('a continuation names the files the user attached in the run it continues, those still saved, and keeps them for the next restart', async t => {
+   const userData = folder(t), workspace = folder(t)
+   const { saveAttachments } = require('../electron/attachments.mts')
+diff --git a/scratchpad/i20/base/docs/TECH-DEBT.md b/docs/TECH-DEBT.md
+index e9e2a41..0c87a17 100644
+--- a/scratchpad/i20/base/docs/TECH-DEBT.md
++++ b/docs/TECH-DEBT.md
+@@ -78,9 +78,10 @@
+     `turn/steer` App Server) не понадобился: прерывание одинаково работает у всех провайдеров. 2026-10-01: прерванный
+     первый ход Codex, Cursor и Antigravity тоже продолжает свою сессию, если модель уже начала отвечать: id сессии
+     приходит событием потока (`session`), а не только в итоге хода. Продолжение, в котором CLI молча открыл другую
+-    сессию, останавливается, и начинается новая с полным запросом. Осталось: продолжение после `restart_orbit` в
+-    первом ходе корня на этих провайдерах начинается в новой сессии (`resume.rootSession` берёт id из записи хода
+-    только у Claude).
++    сессию, останавливается, и начинается новая с полным запросом. Тоже 2026-10-01: продолжение после `restart_orbit`
++    в первом ходе корня на этих провайдерах возобновляет сессию, названную потоком. Запись хода у них не называет
++    сессию, пока её не назвал CLI (id, предложенный Orbit, не их), и `resume.rootSession` берёт id из записи хода у
++    любого провайдера.
+ 15. **Сделано 2026-10-01: сообщение, которое не обработал упавший ход, названо под ответом.** Агент с готовым
+     ответом получает ещё один ход ради сообщения. Если этот ход падает без восстановления, отдаётся готовый ответ, а под
+     ним Orbit пишет, что сообщение осталось без ответа, и приводит его начало (`answerAsKept`,
+diff --git a/scratchpad/i20/base/docs/SESSION-MODE.md b/docs/SESSION-MODE.md
+index c0d3ac1..77c5d2f 100644
+--- a/scratchpad/i20/base/docs/SESSION-MODE.md
++++ b/docs/SESSION-MODE.md
+@@ -144,8 +144,9 @@ Since 2026-10-01 these CLIs' ids are also known before a turn's result: the prov
+ a `session` event as soon as the stream names the session (Codex `thread.started`; the
+ Cursor and Antigravity session parsers on the first valid id, again only if it changes;
+ the Codex App Server with its thread, before `turn/start`). `providerTurn`
+-(`runtime/turn.mts`) records it in the turn's timing (`sessionId`, in place of the id
+-Orbit proposed) and, when a pause or a message cuts a first session turn after its model
++(`runtime/turn.mts`) records it in the turn's timing (`sessionId`; until then a fresh
++session turn of these CLIs records none, as the id Orbit proposed is not theirs) and, when
++a pause or a message cuts a first session turn after its model
+ spoke, throws it as `PauseInterrupt.sessionId`: the repeat resumes that session, as it
+ always did for Claude under Orbit's own id. A first turn cut before its model spoke still
+ starts fresh, since its session may not hold the prompt yet. The event is not the model
+@@ -158,7 +159,10 @@ restart (`run.resumeSession`) whose stream names another session is stopped at o
+ full prompt. An Antigravity conversation cut in its first turn resumes from a new folder,
+ as after an Orbit restart (checked live 2026-10-01: first turns cut 6-11 ms after their first
+ text resumed from a new folder, and the conversation held the cut prompt). A continuation
+-after `restart_orbit` still resumes only Claude's first-turn session (`resume.rootSession`).
++after `restart_orbit` that cut off a root's first session turn resumes the session that turn's
++timing names (`resume.rootSession`), for these CLIs as for Claude, once that turn had called
++a tool (the turn that asked for the restart did); when the stream had named none yet, or the
++turn had called no tool, the continuation starts fresh with the restart note.
+ 
+ ### Per-call limits of MCP clients (2026-09-30)
+ 
+diff --git a/scratchpad/i20/base/docs/CHANGELOG.md b/docs/CHANGELOG.md
+index 5042577..e534138 100644
+--- a/scratchpad/i20/base/docs/CHANGELOG.md
++++ b/docs/CHANGELOG.md
+@@ -4,6 +4,8 @@
+ 
+ ## Не выпущено (после 0.5.0)
+ 
++- **Перезапуск в первом ходе агента на Codex, Cursor или Antigravity продолжает его сессию.** Когда корневой агент применяет правку Orbit (`restart_orbit`), Orbit перезапускается и продолжает задачу новым запуском в том же чате. Если у агента уже была сессия CLI, продолжение возобновляет её, и модель помнит, что делала до перезапуска. Но если перезапуск приходился на первый ход агента на Codex, Cursor или Antigravity, продолжение начиналось в новой сессии. Модель получала только заметку о перезапуске с последним текстом и действиями, а контекст сессии (прочитанные файлы, результаты команд, рассуждения) пропадал. Эти CLI сами называют свою сессию: её id приходит в потоке, а итога хода, где он тоже есть, у оборванного хода нет. Запись хода хранила то id из потока, то id, который предлагал Orbit, и отличить одно от другого было нельзя. Поэтому продолжение верило записи хода только у Claude, чью сессию Orbit называет сам. Теперь запись хода у этих CLI не называет сессию, пока её не назовёт CLI, и продолжение после перезапуска возобновляет сессию из записи у любого провайдера. Возобновляется только ход, который успел вызвать инструмент: ход, попросивший перезапуск, его вызвал (`restart_orbit` или самообновление в оболочке), и его запрос уже есть в сессии. Если поток не успел назвать сессию, продолжение, как и раньше, начинается заново. Если CLI не найдёт сессию, продолжение тоже начнётся заново с полным запросом: Claude сообщает об ошибке, а Codex молча открывает другую сессию, и такой ход останавливается раньше, чем модель начнёт действовать. Подсказка «Сессия …» в истории агента у первого хода этих CLI больше не показывает id, предложенный Orbit. Возобновление разговора Antigravity после обрыва проверено живьём раньше; у Codex и Cursor живой проверки нет, пока у них кончилась квота. Код: `electron/runtime/turn.mts` (`providerTurn`), `electron/resume.mts` (`rootSession`). Тесты: `tests/restart-orbit.test.cjs` (+3 сквозных: поток назвал сессию, не назвал, CLI ответил в чужой; сохранённые записи Codex: названная сессия и ход без инструментов). Закрывает остаток пункта 14 в `docs/TECH-DEBT.md`.
++
+ - **Cursor: прочитанные и изменённые файлы видны во вкладке «Файлы» и в «Изменениях», а неудачная правка не считается правкой.** Cursor по умолчанию работает в режиме конверта: режим сессии у него только в «Полном доступе» и по явному включению (`ORBIT_CURSOR_SESSION=1`). В режиме конверта Orbit записывал вызовы инструментов Cursor сырым JSON и не знал, какой файл тот прочитал или изменил. Поэтому правки, которые Cursor в «Полном доступе» делает своими инструментами, не попадали ни во вкладку «Файлы», ни в карту файлов других агентов, ни в «Изменения». Теперь режим конверта разбирает инструменты Cursor так же, как режим сессии: в истории видна команда, путь или шаблон поиска вместо JSON, а чтения и правки файлов учитываются, как у других CLI. Заодно исправлено, что считать неудачей. Cursor сообщает о ней не только словами `error`, `failure` и `rejected`, но и `fileNotFound`, `writePermissionDenied`, `timeout` и другими. Раньше такие ответы считались успехом, и в режиме сессии правка, которую Cursor не смог записать, попадала в «Изменения» с чужим диффом из git. Теперь успехом считается только вариант успеха (`success` и немногие похожие). И страховка: если у вызова нет `call_id`, Orbit связывает его начало и конец по собственному id вызова (`toolCallId`), а не по всему тексту, к которому в конце добавляется результат. Иначе такой вызов считался бы идущим до конца хода: сторож тишины молчал бы, а ваше сообщение ждало бы конца хода. Нынешний Cursor CLI (2026.09.26) `call_id` присылает, так что это защита на будущее. Проверено тестом на событиях в форме записей реального Cursor. Живьём не проверено: на подписке Cursor Free исчерпан лимит.
+ 
+ - **Агент на Antigravity не получает одно и то же сообщение дважды после прерванного хода.** Если ваше сообщение или пауза прерывает ход, Orbit продолжает ту же сессию CLI. Почту, которую нёс запрос прерванного хода, у Claude он второй раз не передавал: известно, что Claude Code записывает запрос в сессию в начале хода. Остальным CLI почту передавали повторно, потому что не было проверено, сохраняют ли они такой запрос, а лишняя копия лучше потерянного сообщения. Теперь проверено живьём, что Antigravity сохраняет: запрос пользователя он записывает первым шагом хода, ещё до ответа модели. Проверка вызывала провайдера так же, как ход агента (`runProvider` Orbit), с секретным кодом в запросе и обрывала вызов его сигналом отмены, как это делает пауза. Обрыв приходился на 5–17 мс после первого текста модели или после начала её команды (`ping`). Проверены первые ходы (продолжение шло уже из новой папки) и продолжения сессии. Следующий ход начинался сразу, как в Orbit, или через 3 с. Во всех 6 случаях продолжение назвало код. Поэтому у Antigravity, как у Claude, такое сообщение больше не повторяется. Новая сессия (после смены подписки или если прежнюю нельзя продолжить) получает его снова. А если ход оборван до того, как модель начала отвечать, сообщение передаётся повторно, как раньше. Gemini в Antigravity отклонялся по региону, поэтому проверка шла на Claude Sonnet 4.6. Запрос записывает сам CLI, поэтому от модели это, скорее всего, не зависит, но Gemini не проверялся. Codex и Cursor пока не проверены (у обеих подписок кончилась квота), им сообщение по-прежнему передаётся повторно. Сценарий проверки: `scratchpad/i18/live.cjs`. Код: `electron/runtime/pause.mts` (`KEEPS_CUT_PROMPT`). Тесты: `tests/steer-messages.test.cjs` (проверка «почта передаётся снова» стала парой: Antigravity её удерживает, Codex получает повторно; +1: ход, оборванный паузой до ответа модели, получает почту снова). Тесты ловят все 5 намеренно внесённых ошибок.

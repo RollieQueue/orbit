@@ -1,7 +1,7 @@
 import { useEffect, useState, type ReactNode } from 'react'
 import type { HandoverTarget, RunSnapshot } from './types'
 import { plural, timeOf } from './format'
-import { actionCount, durationMs, formatDuration, openTurn, runNotices, transportLabel } from './run-events'
+import { actionCount, durationMs, formatDuration, openTurn, runNotices, thinkingText, transportLabel } from './run-events'
 
 function useTick(ms: number, enabled: boolean) {
   const [, setTick] = useState(0)
@@ -29,12 +29,15 @@ export function WorkingStatus({ run, starting, label, children }: WorkingStatusP
   const totalMs = run ? durationMs(run.startedAt, null, at) : null
   const notices = runNotices(run, label)
   const latest = notices.at(-1)
+  // A thinking model streams nothing visible, sometimes for minutes: the line says it thinks and how much so far.
+  const thinking = thinkingText(turn?.thinking)
   const text = paused ? 'Агент на паузе' : starting && !run ? 'Запускаем агента…'
-    : turn && turnMs !== null ? ['Агент работает', actions ? plural(actions, ['действие', 'действия', 'действий']) : '', formatDuration(turnMs)].filter(Boolean).join(' · ')
+    : turn && turnMs !== null ? ['Агент работает', actions ? plural(actions, ['действие', 'действия', 'действий']) : '', formatDuration(turnMs), thinking].filter(Boolean).join(' · ')
     : totalMs !== null ? `Агент работает · ${formatDuration(totalMs)}` : 'Агент работает'
   // In session mode one turn is one model run that does the whole task, so the turn number says little; actions are counted instead.
   const title = turn ? `Ход ${turn.turn}: ход — один запуск модели; в режиме сессии модель делает за один ход много действий (команды, правки, инструменты Orbit). `
-    + `Режим: ${transportLabel(turn.transport)}${totalMs !== null ? ` · с начала запуска ${formatDuration(totalMs)}` : ''}` : undefined
+    + `Режим: ${transportLabel(turn.transport)}${totalMs !== null ? ` · с начала запуска ${formatDuration(totalMs)}` : ''}`
+    + (thinking ? '. «Думает»: модель рассуждает перед следующим шагом; число токенов — примерная оценка Claude CLI для этого размышления' : '') : undefined
   return <>
     <div className="working-indicator" role="status"><span className={`status-dot ${paused ? 'paused' : 'working'}`} /><span title={title}>{text}</span>{children}</div>
     {!!notices.length && <details className="chat-notices">

@@ -1,0 +1,78 @@
+{
+ "status": "implementing",
+ "tasks": [
+  {
+   "id": "I21",
+   "title": "Codex App Server, из ревью I9: прерывание во время openCodexSession (после initialize или thread/start, до первого хода) оставляет процесс в sessions до таймаута простоя (30 мин); закрывать его при отмене",
+   "status": "done",
+   "evidence": "electron/codex-server.mts: отмена во время openCodexSession …"
+  },
+  {
+   "id": "I22",
+   "title": "Codex в режиме сессии не получает системный текст Orbit (sessionGuide: кто он, правила инструментов Orbit, делегирования, памяти, «When you finish…»): ни codex exec (buildCodexSessionArgs), ни App Server (openCodexSession/turn/start) не передают session.systemAppend. Передать его первым сообщением …",
+   "status": "done",
+   "evidence": "electron/providers.mts: buildCodexSessionArgs передаёт постоянный блок Orbit (systemAppend) как -c developer_instructions=<строка TOML> каждому процессу codex exec, новому и resume (tomlString = JSON.stringify(wellFormed(text)), DEL экранируется); electron/codex-server.mts: developerInstructions в thread/start и thread/resume, rpcLine: строки JSON-RPC App Server (оба режима Ask) уходят без одиночных суррогатов — Codex такую строку молча отбрасывал, и сессия висела до сторожа. Проверено: оба tsc 0; providers-session + codex-server 24/24 трижды; 8 связанных файлов 168/168; мутации 14/14 на копии в %TMP% (scratchpad/i22/mutate.cjs, mutate.log); живьём на codex-cli 0.155 с подставным Responses API без квоты (scratchpad/i22/live-*.cjs): блок доходит до модели один раз сообщением developer байт в байт, resume не дублирует, тред хранит блок начала, суррогат → U+FFFD, ответ за 388 мс. Ревью claude-opus-5-5: high/medium нет; low 1 (суррогат подвешивал App Server) исправлен (rpcLine + 2 теста), low 2–5 — документация и тест. Попутно в старой записи CHANGELOG восстановлены `\\d` и `\\b`. Docs: CHANGELOG, SESSION-MODE, providers.md, ARCHITECTURE, TECH-DEBT п.16. С настоящей моделью не проверено (квота Codex исчерпана). Применено restart_orbit (runtime, 05:39 UTC): проверки самообновления ok; отчёт здоровья ok, отпечатки shell/runtime/renderer совпадают с файлами, runtime жив (pid 4956)."
+  },
+  {
+   "id": "I23",
+   "title": "История запусков, остатки ревью I11: при переводе часов назад порядок по mtime удаляет новые запуски (и обрезка памяти по startedAt их вытесняет); первая очистка огромной старой истории синхронна в конструкторе (риск startTimeoutMs 20 с); сироты images/<id>, .bak и .tmp без <id>.json не удаляются",
+   "status": "pending",
+   "evidence": ""
+  },
+  {
+   "id": "I24",
+   "title": "Эндпоинты провайдеров, из ревью I12: fetch к Ollama и совместимому API следует редиректам 307/308 и повторяет POST с запросом по новому адресу, в том числе на http:// другого хоста (Authorization при смене origin срезается); проверять адрес редиректа правилом endpointUrl (redirect: 'manual') или от…",
+   "status": "pending",
+   "evidence": ""
+  },
+  {
+   "id": "I26",
+   "title": "Квоты Codex, из ревью I13: упёршийся scoped-бакет одной модели (quota.mts parseCodexLimits: blocked по rateLimitReachedType любого бакета) делает в assess исчерпанными все модели Codex — автозамена и маршрутизация пропускают и gpt-6-astra, и gpt-6-luna; учитывать blocked по бакету (его models)",
+   "status": "pending",
+   "evidence": ""
+  },
+  {
+   "id": "I27",
+   "title": "spawn_agent kind, остатки ревью I13: в пачке конверта помощник, созданный раньше, стартует во время ожидания маршрутизации следующего (холодный каталог): без B в TEAM DIRECTORY, send_message той же пачки приходит уже в ход; предпроверка до ожидания ловит не все отказы (depth/agent/turn limits, pool…",
+   "status": "pending",
+   "evidence": ""
+  },
+  {
+   "id": "I28",
+   "title": "Автозамена, остатки ревью I25: провайдер в пуле без модели (и cursor auto) запускает модель CLI по умолчанию, Orbit её не видит — исключённая (Fable) может пройти; узнавать модель из init провайдера и не брать такую замену; возможно, список исключённых моделей в «Квоты»",
+   "status": "pending",
+   "evidence": ""
+  },
+  {
+   "id": "I30",
+   "title": "Вложения ранних сообщений чата, из ревью I17: дайджест прошлых ходов и team_history (electron/chat-memory.mts) не называют файлы прошлых запусков, а продолжение после restart_orbit приходит без истории чата (restartPayload её убирает) — пути вложений из более ранних сообщений теряются; записи запус…",
+   "status": "pending",
+   "evidence": ""
+  },
+  {
+   "id": "I31",
+   "title": "Почта прерванного хода у Codex и Cursor (остаток I18): когда будет квота (Codex: окно 5 ч до 05:27 UTC 01.10; Cursor Free исчерпан), проверить живьём scratchpad/i18/live.cjs (first/resumed, I18_CUT_ON=tool, I18_RESUME_WAIT_MS=0; Codex exec и App Server); если сохраняют — в pause.KEEPS_CUT_PROMPT",
+   "status": "pending",
+   "evidence": ""
+  },
+  {
+   "id": "I32",
+   "title": "Cursor, остаток ревью I19: удаление файла инструментом Cursor (deleteToolCall, аргументы {path, toolCallId}) не попадает во вкладку «Файлы» и в «Изменения»: его нет в CURSOR_FILE_TOOLS (subscription-providers.mts) и среди WRITE_TOOLS file-activity; учитывать как запись (kind delete из git) с тестом",
+   "status": "pending",
+   "evidence": ""
+  },
+  {
+   "id": "I33",
+   "title": "Продолжение после перезапуска, остаток ревью I20: перезапуск между остановкой хода сторожем (handover.recoverStall бросает сессию) и записью повтора возобновит брошенную сессию — запись хода этого не знает; Cursor --resume с неизвестным id открывает пустой чат под тем же id, защита от чужой сессии …",
+   "status": "pending",
+   "evidence": ""
+  },
+  {
+   "id": "I34",
+   "title": "MCP-сервер Orbit, из ревью I22: ответ инструмента с одиночным суррогатом (текст, обрезанный посреди эмодзи) уходит как \\ud83d, а Codex (serde_json), вероятно, такой JSON не разбирает и вызов Orbit падает; отдавать JSON без одиночных суррогатов (providers.wellFormed), проверить живьём",
+   "status": "pending",
+   "evidence": ""
+  }
+ ],
+ "handoff": "Цель: бесконечное улучшение Orbit. УСЛОВИЕ: никогда не брать Claude Fable 5.1 ни помощникам, ни для ревью. spawn_agent kind=review без model (маршрут по квотам; проверять routed: не fable). Мелкую задачу сам + одно ревью; high/medium и дешёвые low исправлять, остальное в план. Каждое изменение — запись в docs/CHANGELOG.md «## Не выпущено (после 0.5.0)» (новые сверху). Не коммитить. Проверка: оба tsc, целевые тесты, мутации на КОПИИ в %TMP% (образец scratchpad/i22/mutate.cjs; PowerShell: robocopy electron и tests, package.json, tsconfig*.json, Junction node_modules; [IO.Directory]::Delete junction ДО Remove-Item). Diff для ревью: ДО правок копия в scratchpad/<id>/base/, затем git diff --no-index --ignore-cr-at-eol. Codex живьём без квоты: подставной Responses API, память 78fbfe3c (scratchpad/i22/fake-responses.cjs, live-*.cjs). Bash съедает \\\\ в node -e: правки со слэшами — скриптом через Write. Квоты: scratchpad/i18/quota.mjs. Cursor: конверт по умолчанию, stream-json — память ef633a7b. restart_orbit смотрит отпечатки electron/ и src/. Следующая — I23. improvement_plan заменяет весь план: названия из последней записи run-history с improvements. electron/runtime/*.mts ≤ 400 строк (loops.mts 399, turn.mts 296). Окончания строк: git ls-files --eol; CRLF: tools, util, agents, lifecycle, ledger, run-store, store (.mts), failover.mts, codex-server.mts, QuotaPanel.tsx, tests/runtime, providers, storage, failover, improvement-loop-runtime, codex-server; остальное LF."
+}

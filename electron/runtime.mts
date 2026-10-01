@@ -12,7 +12,7 @@
 //   mailbox    team correspondence: send, read, wait, notices, ask_team, the user's messages, the prompt's mail block
 //   changes    file activity, change capture, attributed commands, index readiness
 //   turn       one provider turn and its event stream (buffers, streaming, usage, timings)
-//   handover   subscription failover as applied to an agent (preflight, handover, recovery)
+//   handover   subscription failover as applied to an agent (preflight, handover, recovery), a new helper's model by kind
 //   loops      executeAgent, the envelope loop (loop guard, poll budget) and the session loop (post-answer checks)
 //   session    transport choice, the MCP server, tokens, tools/list, approve and tools/call handlers
 //   tools      executeTool: approval gate, shared notes, improvement plan, workspace, index and team tools
@@ -147,9 +147,9 @@ class OrbitRuntime implements OrbitRuntimeLike {
   sendAgentMessage(run: RunRecord, sender: AgentRecord, args: ToolArgs) { return mailbox.sendAgentMessage(this, run, sender, args) }
   recordCommunication(run: RunRecord, sender: AgentRef, target: AgentRef, text: string, extra?: Partial<Communication>) { return mailbox.recordCommunication(this, run, sender, target, text, extra) }
   readAgentMessages(run: RunRecord, agent: AgentRecord, args?: ToolArgs) { return mailbox.readAgentMessages(this, run, agent, args) }
-  waitForTeam(run: RunRecord, agent: AgentRecord, participants: { id: string }[], timeout?: number) { return mailbox.waitForTeam(this, run, agent, participants, timeout) }
-  waitAgentMessage(run: RunRecord, agent: AgentRecord, args: ToolArgs) { return mailbox.waitAgentMessage(this, run, agent, args) }
-  mailboxContext(run: RunRecord, agent: AgentRecord) { return mailbox.mailboxContext(this, run, agent) }
+  waitForTeam(run: RunRecord, agent: AgentRecord, participants: { id: string }[], timeout?: number, signal?: AbortSignal) { return mailbox.waitForTeam(this, run, agent, participants, timeout, signal) }
+  waitAgentMessage(run: RunRecord, agent: AgentRecord, args: ToolArgs, signal?: AbortSignal, ready?: () => Promise<void>) { return mailbox.waitAgentMessage(this, run, agent, args, signal, ready) }
+  mailboxContext(run: RunRecord, agent: AgentRecord, held?: ReadonlySet<string>) { return mailbox.mailboxContext(this, run, agent, held) }
   askTeam(run: RunRecord, sender: AgentRecord, args: ToolArgs) { return mailbox.askTeam(this, run, sender, args) }
   postUserMessage(runId: string, agentId: string, text: unknown, attachments?: Attachment[]) { return mailbox.postUserMessage(this, runId, agentId, text, attachments) }
   userMail(run: RunRecord, agent: AgentRecord) { return mailbox.userMail(this, run, agent) }
@@ -173,7 +173,7 @@ class OrbitRuntime implements OrbitRuntimeLike {
   runTrackedCommand(run: RunRecord, agent: AgentRecord, args: ToolArgs, context: WorkspaceContext) { return changes.runTrackedCommand(this, run, agent, args, context) }
   // ---- tools and knowledge: Orbit tool execution ----
   approve(run: RunRecord, agent: AgentRecord, request: ApprovalRequest, signal?: AbortSignal) { return tools.approve(this, run, agent, request, signal) }
-  executeTool(run: RunRecord, agent: AgentRecord, name: string, args: ToolArgs, signal?: AbortSignal) { return tools.executeTool(this, run, agent, name, args, signal) }
+  executeTool(run: RunRecord, agent: AgentRecord, name: string, args: ToolArgs, signal?: AbortSignal, ready?: () => Promise<void>) { return tools.executeTool(this, run, agent, name, args, signal, ready) }
   markMemoryUse(run: RunRecord, entries: MemoryEntry[]) { return knowledge.markMemoryUse(this, run, entries) }
   // ---- ledger: transcript and work log ----
   recordLedger(agent: AgentRecord, name: string, text: string) { return ledger.recordLedger(this, agent, name, text) }
@@ -191,12 +191,13 @@ class OrbitRuntime implements OrbitRuntimeLike {
   recordUsage(run: RunRecord, usage: UsageFigures) { return turn.recordUsage(this, run, usage) }
   trackOperation<T>(run: RunRecord, operation: T | PromiseLike<T>, agent: { id: string }): Promise<Awaited<T>> { return turn.trackOperation(this, run, operation, agent) }
   providerTurn(run: RunRecord, agent: AgentRecord, prompt: string | (() => string), sessionOptions?: SessionInfo | null) { return turn.providerTurn(this, run, agent, prompt, sessionOptions) }
-  // ---- handover: subscription failover ----
+  // ---- handover: subscription failover, model routing ----
   failoverActive(run: RunRecord) { return handovers.failoverActive(this, run) }
   providerCatalog(run: RunRecord) { return handovers.providerCatalog(this, run) }
   preflightQuota(run: RunRecord, agent: AgentRecord) { return handovers.preflightQuota(this, run, agent) }
   handover(run: RunRecord, agent: AgentRecord, request: HandoverRequest) { return handovers.handover(this, run, agent, request) }
   recoverProvider(run: RunRecord, agent: AgentRecord, error: unknown) { return handovers.recoverProvider(this, run, agent, error) }
+  routeSpawn(run: RunRecord, parent: AgentRecord, spec: ToolArgs) { return handovers.routeSpawn(this, run, parent, spec) }
   // ---- loops: running an agent to its result ----
   executeAgent(run: RunRecord, agent: AgentRecord) { return loops.executeAgent(this, run, agent) }
   envelopeLoop(run: RunRecord, agent: AgentRecord, signal: AbortSignal) { return loops.envelopeLoop(this, run, agent, signal) }

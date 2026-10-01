@@ -10,6 +10,7 @@ const { createRuntimeClient, utilityFork } = require('./runtime-client.cjs')
 const { ERROR_CODES } = require('./runtime-protocol.mts')
 const git = require('./git.mts')
 const { SKILL_SCHEME, SKILLS_DIR, resolvePackageFile, mimeType } = require('./skill-files.mts')
+const { envProxyConfig, followEnvProxy } = require('./window-proxy.cjs')
 
 // The shell. Main keeps the window, the dialogs, `shell`, the health reports and the restarts; the runtime (agents,
 // stores, providers, quotas, the Orbit MCP server) runs in a child process that electron/runtime-client.cjs drives
@@ -70,11 +71,12 @@ delete process.env.ELECTRON_RUN_AS_NODE
 // without a restart host nothing would override them in the next agents' shells.
 for (const name of ['ORBIT_RUN_ID', 'ORBIT_CHAT_ID', 'ORBIT_PROJECT_ID', 'ORBIT_AGENT_ID', 'ORBIT_RESUME_FILE', 'ORBIT_RESTART_SOURCE']) delete process.env[name]
 // Self-upgrade health report: one per generation (the start, then every runtime restart and renderer reload), written
-// once that generation is healthy or at its first failure. ORBIT_HEALTH_FILE overrides the path; "0" (smoke, tests)
-// disables the file (the checks still run: the runtime is told when a start was healthy either way).
+// once that generation is healthy or at its first failure. ORBIT_HEALTH_FILE overrides the path (a relative one is from
+// the repository, whatever folder Orbit started in, as scripts/self-upgrade.cjs and the runtime read it); "0" (smoke,
+// tests) disables the file (the checks still run: the runtime is told when a start was healthy either way).
 const healthFile = process.env.ORBIT_HEALTH_FILE === undefined
   ? path.join(repoRoot, 'artifacts', 'self-upgrade-health.json')
-  : (process.env.ORBIT_HEALTH_FILE && process.env.ORBIT_HEALTH_FILE !== '0' ? path.resolve(process.env.ORBIT_HEALTH_FILE) : null)
+  : (process.env.ORBIT_HEALTH_FILE && process.env.ORBIT_HEALTH_FILE !== '0' ? path.resolve(repoRoot, process.env.ORBIT_HEALTH_FILE) : null)
 const startedAt = Date.now()
 
 /** @param {unknown} error @returns {string} */
@@ -771,8 +773,9 @@ function startRuntime() {
     },
     onEvent: forwardRuntimeEvent,
     onApproval: showApprovalDialog,
-    // The system proxy (PAC included) for the runtime process, which has no Electron session of its own.
-    resolveProxy: (url) => session.defaultSession.resolveProxy(url),
+    // The system proxy (PAC included) for the runtime process, which has no Electron session of its own: from a
+    // session left on the system's settings, since the window's may go through the environment's proxy.
+    resolveProxy: (url) => systemProxySession().resolveProxy(url),
     onStatus: (status) => toWindows(webContents => webContents.send('runtime:status-changed', status)),
     log: (level, text) => { if (level === 'info') console.log(`[orbit] ${text}`); else console[level](`[orbit] ${text}`) },
   })
@@ -831,10 +834,17 @@ function createWindow(generation) {
     void (generation.generation === startGeneration.generation ? reportStart(win, generation) : reportRenderer(win, generation))
   })
   win.webContents.on('did-fail-load', (_event, errorCode, errorDescription, validatedURL, isMainFrame) => {
+    // -3 is ERR_ABORTED: a navigation replaced by another one, not a broken build.
+    const aborted = errorCode === -3
+    // A frame inside the page (a skill page, its video player) that fails leaves the window as it is: the window is not
+    // brought over the others, and the renderer has not failed.
+    if (isMainFrame === false) {
+      if (!aborted) console.warn(`[orbit] a frame of the window failed to load (${errorCode}): ${errorDescription} — ${validatedURL}`)
+      return
+    }
     win.show()
     console.error(`Orbit renderer failed to load (${errorCode}): ${errorDescription} — ${validatedURL}`)
-    // -3 is ERR_ABORTED: a navigation replaced by another one, not a broken build.
-    if (isMainFrame !== false && errorCode !== -3) writeHealth(rendererGeneration, { ok: false, error: `renderer failed to load (${errorCode}): ${errorDescription} — ${validatedURL}` })
+    if (!aborted) writeHealth(rendererGeneration, { ok: false, error: `renderer failed to load (${errorCode}): ${errorDescription} — ${validatedURL}` })
   })
   // A crashed renderer leaves a blank window while agents keep running and Stop is unreachable. Reloading
   // restores the chats and runs from saved state; a crash loop gives up after three reloads per minute.
@@ -893,6 +903,14 @@ function allowVideoEmbeds() {
   })
 }
 
+// The window's proxy: the environment's (HTTP(S)_PROXY) while the system has none, electron/window-proxy.cjs. Read once,
+// as a process's environment does not change. The system's own settings stay readable in a session of their own, which
+// the window's no longer shows once it takes the environment's proxy.
+const envProxy = envProxyConfig(process.env)
+/** @type {import('electron').Session | null} */
+let systemSession = null
+const systemProxySession = () => (systemSession ??= session.fromPartition('orbit-system-proxy'))
+
 // What a skill page may reach: its own package, inline code and styles, data: and blob: media, and the YouTube player
 // frame; no other host, so a page an agent wrote cannot send what it read anywhere (fetch, images, forms, frames).
 const SKILL_PAGE_CSP = [
@@ -926,6 +944,7 @@ function serveSkillPages() {
 
 app.whenReady().then(() => {
   allowVideoEmbeds()
+  followEnvProxy({ target: session.defaultSession, system: systemProxySession, config: envProxy, log: (text) => console.log(`[orbit] ${text}`) })
   serveSkillPages()
   client = startRuntime()
   createWindow(startGeneration)

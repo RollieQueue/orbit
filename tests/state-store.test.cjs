@@ -209,6 +209,19 @@ test('chatHistory sends the last 40 user and assistant turns', () => {
   assert.deepEqual(history.at(-1), { role: 'assistant', content: '43' }, '44 is a system message; 43 is an assistant turn')
 })
 
+test('chatHistory puts the paths of a message\'s files before its text, so that cutting a long entry at its end keeps them', () => {
+  const file = { id: '1', name: 'a.png', type: 'image/png', size: 1, path: 'C:\\o\\a.png' }
+  const long = 'x'.repeat(9000)
+  const history = store.chatHistory(chat('c', [
+    { id: '1', author: 'user', text: long, time: T0, attachments: [file] },
+    { id: '2', author: 'user', text: '', time: T0, attachments: [file] },
+    { id: '3', author: 'user', text: 'pending', time: T0, attachments: [{ ...file, path: '' }] },
+  ]))
+  assert.equal(history[0].content, `[Вложения этого сообщения: C:\\o\\a.png (image/png)]\n\n${long}`)
+  assert.equal(history[0].content.slice(0, 8000).includes('C:\\o\\a.png'), true)
+  assert.deepEqual(history.slice(1).map(entry => entry.content), ['[Вложения этого сообщения: C:\\o\\a.png (image/png)]', 'pending'], 'files alone; a file not saved yet is not named')
+})
+
 test('access, model and reasoning patches', () => {
   const settings = { ...store.defaults, providerId: 'claude', models: { codex: 'gpt' }, providerOptions: { claude: { command: 'c' } } }
   assert.equal(store.accessChoice(settings), 'ask')

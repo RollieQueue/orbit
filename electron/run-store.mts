@@ -20,6 +20,24 @@ const IMAGE_EXTENSIONS: Record<string, string> = { 'image/png': 'png', 'image/jp
 const IMAGE_TYPES: Record<string, string> = Object.fromEntries(Object.entries(IMAGE_EXTENSIONS).map(([type, extension]) => [extension, type]))
 const MAX_IMAGE_BYTES = 20 * 1024 * 1024
 
+// Run files kept on disk. The store holds and lists the newest 200 runs; an older file stays readable by id (get) until
+// there are more than KEEP_RUNS, then the oldest are deleted (prune). A prune runs when the store opens and again once
+// PRUNE_SLACK files more than KEEP_RUNS (or than the last prune left) are on disk, so a session does not list the folder
+// on every write.
+const KEEP_RUNS = 500
+const PRUNE_SLACK = 50
+
+// The run files of a history folder, newest write first; a file deleted between the listing and its stat is left out.
+function runFiles(root: string, names: string[]): Array<{ id: string; modified: number }> {
+  const files: Array<{ id: string; modified: number }> = []
+  for (const name of names) {
+    const id = /^([\w-]+)\.json$/.exec(name)?.[1]
+    if (!id) continue
+    try { files.push({ id, modified: fs.statSync(path.join(root, name)).mtimeMs }) } catch { /* Gone meanwhile. */ }
+  }
+  return files.sort((a, b) => b.modified - a.modified)
+}
+
 // A copy of a run record whose file changes carry no diff text, only `hasDiff`, so lists stay small. The text is
 // served by RunStore.getChanges / the runtime on demand. The copy is shallow: everything but `changes` is shared.
 function stripDiffs(record: StoredRun): StoredRun {
@@ -39,17 +57,24 @@ class RunStore {
   declare dirty: Set<string>
   declare timer: ReturnType<typeof setTimeout> | null
   declare lastError: unknown
-  constructor(userDataPath: string) {
+  declare keep: number
+  declare slack: number
+  declare files: Set<string>
+  declare nextPrune: number
+  // keep and slack are KEEP_RUNS and PRUNE_SLACK unless a test asks for fewer.
+  constructor(userDataPath: string, { keep = KEEP_RUNS, slack = PRUNE_SLACK }: { keep?: number; slack?: number } = {}) {
     this.root = path.join(userDataPath, 'run-history')
     this.records = new Map()
     this.dirty = new Set()
     this.timer = null
     this.lastError = null
+    this.keep = keep
+    this.slack = slack
+    this.files = new Set()
+    this.nextPrune = Infinity
     fs.mkdirSync(this.root, { recursive: true })
-    const recentFiles = fs.readdirSync(this.root).filter(name => /^[\w-]+\.json$/.test(name))
-      .map(name => ({ name, modified: fs.statSync(path.join(this.root, name)).mtimeMs }))
-      .sort((a, b) => b.modified - a.modified).slice(0, 200)
-    for (const { name: file } of recentFiles) {
+    for (const { id } of runFiles(this.root, fs.readdirSync(this.root)).slice(0, 200)) {
+      const file = `${id}.json`
       const record = readJSON(path.join(this.root, file), null)
       if (!isStoredRun(record)) continue
       if (activeStatuses.has(record.status)) {
@@ -62,6 +87,7 @@ class RunStore {
       }
       this.records.set(record.runId, record)
     }
+    this.prune()
   }
 
   save(snapshot: StoredRun): void {
@@ -88,17 +114,42 @@ class RunStore {
     for (const id of this.dirty) {
       writeJSON(path.join(this.root, `${id}.json`), this.records.get(id))
       this.dirty.delete(id)
+      this.files.add(id)
     }
     if (this.records.size > 200) {
       const oldest = [...this.records.values()].filter(record => !activeStatuses.has(record.status))
         .sort((a, b) => String(a.startedAt || '').localeCompare(String(b.startedAt || '')))
       for (const record of oldest.slice(0, this.records.size - 200)) this.records.delete(record.runId)
     }
+    if (this.files.size >= this.nextPrune) this.prune()
+  }
+
+  // Deletes the oldest runs beyond `keep` by last write, each with its backup copy, leftover temporary files and saved
+  // images; the run file goes last, so a run a locked file kept is tried again by the next prune. A run this store holds
+  // as active is never deleted. Housekeeping: nothing here throws. Returns the ids it deleted.
+  prune(): string[] {
+    let names: string[]
+    try { names = fs.readdirSync(this.root) } catch { this.nextPrune = this.files.size + this.slack; return [] }
+    const files = runFiles(this.root, names)
+    const removed = new Set<string>()
+    for (const { id } of files.slice(this.keep)) {
+      if (activeStatuses.has(this.records.get(id)?.status)) continue
+      try {
+        fs.rmSync(path.join(this.root, 'images', id), { recursive: true, force: true })
+        for (const name of names) if (name.startsWith(`${id}.json.`)) fs.rmSync(path.join(this.root, name), { force: true })
+        fs.rmSync(path.join(this.root, `${id}.json`), { force: true })
+        this.records.delete(id)
+        removed.add(id)
+      } catch { /* Locked: the next prune tries again. */ }
+    }
+    this.files = new Set(files.map(file => file.id).filter(id => !removed.has(id)))
+    this.nextPrune = Math.max(this.files.size, this.keep) + this.slack
+    return [...removed]
   }
 
   get(id: unknown): StoredRun | null {
     if (typeof id !== 'string' || !/^[\w-]+$/.test(id)) return null
-    // A file this store did not load (older than the newest 200) is served as it was written.
+    // A file this store did not load (older than the newest 200) is served as it was written, until a prune deletes it.
     return this.records.has(id) ? clone(this.records.get(id)!) : readJSON(path.join(this.root, `${id}.json`), null) as StoredRun | null
   }
 

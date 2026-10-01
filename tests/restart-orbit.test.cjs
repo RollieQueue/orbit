@@ -162,6 +162,53 @@ test('restart_orbit is refused to workers, without a usable restart host, in rea
   assert.deepEqual(registry.validate('restart_orbit', { reason: 'r', continueWith: 'c', verify: null }), { ok: true, args: { reason: 'r', continueWith: 'c' } })
 })
 
+test('the host tells which parts of the code on disk the running Orbit does not run, from main\'s health report', t => {
+  const { fingerprints, rendererHash } = require('../electron/fingerprint.cjs')
+  const repo = repository(t)
+  const write = (file, text) => { fs.mkdirSync(path.dirname(path.join(repo, file)), { recursive: true }); fs.writeFileSync(path.join(repo, file), text) }
+  write('electron/main.cjs', 'main\n'); write('electron/runtime/loops.mts', 'loops\n'); write('src/App.tsx', 'app\n'); write('package.json', '{}\n')
+  const healthFile = path.join(repo, 'artifacts', 'self-upgrade-health.json')
+  // Main's report about this runtime process, with the fingerprints of the code on disk now.
+  const report = (fields = {}) => {
+    fs.mkdirSync(path.dirname(healthFile), { recursive: true })
+    const code = fingerprints(repo)
+    fs.writeFileSync(healthFile, JSON.stringify({ ok: true, pid: 1, writtenAt: Date.now(), runtime: { mode: 'child', ready: true, pid: process.pid }, shellHash: code.shell, runtimeHash: code.runtime, rendererHash: rendererHash(repo), ...fields }))
+  }
+  const host = resume.createRestartHost({ repoRoot: repo, userData: folder(t), healthFile, spawn: fakeSpawn(() => {}).spawn })
+  report()
+  assert.deepEqual(host.unapplied(), [], 'the running Orbit runs the code on disk')
+  // Whatever changed a file counts (here fs, as a shell command or git would); undone, the change counts no more.
+  write('electron/runtime/loops.mts', 'loops, changed\n')
+  assert.deepEqual(host.unapplied(), ['runtime'])
+  write('electron/runtime/loops.mts', 'loops\r\n')
+  assert.deepEqual(host.unapplied(), [], 'undone (line endings aside): nothing to apply')
+  write('electron/runtime/new-module.mts', 'new\n')
+  assert.deepEqual(host.unapplied(), ['runtime'], 'a new file counts')
+  fs.rmSync(path.join(repo, 'electron', 'runtime', 'new-module.mts'))
+  write('src/App.tsx', 'app, changed\n')
+  assert.deepEqual(host.unapplied(), ['renderer'])
+  write('package.json', '{ "version": "2" }\n')
+  assert.deepEqual(host.unapplied(), ['shell', 'renderer'], 'package.json is read by the main process and by the build')
+  // What cannot be told is null (the caller falls back to the files its agents wrote).
+  for (const [label, fields] of [
+    ['a failed report', { ok: false }], ['a report about another runtime process', { runtime: { pid: process.pid + 1 } }], ['a report without fingerprints', { rendererHash: null }],
+    ['a report older than this process', { writtenAt: 0 }], ['a pid that is no number', { runtime: { pid: { valueOf: 0, toString: 0 } } }], ['a time that is no number', { writtenAt: String(Date.now()) }],
+  ]) {
+    report(fields)
+    assert.equal(host.unapplied(), null, label)
+  }
+  fs.writeFileSync(healthFile, '{broken')
+  assert.equal(host.unapplied(), null, 'an unreadable report')
+  assert.equal(resume.createRestartHost({ repoRoot: repo, userData: folder(t), healthFile: null }).unapplied(), null, 'no report (ORBIT_HEALTH_FILE=0)')
+  assert.equal(resume.createRestartHost({ repoRoot: folder(t), userData: folder(t), healthFile }).unapplied(), null, 'Orbit does not run from this folder')
+  // Where main writes its report.
+  assert.equal(resume.healthFilePath(repo, {}), healthFile)
+  assert.equal(resume.healthFilePath(repo, { ORBIT_HEALTH_FILE: '0' }), null)
+  assert.equal(resume.healthFilePath(repo, { ORBIT_HEALTH_FILE: '' }), null)
+  assert.equal(resume.healthFilePath(repo, { ORBIT_HEALTH_FILE: path.join(repo, 'elsewhere.json') }), path.join(repo, 'elsewhere.json'))
+  assert.equal(resume.healthFilePath(repo, { ORBIT_HEALTH_FILE: 'elsewhere.json' }), path.join(repo, 'elsewhere.json'), 'a relative path is from the repository, not the current folder')
+})
+
 test('restart_orbit waits for other chats: it is refused while they work, its own helpers do not count', async t => {
   const repo = repository(t), userData = folder(t)
   const { spawn, calls } = fakeSpawn(async child => { writeReport(repo, { status: 'up-to-date' }); await child.exit(0) })
@@ -254,7 +301,9 @@ test('shutting down for a restart ends exactly the run the intent names, as rest
   const marked = runtime.getRun(target)
   assert.equal(marked.status, 'restarting')
   assert.ok(marked.finishedAt)
-  assert.deepEqual({ ...marked.restart, note: undefined }, { reason: 'New tool', requestedAt: intent.createdAt, source: 'script', intentId: 'upgrade-1', note: undefined }, 'the mark keeps the id of the intent that made it')
+  assert.deepEqual({ ...marked.restart, note: undefined }, { reason: 'New tool', requestedAt: intent.createdAt, source: 'script', intentId: 'upgrade-1', note: undefined, mailMark: root.mailMark }, 'the mark keeps the id of the intent that made it, and the root\'s mail mark for the continuation')
+  assert.match(root.mailMark, /^[0-9a-f]{10}$/)
+  assert.ok(marked.agents.every(agent => !('mailMark' in agent)), 'agents in the record do not show their mark')
   const note = marked.restart.note
   assert.match(note, new RegExp(`^RESTART NOTE: Orbit restarted with new code, and this run continues run ${target}`))
   assert.match(note, /files written: \["electron\/new-tool\.mts"\]; files read: \["electron\/tool-registry\.mts"\]/)
@@ -351,13 +400,13 @@ test('a continuation resumes the old root session when it keeps the provider, an
     runId, status: 'restarting', projectId: 'project-1', chatId: `chat-${runId}`, workspace, startedAt: new Date().toISOString(),
     startPayload: { workspace, providerId: root.providerId || 'claude', projectId: 'project-1', chatId: `chat-${runId}`, accessMode: 'danger-full-access' },
     agents: [{ id: 'root', name: 'Orbit', status: 'cancelled', providerId: 'claude', transport: 'session', sessionId, files: { read: [], wrote: ['a.txt'] }, ...root }],
-    restart: { reason: 'New tool', requestedAt: new Date().toISOString(), source: 'tool', note: `RESTART NOTE: saved for ${runId}`, intentId: 'upgrade-1' },
+    restart: { reason: 'New tool', requestedAt: new Date().toISOString(), source: 'tool', note: `RESTART NOTE: saved for ${runId}`, intentId: 'upgrade-1', mailMark: 'a1b2c3d4e5' },
   })
   oldRun('resumable-run', 'old-session')
   oldRun('broken-run', 'broken-session')
   const calls = []
   const runtime = runtimeWith({ runStore, mcp: fakeMcp(), transportFor: () => 'session', runProvider: async options => {
-    calls.push({ id: options.session.id, resume: options.session.resume, prompt: options.prompt })
+    calls.push({ id: options.session.id, resume: options.session.resume, prompt: options.prompt, system: options.session.systemAppend })
     if (options.session.resume && options.session.id === 'broken-session') throw new Error('No conversation found with session ID: broken-session')
     return { text: 'Continued', sessionId: options.session.id }
   } })
@@ -368,6 +417,7 @@ test('a continuation resumes the old root session when it keeps the provider, an
   assert.match(calls[0].prompt, /Wire the new tool in\n\nOrbit перезапущен с новым кодом[\s\S]*RESTART NOTE: saved for resumable-run/)
   assert.equal(resumed.agents.find(agent => agent.id === 'root').sessionId, 'old-session')
   assert.equal(runtime.runs.get(resumed.runId).resumeSession, undefined, 'once it answered, it is an ordinary session')
+  assert.ok(calls[0].system.includes('"[orbit:a1b2c3d4e5] MESSAGE FROM THE USER"'), 'the resumed session keeps the mark of its mail')
 
   calls.length = 0
   writeIntent(userData, { runId: 'broken-run', chatId: 'chat-broken-run', continueWith: 'Finish the migration' })
@@ -389,16 +439,26 @@ test('a continuation resumes the old root session when it keeps the provider, an
   writeIntent(userData, { runId: 'first-turn-run', chatId: 'chat-first-turn-run', continueWith: 'Go on with the tool' })
   assert.equal((await continuationOf(runtime, await resume.resumePending({ runtime, userData }))).status, 'completed')
   assert.deepEqual(calls.map(call => [call.id, call.resume]), [['first-turn-session', true]], 'the cut-off first turn\'s session is resumed')
-  // Not for a provider that names its own sessions (the id Orbit proposed is not Codex's thread), nor when the root
-  // moved to Claude after that turn had started.
-  oldRun('codex-run', null, { providerId: 'codex', turnTimings: [timing('proposed-by-orbit')] })
+  // So is the session a provider that names its own sessions named in its stream (a Codex thread here).
+  oldRun('codex-run', null, { providerId: 'codex', turnTimings: [timing('thread-named')] })
+  calls.length = 0
+  writeIntent(userData, { runId: 'codex-run', chatId: 'chat-codex-run', continueWith: 'Go on with the tool' })
+  assert.equal((await continuationOf(runtime, await resume.resumePending({ runtime, userData }))).status, 'completed')
+  assert.deepEqual(calls.map(call => [call.id, call.resume]), [['thread-named', true]], 'the session the stream named is resumed')
+  // Not when the stream of such a provider had named none yet (the record then names no session), when the turn had not
+  // called a tool yet (its session may not hold its prompt; the turn that asked for the restart did call one), nor when
+  // the root moved to Claude after that turn had started.
+  oldRun('unnamed-run', null, { providerId: 'codex', turnTimings: [timing(null)] })
+  oldRun('idle-run', null, { providerId: 'codex', turnTimings: [{ ...timing('thread-idle'), orbitToolCalls: 0 }] })
   oldRun('moved-run', null, { turnTimings: [timing('before-the-handover')], handovers: [{ id: 'h1', time: new Date(Date.now() - 30000).toISOString(), reason: 'exhausted', from: { providerId: 'codex', model: 'm' }, to: { providerId: 'claude', model: 'm' }, fresh: false }] })
-  for (const runId of ['codex-run', 'moved-run']) {
+  for (const runId of ['unnamed-run', 'idle-run', 'moved-run']) {
     calls.length = 0
     writeIntent(userData, { runId, chatId: `chat-${runId}`, continueWith: 'Go on' })
     await continuationOf(runtime, await resume.resumePending({ runtime, userData }))
     assert.deepEqual(calls.map(call => call.resume), [false], `${runId}: a fresh session`)
-    assert.ok(!['proposed-by-orbit', 'before-the-handover'].includes(calls[0].id), runId)
+    assert.ok(!['thread-named', 'thread-idle', 'before-the-handover'].includes(calls[0].id), runId)
+    assert.match(calls[0].system, /"\[orbit:[0-9a-f]{10}\] MESSAGE FROM THE USER"/)
+    assert.ok(!calls[0].system.includes('a1b2c3d4e5'), `${runId}: a fresh session gets a mark of its own`)
   }
 
   // Without a session transport for the new root (or another provider) nothing is resumed; the note still leads.
@@ -409,6 +469,118 @@ test('a continuation resumes the old root session when it keeps the provider, an
   await continuationOf(envelope, await resume.resumePending({ runtime: envelope, userData, maxChain: 5 }))
   assert.equal(calls[0].session, undefined)
   assert.match(calls[0].prompt, /AGENT TRANSCRIPT[\s\S]*RESTART NOTE: saved for envelope-run/)
+  // The old session is not resumed, so its mark is not kept either.
+  assert.match(calls[0].prompt, /"\[orbit:[0-9a-f]{10}\] MESSAGE FROM THE USER"/)
+  assert.ok(!calls[0].prompt.includes('a1b2c3d4e5'), 'a root that does not resume the session gets a mark of its own')
+})
+
+// Codex, Cursor and Antigravity name their sessions themselves, in the stream as the turn begins (a `session` event); the
+// id Orbit proposes for a first turn is not theirs. A root the restart cuts off in that turn (after it ran the
+// self-upgrade in its shell) is continued in the session its stream named, which its saved record holds. A CLI that does
+// not find that session and silently opens another one (`codex exec resume`, the App Server) is stopped before its
+// model acts, and the continuation starts afresh with the full prompt.
+for (const variant of ['named', 'unnamed', 'stray']) test(`a root the restart cuts off in its first turn on a CLI that names its sessions: the continuation ${{ named: 'resumes the session its stream named', unnamed: 'starts fresh when the stream had named none', stray: 'starts afresh when the CLI answers the resume in another session' }[variant]}`, async t => {
+  const userData = folder(t), workspace = folder(t)
+  const named = variant !== 'unnamed'
+  const session = { transportFor: () => 'session', mcp: fakeMcp() }
+  const proposed = []
+  const before = runtimeWith({ ...session, runStore: new RunStore(userData), runProvider: options => {
+    proposed.push(options.session.id)
+    if (named) options.onEvent({ kind: 'session', sessionId: 'thread-named' })
+    options.onEvent({ kind: 'output', text: 'Applying the change', partial: true })
+    options.onEvent({ kind: 'tool', native: true, tool: 'shell', toolId: 'upgrade', status: 'started', text: 'npm run self-upgrade' })
+    return blocking(options)
+  } })
+  const runId = await before.start(payload(workspace, { chatId: 'chat-a', accessMode: 'danger-full-access' }))
+  const root = before.runs.get(runId).agentNodes.get('root')
+  await waitFor(() => root.partialTurn?.messages.size && root.turnTimings[0]?.nativeToolCalls)
+  assert.equal(root.turnTimings[0].sessionId, named ? 'thread-named' : null, 'the record names the session the stream named, never the id Orbit proposed')
+  writeIntent(userData, { runId, chatId: 'chat-a', continueWith: 'Check that the change runs' })
+  assert.deepEqual(resume.markRestartingRuns({ runtime: before, userData }), [runId])
+  await waitFor(() => !root.activeTurn)
+  const saved = new RunStore(userData).get(runId)
+  assert.equal(saved.agents.find(agent => agent.id === 'root').turnTimings[0].sessionId, named ? 'thread-named' : null)
+
+  const calls = [], recorded = []
+  const after = runtimeWith({ ...session, runStore: new RunStore(userData), runProvider: options => {
+    calls.push(options)
+    recorded.push([...after.runs.values()].find(run => run.resumedFrom === runId)?.agentNodes.get('root').turnTimings.at(-1)?.sessionId)
+    if (variant === 'stray' && options.session.resume) {
+      options.onEvent({ kind: 'session', sessionId: 'thread-other' })
+      return blocking(options)
+    }
+    return Promise.resolve({ text: 'The change runs', sessionId: options.session.resume ? options.session.id : 'thread-fresh' })
+  } })
+  const continuation = await continuationOf(after, await resume.resumePending({ runtime: after, userData }))
+  assert.equal(continuation.status, 'completed')
+  assert.deepEqual(calls.map(call => call.session.resume), { named: [true], unnamed: [false], stray: [true, false] }[variant])
+  const fresh = calls.at(-1)
+  if (named) {
+    assert.equal(calls[0].session.id, 'thread-named')
+    assert.equal(recorded[0], 'thread-named', 'the record of a resumed turn names its session from the start')
+    assert.match(calls[0].prompt, /Check that the change runs\n\nOrbit перезапущен с новым кодом[\s\S]*RESTART NOTE: Orbit restarted with new code[\s\S]*Applying the change/)
+    assert.doesNotMatch(calls[0].prompt, /YOUR CURRENT TASK/, 'the resumed session holds the task')
+    assert.ok(calls[0].session.systemAppend.includes(`[orbit:${saved.restart.mailMark}]`), 'the resumed session keeps the mark of its mail')
+  }
+  if (variant === 'stray') {
+    assert.equal(calls[0].signal.aborted, true, 'the stray session is stopped before its model acts on a prompt without the task')
+    assert.ok(continuation.traces.some(trace => trace.kind === 'transport' && /could not be resumed \(.*opened session thread-other instead of resuming thread-named/.test(trace.text)))
+    assert.equal(after.runs.get(continuation.runId).resumeSession, undefined)
+  }
+  if (variant !== 'named') {
+    assert.ok(![proposed[0], 'thread-named', 'thread-other'].includes(fresh.session.id))
+    assert.match(fresh.prompt, /YOUR CURRENT TASK:\nCheck that the change runs/)
+    assert.match(fresh.prompt, /RESTART NOTE: Orbit restarted with new code/)
+  }
+  assert.equal(continuation.agents.find(agent => agent.id === 'root').sessionId, variant === 'named' ? 'thread-named' : 'thread-fresh')
+})
+
+test('a continuation names the files the user attached in the run it continues, those still saved, and keeps them for the next restart', async t => {
+  const userData = folder(t), workspace = folder(t)
+  const { saveAttachments } = require('../electron/attachments.mts')
+  const upload = (name, text, type) => ({ name, type, data: Buffer.from(text).toString('base64') })
+  const [shot, spec] = await saveAttachments(userData, 'chat-a', [upload('shot.png', 'png', 'image/png'), upload('spec.pdf', '%PDF', 'application/pdf')])
+  // More files than one message may carry (10): a run's list is checked whole.
+  const extra = await saveAttachments(userData, 'chat-a', Array.from({ length: 9 }, (_, index) => upload(`e${index}.txt`, 'e', 'text/plain')))
+  const [log] = await saveAttachments(userData, 'chat-a', [upload('log.txt', 'boom', 'text/plain')])
+  const before = runtimeWith({ runStore: new RunStore(userData), runProvider: blocking })
+  const oldRunId = await before.start(payload(workspace, { chatId: 'chat-a', attachments: [shot, spec, ...extra] }))
+  t.after(() => before.stop(oldRunId))
+  await waitFor(() => before.runs.get(oldRunId).agentNodes.get('root').activeTurn)
+  assert.equal(before.postUserMessage(oldRunId, 'root', 'and the log', [log]).ok, true)
+  assert.deepEqual(before.getRun(oldRunId).attachments.map(item => item.path), [shot, spec, ...extra, log].map(item => item.path), 'the first message\'s files, then a message\'s')
+  writeIntent(userData, { runId: oldRunId, chatId: 'chat-a' })
+  assert.deepEqual(resume.markRestartingRuns({ runtime: before, userData }), [oldRunId])
+  // A file deleted since then is not named.
+  fs.rmSync(spec.path)
+  const prompts = []
+  const store = new RunStore(userData)
+  const after = runtimeWith({ runStore: store, runProvider: async options => { prompts.push(options.prompt); return { text: 'Continued' } } })
+  const continuation = await continuationOf(after, await resume.resumePending({ runtime: after, userData }))
+  assert.equal(continuation.status, 'completed')
+  // The envelope transcript holds the note as JSON text: the paths are escaped there.
+  const listed = item => JSON.stringify(`- ${item.path} (${item.type}, `).slice(1, -1)
+  assert.match(prompts[0], /AGENT TRANSCRIPT[\s\S]*RESTART NOTE: Orbit restarted with new code[\s\S]*Check the real state[^\n]*\\nFiles the user attached in that run \(still in Orbit's attachments folder; read them with your file tools when the task needs them\):\\n- /)
+  for (const item of [shot, ...extra, log]) assert.ok(prompts[0].includes(listed(item)), `${item.name} is named`)
+  assert.ok(!prompts[0].includes(path.basename(spec.path)), 'the deleted file is not')
+  assert.doesNotMatch(prompts[0], /ATTACHMENTS FROM THE USER/, 'the continuation\'s own message carries no files')
+  assert.deepEqual(continuation.attachments.map(item => item.path), [shot, ...extra, log].map(item => item.path), 'kept for a restart of the continuation')
+  assert.equal(continuation.startPayload.resumeAttachments, undefined, 'not a setting a later continuation starts again from')
+  // A damaged or forged record brings no file from outside the attachments folder, not even through its start payload.
+  const outside = path.join(userData, 'deadbeef-secret.txt')
+  fs.writeFileSync(outside, 'x')
+  const forged = { id: 'x', name: 'secret.txt', type: 'text/plain', size: 1, path: outside }
+  store.save({
+    runId: 'forged-run', status: 'restarting', projectId: 'project-1', chatId: 'chat-f', workspace, startedAt: new Date().toISOString(), attachments: [forged],
+    startPayload: { workspace, providerId: 'test', projectId: 'project-1', chatId: 'chat-f', attachments: [forged], resumeAttachments: [forged] }, restart: marked({ note: 'RESTART NOTE: forged' }),
+  })
+  writeIntent(userData, { runId: 'forged-run', chatId: 'chat-f' })
+  prompts.length = 0
+  const second = await continuationOf(after, await resume.resumePending({ runtime: after, userData }))
+  assert.equal(second.status, 'completed')
+  assert.match(prompts[0], /RESTART NOTE: forged/)
+  assert.ok(!prompts[0].includes('secret.txt'), 'no file outside the attachments folder is named')
+  assert.equal(second.attachments, undefined)
 })
 
 test('the continuation waits for the watcher: a verdict continues, a rollback does not, an unconfirmed intent only while young', async t => {

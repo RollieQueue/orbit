@@ -191,6 +191,28 @@ test('a chat whose agent restarted Orbit waits for the continuation: busy until 
   assert.deepEqual([...store.restartWaits(state, restored, at)], [['p/c', Date.parse(T1) + store.RESTART_WAIT_MS]])
 })
 
+test("the card of a run that restarted Orbit says how the restart ended once the chat has its note, not «перезапустил» under a rollback", () => {
+  const run = snapshot('old', { status: 'restarting', restart: { reason: 'новый инструмент', requestedAt: T0, source: 'tool' } })
+  const state = baseState([chat('c', [{ id: 'u', author: 'user', text: 'Сделай навык', time: T0, runId: 'old' }])])
+  const noted = (kind, runId = 'old') => store.addRestartNote(state, { kind, projectId: 'p', chatId: 'c', runId, text: `заметка ${kind}`, time: T2 }).projects[0].chats[0]
+  // No note yet (the restart is under way) or the task went on: what the agent did, as before.
+  assert.equal(store.settlingRestart(state.projects[0].chats[0], 'old'), undefined)
+  assert.equal(store.restartCardDetail(run), '. Агент перезапустил Orbit: новый инструмент.')
+  assert.equal(store.restartCardDetail(run, 'resumed'), '. Агент перезапустил Orbit: новый инструмент.')
+  // Before, the card said «Агент перезапустил Orbit» right under the note «Перезапуск не удался и откатился».
+  assert.deepEqual(store.settlingRestart(noted('rolled-back'), 'old'), { kind: 'rolled-back', text: 'заметка rolled-back' })
+  assert.equal(store.restartCardDetail(run, 'rolled-back'), ' не удался и откатился, работает прежний код. Агент перезапускал Orbit: новый инструмент.')
+  for (const kind of ['loop-limit', 'expired', 'failed']) {
+    assert.equal(store.settlingRestart(noted(kind), 'old')?.kind, kind)
+    assert.equal(store.restartCardDetail(run, kind), '. Агент перезапустил Orbit: новый инструмент. Продолжение не запущено.', kind)
+  }
+  // A note about another run, or the note of a continuation, says nothing about this one; a run without a reason still reads.
+  assert.equal(store.settlingRestart(noted('rolled-back', 'another'), 'old'), undefined)
+  assert.equal(store.settlingRestart(store.addRestartNote(state, resumed()).projects[0].chats[0], 'old'), undefined)
+  assert.equal(store.restartCardDetail({}, 'rolled-back'), ' не удался и откатился, работает прежний код. Агент перезапускал Orbit.')
+  assert.equal(store.settlingRestartText(noted('expired'), 'old'), 'заметка expired', 'the loop still reads the note text')
+})
+
 test('a resumed run attaches to its chat: restored from the saved runs with the note instead of a user prompt', () => {
   const snapshots = [
     snapshot('new', { startedAt: T1, prompt: 'Продолжи задачу.\n\nOrbit перезапущен с новым кодом…', resumedFrom: 'old', resumeChain: 1, status: 'working',

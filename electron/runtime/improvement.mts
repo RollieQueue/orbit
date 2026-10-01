@@ -1,11 +1,12 @@
 // The endless improvement loop, runtime side. Every improvement task is one run in a fresh context; the renderer starts
 // the next run in the same chat. This module carries the plan (and a short handoff) from the previous run of the chat,
 // updates it (improvement_plan), shows it to the root agent, and decides whether the root's answer closes the run: one
-// task closed, none left working, and, in Orbit's own repository, the written change applied with restart_orbit.
+// task closed, none left working, and, in Orbit's own repository, the changed code applied with restart_orbit.
 import { saveNote } from '../shared-context.mts'
 import { ellipsis } from '../text.mts'
 import { clip, oneOf, diagnostics } from './util.mts'
 import { restartOffered } from './restart.mts'
+import type { CodePart } from '../resume.mts'
 import type { ImprovementStatus, ImprovementTask, OrbitRuntimeLike, RunRecord, StoredRun, TaskStatus, ToolArgs } from '../types.mts'
 
 const PLAN_STATUSES: readonly ImprovementStatus[] = ['planning', 'implementing', 'completed', 'blocked']
@@ -155,8 +156,8 @@ function progressBlock(run: RunRecord): string {
 }
 
 // What the root's answer still misses, first thing first: a task left working, no task closed in this run, or Orbit's
-// own code written but not applied. `null`: the answer closes the run.
-type Missing = { kind: 'working'; task: ImprovementTask } | { kind: 'none' } | { kind: 'restart' }
+// own code changed but not applied. `null`: the answer closes the run.
+type Missing = { kind: 'working'; task: ImprovementTask } | { kind: 'none' } | { kind: 'restart'; parts: CodePart[] | null }
 function missing(runtime: OrbitRuntimeLike, run: RunRecord): Missing | null {
   if (!run.improvementMode) return null
   const working = run.improvements.find(task => task.status === 'working')
@@ -165,17 +166,22 @@ function missing(runtime: OrbitRuntimeLike, run: RunRecord): Missing | null {
   // Only a pause (blocked: the user is needed, or a bounded goal is reached) excuses a run from closing a task: marking the
   // inherited plan completed without new work is not a task.
   if (!closed && run.improvementStatus !== 'blocked' && !run.resumedFrom) return { kind: 'none' }
-  const wrote = [...run.agentNodes.keys()].some(id => run.fileActivity.forAgent(id).wrote.length > 0)
-  if (wrote && !run.restartApplied && !run.restartDeferred && restartOffered(runtime, run, { id: 'root' })) return { kind: 'restart' }
-  return null
+  if (run.restartApplied || run.restartDeferred || !restartOffered(runtime, run, { id: 'root' })) return null
+  // The code on disk against the code the running Orbit runs, whatever changed it; when that cannot be told, the files
+  // this run's agents wrote with the tools Orbit sees.
+  const parts = runtime.restartHost?.unapplied?.() ?? null
+  const changed = parts ? parts.length > 0 : [...run.agentNodes.keys()].some(id => run.fileActivity.forAgent(id).wrote.length > 0)
+  return changed ? { kind: 'restart', parts } : null
 }
+const PART_NAMES: Record<CodePart, string> = { shell: 'main process', runtime: 'runtime', renderer: 'interface' }
 const lastClosed = (run: RunRecord): string => run.improvements.filter(isClosed).at(-1)?.id || '<id>'
 function reminderFor(runtime: OrbitRuntimeLike, run: RunRecord): string | null {
   const gap = missing(runtime, run)
   if (!gap) return null
   if (gap.kind === 'working') return `Improvement mode: task ${gap.task.id} ("${clip(gap.task.title, 120)}") is still marked working. Close it with improvement_plan: done with evidence of the checks, or blocked with the reason. Then give your final answer.`
   if (gap.kind === 'none') return 'Improvement mode: this run has not closed a task yet. Take the next task of the plan (or record new ones for the goal), implement and verify it, close it with improvement_plan (done with evidence, or blocked with the reason) and apply it. A list of suggestions is not a closed task.'
-  return `Improvement mode: this run changed Orbit's own code, but the change is not applied yet. Call restart_orbit now as the last step: it runs the checks and the build and installs the change. continueWith: "Task ${lastClosed(run)} was applied: confirm the new code runs, then give the final answer".`
+  const what = gap.parts ? `Orbit's code on disk differs from the code the running Orbit runs (${gap.parts.map(part => PART_NAMES[part]).join(', ')}), so a change is not applied yet` : 'this run changed Orbit\'s own code, but the change is not applied yet'
+  return `Improvement mode: ${what}. Call restart_orbit now as the last step: it runs the checks and the build and installs the change. continueWith: "Task ${lastClosed(run)} was applied: confirm the new code runs, then give the final answer".`
 }
 // The note an answer accepted after the ignored reminders carries (Russian: the user reads it).
 function acceptedWithout(runtime: OrbitRuntimeLike, run: RunRecord, limit: number): string {

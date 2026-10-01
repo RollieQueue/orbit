@@ -1,5 +1,5 @@
 import { useEffect, useRef } from 'react'
-import type { ChatThread, HandoverTarget, InspectorTab, Message, Project, RunSnapshot } from './types'
+import type { ChatThread, HandoverTarget, InspectorTab, Message, Project, RestartNoticeKind, RunSnapshot } from './types'
 import { RunHistory, runChangedFiles } from './AgentHistory'
 import { MessageAttachments } from './AttachmentChips'
 import { WorkingStatus } from './ChatNotices'
@@ -10,17 +10,17 @@ import { Markdown, plural, statusText, timeOf } from './format'
 import { loopPhaseText, type LoopView } from './improvement-loop'
 import { providers } from './providers'
 import { historyAnchors, isActiveStatus, resumeLinks, shortRunId, shownStatus, type RunMap } from './run-events'
-import { RESTART_WAIT_TEXT } from './state-store'
+import { RESTART_WAIT_TEXT, restartCardDetail, settlingRestart } from './state-store'
 
 type OpenTeam = (runId: string, tab?: InspectorTab, agentId?: string) => void
 const suggestions = ['Помоги разобраться в проекте', 'Давай обсудим новую функцию', 'Найди, что можно улучшить']
 const failedStatuses = ['failed', 'error', 'cancelled', 'interrupted', 'restarting']
 const handoverName = (target: HandoverTarget) => handoverLabel(providers, target)
 const distanceToBottom = (element: HTMLElement) => element.scrollHeight - element.scrollTop - element.clientHeight
-const failureDetail = (run: RunSnapshot) =>
+const failureDetail = (run: RunSnapshot, restartOutcome?: RestartNoticeKind) =>
   run.error ? `: ${run.error}`
   : run.status === 'interrupted' ? '. Приложение закрылось во время работы. Можно продолжить новым сообщением.'
-  : run.status === 'restarting' ? `. Агент перезапустил Orbit${run.restart?.reason ? `: ${run.restart.reason}` : ''}.` : ''
+  : run.status === 'restarting' ? restartCardDetail(run, restartOutcome) : ''
 
 type ChatPaneProps = {
   project?: Project; chat?: ChatThread; chatKey: string; runs: RunMap; ready: boolean; desktop: boolean
@@ -53,8 +53,11 @@ export function ChatPane({
   const otherActiveChats = Object.values(runs).filter(run => run.projectId === project?.id && run.chatId !== chat?.id && isActiveStatus(run.status)).length
   // Each run's team strip and history hang under its answer, or under the message that opened a run that never answered.
   const historyAnchor = historyAnchors(chat?.messages || [], runs)
-  // A run that ended by restarting Orbit links to the run that continued it.
+  // A run that ended by restarting Orbit links to the run that continued it. Without one, the chat's note of the restart
+  // says how it ended, and a rollback turns the card red.
   const continuation = currentRun?.status === 'restarting' ? resumeLinks(runs, currentRun).next : undefined
+  const restartOutcome = currentRun?.status === 'restarting' && !continuation && chat ? settlingRestart(chat, currentRun.runId)?.kind : undefined
+  const noticeTone = restartOutcome === 'rolled-back' ? 'failed' : currentRun?.status
   useEffect(() => { nearBottom.current = true; bottom.current?.scrollIntoView({ behavior: 'instant' }) }, [chatKey])
   useEffect(() => { if (nearBottom.current) bottom.current?.scrollIntoView({ behavior: 'smooth' }) }, [chat?.messages.length, running])
   // A growing answer keeps the view pinned to the bottom, without the smooth scroll that would stutter several times a second.
@@ -88,9 +91,9 @@ export function ChatPane({
         {running && <WorkingStatus run={workingRun} starting={starting && !workingRun} label={handoverName}>
           <button onClick={() => workingRun ? onOpenTeam(workingRun.runId) : onOpenAgents()}>Посмотреть действия <Icon name="agents" size={14} /></button>
         </WorkingStatus>}
-        {currentRun && !running && failedStatuses.includes(currentRun.status) && <div className={`run-notice ${currentRun.status}`}>
-          <span className={`status-dot ${currentRun.status}`} />
-          <span>{statusText(currentRun.status)}{failureDetail(currentRun)}</span>
+        {currentRun && !running && failedStatuses.includes(currentRun.status) && <div className={`run-notice ${noticeTone}`}>
+          <span className={`status-dot ${noticeTone}`} />
+          <span>{statusText(currentRun.status)}{failureDetail(currentRun, restartOutcome)}</span>
           {continuation && <button onClick={() => onOpenTeam(continuation.runId)}>Продолжен в {shortRunId(continuation.runId)}</button>}
           <button onClick={onOpenAgents}>Подробности</button>
         </div>}

@@ -1,0 +1,83 @@
+{
+ "improvements": [
+  {
+   "id": "I19",
+   "title": "Парсер Cursor в режиме конверта (subscription-providers.mts ~210): событие tool_call без call_id ключуется JSON всего tool_call, конец с результатом не совпадает с началом — ход навсегда «занят» (steer ждёт конца хода, сторож тишины молчит); ключ без результата или cursorToolEvent (остаток ревью T1…",
+   "status": "done",
+   "evidence": "electron/subscription-providers.mts: конверт Cursor разбирает tool_call через cursorToolEvent(event, false), как сессия (MCP-вызов в конверте всегда native: сервера Orbit там нет); toolId = call_id, иначе tool_call.toolCallId (CLI 2026.09.26), иначе текст из аргументов; неудача — результат без варианта успеха (CURSOR_DONE), раньше writePermissionDenied/fileNotFound/timeout шли как completed; текст поиска — шаблон, а не папка. Главный эффект: в конверте (у Cursor он по умолчанию) чтения и правки Cursor попадают во вкладку «Файлы», карту файлов и «Изменения»; реальный CLI шлёт call_id, ключ по toolCallId — страховка. Проверено: оба tsc 0; tests/subscription-providers 31/31 (новый тест: ключи начала и конца, busy() сторожа, FileActivity — неудачная правка не запись); 8 связанных файлов 144/144; мутации 7/7 на копии в %TMP% (scratchpad/i19/mutate.cjs, mutate.log). Ревью claude-opus-5-5: high нет; M1 и M2 исправлены; low 1, 2, 4, 5, 6, 7 исправлены; low 3 → I32. Живьём не проверено: Cursor Free исчерпан. Docs: providers.md, CHANGELOG. Применено restart_orbit (runtime, 03:53 UTC): отчёт здоровья ok, отпечатки shell/runtime/renderer совпадают с файлами, процесс runtime жив."
+  },
+  {
+   "id": "I20",
+   "title": "Продолжение после restart_orbit, вызванного в первом ходе корня на Codex, Cursor или Antigravity, возобновляет сессию, названную потоком: resume.rootSession берёт id из записи хода только у Claude (запись хода с I9 называет id потока, но в ней же бывает id, предложенный Orbit; нужен признак или nul…",
+   "status": "done",
+   "evidence": "electron/runtime/turn.mts providerTurn: запись хода (timing.sessionId) называет сессию, как её знает провайдер: возобновлённую или Claude (--session-id); у Codex/Cursor/Antigravity null, пока поток не назвал; opened прерванного первого хода читает ту же запись. electron/resume.mts rootSession: без условия «только Claude»; запись хода берётся, только если ход вызвал инструмент (ход, попросивший перезапуск, вызвал restart_orbit или самообновление в оболочке). tests/restart-orbit: +3 сквозных (поток назвал → продолжение возобновляет thread-named с меткой почты, без YOUR CURRENT TASK; не назвал → заново; CLI ответил в чужой сессии → ход остановлен, новая сессия с полным запросом), сохранённые записи Codex (названная → resume; null и ход без инструментов → заново). Оба tsc 0; 11 связанных файлов 219/219; мутации 10/10 на копии в %TMP% (scratchpad/i20/mutate.cjs, mutate.log). Ревью claude-opus-5-5: high нет; M1 (нет теста защиты от чужой сессии после перезапуска) и low 1–4 исправлены; окно recoverStall и пустой чат Cursor → I33. Живьём не проверено: Codex и Cursor без квоты. Docs: CHANGELOG, TECH-DEBT п.14, SESSION-MODE. Применено restart_orbit (runtime, 04:26 UTC): отчёт здоровья ok, отпечатки shell/runtime/renderer совпадают с файлами, процесс runtime жив."
+  },
+  {
+   "id": "I21",
+   "title": "Codex App Server, из ревью I9: прерывание во время openCodexSession (после initialize или thread/start, до первого хода) оставляет процесс в sessions до таймаута простоя (30 мин); закрывать его при отмене",
+   "status": "done",
+   "evidence": "electron/codex-server.mts openCodexSession: отмена во время открытия (initialize, thread/resume, thread/start без ответа) сразу убивает процесс, открытие падает AbortError после остановки дерева (catch ждёт fail); уже отменённое открытие ничего не запускает; сессия, закрытая между ответом и регистрацией (то же чтение), не регистрируется; запрос после закрытия отклоняется ошибкой, закрывшей соединение (отмена, stderr Codex), а не «Codex connection closed». runCodexSessionTurn: отмена к событию session (runtime останавливает ход с чужим тредом) закрывает сессию, открытую этим вызовом; повторно взятая живая остаётся. Раньше процесс жил до 30 мин простоя, а без ответа сервера вызов не завершался (слот хода, chatBusy и отказ cleanup до перезапуска Orbit). Проверено: оба tsc 0; tests/providers-session +1 тест (initialize, thread/start, thread/resume, то же чтение, событие треда, повторно взятая сессия; фикстура FIXTURE_HOLD/MARK/TRAIL), App Server 3/3 трижды; 4 связанных файла 60/60; мутации 8/8 на копии в %TMP% (scratchpad/i21/mutate.cjs, mutate.log). Ревью claude-opus-5-5: high/medium нет; LOW-1 (подмена ошибки скрывала RPC-отказ) решён иначе: request после закрытия несёт failure, catch бросает свою ошибку; LOW-2 (pid reuse в уборке теста), стиль и CHANGELOG (отказ «очистки процессов») исправлены; LOW-3 (FIXTURE_TRAIL при разрезанном pipe теряет покрытие, не флак) принят. Живьём не проверено: Codex без квоты до ~05:27 UTC. Docs: CHANGELOG, SESSION-MODE."
+  },
+  {
+   "id": "I22",
+   "title": "Codex в режиме сессии не получает системный текст Orbit (sessionGuide: кто он, правила инструментов Orbit, делегирования, памяти, «When you finish…»): ни codex exec (buildCodexSessionArgs), ни App Server (openCodexSession/turn/start) не передают session.systemAppend. Передать его первым сообщением …",
+   "status": "pending",
+   "evidence": ""
+  },
+  {
+   "id": "I23",
+   "title": "История запусков, остатки ревью I11: при переводе часов назад порядок по mtime удаляет новые запуски (и обрезка памяти по startedAt их вытесняет); первая очистка огромной старой истории синхронна в конструкторе (риск startTimeoutMs 20 с); сироты images/<id>, .bak и .tmp без <id>.json не удаляются",
+   "status": "pending",
+   "evidence": ""
+  },
+  {
+   "id": "I24",
+   "title": "Эндпоинты провайдеров, из ревью I12: fetch к Ollama и совместимому API следует редиректам 307/308 и повторяет POST с запросом по новому адресу, в том числе на http:// другого хоста (Authorization при смене origin срезается); проверять адрес редиректа правилом endpointUrl (redirect: 'manual') или от…",
+   "status": "pending",
+   "evidence": ""
+  },
+  {
+   "id": "I26",
+   "title": "Квоты Codex, из ревью I13: упёршийся scoped-бакет одной модели (quota.mts parseCodexLimits: blocked по rateLimitReachedType любого бакета) делает в assess исчерпанными все модели Codex — автозамена и маршрутизация пропускают и gpt-6-astra, и gpt-6-luna; учитывать blocked по бакету (его models)",
+   "status": "pending",
+   "evidence": ""
+  },
+  {
+   "id": "I27",
+   "title": "spawn_agent kind, остатки ревью I13: в пачке конверта помощник, созданный раньше, стартует во время ожидания маршрутизации следующего (холодный каталог): без B в TEAM DIRECTORY, send_message той же пачки приходит уже в ход; предпроверка до ожидания ловит не все отказы (depth/agent/turn limits, pool…",
+   "status": "pending",
+   "evidence": ""
+  },
+  {
+   "id": "I28",
+   "title": "Автозамена, остатки ревью I25: провайдер в пуле без модели (и cursor auto) запускает модель CLI по умолчанию, Orbit её не видит — исключённая (Fable) может пройти; узнавать модель из init провайдера и не брать такую замену; возможно, список исключённых моделей в «Квоты»",
+   "status": "pending",
+   "evidence": ""
+  },
+  {
+   "id": "I30",
+   "title": "Вложения ранних сообщений чата, из ревью I17: дайджест прошлых ходов и team_history (electron/chat-memory.mts) не называют файлы прошлых запусков, а продолжение после restart_orbit приходит без истории чата (restartPayload её убирает) — пути вложений из более ранних сообщений теряются; записи запус…",
+   "status": "pending",
+   "evidence": ""
+  },
+  {
+   "id": "I31",
+   "title": "Почта прерванного хода у Codex и Cursor (остаток I18): когда будет квота (Codex: окно 5 ч до 05:27 UTC 01.10; Cursor Free исчерпан), проверить живьём scratchpad/i18/live.cjs (first/resumed, I18_CUT_ON=tool, I18_RESUME_WAIT_MS=0; Codex exec и App Server); если сохраняют — в pause.KEEPS_CUT_PROMPT",
+   "status": "pending",
+   "evidence": ""
+  },
+  {
+   "id": "I32",
+   "title": "Cursor, остаток ревью I19: удаление файла инструментом Cursor (deleteToolCall, аргументы {path, toolCallId}) не попадает во вкладку «Файлы» и в «Изменения»: его нет в CURSOR_FILE_TOOLS (subscription-providers.mts) и среди WRITE_TOOLS file-activity; учитывать как запись (kind delete из git) с тестом",
+   "status": "pending",
+   "evidence": ""
+  },
+  {
+   "id": "I33",
+   "title": "Продолжение после перезапуска, остаток ревью I20: перезапуск между остановкой хода сторожем (handover.recoverStall бросает сессию) и записью повтора возобновит брошенную сессию — запись хода этого не знает; Cursor --resume с неизвестным id открывает пустой чат под тем же id, защита от чужой сессии …",
+   "status": "pending",
+   "evidence": ""
+  }
+ ],
+ "handoff": "Цель: бесконечное улучшение Orbit. УСЛОВИЕ: никогда не брать Claude Fable 5.1 ни помощникам, ни для ревью. spawn_agent kind=review без model (маршрут по квотам; проверять routed: не fable). Мелкую задачу сам + одно ревью; high/medium и дешёвые low исправлять, остальное в план. Каждое изменение — запись в docs/CHANGELOG.md «## Не выпущено (после 0.5.0)» (новые сверху). Не коммитить. Проверка: оба tsc, целевые тесты, мутации на КОПИИ в %TMP% (образец scratchpad/i21/mutate.cjs; PowerShell: robocopy electron и tests, package.json, tsconfig*.json, Junction node_modules; [IO.Directory]::Delete junction ДО Remove-Item). Diff для ревью: ДО правок копия в scratchpad/<id>/base/, затем git diff --no-index --ignore-cr-at-eol. Квоты: scratchpad/i18/quota.mjs. Cursor: конверт по умолчанию (сессия: Full access + ORBIT_CURSOR_SESSION=1), stream-json — память ef633a7b. restart_orbit смотрит отпечатки electron/ и src/. Следующая — I22 (фикстура App Server: tests/providers-session helpers(launches, env), FIXTURE_HOLD/MARK/TRAIL). Квота Codex обновится ~05:27 UTC 01.10: тогда живые проверки I22/I31. improvement_plan заменяет весь план: названия из последней записи run-history с improvements. electron/runtime/*.mts ≤ 400 строк (loops.mts 399, turn.mts 296). Окончания строк: git ls-files --eol; CRLF: tools, util, agents, lifecycle, ledger, run-store, store (.mts), failover.mts, codex-server.mts, QuotaPanel.tsx, tests/runtime, providers, storage, failover, improvement-loop-runtime; остальное LF."
+}

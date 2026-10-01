@@ -11,7 +11,7 @@ type SessionToken = string | SessionRef | null | undefined
 import * as providers from '../providers.mts'
 // Used only for an identity check against the runtime's runProvider.
 const defaultRunProvider: unknown = providers.runProvider
-import { TERMINAL, AGENT_TERMINAL, WORK_TOOLS, MUTATING_TOOLS, SKILL_READ_CHARS, bounded, clip, diagnostics } from './util.mts'
+import { TERMINAL, AGENT_TERMINAL, WORK_TOOLS, MUTATING_TOOLS, SKILL_READ_CHARS, abortable, bounded, clip, diagnostics } from './util.mts'
 import { describeCall } from './ledger.mts'
 import { restartOffered } from './restart.mts'
 // Type only: the module itself (with the MCP SDK and zod, most of the runtime's load time) is imported by ensureMcp on
@@ -20,6 +20,12 @@ import type { createMcpServer } from '../mcp-server.mts'
 import * as toolRegistry from '../tool-registry.mts'
 // Session mode: tools that block on the team release the agent's model slot while they wait.
 const WAIT_TOOLS = new Set(['wait_agent', 'wait_message', 'followup_agent'])
+// A wait serves the turn that called it: it ends with that turn (finished, cut off, failed), and takes what it found
+// (mail marked read, helper results marked seen) only while that turn still runs and has its model slot back (a provider
+// whose client ends calls on its own clock goes on without it once the grace runs out, see slotBack). A wait the turn
+// left behind takes nothing: the next turn gets that mail and those results.
+const TURN_WAITS = new Set(['wait_agent', 'wait_message'])
+const TURN_ENDED = 'Your turn ended before this wait could answer (it was interrupted or failed): the wait took nothing. Unread mail comes with your next prompt; call wait_agent again for helpers\' results.'
 // Some providers' MCP clients end a tool call on their own clock (Cursor: 60 s, without a progress token), so a session
 // agent of such a provider is answered before that (providers.mcpCallLimit): a wait is cut at the limit and answers
 // "still running, call again"; any other call that outlives it keeps running and the agent's next identical call
@@ -245,11 +251,31 @@ async function dispatchMcp(runtime: OrbitRuntimeLike, token: SessionToken, name:
   const raw = args && typeof args === 'object' && !Array.isArray(args) ? args : null
   const call: ToolCall = { id: randomUUID(), name: String(name || ''), arguments: raw ? Object.fromEntries(Object.entries(raw).filter(([, value]) => value !== null)) : { __invalidArguments: true } }
   const turn = agent.activeTurn
+  // Without a running turn no model would read a wait's answer.
+  if (!turn && TURN_WAITS.has(call.name)) return refuse(TURN_ENDED)
   if (turn) { turn.timing.orbitToolCalls++; publishProgress(runtime, run, agent) }
   runtime.trace(run, agent.id, 'tool', `${call.name} ${bounded(call.arguments, 1200)}`)
   const waits = WAIT_TOOLS.has(call.name)
   const limit = callLimit(agent), calledAt = Date.now()
   if (waits && turn?.slot.held) { turn.slot.held = false; runtime.releaseTurn(run) }
+  // The slot is taken back before the result goes to the model, once: by a wait before it takes what it found (`ready`),
+  // else after the call. A provider whose client ends a call on its own clock is not kept waiting past it for a busy
+  // slot: the slot comes back in the background, the turn goes on meanwhile. A turn that ended takes no slot back.
+  let back: Promise<void> | undefined
+  const slotBack = (): Promise<void> => back ??= (async () => {
+    if (!waits || !turn || turn.slot.held || turn.signal.aborted) return
+    const retake = abortable(retakeSlot(runtime, run, agent, turn), turn.signal)
+    // What is left of the limit, or a tenth of it (at most 5 s) when the wait used it all: Cursor's 60 s outlast 50 s + 5 s.
+    const grace = Math.max(Math.min(5000, Math.ceil(limit / 10)), limit - (Date.now() - calledAt))
+    if (!limit) await retake
+    else if (await withinLimit(retake, grace) === STILL_RUNNING && agent.activeTurn === turn) runtime.updateAgent(run, agent, { status: 'working', detail: 'Provider is executing' })
+  })()
+  const turnWait = turn && TURN_WAITS.has(call.name) ? turn : null
+  const bound = turnWait ? turnWait.signal : signal
+  const ready = turnWait ? async (): Promise<void> => {
+    await slotBack().catch(() => {})
+    if (agent.activeTurn !== turnWait || turnWait.signal.aborted) throw new Error(TURN_ENDED)
+  } : undefined
   // `joined`: when the call found its own run under way (or finished), the time that run started.
   let observation: Observation, failure: string | null = null, cut = false, parked = 0, joined: number | null = null
   try {
@@ -259,7 +285,7 @@ async function dispatchMcp(runtime: OrbitRuntimeLike, token: SessionToken, name:
     if (limit && Object.hasOwn(TIMED_WAITS, call.name)) {
       const asked = call.arguments.timeout_ms === undefined ? TIMED_WAITS[call.name] : Number(call.arguments.timeout_ms) || 30000
       cut = asked > limit
-      observation = await runtime.trackOperation(run, runtime.executeTool(run, agent, call.name, cut ? { ...call.arguments, timeout_ms: limit } : call.arguments), agent)
+      observation = await runtime.trackOperation(run, runtime.executeTool(run, agent, call.name, cut ? { ...call.arguments, timeout_ms: limit } : call.arguments, bound, ready), agent)
     } else if (limit && !waits) {
       // The call is registered before anything is awaited, so an identical one made meanwhile joins it. A run begun
       // before files changed is not handed out: it is stopped and the call starts afresh.
@@ -283,20 +309,13 @@ async function dispatchMcp(runtime: OrbitRuntimeLike, token: SessionToken, name:
         forget()
         observation = joined === null ? outcome : collectedResult(outcome, joined)
       }
-    } else observation = await runtime.trackOperation(run, runtime.executeTool(run, agent, call.name, call.arguments), agent)
+    } else observation = await runtime.trackOperation(run, runtime.executeTool(run, agent, call.name, call.arguments, bound, ready), agent)
   } catch (error) {
-    failure = (error as Error).message
+    // A wait its turn left behind was aborted with the turn (abortable says "Run cancelled"), the run itself goes on.
+    failure = turnWait?.signal.aborted && !signal.aborted ? TURN_ENDED : (error as Error).message
     observation = joined === null ? { ok: false, error: failure } : collectedResult({ ok: false, error: failure }, joined)
   } finally {
-    // The slot is taken back before the result goes to the model. A provider whose client ends a call on its own clock
-    // is not kept waiting past it for a busy slot: the slot comes back in the background, the turn goes on meanwhile.
-    if (waits && turn && !turn.slot.held && !signal.aborted) {
-      const retake = retakeSlot(runtime, run, agent, turn)
-      // What is left of the limit, or a tenth of it (at most 5 s) when the wait used it all: Cursor's 60 s outlast 50 s + 5 s.
-      const grace = Math.max(Math.min(5000, Math.ceil(limit / 10)), limit - (Date.now() - calledAt))
-      if (!limit) await retake
-      else if (await withinLimit(retake, grace) === STILL_RUNNING && agent.activeTurn === turn) runtime.updateAgent(run, agent, { status: 'working', detail: 'Provider is executing' })
-    }
+    await slotBack().catch(() => {})
   }
   if (!failure && !parked && (observation as { ok?: unknown } | null | undefined)?.ok !== false && MUTATING_TOOLS.has(call.name)) {
     if (turn) turn.changed = true

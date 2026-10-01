@@ -1,0 +1,60 @@
+{
+ "mode": "reduced",
+ "packageId": "c14befdb-9a4c-41c1-a956-0d469e9e487e",
+ "steps": [
+  {
+   "step": "stage opened",
+   "runId": "d9c7a069-073a-48f1-b507-37d5fc686882",
+   "src": "orbit-skill://c14befdb-9a4c-41c1-a956-0d469e9e487e/page.html?video=https%3A%2F%2Fwww.youtube.com%2Fwatch%3Fv%3D6-8E4Nirh9s&start=42&end=47&text=TASK+COMPLETED&confetti=true&orbit_event=task-completed&orbit_run=d9c7a069-073a-48f1-b507-37d5fc686882",
+   "fullScreen": true
+  },
+  {
+   "step": "motion",
+   "reduce": true,
+   "spin": "none",
+   "pulse": "none",
+   "backdrop": "none",
+   "words": 2,
+   "size": [
+    1536,
+    864
+   ],
+   "textMoved": false,
+   "transforms": [
+    "translate3d(436px, 327.5px, 0px)",
+    "translate3d(436px, 327.5px, 0px)"
+   ],
+   "text": [
+    436,
+    328
+   ],
+   "centre": [
+    436,
+    328
+   ],
+   "confettiChanged": false,
+   "canvases": [
+    "0a950530c7",
+    "0a950530c7"
+   ],
+   "pieces": [
+    120,
+    120
+   ]
+  },
+  {
+   "step": "closed by a click on the page",
+   "fullScreen": false
+  },
+  {
+   "step": "closed by Esc",
+   "fullScreen": false
+  },
+  {
+   "step": "console errors",
+   "all": 0,
+   "relevant": []
+  }
+ ],
+ "ok": true
+}

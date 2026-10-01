@@ -12,8 +12,8 @@ import { messageNote, stopSteer } from './steer.mts'
 import type { AgentRecord, OrbitRuntimeLike, ProviderEvent, ProviderResult, RunRecord, SessionInfo, StreamState, ToolImage, TraceImage, TurnTiming, UsageFigures } from '../types.mts'
 // The root agent's answer in progress is published at most four times a second.
 const STREAM_INTERVAL_MS = 250
-// A session turn can hold the whole task, so the window counts the agent's actions (tool calls) while the turn runs:
-// a changed count is published at most once a second, and the delayed update carries the latest one.
+// A session turn can hold the whole task, so the window counts the agent's actions (tool calls) and shows its thinking
+// while the turn runs: a change is published at most once a second, and the delayed update carries the latest state.
 const PROGRESS_INTERVAL_MS = 1000
 const progressTimers = new WeakMap<AgentRecord, ReturnType<typeof setTimeout>>()
 function publishProgress(runtime: OrbitRuntimeLike, run: RunRecord, agent: AgentRecord): void {
@@ -24,6 +24,29 @@ function publishProgress(runtime: OrbitRuntimeLike, run: RunRecord, agent: Agent
   }, PROGRESS_INTERVAL_MS)
   timer.unref?.()
   progressTimers.set(agent, timer)
+}
+// A turn that ends with a change still unpublished sends it at once, with the turn closed: the window must not keep
+// showing the thinking (or an old count) of a turn that is over until the agent's next update.
+function flushProgress(runtime: OrbitRuntimeLike, run: RunRecord, agent: AgentRecord): void {
+  const timer = progressTimers.get(agent)
+  if (timer === undefined) return
+  clearTimeout(timer); progressTimers.delete(agent)
+  if (!TERMINAL.has(run.status)) runtime.updateAgent(run, agent, {}, false)
+}
+// The model's thinking in progress, which the window shows as «думает · ~N тыс. токенов»: the provider's estimate of the
+// thinking block so far. A text or a tool call of the agent itself (not of a native subagent) means the block is over.
+function noteThinking(timing: TurnTiming, event: ProviderEvent): void {
+  if (event.kind === 'thinking') {
+    if (event.done) delete timing.thinking
+    else timing.thinking = Math.max(0, Math.round(Number(event.tokens) || 0))
+  } else if (((event.kind === 'output' && event.text) || event.kind === 'tool') && !event.parentToolId) delete timing.thinking
+}
+// Thinking still open when the turn ends is over with it (the provider stopped, the turn was cut off); the window learns
+// it with the turn's end (flushProgress).
+function closeThinking(runtime: OrbitRuntimeLike, run: RunRecord, agent: AgentRecord, timing: TurnTiming): void {
+  if (timing.thinking === undefined) return
+  delete timing.thinking
+  publishProgress(runtime, run, agent)
 }
 
 // What a turn had produced when the provider cut it off: the last streamed message and the native tool actions.
@@ -52,9 +75,11 @@ function providerEvent(runtime: OrbitRuntimeLike, run: RunRecord, agent: AgentRe
     return
   }
   runtime.notePartialTurn(agent, event)
-  const counted = agent.activeTurn?.timing.nativeToolCalls
+  const counted = agent.activeTurn?.timing.nativeToolCalls, thinking = agent.activeTurn?.timing.thinking
   runtime.noteTurnEvent(agent, event)
-  if (agent.activeTurn && agent.activeTurn.timing.nativeToolCalls !== counted) publishProgress(runtime, run, agent)
+  if (agent.activeTurn && (agent.activeTurn.timing.nativeToolCalls !== counted || agent.activeTurn.timing.thinking !== thinking)) publishProgress(runtime, run, agent)
+  // The thinking estimate lives in the turn's record for the window; it is no trace.
+  if (event?.kind === 'thinking') return
   // Bookkeeping about touched files must never break the provider stream it is read from.
   if (event?.native) { try { runtime.trackNativeFiles(run, agent, event) } catch (error) { diagnostics(runtime, run, 'trackNativeFiles', error, agent.id) } }
   if (event?.usage) runtime.recordUsage(run, event.usage)
@@ -101,6 +126,7 @@ function noteTurnEvent(runtime: OrbitRuntimeLike, agent: AgentRecord, event: Pro
   if (!turn) return
   turn.watch?.note(event)
   if (!turn.timing.firstEventAt) turn.timing.firstEventAt = new Date().toISOString()
+  if (event) noteThinking(turn.timing, event)
   if (event?.kind !== 'tool' || !event.native || String(event.tool || '').startsWith(MCP_TOOL_PREFIX)) return
   const key = event.toolId || `${event.tool || 'tool'}:${turn.nativeSeen.size}`
   if (turn.nativeSeen.has(key)) return
@@ -161,6 +187,9 @@ async function providerTurn(runtime: OrbitRuntimeLike, run: RunRecord, agent: Ag
   const slot = { held: true }
   let providerTask: Promise<ProviderResult> | undefined, counted = false, timing: TurnTiming | null = null
   let interrupted: InterruptReason | null = null, pauseHolder: AgentRecord | null = null, watch: TurnWatch | null = null
+  // The session the provider's stream named in this session turn (a Codex thread, a Cursor chat, an Antigravity conversation),
+  // and one it named instead of the session it was to resume.
+  let named: string | null = null, strayed: string | null = null
   signal.addEventListener('abort', abort, { once: true })
   try {
     if (signal.aborted) throw abortError()
@@ -169,11 +198,15 @@ async function providerTurn(runtime: OrbitRuntimeLike, run: RunRecord, agent: Ag
     if (agent.id !== 'root') run.usage.workerTurns++
     counted = true
     agent.partialTurn = { messages: new Map(), tools: new Map() }
-    timing = { turn: agent.turns, transport: agent.transport, startedAt: new Date().toISOString(), firstEventAt: null, endedAt: null, promptChars: 0, nativeToolCalls: 0, orbitToolCalls: 0, sessionId: session?.id || null }
+    // The record names the turn's session as its provider knows it: the one resumed, or Claude's, started under Orbit's id
+    // (--session-id). Codex, Cursor and Antigravity name their own: none until their stream does (below), as the id Orbit
+    // proposes is not theirs. A cut first turn's repeat and a restart's continuation resume it (resume.rootSession).
+    timing = { turn: agent.turns, transport: agent.transport, startedAt: new Date().toISOString(), firstEventAt: null, endedAt: null, promptChars: 0, nativeToolCalls: 0, orbitToolCalls: 0, sessionId: session && (session.resume || agent.providerId === 'claude') ? session.id || null : null }
     agent.turnTimings.push(timing)
     runtime.updateAgent(run, agent, { status: 'working', detail: 'Provider is executing', startedAt: agent.startedAt || new Date().toISOString() })
     // `delivered`: the mail this turn's prompt carries; during a session turn it is no longer pending (see pendingMail).
-    agent.activeTurn = { slot, timing, changed: false, nativeSeen: new Set(), stream: null, delivered: new Set(),
+    // `signal`: aborted when the turn ends, however it ends; an Orbit wait the turn called ends with it (dispatchMcp).
+    agent.activeTurn = { slot, timing, changed: false, nativeSeen: new Set(), stream: null, delivered: new Set(), signal: controller.signal,
       interrupt: (reason: InterruptReason = 'pause') => { interrupted = reason; pauseHolder = pausedBy(run, agent); controller.abort() } }
     const resolvedPrompt = typeof prompt === 'function' ? prompt() : prompt
     run.usage.promptChars = (run.usage.promptChars || 0) + resolvedPrompt.length
@@ -192,7 +225,18 @@ async function providerTurn(runtime: OrbitRuntimeLike, run: RunRecord, agent: Ag
       ...(Object.keys(extraEnv).length ? { extraEnv } : {}),
       onApproval: request => turnWatch.hold(runtime.approve(run, agent, request, controller.signal)),
       signal: controller.signal, timeoutMs: run.limits.timeoutMs,
-      onEvent: (event) => { if (!controller.signal.aborted) runtime.providerEvent(run, agent, event) },
+      onEvent: (event) => {
+        if (controller.signal.aborted) return
+        // The stream naming its session is not the model speaking: the turn's record names that session at once, and a cut
+        // first turn resumes it (below).
+        if (event?.kind !== 'session') return runtime.providerEvent(run, agent, event)
+        if (!session || !event.sessionId || !timing) return
+        timing.sessionId = named = event.sessionId
+        // A CLI that did not find the session from before a cut or a restart may start another one silently (Codex
+        // `exec resume`, the App Server's thread/start): without the task, which only the lost session held. The turn
+        // stops before the model acts, and the session loop starts afresh with the full prompt.
+        if (session.resume && named !== session.id && (agent.pausedSession === session.id || run.resumeSession === session.id)) { strayed = named; controller.abort() }
+      },
     })).catch((error: unknown) => { throw markProviderFailure(error) }), agent)
     const result = await abortable(providerTask, controller.signal, run.limits.timeoutMs, 'Provider turn time budget exhausted')
     clearSilentTurns(agent)
@@ -203,20 +247,26 @@ async function providerTurn(runtime: OrbitRuntimeLike, run: RunRecord, agent: Ag
     if (typeof result?.reasoningEffort === 'string' && result.reasoningEffort !== agent.reasoningEffort) { runtime.updateAgent(run, agent, { reasoningEffort: result.reasoningEffort }); if (agent.id === 'root') run.reasoningEffort = result.reasoningEffort }
     if (result?.usage) runtime.recordUsage(run, result.usage)
     timing.endedAt = new Date().toISOString()
+    closeThinking(runtime, run, agent, timing)
     runtime.emit(run, 'run.info', { agentId: agent.id, providerId: agent.providerId, model: agent.model, usage: { ...run.usage }, timing: { ...timing } })
     return result
   } catch (caught) {
-    // A turn that is repeated at once (after a silence, on another subscription, or with a message the agent is to read
-    // now) was never taken: it must not eat the turn budgets.
+    // A turn that is repeated (after a silence, on another subscription, with a message the agent is to read now, or
+    // after the user's pause) was never taken: it must not eat the turn budgets.
     const refund = () => { if (counted) { run.usage.providerTurns--; agent.turns--; if (agent.id !== 'root') run.usage.workerTurns-- } }
     if (interrupted && !signal.aborted) {
-      if (interrupted === 'message') refund()
+      refund()
       // The model itself spoke (a stderr line or a note from before the CLI started does not count): its session holds
-      // the turn's prompt. A first session turn of Claude that spoke has its session under Orbit's id (--session-id),
-      // which the repeat resumes, as a restart's continuation does (resume.rootSession).
+      // the turn's prompt. A first session turn that spoke has its session, which the repeat resumes: the one the turn's
+      // record names (named by the stream of Codex, Cursor or Antigravity, or Claude's under Orbit's id), as a restart's
+      // continuation resumes it (resume.rootSession).
       const spoke = watch ? Number.isFinite(watch.stepAge()) : !!timing?.firstEventAt
-      const opened = session && !session.resume && agent.providerId === 'claude' && spoke ? session.id : null
+      const opened = session && !session.resume && spoke ? timing?.sessionId || null : null
       throw new PauseInterrupt(interrupted === 'message' ? messageNote(agent) : pauseNote(agent, pauseHolder), interrupted, opened, spoke)
+    }
+    if (strayed && !signal.aborted) {
+      refund()
+      throw Object.assign(new Error(`${agent.providerId} opened session ${strayed} instead of resuming ${session?.id}`), { code: 'ORBIT_SESSION_ID' })
     }
     // A turn the watchdog stopped ends as a stall, whatever the aborted provider reported.
     const error = watch?.stalled && !signal.aborted ? watch.stalled : caught
@@ -229,6 +279,8 @@ async function providerTurn(runtime: OrbitRuntimeLike, run: RunRecord, agent: Ag
       run.providerBuffers.delete(key)
     }
     if (timing && !timing.endedAt) timing.endedAt = new Date().toISOString()
+    if (timing) closeThinking(runtime, run, agent, timing)
+    flushProgress(runtime, run, agent)
     if (agent.activeTurn?.stream) runtime.flushStream(run, agent, agent.activeTurn.stream)
     stopSteer(agent.activeTurn)
     agent.activeTurn = null

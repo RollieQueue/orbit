@@ -39,7 +39,7 @@ function describeCall(call: ToolCall, observation: Loose, failure: string | null
   else if (call.name === 'team_history') outcome = `${Array.isArray(observation) ? observation.length : 0} earlier turns`
   else if (call.name === 'list_agents') outcome = `${observation.length} participants`
   else if (call.name === 'context_read') outcome = observation.notes ? `${observation.notes.length} notes listed` : `note ${observation.key}`
-  else if (['read_messages', 'wait_message'].includes(call.name)) outcome = `${observation.messages?.length ?? 0} messages${observation.timedOut ? ', timed out' : ''}`
+  else if (['read_messages', 'wait_message'].includes(call.name)) outcome = `${observation.messages?.length ?? 0} messages${observation.timedOut ? ', timed out' : ''}${observation.stopped?.length ? `, stopped by the user: ${observation.stopped.map((item: Loose) => clip(item.name, 40)).join(', ')}` : ''}`
   else if (call.name === 'wait_agent' && Array.isArray(observation)) outcome = observation.map((item: Loose) => `${clip(nameOf(item.agentId), 40)}: ${item.status}`).join(', ') || 'no children'
   else if (call.name === 'memory_search') outcome = `${Array.isArray(observation) ? observation.length : 0} entries`
   else if (call.name === 'memory_save') outcome = `${observation.merged ? 'updated' : 'saved'} ${observation.scope || ''} note "${clip(observation.title, 60)}"${observation.demoted ? ' (kept in the project)' : ''}`

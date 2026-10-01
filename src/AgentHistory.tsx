@@ -2,7 +2,7 @@ import { useMemo, useState } from 'react'
 import type { Agent, InspectorTab, RunSnapshot, RunStatus, TurnTiming } from './types'
 import { Markdown, assistantOutput, plural, statusText, timeOf } from './format'
 import { changedFiles } from './file-map'
-import { durationMs, formatDuration, transportLabel } from './run-events'
+import { durationMs, formatDuration, shownStatus, transportLabel } from './run-events'
 import './agent-history.css'
 
 const dotOf = (status?: RunStatus) => status === 'completed' ? 'done' : status === 'failed' ? 'error' : status || 'idle'
@@ -102,11 +102,11 @@ function AgentCard({ agent, depth, entries, actions, answered, onOpen }: CardPro
   const excerpt = (agent.task || agent.role || '').replace(/\s+/g, ' ').trim()
   return <details className="history-agent" style={{ marginLeft: Math.min(depth, 4) * 14 }} onToggle={event => setOpened(event.currentTarget.open)}>
     <summary>
-      <span className={`status-dot ${agent.status}`} />
+      <span className={`status-dot ${shownStatus(agent)}`} />
       <span className="history-agent-main">
         <strong>{agent.name || agent.id}</strong>{excerpt && <small>{excerpt.length > 110 ? `${excerpt.slice(0, 110)}…` : excerpt}</small>}
       </span>
-      <span className="history-agent-state">{statusText(agent.status)}{!!entries.length && ` · ${entries.length}`}</span>
+      <span className="history-agent-state">{statusText(shownStatus(agent))}{!!entries.length && ` · ${entries.length}`}</span>
     </summary>
     {opened && <div className="history-agent-body">
       <div className="history-agent-meta">

@@ -18,8 +18,8 @@
  *       none      the running Orbit already runs all of it: status up-to-date, nothing restarts
  *     The signal is `electron.exe <repo> <flag>`, what `Orbit.cmd <flag>` runs: the second-instance handler in
  *     electron/main.cjs acts on it; with no instance running it simply starts one.
- *   → wait ≤ 15 s for a fresh artifacts/self-upgrade-health.json (main writes one per start, runtime restart and
- *     renderer reload); on success the candidate becomes refs/orbit/self-upgrade/last-good
+ *   → wait ≤ 15 s for a fresh artifacts/self-upgrade-health.json, or the file ORBIT_HEALTH_FILE names (main writes one
+ *     per start, runtime restart and renderer reload); on success the candidate becomes refs/orbit/self-upgrade/last-good
  *   → on failure the failed sources are kept as refs/orbit/self-upgrade/failed + artifacts/self-upgrade-failed.patch
  *     and, per level: full — Orbit processes of this repository are stopped, dist-prev/ and electron/ + src/ come
  *     back, Orbit is started again; runtime — the runtime files of electron/ come back (the files of the running main
@@ -82,12 +82,15 @@
  *      renderer reloads are not limited), ORBIT_UPGRADE_HEALTH_TIMEOUT_MS (default 15000), ORBIT_USER_DATA (the profile
  *      of the Orbit to restart — Orbit sets it for its agents' commands; it wins over the health report's, a health
  *      report of another profile is not used to pick the level, and a freshly started Orbit inherits it),
+ *      ORBIT_HEALTH_FILE (where main writes its health report, as electron/main.cjs reads it: the script reads and
+ *      waits for the report there; "0" or empty — no report, so nothing restarts: status no-health-report),
  *      ORBIT_RUN_ID / ORBIT_CHAT_ID / ORBIT_PROJECT_ID / ORBIT_AGENT_ID / ORBIT_RESUME_FILE (Orbit sets them for its
  *      agents' commands), ORBIT_RESTART_SOURCE=tool (restart_orbit), ORBIT_DEV=1 (npm run dev: nothing restarts).
  *
  * Exit: 0 applied or up to date; 1 failure (arguments, tools, checks, build, rolled back); 2 cycle limit, lock, dev
- *       mode, cancelled, or a watcher that has not reported in time.
- * Reports: artifacts/self-upgrade-last.json (status, level, step timings, health, rollback, intentFile, intentWritten),
+ *       mode, no health report (ORBIT_HEALTH_FILE=0), cancelled, or a watcher that has not reported in time.
+ * Reports: artifacts/self-upgrade-last.json (status, level, step timings, health, rollback, intentFile, intentWritten,
+ *          failures of a failed check), artifacts/self-upgrade-checks.log (the whole output of the checks and the build),
  *          artifacts/self-upgrade-watch.log.
  */
 const crypto = require('node:crypto')
@@ -95,31 +98,51 @@ const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
 const { spawn, spawnSync } = require('node:child_process')
+const { StringDecoder } = require('node:string_decoder')
 const { SHELL_FILES, RENDERER_INPUTS, fingerprints, rendererHash } = require('../electron/fingerprint.cjs')
 
 const root = path.resolve(__dirname, '..')
 
-/** Every file the loop reads or writes for the repository at `base`; tests pass a temporary folder. */
-function upgradePaths(base = root) {
+/**
+ * Where main writes its health report (electron/main.cjs healthFile, electron/resume.mts healthFilePath):
+ * ORBIT_HEALTH_FILE, a relative path from the repository; null for "0" or an empty value (smoke, tests: no report);
+ * else artifacts/self-upgrade-health.json.
+ */
+function healthFileFor(base, env) {
+  const value = env.ORBIT_HEALTH_FILE
+  if (value === undefined) return path.join(base, 'artifacts', 'self-upgrade-health.json')
+  return value && value !== '0' ? path.resolve(base, value) : null
+}
+
+/**
+ * Every file the loop reads or writes for the repository at `base`; tests pass a temporary folder. `env` names the
+ * health file (ORBIT_HEALTH_FILE): the script's own environment for PATHS, none (the default file) for a test's paths.
+ */
+function upgradePaths(base = root, env = {}) {
   const artifacts = path.join(base, 'artifacts')
+  const health = healthFileFor(base, env)
+  const extension = health ? path.extname(health) : ''
   return {
     root: base,
     artifacts,
     dist: path.join(base, 'dist'),
     distPrev: path.join(base, 'dist-prev'),
-    health: path.join(artifacts, 'self-upgrade-health.json'),
-    healthPrev: path.join(artifacts, 'self-upgrade-health-prev.json'),
+    health,
+    // The report a restart moves aside before its signal, next to it: self-upgrade-health-prev.json by default.
+    healthPrev: health ? path.join(path.dirname(health), `${path.basename(health, extension)}-prev${extension}`) : null,
     report: path.join(artifacts, 'self-upgrade-last.json'),
     plan: path.join(artifacts, 'self-upgrade-plan.json'),
     cycles: path.join(artifacts, 'self-upgrade-cycles.json'),
     watchLog: path.join(artifacts, 'self-upgrade-watch.log'),
+    // The whole output of the last run's checks and build: the console and the agent's error show only its end.
+    checksLog: path.join(artifacts, 'self-upgrade-checks.log'),
     failedPatch: path.join(artifacts, 'self-upgrade-failed.patch'),
     running: path.join(artifacts, 'self-upgrade-running.json'),
     // Written by the restart host when the user stops the run whose restart is under way (cancelRequested).
     cancel: path.join(artifacts, 'self-upgrade-cancel.json'),
   }
 }
-const PATHS = upgradePaths(root)
+const PATHS = upgradePaths(root, process.env)
 const DIST = PATHS.dist
 const DIST_PREV = PATHS.distPrev
 const HEALTH_FILE = PATHS.health
@@ -142,6 +165,7 @@ const DEFAULT_REASON = 'самообновление Orbit (npm run self-upgrade
 const DEFAULT_CONTINUE_WITH = 'Продолжи задачу с того места, где остановился перед перезапуском Orbit.'
 const NO_BASE_NOTE = 'sources left as they are (no trustworthy rollback base)'
 const DEV_MODE_MESSAGE = 'Orbit runs from the Vite dev server (ORBIT_DEV=1, npm run dev): restarting it would stop npm run dev (its Electron and Vite end together). Nothing was restarted. Restart Orbit by hand, or pass --no-relaunch or --verify-only to verify and build without a restart.'
+const NO_HEALTH_MESSAGE = 'Orbit writes no health report (ORBIT_HEALTH_FILE=0): a restart could be neither checked nor rolled back. Nothing was restarted. Restart Orbit by hand, or pass --no-relaunch or --verify-only to verify and build without a restart.'
 
 // Flags that take a value, as `--reason text` or `--reason=text`; any other `--x` is a switch.
 const VALUE_FLAGS = new Set(['--watch', '--reason', '--continue-with', '--level', '--intent-file', '--pid', '--started-at', '--shell-hash', '--runtime-hash', '--renderer-hash'])
@@ -560,16 +584,123 @@ function createTimer(log = console.log, beforeStep = null) {
   return { timings, step }
 }
 
-/** A check or the build, with its output passed through. Asynchronous, so that the lock's heartbeat goes on meanwhile. */
-function run(label, command, commandArgs) {
+/**
+ * A check or the build, with its output passed through, appended to `log` (the whole output of this run's steps: the
+ * console and the agent's error show only its end) and searched for what failed: a failed step's error names the failed
+ * tests and carries them as `failures` (failureCollector). Asynchronous, so that the lock's heartbeat goes on meanwhile.
+ */
+function run(label, command, commandArgs, { log = null, cwd = root, stdout = process.stdout, stderr = process.stderr } = {}) {
   return new Promise((resolve, reject) => {
-    const child = spawn(command, commandArgs, { cwd: root, stdio: 'inherit', shell: false, windowsHide: true, env: process.env })
-    child.on('error', reject)
+    const found = failureCollector(cwd)
+    let fd = null
+    const closeLog = () => { if (fd !== null) { try { fs.closeSync(fd) } catch { /* Closed already. */ } fd = null } }
+    const toLog = (chunk) => { if (fd !== null) { try { fs.writeSync(fd, chunk) } catch { closeLog() } } }
+    if (log) { try { fd = fs.openSync(log, 'a') } catch { fd = null } }
+    toLog(`\n==> ${label}\n`)
+    const child = spawn(command, commandArgs, { cwd, stdio: ['ignore', 'pipe', 'pipe'], shell: false, windowsHide: true, env: process.env })
+    child.stdout.on('data', (chunk) => { stdout.write(chunk); toLog(chunk); found.feed(chunk) })
+    child.stderr.on('data', (chunk) => { stderr.write(chunk); toLog(chunk) })
+    child.on('error', (error) => { closeLog(); reject(error) })
     child.on('close', (code, signal) => {
-      if (code === 0) resolve(undefined)
-      else reject(new Error(`${label} exited with ${code ?? signal}`))
+      closeLog()
+      if (code === 0) return resolve(undefined)
+      const { failures, total } = found.result()
+      const names = failures.map((item) => item.name).join(', ')
+      const error = new Error(`${label} exited with ${code ?? signal}${total ? ` (${total} failed: ${names.length > 300 ? `${names.slice(0, 300)}…` : names})` : ''}`)
+      reject(Object.assign(error, { failures, failuresTotal: total }))
     })
   })
+}
+
+const FAILURE_LIMIT = 12
+const FAILURE_CHARS = 300
+/**
+ * What failed, read from a check's output as it streams by: node:test's TAP `not ok` entries with the error and the
+ * location from their YAML block, and TypeScript's `error TS` lines. Left out: a test that failed only because a subtest
+ * did (failureType subtestsFailed; the subtest is listed itself) and a failing TODO test. `feed` takes chunks, `result`
+ * ends the input and returns the first `limit` failures and how many there were in all.
+ */
+function failureCollector(base = root, limit = FAILURE_LIMIT) {
+  const decoder = new StringDecoder('utf8')
+  const failures = []
+  let total = 0, rest = '', entry = null, blockField = null
+  const clipped = (text) => (text.length > FAILURE_CHARS ? `${text.slice(0, FAILURE_CHARS)}…` : text)
+  const add = (item) => { total++; if (failures.length < limit) failures.push(item) }
+  // Where a test is, relative to the repository when it is inside it.
+  const place = (value) => {
+    const match = /^(.*):(\d+):(\d+)$/.exec(value)
+    if (!match) return value
+    const relative = path.relative(base, match[1])
+    const file = relative && !relative.startsWith('..') && !path.isAbsolute(relative) ? relative.split(path.sep).join('/') : match[1]
+    return `${file}:${match[2]}:${match[3]}`
+  }
+  // A one-line value of the YAML block is util.inspect's quoted string literal.
+  const unquoted = (value) => {
+    const text = value.trim()
+    if (text.length < 2 || !/^['"`]$/.test(text[0]) || text.at(-1) !== text[0]) return text
+    return text.slice(1, -1).replace(/\\(.)/g, (_, char) => ({ n: ' ', r: '', t: ' ' })[char] ?? char)
+  }
+  const settle = () => {
+    if (entry && entry.type !== 'subtestsFailed') add({ name: clipped(entry.name), ...(entry.error ? { error: clipped(entry.error) } : {}), ...(entry.location ? { location: entry.location } : {}) })
+    entry = null
+    blockField = null
+  }
+  const line = (text) => {
+    const tap = /^\s*(not )?ok \d+ - (.*)$/.exec(text)
+    if (tap) {
+      settle()
+      if (tap[1] && !/(?:^|\s)# TODO\b/i.test(tap[2])) entry = { name: tap[2].replace(/\\#/g, '#').trim(), error: '', location: '', type: '' }
+      return
+    }
+    if (entry) {
+      if (/^\s*\.\.\.\s*$/.test(text)) return settle()
+      // The first line of a multi-line value (`error: |-`) stands for all of it.
+      if (blockField) { if (text.trim()) { entry[blockField] = text.trim(); blockField = null }; return }
+      const field = /^\s*(error|location|failureType):\s*(.*)$/.exec(text)
+      if (!field) return
+      const key = field[1] === 'failureType' ? 'type' : field[1]
+      if (/^[|>][-+]?$/.test(field[2].trim())) blockField = key
+      else entry[key] = key === 'location' ? place(unquoted(field[2])) : unquoted(field[2])
+      return
+    }
+    const ts = /^(.+?)\((\d+),(\d+)\): error (TS\d+): (.*)$/.exec(text) || /^(.+?):(\d+):(\d+) - error (TS\d+): (.*)$/.exec(text)
+    if (ts) return add({ name: `${ts[1].split(path.sep).join('/')}:${ts[2]}:${ts[3]}`, error: clipped(`${ts[4]}: ${ts[5]}`) })
+    // An error of the compiler's setup, with no file (a bad tsconfig.json, an unknown option).
+    const general = /^error (TS\d+): (.*)$/.exec(text)
+    if (general) add({ name: 'tsc', error: clipped(`${general[1]}: ${general[2]}`) })
+  }
+  const feed = (chunk) => {
+    const parts = (rest + (typeof chunk === 'string' ? chunk : decoder.write(chunk))).split('\n')
+    rest = parts.pop() ?? ''
+    // A line that never ends (binary output) is not kept whole.
+    if (rest.length > 1 << 16) rest = rest.slice(-(1 << 16))
+    for (const part of parts) line(part.replace(/\r$/, ''))
+  }
+  const result = () => {
+    const last = rest + decoder.end()
+    rest = ''
+    if (last) line(last.replace(/\r$/, ''))
+    settle()
+    return { failures, total }
+  }
+  return { feed, result }
+}
+
+/** The lines that end a failed run's output: what failed (failureCollector) and where the whole output of the checks is. */
+function failureSummary({ failures = [], failuresTotal = failures.length, checksLog = null } = {}) {
+  const lines = failures.map((item) => `  - ${item.name}${item.error ? ` — ${item.error}` : ''}${item.location ? ` (${item.location})` : ''}`)
+  if (lines.length) lines.unshift(`Failed: ${failuresTotal}${failuresTotal > failures.length ? `, the first ${failures.length}:` : ':'}`)
+  if (checksLog) lines.push(`Whole output of the checks: ${checksLog}`)
+  return lines
+}
+
+/** Starts this run's log of the checks and the build; null when it cannot be written (the steps run without it). */
+function startChecksLog(file, runId) {
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true })
+    fs.writeFileSync(file, `Orbit self-upgrade ${runId}: the output of the checks and the build, ${new Date().toISOString()}\n`)
+    return file
+  } catch { return null }
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -875,14 +1006,16 @@ function sameFolder(left, right) {
 /**
  * Which Orbit instances of this repository run, and the last health report when it is one of theirs. Two instances of
  * one repository (two profiles) write the same health file: with `userData` (the profile this script restarts, from
- * ORBIT_USER_DATA) a report of another profile is not the instance's own (`healthNote` says why).
+ * ORBIT_USER_DATA) a report of another profile is not the instance's own (`healthNote` says why), and with
+ * ORBIT_HEALTH_FILE=0 (no `paths.health`) there is no report at all.
  */
 function observeOrbit({ paths = PATHS, system = SYSTEM, userData = null } = {}) {
-  const health = readJson(paths.health)
+  const health = paths.health ? readJson(paths.health) : null
   const running = system.findOrbitProcesses().map((process_) => process_.pid)
   const own = !!health && typeof health === 'object' && running.includes(Number(health.pid))
   const foreign = own && !!userData && typeof health.userData === 'string' && !!health.userData && !sameFolder(health.userData, userData)
-  const healthNote = foreign ? `the health report is of another Orbit instance of this repository (pid ${health.pid}, profile ${health.userData}), not of the one this script restarts (ORBIT_USER_DATA ${userData}): its code hashes do not count` : null
+  const healthNote = foreign ? `the health report is of another Orbit instance of this repository (pid ${health.pid}, profile ${health.userData}), not of the one this script restarts (ORBIT_USER_DATA ${userData}): its code hashes do not count`
+    : !paths.health ? 'Orbit writes no health report (ORBIT_HEALTH_FILE=0)' : null
   return { running, health, runningHealth: own && !foreign ? health : null, healthNote }
 }
 
@@ -1039,7 +1172,8 @@ function writeReport(report) { return writeJson(REPORT_FILE, report) }
 /** A failure the next reader of self-upgrade-last.json must be able to see, not only the console. */
 function failWithReport(message, details = {}) {
   const file = writeReport({ ok: false, status: 'failed', nextAction: 'fix-and-retry', timestamp: new Date().toISOString(), error: message, phase: 'done', ...details })
-  console.error(`${message}\nReport: ${file}`)
+  // Printed last, so that the end of the output the agent gets names what failed.
+  console.error([message, ...failureSummary(details), `Report: ${file}`].join('\n'))
   process.exit(details.exitCode || 1)
 }
 
@@ -1486,6 +1620,8 @@ async function main() {
   // Under `npm run dev` (ORBIT_DEV=1, inherited by the agents' commands) a restart would stop the dev server with it.
   const devMode = process.env.ORBIT_DEV === '1'
   if (devMode && !dryRun && !noRelaunch && !verifyOnly) failWithReport(DEV_MODE_MESSAGE, { runId, status: 'dev-mode', nextAction: 'restart-orbit-by-hand', exitCode: 2 })
+  // Without a health report (ORBIT_HEALTH_FILE=0) every restart would end in a timeout and a rollback of good code.
+  if (!PATHS.health && !dryRun && !noRelaunch && !verifyOnly) failWithReport(NO_HEALTH_MESSAGE, { runId, status: 'no-health-report', nextAction: 'restart-orbit-by-hand', exitCode: 2 })
   try { sweepParked() } catch { /* Housekeeping only. */ }
   let tools = null
   let toolchainError = null
@@ -1519,7 +1655,7 @@ async function main() {
     steps: planSteps({ verifyOnly, noRelaunch: noRelaunch || predicted.level === 'none', desktop: runDesktop, verify: verify.needed, build: build.needed }),
     tools, toolchainError, ...levelFields(predicted, intentPreview), build, verify,
     fingerprint, rendererHash: renderer.hash, fingerprintMs, distPresent, newestSource: sourceAtStart.file, marker,
-    running: observed.running, health: healthSummary(observed.health), healthIsRunning: !!observed.runningHealth,
+    running: observed.running, healthFile: PATHS.health, health: healthSummary(observed.health), healthIsRunning: !!observed.runningHealth,
     ...(observed.healthNote ? { healthNote: observed.healthNote } : {}), ...profileOf(observed),
     lastGood, healthTimeoutMs,
     cycles: { used: readCycles().length, max: maxCycles, windowMinutes: cycleWindowMs / 60000, counts: countsAsRestart(predicted.level) },
@@ -1571,16 +1707,18 @@ async function main() {
   let distPrevSaved = false
   let distDirty = false
   let markerWritten = false
-  const details = () => ({ runId, started, timings, lastGood, candidate, distPrevSaved, built: build.needed, verified: verify.needed, ...levelFields(predicted, intentPreview) })
+  const checksLog = verify.needed || build.needed ? startChecksLog(PATHS.checksLog, runId) : null
+  const check = (label, command, commandArgs) => run(label, command, commandArgs, { log: checksLog })
+  const details = () => ({ runId, started, timings, lastGood, candidate, distPrevSaved, built: build.needed, verified: verify.needed, ...(checksLog ? { checksLog } : {}), ...levelFields(predicted, intentPreview) })
   const cancelled = (error, extra = {}) => failWithReport(error.message, { ...details(), status: 'cancelled', nextAction: 'none', exitCode: 2, cancel: error.stop, ...extra })
 
   try {
     if (verify.needed) {
-      await step('typecheck', async () => { await run('typecheck', process.execPath, [tools.tsc, '--noEmit']); await run('typecheck:main', process.execPath, [tools.tsc, '-p', 'tsconfig.main.json']) })
-      await step('test', () => run('test', process.execPath, ['--experimental-strip-types', '--disable-warning=ExperimentalWarning', '--test', ...testFiles()]))
-      await step('smoke', () => run('smoke', process.execPath, ['--experimental-strip-types', '--disable-warning=ExperimentalWarning', path.join('scripts', 'smoke-runtime.cjs')]))
-      await step('main-load', () => run('main-load', process.execPath, ['--experimental-strip-types', '--disable-warning=ExperimentalWarning', '--test', path.join('tests', 'main-load.test.cjs')]))
-      if (runDesktop) await step('smoke:desktop', () => run('smoke:desktop', process.execPath, [path.join('scripts', 'run-electron.cjs'), path.join('scripts', 'smoke-desktop.cjs')]))
+      await step('typecheck', async () => { await check('typecheck', process.execPath, [tools.tsc, '--noEmit']); await check('typecheck:main', process.execPath, [tools.tsc, '-p', 'tsconfig.main.json']) })
+      await step('test', () => check('test', process.execPath, ['--experimental-strip-types', '--disable-warning=ExperimentalWarning', '--test', ...testFiles()]))
+      await step('smoke', () => check('smoke', process.execPath, ['--experimental-strip-types', '--disable-warning=ExperimentalWarning', path.join('scripts', 'smoke-runtime.cjs')]))
+      await step('main-load', () => check('main-load', process.execPath, ['--experimental-strip-types', '--disable-warning=ExperimentalWarning', '--test', path.join('tests', 'main-load.test.cjs')]))
+      if (runDesktop) await step('smoke:desktop', () => check('smoke:desktop', process.execPath, [path.join('scripts', 'run-electron.cjs'), path.join('scripts', 'smoke-desktop.cjs')]))
     } else console.log(`Skipping the checks: ${verify.reason}.`)
     if (verifyOnly) {
       writeReport({ ok: true, status: 'verify-only', nextAction: 'build-when-ready', phase: 'done', finished: new Date().toISOString(), ...details() })
@@ -1595,7 +1733,7 @@ async function main() {
         if (tools.git) candidate = snapshotTree({ label: 'candidate', fingerprint: candidateHashes })
       })
       distDirty = true
-      await step('build', () => run('build', process.execPath, [tools.vite, 'build']))
+      await step('build', () => check('build', process.execPath, [tools.vite, 'build']))
     } else {
       console.log(`Skipping the renderer build: ${build.reason}.`)
       if (tools.git) await step('snapshot', () => { candidate = snapshotTree({ label: 'candidate', fingerprint: candidateHashes }) })
@@ -1615,7 +1753,7 @@ async function main() {
     let distRestored = false
     if (distDirty && distPrevSaved) { try { restoreDistPrev(); distRestored = true } catch { /* Reported below as not restored. */ } }
     if (error instanceof CancelledError) cancelled(error, { distRestored })
-    failWithReport(error.message, { ...details(), distRestored })
+    failWithReport(error.message, { ...details(), distRestored, ...(error.failures?.length ? { failures: error.failures, failuresTotal: error.failuresTotal } : {}) })
   }
 
   // Decided again: during the checks Orbit may have been closed, or restarted with this code by hand.
@@ -1687,7 +1825,7 @@ module.exports = {
   restoreDistPrev, replaceDirectory, orbitLaunch, matchesOrbitProcess, findOrbitProcesses, readCycles, recordCycle,
   cycleLimitReached, resolveIntent, writeIntent, writeJsonAtomic, markIntentRolledBack, markIntentRelaunched, settleIntent,
   snapshotInfo, rollbackBase, chooseRollbackBase, recordRunning, relaunchAndWait, rollback, runWatcher, summarize,
-  NO_BASE_NOTE, DEV_MODE_MESSAGE,
+  NO_BASE_NOTE, DEV_MODE_MESSAGE, NO_HEALTH_MESSAGE,
   // Restore (overlay, temporary index) and what a rollback puts back; `git` is the runner restoreTree uses by default.
   addedFiles, rollbackParts, git,
   // The lock (see its section for the format) and the stop marker: the restart host (runtime side) uses releaseLockOf,
@@ -1696,4 +1834,6 @@ module.exports = {
   cancelRequested, requestCancel, clearCancel, CancelledError, watch,
   // --mark-build (npm run build).
   markBuild,
+  // A check's output: its log and what failed in it.
+  run, failureCollector, failureSummary, startChecksLog,
 }

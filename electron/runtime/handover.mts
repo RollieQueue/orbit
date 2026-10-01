@@ -1,9 +1,11 @@
 // Subscription failover as the runtime applies it: the quota check before a turn, the handover of an agent to another
 // provider with its note, and the recovery after a refused or failed turn. The pure choice lives in ../failover.mts.
+// Also the model a new helper gets for its kind of work (routeSpawn), judged on the same provider list and quotas.
 import { randomUUID } from 'node:crypto'
 import { classifyQuotaError, assess } from '../quota.mts'
 import { replacements, handoverNote, targetLabel, unreachable } from '../failover.mts'
-import type { AgentRecord, CatalogEntry, HandoverReason, HandoverRecord, HandoverRequest, InterruptedTurn, ModelTarget, OrbitRuntimeLike, RunRecord } from '../types.mts'
+import { candidates, route } from '../model-routing.mts'
+import type { AgentRecord, CatalogEntry, HandoverReason, HandoverRecord, HandoverRequest, InterruptedTurn, ModelTarget, OrbitRuntimeLike, RoutedSpawn, RunRecord, ToolArgs } from '../types.mts'
 import { withoutGoogleReasoning, publicAgent, bounded, clip, TurnBudgetError, diagnostics, fromProvider } from './util.mts'
 import { closeAgentSession } from './session.mts'
 import { isStall, silentMinutes, stallNote, countSilentTurn, clearSilentTurns } from './watchdog.mts'
@@ -15,6 +17,9 @@ const QUOTA_WAIT_MS = 6000
 const QUOTA_STALE_MS = 5 * 60000
 const CATALOG_MAX_AGE_MS = 120000
 const BROKEN_PROVIDER_MS = 10 * 60000
+// A helper waits this long at most for the provider list before its model is chosen without it (ORBIT_ROUTE_WAIT_MS).
+const ROUTE_WAIT_MS = 8000
+const routeWait = (): number => { const raw = process.env.ORBIT_ROUTE_WAIT_MS?.trim(), value = Number(raw); return raw && Number.isFinite(value) && value >= 0 ? value : ROUTE_WAIT_MS }
 
 // ---- Subscription failover -------------------------------------------------------------------------------------
 // An agent's memory (transcript, work log, files, mailbox) lives in Orbit, and every provider turn is a fresh
@@ -154,4 +159,36 @@ async function recoverStall(runtime: OrbitRuntimeLike, run: RunRecord, agent: Ag
   throw new Error(`Модель ${label} не присылала событий ${silent} мин два хода подряд, поэтому сторож Orbit остановил агента: ${why}. Журнал действий сохранён.`, { cause: error })
 }
 
-export { failoverActive, providerCatalog, preflightQuota, handover, recoverProvider }
+// ---- Model routing -----------------------------------------------------------------------------------------------
+// spawn_agent {kind} without a model: the model for that kind of work (../model-routing.mts). The candidates' quotas are
+// refreshed like a handover's, and the provider list is waited for at most ROUTE_WAIT_MS: without it only the providers
+// already known to answer count. Nothing here throws; without a usable candidate the spec stays as it is, and the helper
+// gets the model it would get without a kind.
+async function routeSpawn(runtime: OrbitRuntimeLike, run: RunRecord, parent: AgentRecord, spec: ToolArgs): Promise<{ spec: ToolArgs; routed: RoutedSpawn }> {
+  const kind = String(spec.kind)
+  const ids = [...new Set(candidates(kind).map(candidate => candidate.providerId))].filter(id => !spec.providerId || id === spec.providerId)
+  if (!ids.length) return { spec, routed: { kind, model: null, note: `The routing table has no ${kind} candidate on ${spec.providerId}; the helper got the model it gets without a kind.` } }
+  const timers: NodeJS.Timeout[] = []
+  const late = new Promise<null>(resolve => { timers.push(setTimeout(resolve, routeWait(), null)) })
+  const [list] = await Promise.all([
+    Promise.race([runtime.providerCatalog(run), late]).catch(() => null),
+    runtime.quota ? Promise.all(ids.map(id => runtime.quota!.get(id, { maxAgeMs: CATALOG_MAX_AGE_MS, waitMs: QUOTA_WAIT_MS, options: run.providerOptions[id] || {} }).catch(() => null))) : null,
+  ])
+  timers.forEach(clearTimeout)
+  const now = runtime.clock()
+  const { choice, skipped } = route({
+    kind, providerId: spec.providerId, catalog: list?.length ? list : null,
+    known: new Set([parent.providerId, run.providerId, ...run.providerPool.map(member => member.providerId)]),
+    pool: run.providerPool, runProviderId: run.providerId, quota: runtime.quota, threshold: run.failover.switchAtPercent, now,
+    skip: new Set([...run.brokenProviders].filter(([, until]) => until > now).map(([id]) => id)),
+  })
+  const passed = skipped.length ? { skipped } : {}
+  if (!choice) return { spec, routed: { kind, model: null, ...passed, note: 'No model of the routing table can take this work now; the helper got the model it gets without a kind.' } }
+  // The measured level only where nothing else names one: the caller, the pool (createAgent), the provider's settings, or
+  // the parent's own model, whose level the helper inherits.
+  const inherits = choice.providerId === parent.providerId && [parent.requestedModel, parent.model].includes(choice.model)
+  const effort = spec.reasoningEffort === undefined && !inherits && !run.providerOptions[choice.providerId]?.reasoningEffort && choice.reasoningEffort ? { reasoningEffort: choice.reasoningEffort } : {}
+  return { spec: { ...spec, providerId: choice.providerId, model: choice.model, ...effort }, routed: { kind, model: `${choice.providerId}/${choice.model}`, ...passed } }
+}
+
+export { failoverActive, providerCatalog, preflightQuota, handover, recoverProvider, routeSpawn }

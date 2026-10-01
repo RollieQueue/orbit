@@ -43,6 +43,14 @@ credentials embedded in the URL are rejected. Ollama defaults to
 `http://127.0.0.1:11434`; `ORBIT_OLLAMA_URL` may override the base URL or the
 legacy full `/api/generate` URL.
 
+Plain `http://` is accepted only for this machine (`localhost`, `127.0.0.0/8`,
+`[::1]`, as the URL parser canonicalizes them): to another host the prompt and
+`ORBIT_OPENAI_API_KEY` would travel unencrypted, so such an address needs
+`https://`, or `ORBIT_ALLOW_INSECURE_HTTP=1` for a trusted network (Ollama on
+another computer at home). A refused address stops the run before any request,
+and the provider list shows the variable and the reason (`endpointUrl` in
+`electron/providers.mts`).
+
 ## Execution and permissions
 
 Prompts go through stdin, including on Windows. Commands use `shell: false`.
@@ -142,9 +150,10 @@ Codex exec (checked against 0.155):
 codex exec --json --skip-git-repo-check -C <ws> --sandbox <mode> -c features.multi_agent=false
      -c 'mcp_servers.orbit.url="http://127.0.0.1:<port>/mcp"' -c 'mcp_servers.orbit.bearer_token_env_var="ORBIT_MCP_TOKEN"'
      -c mcp_servers.orbit.tool_timeout_sec=3600
+     [-c developer_instructions="<the stable Orbit block>"]
      [-c approval_policy="never" | --approve-for-me] [--model m] [-c model_reasoning_effort="x"] -
 codex exec resume --json --skip-git-repo-check -c sandbox_mode="<mode>" -c features.multi_agent=false
-     -c mcp_servers.orbit.* … <thread id> -
+     -c mcp_servers.orbit.* … [-c developer_instructions=…] <thread id> -
 ```
 
 `ORBIT_MCP_TOKEN` is in the child environment, never on the command line. No
@@ -152,6 +161,16 @@ codex exec resume --json --skip-git-repo-check -c sandbox_mode="<mode>" -c featu
 `thread.started` event. `codex exec resume` accepts neither `-C` nor `--sandbox`
 nor `--approve-for-me`, so the process cwd is the workspace, the sandbox travels as
 `sandbox_mode`, and an auto-review resume keeps the thread's own approval policy.
+The stable Orbit block (`systemAppend`) becomes the thread's developer instructions,
+a TOML string on the command line (Codex has no file option for it); the App Server
+gets it as `developerInstructions` in `thread/start` and `thread/resume`. A resumed
+thread keeps the block it started with (both transports, checked 2026-10-01 against
+0.155 with a stub Responses server); a resume passes it all the same. The override
+replaces a `developer_instructions` the user set in `CODEX_HOME/config.toml` for Orbit's
+sessions (`AGENTS.md` still applies). A lone surrogate (a string bounded inside an emoji)
+goes out as U+FFFD: on the command line TOML refuses its escape, and the App Server drops
+a JSON-RPC line that carries one without answering, so every string of every App Server
+message is made well-formed (`rpcLine`).
 
 Codex ends an MCP tool call after the server's `tool_timeout_sec` (60 s unless set), and Orbit's tools legitimately
 take longer (`wait_agent`, `run_command`, the checks of `restart_orbit`), so both Codex transports set it to 3600
@@ -252,6 +271,13 @@ items and App Server readable reasoning-summary deltas are forwarded when suppli
 unavailable reasoning is not reconstructed. See the official
 [configuration reference](https://learn.chatgpt.com/docs/config-file/config-reference)
 and [App Server events](https://learn.chatgpt.com/docs/app-server).
+Claude streams its thinking text empty; inside the agent's own thinking block
+(`content_block_start` of type `thinking` without `parent_tool_use_id`, up to its
+`content_block_stop`) the CLI's `system/thinking_tokens` events (`estimated_tokens`:
+the estimate of the block so far) become `thinking` events. The runtime keeps the
+estimate on the open turn's record (`turnTimings[].thinking`, gone when the block,
+a text or tool call, or the turn ends) and the chat shows it as
+«думает · ~N тыс. токенов»; it is not traced.
 
 Claude uses `bypassPermissions` in Full access. In other modes, native tools
 are restricted to Read/Glob/Grep with `default` permissions; writes and commands
@@ -320,7 +346,16 @@ give a tier (3 flagship, 2 strong, 1 light, 0.5 weak, 0 unknown or unreliable). 
 the model audit (`docs/MODEL-AUDIT.md`) placed away from what their names suggest, each with the reason in `measured`
 (GPT-6 Luna is strong, not light; Claude Haiku 4.5 and the `haiku` alias are weak; GPT-OSS gave no answer and is taken
 only from the pool). The rest follow naming conventions; edit the file when a new model family appears or a new audit
-measures one. Doubtful models are placed low, which only makes a replacement rarer, never worse.
+measures one. Doubtful models are placed low, which only makes a replacement rarer, never worse. Models listed in
+`excluded` are never chosen on their own, whatever their tier, only when the user named them in the provider pool: Claude
+Fable (also Cursor's `claude-fable-5-thinking-high`) is there at the user's request. A provider pooled without a model (or
+Cursor's `auto`) runs whatever its CLI picks, which Orbit cannot see: name the model in the pool to keep an excluded one out.
+
+Which model a new helper gets for a kind of work (`spawn_agent` with `kind`) is decided by `electron/model-routing.json`:
+per kind, the candidates in the order of the model audit, each with what was measured in `why` and the level the audit ran
+at. Claude models are named by the CLI aliases the health list shows (`sonnet`, `opus`). A candidate whose provider lists
+models but not this one is passed over, so a renamed model drops out instead of failing a helper. Claude Fable 5.1 is
+left out at the user's request. Edit the file after a new audit.
 
 ## Runtime contract
 
@@ -359,6 +394,11 @@ can recover before finishing its turn.
 Usage is emitted on completion where the provider supplies it. Provider
 reasoning traces are not used as assistant answers. Consumers should display
 progress separately and use returned `text` as the authoritative final result.
+A CLI that names its own session announces it as soon as it does:
+`{ kind: 'session', sessionId }` (Codex `thread.started`, Cursor `system/init`,
+Antigravity `init`, the Codex App Server's thread before `turn/start`), so the
+runtime can resume a turn cut off before its result (docs/SESSION-MODE.md,
+"Session ids").
 
 The HTTP adapters request text responses. Orbit's model-controlled tool loop
 interprets its text protocol in the runtime. Unexpected native HTTP function
@@ -434,7 +474,7 @@ Google CLI по умолчанию получает системный HTTP-пр
 
 Путь к CLI настраивается в интерфейсе или через `ORBIT_ANTIGRAVITY_COMMAND` / `ORBIT_CURSOR_COMMAND`. Приложение запускает команду без shell, передаёт запрос через stdin и завершает дерево процессов при отмене. Для Cursor Windows поддерживаются native executable, стандартные npm-shim и официальный пакет с `versions/<version>/node.exe` + `index.js`.
 
-Cursor в Full access запускается в Agent (без `--mode ask`), с `--force --sandbox disabled`. В режимах Ask, чтения и доступа к проекту native-инструменты остаются read-only, а разрешённые записи выполняются через Orbit. Antigravity использует временный custom agent `tools: []`; все действия выполняет Orbit с выбранными правами. Политика и способ выполнения разрешённых записей явно указаны агентам в контексте. Завершённый шаг Antigravity (`agent_response`, `state: DONE`) с целым ответом по схеме Orbit сразу передаёт управление рантайму; дерево CLI останавливается до повторной генерации или исправления схемы. Частичные сообщения, текст инструментов и невалидный JSON этого не делают. Без такой передачи управления обязателен успешный terminal result. Всё это — режим конверта; в Full access Antigravity (и Cursor, если включён `ORBIT_CURSOR_SESSION=1`) работает в сессионном режиме с инструментами Orbit по MCP, см. «Cursor and Antigravity sessions» выше.
+Cursor в Full access запускается в Agent (без `--mode ask`), с `--force --sandbox disabled`. В режимах Ask, чтения и доступа к проекту native-инструменты остаются read-only, а разрешённые записи выполняются через Orbit. Antigravity использует временный custom agent `tools: []`; все действия выполняет Orbit с выбранными правами. Политика и способ выполнения разрешённых записей явно указаны агентам в контексте. Завершённый шаг Antigravity (`agent_response`, `state: DONE`) с целым ответом по схеме Orbit сразу передаёт управление рантайму; дерево CLI останавливается до повторной генерации или исправления схемы. Частичные сообщения, текст инструментов и невалидный JSON этого не делают. Без такой передачи управления обязателен успешный terminal result. Всё это — режим конверта; в Full access Antigravity (и Cursor, если включён `ORBIT_CURSOR_SESSION=1`) работает в сессионном режиме с инструментами Orbit по MCP, см. «Cursor and Antigravity sessions» выше. Native-инструменты Cursor оба режима разбирают одинаково (`cursorToolEvent`). Инструмент называется по ключу внутри `tool_call`. Начало и конец вызова связываются по `call_id`, без него по `tool_call.toolCallId`, без обоих по тексту из аргументов (тогда два одинаковых одновременных вызова делят ключ). Законченный вызов, чей результат не вариант успеха (`success`, у немногих инструментов `approved`, `complete` и т. п.), считается неудачным: `error`, `rejected`, `fileNotFound`, `writePermissionDenied`, `timeout` и другие. Чтения и удачные правки попадают в учёт файлов агентов и в записи изменений. В режиме конверта MCP-вызов Cursor всегда native: сервера Orbit у него там нет.
 
 Потоковые сообщения обновляют одну запись по идентификатору сообщения, участнику и ходу. Интервал обновления интерфейса больше не разрезает текст на отдельные записи, а длинные сообщения не обрезаются до 6000 символов. В панели агента показывается текст `content`, итоговый ответ публикуется в чате после обработки инструментов Orbit.
 

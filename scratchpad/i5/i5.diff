@@ -1,0 +1,362 @@
+diff --git a/docs/ARCHITECTURE.md b/docs/ARCHITECTURE.md
+index 8829406..a390797 100644
+--- a/docs/ARCHITECTURE.md
++++ b/docs/ARCHITECTURE.md
+@@ -175,7 +175,7 @@ skills   procedures worked out in a task: per project or global, with a track re
+ 
+ **Skills as add-ons (packages).** A skill is any add-on Orbit builds for itself, not only a procedure: besides the text it may carry a package of files (pages, scripts, assets; `<userData>/skills/<package id>/`, `electron/skill-files.mts` keeps every path inside it, `electron/skill-packages.mts` validates and writes) and three generic mechanisms: `params` (typed values the user sets in the Skills panel, `capabilities:params`; an update by an agent keeps the user's value of a parameter whose key and type stay), `triggers` (today `task-completed` → `show` one of the package's `.html` files) and `commands` (named shell commands an agent runs in the package folder with its ordinary, approved tools). `capability_install` takes `files`, `removeFiles`, `fromDir` (a folder, for an agent inside the project or the temp folder, whose `skill.json` fills the fields the call omits), `params`, `triggers` and `commands`; it validates everything before it writes and puts the files back if the commit fails. `capability_read` returns `package.dir`, files, params with their values, triggers and commands, and refuses a switched-off skill. A skill with files, triggers or commands is protected like a pinned one (never expired, evicted or merged); prompt suggestions skip skills that only have a trigger. Revisions keep the text; the package is current state. Nothing in a skill runs by itself in the runtime: a trigger only makes the window show a page. Main serves `orbit-skill://<package id>/<file>` (a standard, secure scheme registered before the app is ready, read-only, 404 outside a package) with a Content-Security-Policy that allows the package itself, inline code, data:/blob: media and the YouTube player frame and no other host, and it keeps a skill frame from navigating outside its package (`will-frame-navigate`), so a page an agent wrote cannot send what it read anywhere; and `src/SkillStage.tsx` shows the page of each enabled skill with a `task-completed` trigger when a run of its project completes (after a `restart_orbit` restart, when the continuation completes; completions missed while the window reloaded are caught up once), one page at a time, full screen, in an iframe sandboxed to scripts and its own origin, with the parameter values in the address. The page closes itself with `parent.postMessage({ type: 'orbit-skill:close' }, '*')`; the stage also closes on Esc, its × button and after 10 minutes. A skill page that embeds YouTube gets a web Referer from main (`allowVideoEmbeds`), without which the player refuses to play. The first such skill is the celebration in `skills/task-completed-celebration/`.
+ 
+-**Attachments.** The composer attaches documents and images (the paperclip, drag and drop, paste). The window sends them as base64 to `attachments:save`; the runtime (`electron/attachments.mts`) writes them under `<userData>/attachments/<chat>/` (at most 10 files of 20 MB, 50 MB per message) and answers `{id, name, type, size, path}`. `runtime:start` and `runtime:message` accept attachments only inside that folder (`trustedAttachments`: name, type and size come from the disk). The root's task and a steering message list them as `ATTACHMENTS FROM THE USER`, one absolute path per line; the model reads them with its file tools (Claude sees an image it reads). Claude gets `--add-dir <userData>/attachments`, so the folder is readable in every access mode. The chat shows image thumbnails through `attachments:image` and opens a file through `shell:open-path`, which main allows only inside the attachments and skills folders.
++**Attachments.** The composer attaches documents and images (the paperclip, drag and drop, paste). The window sends them as base64 to `attachments:save`; the runtime (`electron/attachments.mts`) writes them under `<userData>/attachments/<chat>/` (at most 10 files of 20 MB, 50 MB per message) and answers `{id, name, type, size, path}`. `runtime:start` and `runtime:message` accept attachments only inside that folder (`trustedAttachments`: name, type and size come from the disk). The root's task and a steering message list them as `ATTACHMENTS FROM THE USER`, one absolute path per line; the model reads them with its file tools (Claude sees an image it reads). Claude gets `--add-dir <userData>/attachments`, so the folder is readable in every access mode. The chat shows image thumbnails through `attachments:image` and opens a file through `shell:open-path`, which main allows only inside the attachments and skills folders. Until `attachments:save` answers, the message shows the chosen files without a path (nothing to open). `attachments:discard` deletes what no message will carry: the saved copies of a send or a message the runtime refused (the files go back to the composer), or a deleted chat's whole folder; only files `saveAttachments` wrote in that chat's folder can go, and a link inside is removed, not followed.
+ 
+ **Shared project notes.** `context_save` notes remain the project's code-knowledge cache with dependency hashes (see above); `project-context.json` holds per workspace only the notes (the Git fingerprint and folder counts an older version stored beside them are dropped on load), and what agents receive is the notes with their staleness plus the folder overview. The notes agents leave automatically (`agent:<chat>:<name>`, `progress:<chat>`) are working state of a chat that happens to live in the project's file, so they are budgeted per chat: 30 per chat, the four most recently active chats, 14 days. A busy chat cannot push out another chat's notes, and notes saved on purpose are never touched.
+ 
+diff --git a/electron/attachments.mts b/electron/attachments.mts
+index 4c0161c..2c4445f 100644
+--- a/electron/attachments.mts
++++ b/electron/attachments.mts
+@@ -89,6 +89,34 @@ async function saveAttachments(userData: string, chatId: string, uploads: unknow
+   return saved
+ }
+ 
++// Deletes saved files that no message will carry. With `paths`, those files of the chat's folder: a send or a message
++// that was refused keeps its files in the composer, and the next try saves them again. Without (null or undefined: the
++// JSON of a child runtime turns a missing argument into null), the chat's whole folder: the chat was deleted. Only what
++// saveAttachments wrote there can go; a link is removed, not followed. Answers how many entries were removed.
++async function discardAttachments(userData: string, chatId: string, paths?: unknown): Promise<number> {
++  if (!chatId) return 0
++  const folder = path.join(attachmentsRoot(userData), safeFolder(chatId))
++  if (paths === undefined || paths === null) {
++    let count = 0
++    try { count = (await fs.promises.readdir(folder)).length } catch { return 0 }
++    await fs.promises.rm(folder, { recursive: true, force: true })
++    return count
++  }
++  if (!Array.isArray(paths)) return 0
++  let removed = 0
++  for (const item of paths.slice(0, MAX_FILES)) {
++    if (typeof item !== 'string' || !path.isAbsolute(item)) continue
++    const name = path.relative(folder, path.resolve(item))
++    if (name !== path.basename(name) || !/^[0-9a-f]{8}-/.test(name)) continue
++    try {
++      if ((await fs.promises.lstat(item)).isDirectory()) continue
++      await fs.promises.unlink(item)
++      removed++
++    } catch { /* already gone */ }
++  }
++  return removed
++}
++
+ // An image of the attachments folder as a data URL for the window's thumbnail; null for anything else (another folder, a
+ // missing file, not an image, over MAX_IMAGE_BYTES).
+ async function readAttachmentImage(userData: string, target: unknown): Promise<string | null> {
+@@ -128,4 +156,4 @@ const ATTACHMENTS_HEADER = 'ATTACHMENTS FROM THE USER (files attached to this me
+ const attachmentLines = (attachments: Attachment[] | undefined): string => (attachments || []).map(item => `- ${item.path} (${item.type}, ${sizeText(item.size)})`).join('\n')
+ const attachmentBlock = (attachments: Attachment[] | undefined): string => attachments?.length ? `${ATTACHMENTS_HEADER}\n${attachmentLines(attachments)}` : ''
+ 
+-export { ATTACHMENTS_DIR, ATTACHMENTS_HEADER, MAX_FILES, MAX_FILE_BYTES, MAX_TOTAL_BYTES, MAX_IMAGE_BYTES, attachmentsRoot, configureAttachments, attachmentsFolder, safeName, saveAttachments, readAttachmentImage, trustedAttachments, attachmentLines, attachmentBlock }
++export { ATTACHMENTS_DIR, ATTACHMENTS_HEADER, MAX_FILES, MAX_FILE_BYTES, MAX_TOTAL_BYTES, MAX_IMAGE_BYTES, attachmentsRoot, configureAttachments, attachmentsFolder, safeName, saveAttachments, discardAttachments, readAttachmentImage, trustedAttachments, attachmentLines, attachmentBlock }
+diff --git a/electron/ipc-contract.cjs b/electron/ipc-contract.cjs
+index 6eabf2e..131cec4 100644
+--- a/electron/ipc-contract.cjs
++++ b/electron/ipc-contract.cjs
+@@ -66,6 +66,9 @@ const CALLS = [
+   // the model gets their paths. An attached image is read back (as a data: URL) for its thumbnail in the chat.
+   { method: 'saveAttachments', channel: 'attachments:save', args: [{ name: 'chatId', type: 'string' }, { name: 'files', type: `${T('AttachmentUpload')}[]` }], returns: `${T('Attachment')}[]` },
+   { method: 'readAttachmentImage', channel: 'attachments:image', args: [{ name: 'path', type: 'string' }], returns: 'string | null' },
++  // Saved files no message will carry: `paths` of the chat's folder (a refused send, whose files stay in the composer for
++  // the next try), or with no paths the chat's whole folder (a deleted chat). Answers how many were removed.
++  { method: 'discardAttachments', channel: 'attachments:discard', args: [{ name: 'chatId', type: 'string' }, { name: 'paths', type: 'string[]', optional: true }], returns: 'number' },
+   { method: 'loadState', channel: 'state:load', args: [], returns: `${T('AppState')} | null` },
+   { method: 'saveState', channel: 'state:save', args: [{ name: 'state', type: T('AppState') }], returns: 'unknown' },
+   { method: 'projectIndexStatus', channel: 'project-index:status', args: [workspace, { name: 'rebuild', type: 'boolean', optional: true }], returns: 'ProjectIndexStatus | null' },
+diff --git a/electron/preload.cjs b/electron/preload.cjs
+index 50d6685..b680dc8 100644
+--- a/electron/preload.cjs
++++ b/electron/preload.cjs
+@@ -23,6 +23,7 @@ const CALLS = [
+   ['messageAgent', 'runtime:message', 4],
+   ['saveAttachments', 'attachments:save', 2],
+   ['readAttachmentImage', 'attachments:image', 1],
++  ['discardAttachments', 'attachments:discard', 2],
+   ['loadState', 'state:load', 0],
+   ['saveState', 'state:save', 1],
+   ['projectIndexStatus', 'project-index:status', 2],
+diff --git a/electron/runtime-api.mts b/electron/runtime-api.mts
+index be22e05..7e79860 100644
+--- a/electron/runtime-api.mts
++++ b/electron/runtime-api.mts
+@@ -10,7 +10,7 @@ import { PROVIDER_IDS } from './quota.mts'
+ import { applyPatch, removeWorktree } from './worktree.mts'
+ import { runGit } from './git.mts'
+ import { workspaceKey } from './storage.mts'
+-import { readAttachmentImage, saveAttachments, trustedAttachments } from './attachments.mts'
++import { discardAttachments, readAttachmentImage, saveAttachments, trustedAttachments } from './attachments.mts'
+ import { RUNTIME_CHANNELS } from './runtime-protocol.mts'
+ import type { OrbitRuntime } from './runtime.mts'
+ import type { QuotaMonitor, QuotaReaderOptions } from './quota.mts'
+@@ -102,6 +102,8 @@ function createRuntimeApi(ctx: RuntimeApiContext): Map<string, RuntimeHandler> {
+   // Attached files: saved under <userData>/attachments and handed back as paths; the window's own paths are trusted only there.
+   handle('attachments:save', (chatId, files) => saveAttachments(userData, text(chatId) ?? '', files))
+   handle('attachments:image', (file) => readAttachmentImage(userData, file))
++  // Saved files no message will carry: those of a refused send (the window names them) or a deleted chat's whole folder.
++  handle('attachments:discard', (chatId, paths) => discardAttachments(userData, text(chatId) ?? '', paths))
+   handle('runtime:pause', (runId, agentId) => runtime.pauseAgent(text(runId) ?? '', text(agentId) ?? ''))
+   handle('runtime:resume', (runId, agentId) => runtime.resumeAgent(text(runId) ?? '', text(agentId) ?? ''))
+   handle('runtime:stop-agent', (runId, agentId) => runtime.stopAgent(text(runId) ?? '', text(agentId) ?? ''))
+diff --git a/electron/runtime-protocol.mts b/electron/runtime-protocol.mts
+index c870329..934a1ce 100644
+--- a/electron/runtime-protocol.mts
++++ b/electron/runtime-protocol.mts
+@@ -27,7 +27,7 @@ const RUNTIME_CHANNELS: readonly string[] = [
+   'state:load', 'state:save', 'project-index:status',
+   'memory:list', 'memory:save', 'memory:remove', 'memory:pin', 'memory:sharing', 'memory:forget-chat', 'memory:stats',
+   'capabilities:list', 'capabilities:pin', 'capabilities:enable', 'capabilities:params', 'capabilities:read', 'capabilities:install', 'capabilities:remove', 'capabilities:restore',
+-  'attachments:save', 'attachments:image',
++  'attachments:save', 'attachments:image', 'attachments:discard',
+   'providers:health', 'quota:get', 'artifact:apply',
+ ]
+ // Call channels main answers itself: dialogs, `shell`, `app`, health and restarts.
+diff --git a/src/AttachmentChips.tsx b/src/AttachmentChips.tsx
+index fbcf9db..2457c78 100644
+--- a/src/AttachmentChips.tsx
++++ b/src/AttachmentChips.tsx
+@@ -34,7 +34,7 @@ function useThumbnail(attachment: Attachment): string | null {
+   useEffect(() => {
+     let current = true
+     setUrl(null)
+-    if (isImage(attachment)) void thumbnail(attachment.path).then(value => { if (current) setUrl(value) })
++    if (attachment.path && isImage(attachment)) void thumbnail(attachment.path).then(value => { if (current) setUrl(value) })
+     return () => { current = false }
+   }, [attachment.path])
+   return url
+@@ -68,6 +68,14 @@ export function ComposerAttachments({ files, onRemove }: { files: File[]; onRemo
+ function MessageAttachment({ attachment }: { attachment: Attachment }) {
+   const url = useThumbnail(attachment)
+   const open = () => { void window.orbit?.openPath(attachment.path).catch(() => undefined) }
++  // Not saved yet (the message is being sent): the chip only names the file.
++  if (!attachment.path) return <li>
++    <span className="attachment-chip message-attachment pending" title={`${attachment.name}: ещё не сохранён`}>
++      <span className="attachment-thumb"><Icon name={isImage(attachment) ? 'image' : 'paperclip'} size={15} /></span>
++      <span className="attachment-name">{attachment.name}</span>
++      <small>{formatSize(attachment.size)}</small>
++    </span>
++  </li>
+   return <li>
+     <button type="button" className={`attachment-chip message-attachment ${url ? 'has-image' : ''}`} onClick={open} title={`Открыть: ${attachment.name}`}>
+       <span className="attachment-thumb">{url ? <img src={url} alt="" /> : <Icon name={isImage(attachment) ? 'image' : 'paperclip'} size={15} />}</span>
+diff --git a/src/attachments.css b/src/attachments.css
+index f2af542..da4c508 100644
+--- a/src/attachments.css
++++ b/src/attachments.css
+@@ -8,6 +8,8 @@
+ .attachment-thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+ .message-attachment { cursor: pointer; font: inherit; font-size: 11px; text-align: left; }
+ .message-attachment:hover { border-color: var(--accent, #bbdcca); }
++.message-attachment.pending { cursor: default; opacity: .6; }
++.message-attachment.pending:hover { border-color: var(--line, #2b2d33); }
+ /* A sent image is shown larger than a file icon: the user wants to see what the model received. */
+ .message-attachment.has-image .attachment-thumb { width: 56px; height: 56px; border-radius: 7px; }
+ .attachment-remove { display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0; width: 18px; height: 18px; padding: 0; border: 0; border-radius: 50%; background: transparent; color: var(--muted, #898b96); cursor: pointer; }
+diff --git a/src/attachments.ts b/src/attachments.ts
+index bce47e1..77abf33 100644
+--- a/src/attachments.ts
++++ b/src/attachments.ts
+@@ -46,6 +46,20 @@ export async function saveFiles(chatId: string, files: File[]): Promise<Attachme
+   return window.orbit.saveAttachments(chatId, await readUploads(files))
+ }
+ 
++// The files of a message being sent, shown under it until the desktop has saved them: no path yet, nothing to open.
++export const pendingAttachments = (files: File[]): Attachment[] =>
++  files.map((file, index) => ({ id: `pending-${index}`, name: file.name || 'файл', type: file.type, size: file.size, path: '' }))
++
++// Saved copies no message will carry. A refused send or message deletes its own (the files stay chosen, and the next try
++// saves them again); a deleted chat takes its whole folder. The desktop only deletes inside that chat's folder.
++export function discardFiles(chatId: string, attachments: Attachment[]): void {
++  const paths = attachments.map(item => item.path).filter(Boolean)
++  if (paths.length) void window.orbit?.discardAttachments(chatId, paths).catch(() => undefined)
++}
++export function discardChatFiles(chatId: string): void { void window.orbit?.discardAttachments(chatId).catch(() => undefined) }
++
+ // What a later run of the chat is told about the files of an earlier message: the paths, so that it can open them again.
+-export const attachmentNote = (attachments: Attachment[] | undefined): string =>
+-  attachments?.length ? `[Вложения этого сообщения: ${attachments.map(item => `${item.path} (${item.type})`).join('; ')}]` : ''
++export function attachmentNote(attachments: Attachment[] | undefined): string {
++  const saved = (attachments || []).filter(item => item.path)
++  return saved.length ? `[Вложения этого сообщения: ${saved.map(item => `${item.path} (${item.type})`).join('; ')}]` : ''
++}
+diff --git a/src/useOrbitState.ts b/src/useOrbitState.ts
+index f3596ce..2a86283 100644
+--- a/src/useOrbitState.ts
++++ b/src/useOrbitState.ts
+@@ -1,6 +1,6 @@
+ import { useEffect, useMemo, useRef, useState } from 'react'
+ import type { Attachment, ChatThread, ImprovementLoop, Message, Project, RestartNotice, RuntimeStatus, Settings, Workspace } from './types'
+-import { addFiles, saveFiles } from './attachments'
++import { addFiles, discardChatFiles, discardFiles, pendingAttachments, saveFiles } from './attachments'
+ import { errorText, remoteErrorText } from './format'
+ import { closedKeysOf, loopNote, loopPrompt, loopStartFailed, loopView, newestPlanRun, nextLoopStep } from './improvement-loop'
+ import { providers } from './providers'
+@@ -209,8 +209,9 @@ export function useOrbitState() {
+     setState(previous => removeChat(previous, project.id, chatId))
+     setDrafts(previous => { const next = { ...previous }; delete next[`${project.id}/${chatId}`]; return next })
+     setChosen(previous => { const next = { ...previous }; delete next[`${project.id}/${chatId}`]; return next })
+-    // A deleted chat takes its working notes with it (what proved durable was already moved to the project).
++    // A deleted chat takes its working notes (what proved durable was already moved to the project) and its files with it.
+     if (window.orbit && project.workspace.path) void window.orbit.forgetChatMemory(project.workspace.path, chatId).catch(() => undefined)
++    discardChatFiles(chatId)
+   }
+   // Picks a folder or clones a repository; true when a project is now selected.
+   async function addProject(kind: 'local' | 'git', remote: string) {
+@@ -264,7 +265,8 @@ export function useOrbitState() {
+   function detachFile(index: number) { setChosen(previous => ({ ...previous, [chatKey]: (previous[chatKey] || noFiles).filter((_, at) => at !== index) })) }
+   // Sends the current chat's draft: to the working run's root agent while one works (steer), else as a new run. False
+   // when nothing was sent (no project, nothing written or attached, a start in progress or awaited after a restart, not ready).
+-  // The attached files are saved by the desktop first, in the start's own pending step, and ride with the message.
++  // The attached files are saved by the desktop first, in the start's own pending step, and ride with the message; until
++  // then the message names them, and a refused start deletes the saved copies (the files go back to the composer).
+   // `onStarted` runs as soon as the desktop has given the run its id, before the user's message is tagged with it. With
+   // the improvement switch on, the started run begins (or continues) the chat's endless-improvement loop.
+   function send(onStarted?: (runId: string) => void): boolean {
+@@ -278,7 +280,8 @@ export function useOrbitState() {
+     let saved: Attachment[] = []
+     setDrafts(previous => ({ ...previous, [key]: '' }))
+     setChosen(previous => ({ ...previous, [key]: noFiles }))
+-    setState(previous => titleChat(addChatMessage(previous, targetProject, targetChat, userMessage), targetProject, targetChat, prompt || attached[0]?.name || ''))
++    const shown: Message = attached.length ? { ...userMessage, attachments: pendingAttachments(attached) } : userMessage
++    setState(previous => titleChat(addChatMessage(previous, targetProject, targetChat, shown), targetProject, targetChat, prompt || attached[0]?.name || ''))
+     launch(task, runId => {
+       onStarted?.(runId)
+       setState(previous => addChatMessage(previous, targetProject, targetChat, { ...userMessage, runId, ...(saved.length ? { attachments: saved } : {}) }))
+@@ -289,6 +292,7 @@ export function useOrbitState() {
+       }
+     }, error => {
+       setState(previous => dropMessage(previous, targetProject, targetChat, userMessage.id))
++      discardFiles(targetChat, saved)
+       const warning: Message = { id: uid(), author: 'system', text: `Не удалось запустить агента: ${errorText(error)}`, time: now(), kind: 'warning' }
+       setState(previous => addChatMessage(previous, targetProject, targetChat, warning))
+       setDrafts(previous => ({ ...previous, [key]: previous[key] || prompt }))
+@@ -365,7 +369,8 @@ export function useOrbitState() {
+   }
+   // Sends an extra message to an agent of a working run; rejects with the runtime's reason. A message to the root agent
+   // shows in the run's chat at once and is taken back when refused; one to a helper shows only in the inspector.
+-  // `files` are saved first and go with the message (the composer's attachments; the inspector's box sends none).
++  // `files` are saved first and go with the message (the composer's attachments; the inspector's box sends none); a
++  // refused message deletes the saved copies.
+   async function messageAgent(runId: string, agentId: string, text: string, files: File[] = []): Promise<void> {
+     const run = runs[runId]
+     if (!window.orbit || !run) throw new Error('Запуск не найден')
+@@ -375,6 +380,7 @@ export function useOrbitState() {
+     if (message) setState(previous => addChatMessage(previous, run.projectId, run.chatId, message))
+     try { await window.orbit.messageAgent(runId, agentId, text, attachments.length ? attachments : undefined) } catch (error) {
+       if (message) setState(previous => dropMessage(previous, run.projectId, run.chatId, message.id))
++      discardFiles(run.chatId, attachments)
+       throw new Error(remoteErrorText(error))
+     }
+   }
+diff --git a/src/vite-env.d.ts b/src/vite-env.d.ts
+index a163542..ae98caf 100644
+--- a/src/vite-env.d.ts
++++ b/src/vite-env.d.ts
+@@ -22,6 +22,7 @@ interface OrbitBridge {
+   messageAgent: (runId: string, agentId: string, text: string, attachments?: import('./types').Attachment[]) => Promise<import('./types').AgentMessageResult>
+   saveAttachments: (chatId: string, files: import('./types').AttachmentUpload[]) => Promise<import('./types').Attachment[]>
+   readAttachmentImage: (path: string) => Promise<string | null>
++  discardAttachments: (chatId: string, paths?: string[]) => Promise<number>
+   loadState: () => Promise<import('./types').AppState | null>
+   saveState: (state: import('./types').AppState) => Promise<unknown>
+   projectIndexStatus: (workspace: string, rebuild?: boolean) => Promise<ProjectIndexStatus | null>
+diff --git a/tests/attachments.test.cjs b/tests/attachments.test.cjs
+index b8dd9fe..806b157 100644
+--- a/tests/attachments.test.cjs
++++ b/tests/attachments.test.cjs
+@@ -3,7 +3,7 @@ const assert = require('node:assert/strict')
+ const fs = require('node:fs')
+ const os = require('node:os')
+ const path = require('node:path')
+-const { configureAttachments, saveAttachments, readAttachmentImage, trustedAttachments, attachmentBlock, safeName, attachmentsRoot, MAX_FILES, MAX_FILE_BYTES, MAX_TOTAL_BYTES } = require('../electron/attachments.mts')
++const { configureAttachments, saveAttachments, discardAttachments, readAttachmentImage, trustedAttachments, attachmentBlock, safeName, attachmentsRoot, MAX_FILES, MAX_FILE_BYTES, MAX_TOTAL_BYTES } = require('../electron/attachments.mts')
+ const { OrbitRuntime } = require('../electron/runtime.mts')
+ const { _testing } = require('../electron/providers.mts')
+ 
+@@ -102,6 +102,44 @@ test('trustedAttachments keeps only existing files of the attachments folder and
+   assert.deepEqual(trustedAttachments(userData, undefined), []); assert.deepEqual(trustedAttachments(userData, 'x'), [])
+ })
+ 
++test('discard: the named files of the chat folder go, nothing else; an empty list is not the whole folder', async t => {
++  const userData = folder(t)
++  const [a, b, c] = await saveAttachments(userData, 'chat-1', [upload('a.txt', 'a', 'text/plain'), upload('b.txt', 'b', 'text/plain'), upload('c.txt', 'c', 'text/plain')])
++  const [other] = await saveAttachments(userData, 'chat-2', [upload('other.txt', 'o', 'text/plain')])
++  const chatFolder = path.dirname(a.path)
++  const outside = path.join(userData, '0123abcd-outside.txt')
++  fs.writeFileSync(outside, 'x')
++  fs.writeFileSync(path.join(chatFolder, 'plain.txt'), 'not saved by Orbit')
++  fs.mkdirSync(path.join(chatFolder, 'deadbeef-folder'))
++  assert.equal(await discardAttachments(userData, 'chat-1', [
++    a.path, b.path, other.path, outside, path.join(chatFolder, '..', '..', '0123abcd-outside.txt'), path.join(chatFolder, 'plain.txt'),
++    path.join(chatFolder, 'deadbeef-folder'), path.join(chatFolder, 'deadbeef-gone.txt'), 'deadbeef-relative.txt', 7, null,
++  ]), 2)
++  assert.deepEqual([a, b, c, other].map(item => fs.existsSync(item.path)), [false, false, true, true], 'only the named files of chat-1')
++  assert.ok(fs.existsSync(outside) && fs.existsSync(path.join(chatFolder, 'plain.txt')) && fs.existsSync(path.join(chatFolder, 'deadbeef-folder')))
++  assert.equal(await discardAttachments(userData, 'chat-1', []), 0)
++  assert.equal(await discardAttachments(userData, 'chat-1', 'x'), 0)
++  assert.equal(await discardAttachments(userData, '', [c.path]), 0)
++  assert.ok(fs.existsSync(c.path), 'an empty list, a wrong value or no chat removes nothing')
++})
++
++test('discard: a deleted chat takes its whole folder, another chat keeps its files, and a link inside is not followed', async t => {
++  const userData = folder(t)
++  const [mine] = await saveAttachments(userData, 'chat-1', [upload('a.txt', 'a', 'text/plain')])
++  const [theirs] = await saveAttachments(userData, 'chat-2', [upload('b.txt', 'b', 'text/plain')])
++  const target = path.join(folder(t), 'elsewhere')
++  fs.mkdirSync(target)
++  fs.writeFileSync(path.join(target, 'keep.txt'), 'keep')
++  fs.symlinkSync(target, path.join(path.dirname(mine.path), 'deadbeef-link'), 'junction')
++  assert.equal(await discardAttachments(userData, 'chat-1'), 2)
++  assert.ok(!fs.existsSync(path.dirname(mine.path)), 'the folder is gone')
++  assert.ok(fs.existsSync(theirs.path), 'another chat keeps its files')
++  assert.equal(fs.readFileSync(path.join(target, 'keep.txt'), 'utf8'), 'keep', 'what the link pointed to stays')
++  assert.equal(await discardAttachments(userData, 'chat-2', null), 1, "null (a child runtime's missing argument) is the whole folder too")
++  assert.equal(await discardAttachments(userData, 'chat-3'), 0, 'a chat without files')
++  assert.ok(fs.existsSync(attachmentsRoot(userData)))
++})
++
+ // ---- The prompts ----
+ const payload = (workspace, extra = {}) => ({ workspace, projectId: 'project-1', chatId: 'chat-1', providerId: 'test', prompt: 'Look at my files', ...extra })
+ async function finished(runtime, start) {
+@@ -224,6 +262,8 @@ test('the runtime host configures the attachments folder: Claude args get --add-
+   const [saved] = await service.call('attachments:save', ['chat-9', [upload('a.txt', 'hello', 'text/plain')]])
+   assert.equal(path.dirname(path.dirname(saved.path)), expected)
+   assert.equal((await service.call('attachments:image', [saved.path])), null)
++  assert.equal(await service.call('attachments:discard', ['chat-9', [saved.path]]), 1)
++  assert.ok(!fs.existsSync(saved.path))
+ })
+ 
+ // ---- The window's side: limits before anything is read, the note history carries ----
+@@ -256,3 +296,26 @@ test('window: isImage by type or extension, sizes in Russian units, and the hist
+   assert.equal(w.attachmentNote(undefined), ''); assert.equal(w.attachmentNote([]), '')
+   assert.equal(w.attachmentNote([{ id: '1', name: 'a.png', type: 'image/png', size: 1, path: 'C:\o\a.png' }]), '[Вложения этого сообщения: C:\o\a.png (image/png)]')
+ })
++
++test('window: a message being sent names its files until they are saved; a refused send discards only its own saved copies', async t => {
++  const w = await windowSide()
++  const pending = w.pendingAttachments([{ name: 'shot.png', size: 5, type: 'image/png' }, { name: '', size: 1, type: '' }])
++  assert.deepEqual(pending, [{ id: 'pending-0', name: 'shot.png', type: 'image/png', size: 5, path: '' }, { id: 'pending-1', name: 'файл', type: '', size: 1, path: '' }])
++  assert.equal(w.attachmentNote(pending), '', 'a file not saved yet is nothing a later run could open')
++  const saved = { id: '1', name: 'a.png', type: 'image/png', size: 1, path: path.join(os.tmpdir(), 'a.png') }
++  const calls = []
++  const before = globalThis.window
++  globalThis.window = { orbit: { discardAttachments: async (...args) => { calls.push(args); return 0 } } }
++  t.after(() => { if (before === undefined) delete globalThis.window; else globalThis.window = before })
++  w.discardFiles('chat-1', [])
++  w.discardFiles('chat-1', pending)
++  assert.deepEqual(calls, [], 'no saved copy, no call: never the whole folder by accident')
++  w.discardFiles('chat-1', [...pending, saved])
++  w.discardChatFiles('chat-2')
++  assert.deepEqual(calls, [['chat-1', [saved.path]], ['chat-2']])
++  globalThis.window = { orbit: { discardAttachments: async () => { throw new Error('runtime stopped') } } }
++  w.discardFiles('chat-1', [saved]); w.discardChatFiles('chat-1')
++  await new Promise(resolve => setTimeout(resolve, 10))
++  globalThis.window = {}
++  assert.doesNotThrow(() => { w.discardFiles('chat-1', [saved]); w.discardChatFiles('chat-1') }, 'a plain browser has no desktop')
++})

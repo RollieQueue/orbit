@@ -23,6 +23,10 @@ async function until(check, label, timeoutMs = 5000) {
   }
 }
 
+// A file a fixture process writes with writeFileSync can exist, still empty or half written, for a moment: it is read
+// only once it parses.
+const writtenJson = file => { try { return JSON.parse(fs.readFileSync(file, 'utf8')) } catch { return null } }
+
 let pidSerial = 70000
 // A runtime process as the client sees it. By default it reports ready, echoes calls, and exits after a shutdown.
 class FakeChild {
@@ -575,6 +579,25 @@ test('inprocess mode serves the same calls through the service, relays approvals
   await assert.rejects(client.call('memory:list', []), /shutting down/)
 })
 
+// Electron's default session is the window's, which may go through the environment's proxy (electron/window-proxy.cjs).
+test('inprocess mode gives the runtime main\'s system proxy, as a child process gets it', async () => {
+  const network = require('../electron/provider-network.mts')
+  const asked = []
+  const client = createRuntimeClient({
+    mode: 'inprocess', userData: 'C:\\profile', repoRoot: 'C:\\repo',
+    createService: async () => ({ call: async () => null, rendererHealthy: async () => {}, shutdown: async () => ({ marked: [] }) }),
+    resolveProxy: async (url) => { asked.push(url); return 'PROXY system.example:3128; DIRECT' },
+  })
+  try {
+    await client.ready
+    assert.equal(await network.systemProxy(async () => 'http://registry.example:1'), 'http://system.example:3128')
+    assert.deepEqual(asked, [network.PROXY_PROBE_URL])
+  } finally {
+    network.setProxyResolver(null)
+    await client.shutdown()
+  }
+})
+
 // ---- The real runtime child (electron/runtime-child.cjs) over Node IPC ----------------------------------------------
 
 test('the real runtime child resolves the system proxy through main: systemProxy() in the runtime asks the client', { timeout: 120000 }, async () => {
@@ -750,18 +773,16 @@ process.on('message', (message) => { if (message && message.t === 'call' && mess
   t.after(async () => {
     await client.kill()
     // A failed run leaves nothing either: the CLI's tree, found the same way.
-    if (fs.existsSync(cliFile)) {
-      const cli = JSON.parse(fs.readFileSync(cliFile, 'utf8'))
-      for (const pid of orphansOf([cli], (await listProcessTable()) ?? [], { exitedAt: Date.now() })) await killProcessTree(pid)
-    }
+    const cli = writtenJson(cliFile)
+    if (cli) for (const pid of orphansOf([cli], (await listProcessTable()) ?? [], { exitedAt: Date.now() })) await killProcessTree(pid)
     fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 })
   })
   const childrenOf = async (cli) => ((await listProcessTable()) ?? []).filter(row => row.ppid === cli.pid && row.created !== null && row.created >= cli.startedAt - 100)
   const imageName = (pid) => childProcess.execFileSync('tasklist.exe', ['/fi', `PID eq ${pid}`, '/fo', 'csv', '/nh'], { encoding: 'utf8', windowsHide: true }).split(',')[0].replace(/"/g, '').trim()
 
   await client.ready
-  await until(() => fs.existsSync(cliFile), 'the CLI started', 20000)
-  const cli = JSON.parse(fs.readFileSync(cliFile, 'utf8'))
+  await until(() => writtenJson(cliFile), 'the CLI started', 20000)
+  const cli = writtenJson(cliFile)
   let before = []
   for (const deadline = Date.now() + 20000; !before.some(row => imageName(row.pid) === 'PING.EXE') && Date.now() < deadline;) before = await childrenOf(cli)
   assert.ok(before.some(row => imageName(row.pid) === 'PING.EXE'), 'PING.EXE runs under the CLI')
@@ -804,10 +825,8 @@ exports.inspectProviders = async (options) => { if (options && options.crash) se
   })
   t.after(async () => {
     await client.kill()
-    if (fs.existsSync(cliFile)) {
-      const cli = JSON.parse(fs.readFileSync(cliFile, 'utf8'))
-      for (const pid of orphansOf([cli], (await listProcessTable()) ?? [], { exitedAt: Date.now() })) await killProcessTree(pid)
-    }
+    const cli = writtenJson(cliFile)
+    if (cli) for (const pid of orphansOf([cli], (await listProcessTable()) ?? [], { exitedAt: Date.now() })) await killProcessTree(pid)
     fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 })
   })
   const childrenOf = async (cli) => ((await listProcessTable()) ?? []).filter(row => row.ppid === cli.pid && row.created !== null && row.created >= cli.startedAt - 100)
@@ -817,8 +836,8 @@ exports.inspectProviders = async (options) => { if (options && options.crash) se
     projectId: 'project', chatId: 'chat', prompt: 'Run the CLI', history: [], workspace, memoryEnabled: false,
     providerId: 'custom', model: 'fixture-model', agentInstructions: '', accessMode: 'workspace-write', approvalPolicy: 'never', limits: {},
   }])
-  await until(() => fs.existsSync(cliFile), 'the provider started its CLI', 30000)
-  const cli = JSON.parse(fs.readFileSync(cliFile, 'utf8'))
+  await until(() => writtenJson(cliFile), 'the provider started its CLI', 30000)
+  const cli = writtenJson(cliFile)
   let before = []
   for (const deadline = Date.now() + 20000; !before.length && Date.now() < deadline;) before = await childrenOf(cli)
   assert.ok(before.length > 0, 'the CLI has children of its own')

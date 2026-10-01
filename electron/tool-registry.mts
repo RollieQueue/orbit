@@ -27,10 +27,10 @@ const nullable = (schema: JsonSchema): JsonSchema => ({ anyOf: [schema, { type: 
 // may be omitted or null). `signature` is the prompt spelling, `blurb` the verbatim prompt fragment; `description`
 // (what an MCP client shows) defaults to the blurb.
 const TOOL_ROWS: ToolRow[] = [
-  { name: 'spawn_agent', signature: '{task,name?,reason,providerId?,model?,reasoningEffort?,memoryProfile?,continueFrom?}',
-    blurb: 'independent scoped task, returns id; duplicate names reuse existing agents. continueFrom names an agent from an EARLIER turn of this chat whose reported work the new helper picks up.',
-    description: 'Delegate an independent scoped task to a new Orbit helper agent; returns its id. Duplicate names reuse existing agents. continueFrom names an agent from an EARLIER turn of this chat whose reported work the new helper picks up. Access permissions are always inherited; providerId, model, reasoningEffort and memoryProfile (project or project-global) may differ per agent.',
-    properties: { task: string, reason: string, name: string, providerId: string, model: string, reasoningEffort: enumeration('', 'none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra', 'enabled'), memoryProfile: enumeration('project', 'project-global'), continueFrom: string },
+  { name: 'spawn_agent', signature: '{task,name?,reason,kind?,providerId?,model?,reasoningEffort?,memoryProfile?,continueFrom?}',
+    blurb: 'independent scoped task, returns id; duplicate names reuse existing agents. continueFrom names an agent from an EARLIER turn of this chat whose reported work the new helper picks up. kind code|review|lookup|text without model: Orbit picks the model for that work by its routing table and the quotas (providerId alone keeps it to that subscription); the result names it.',
+    description: 'Delegate an independent scoped task to a new Orbit helper agent; returns its id. Duplicate names reuse existing agents. continueFrom names an agent from an EARLIER turn of this chat whose reported work the new helper picks up. Access permissions are always inherited; providerId, model, reasoningEffort and memoryProfile (project or project-global) may differ per agent. kind names the work (code: writing or changing code; review: finding bugs; lookup: finding and reading code, small edits, running checks; text: text for the user): without model, Orbit picks the model for it from its routing table, passing over subscriptions that are not connected or nearly out of quota (providerId alone keeps the choice to that subscription), and the result names the choice (routed).',
+    properties: { task: string, reason: string, name: string, kind: enumeration('', 'code', 'review', 'lookup', 'text'), providerId: string, model: string, reasoningEffort: enumeration('', 'none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra', 'enabled'), memoryProfile: enumeration('project', 'project-global'), continueFrom: string },
     required: ['task', 'reason'], mutating: true },
   { name: 'wait_agent', signature: '{agentId?,timeout_ms?}',
     blurb: 'wait for direct children; releases provider slot; waits execute last in a batch.',
@@ -53,7 +53,7 @@ const TOOL_ROWS: ToolRow[] = [
     properties: { unread_only: boolean }, required: [] },
   { name: 'wait_message', signature: '{timeout_ms?}',
     blurb: 'durable mailbox.',
-    description: 'Wait for the next message in your durable mailbox (timeout_ms bounds the wait); releases your provider slot while waiting.',
+    description: 'Wait for the next message in your durable mailbox (timeout_ms bounds the wait); releases your provider slot while waiting. Also returns when the user stops one of your helpers: `stopped` names it; what it did comes with wait_agent or your next turn.',
     properties: { timeout_ms: number }, required: [], waits: true },
   { name: 'followup_agent', signature: '{agentId,task,reason?}',
     blurb: 'reuse done/error worker.',

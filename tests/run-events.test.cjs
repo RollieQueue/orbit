@@ -5,13 +5,13 @@ const path = require('node:path')
 
 // Same loader as tests/diff-parse.test.cjs: vite's oxc transform, then an ES module from a data URL.
 // run-events.ts only has type imports, which the transform erases.
-let applyRunEvent, restoreRuns, snapshotBase, runNotices, openTurn, durationMs, formatDuration, activeRunIds, interruptLost, isActiveStatus, LOST_RUN_ERROR, historyAnchors, pauseHolder, shownStatus, actionCount
+let applyRunEvent, restoreRuns, snapshotBase, runNotices, openTurn, durationMs, formatDuration, activeRunIds, interruptLost, isActiveStatus, LOST_RUN_ERROR, historyAnchors, pauseHolder, shownStatus, actionCount, thinkingText
 test.before(async () => {
   const { transformWithOxc } = await import('vite')
   const file = path.join(__dirname, '..', 'src', 'run-events.ts')
   const out = await transformWithOxc(fs.readFileSync(file, 'utf8'), file, { lang: 'ts' })
   const mod = await import(`data:text/javascript;base64,${Buffer.from(out.code).toString('base64')}`)
-  ;({ applyRunEvent, restoreRuns, snapshotBase, runNotices, openTurn, durationMs, formatDuration, activeRunIds, interruptLost, isActiveStatus, LOST_RUN_ERROR, historyAnchors, pauseHolder, shownStatus, actionCount } = mod)
+  ;({ applyRunEvent, restoreRuns, snapshotBase, runNotices, openTurn, durationMs, formatDuration, activeRunIds, interruptLost, isActiveStatus, LOST_RUN_ERROR, historyAnchors, pauseHolder, shownStatus, actionCount, thinkingText } = mod)
 })
 
 const AT = '2026-09-29T10:00:00.000Z'
@@ -357,6 +357,19 @@ test('openTurn, durationMs and formatDuration', () => {
   assert.equal(formatDuration(90000), '1 мин 30 с')
   assert.equal(formatDuration(3_720_000), '1 ч 2 мин')
   assert.equal(snapshotBase({ runId: 'r', projectId: 'p', chatId: 'c' }, AT).startedAt, AT)
+})
+
+test('thinkingText: «думает» with the rounded estimate of the thinking block, nothing when the model does not think', () => {
+  assert.equal(thinkingText(undefined), '')
+  assert.equal(thinkingText(null), '')
+  assert.equal(thinkingText(Number.NaN), '')
+  assert.equal(thinkingText(0), 'думает', 'a thinking block without an estimate yet')
+  assert.equal(thinkingText(50), 'думает · ~50 токенов')
+  assert.equal(thinkingText(219), 'думает · ~220 токенов')
+  assert.equal(thinkingText(996), 'думает · ~1 тыс. токенов', 'a figure that rounds to a thousand is written in thousands')
+  assert.equal(thinkingText(4240), 'думает · ~4,2 тыс. токенов')
+  assert.equal(thinkingText(9960), 'думает · ~10 тыс. токенов')
+  assert.equal(thinkingText(18_400), 'думает · ~18 тыс. токенов')
 })
 
 test('run.started and run.info carry the loop task and the plan handoff onto the run', () => {

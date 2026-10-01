@@ -66,6 +66,9 @@ const CALLS = [
   // the model gets their paths. An attached image is read back (as a data: URL) for its thumbnail in the chat.
   { method: 'saveAttachments', channel: 'attachments:save', args: [{ name: 'chatId', type: 'string' }, { name: 'files', type: `${T('AttachmentUpload')}[]` }], returns: `${T('Attachment')}[]` },
   { method: 'readAttachmentImage', channel: 'attachments:image', args: [{ name: 'path', type: 'string' }], returns: 'string | null' },
+  // Saved files no message will carry: `paths` of the chat's folder (a refused send, whose files stay in the composer for
+  // the next try), or with no paths the chat's whole folder (a deleted chat). Answers how many were removed.
+  { method: 'discardAttachments', channel: 'attachments:discard', args: [{ name: 'chatId', type: 'string' }, { name: 'paths', type: 'string[]', optional: true }], returns: 'number' },
   { method: 'loadState', channel: 'state:load', args: [], returns: `${T('AppState')} | null` },
   { method: 'saveState', channel: 'state:save', args: [{ name: 'state', type: T('AppState') }], returns: 'unknown' },
   { method: 'projectIndexStatus', channel: 'project-index:status', args: [workspace, { name: 'rebuild', type: 'boolean', optional: true }], returns: 'ProjectIndexStatus | null' },

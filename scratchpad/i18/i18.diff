@@ -1,0 +1,146 @@
+diff --git a/scratchpad/i18/base/pause.mts b/electron/runtime/pause.mts
+index 2ce65c2..96ee8a7 100644
+--- a/scratchpad/i18/base/pause.mts
++++ b/electron/runtime/pause.mts
+@@ -5,6 +5,11 @@ import type { AgentControlResult, AgentRecord, OrbitRuntimeLike, RunRecord } fro
+ const STOPPED_BY_USER = 'Stopped by the user from the Orbit window. Not a failure of the task: do not start the same work again unless the user asks; continue with what you have and say what was left undone.'
+ // Why a turn was cut off in the middle: the user's pause, or a message the agent is to read at once (steer.mts).
+ type InterruptReason = 'pause' | 'message'
++// CLIs whose session keeps the prompt of a turn cut off after its model spoke. Claude's session log records it as the
++// turn begins; Antigravity records the user input as the turn's first step, before any step of the model (checked live
++// 2026-10-01: first and resumed turns cut 5-11 ms after their first text, each resumed session named the code the cut
++// prompt carried). Codex and Cursor are not checked yet: both were out of quota.
++const KEEPS_CUT_PROMPT = new Set(['claude', 'antigravity'])
+ class PauseInterrupt extends Error {
+   note: string
+   reason: InterruptReason
+@@ -118,15 +123,15 @@ function pauseNote(agent: AgentRecord, holder: AgentRecord | null): string {
+ // the one a first turn's CLI opened (PauseInterrupt.sessionId: named by its stream, or Claude's under Orbit's id; the
+ // cursor stays past the full prompt that turn carried). A first turn without one starts afresh, the note in its full prompt. The mail the cut turn's prompt
+ // carried (`delivered`) joins `held` when the session that goes on has it: resuming that session does not hand it over
+-// again, a fresh session does (loops.sessionLoop). Only Claude is known to keep a cut turn's prompt (its session log
+-// records it when the turn begins); another CLI's resumed session is given the mail again, as a copy costs less than a
+-// lost message. Returns the instruction the next turn resumes with.
++// again, a fresh session does (loops.sessionLoop). Only a CLI known to keep a cut turn's prompt (KEEPS_CUT_PROMPT) holds
++// it; another CLI's resumed session is given the mail again, as a copy costs less than a lost message. Returns the
++// instruction the next turn resumes with.
+ function interruptedSession(runtime: OrbitRuntimeLike, agent: AgentRecord, error: PauseInterrupt, cursorBeforeTurn: number, delivered: string[] = [], held = new Set<string>()): string {
+   if (!agent.sessionId && error.sessionId) agent.sessionId = error.sessionId
+   else if (!error.spoke) agent.sessionCursor = cursorBeforeTurn
+   agent.pausedSession = agent.sessionId
+   if (!agent.sessionId) runtime.remember(agent, { type: 'instruction', content: error.note })
+-  else if (error.spoke && agent.providerId === 'claude') for (const id of delivered) held.add(id)
++  else if (error.spoke && KEEPS_CUT_PROMPT.has(agent.providerId)) for (const id of delivered) held.add(id)
+   return error.note
+ }
+ export type { InterruptReason }
+diff --git a/scratchpad/i18/base/steer-messages.test.cjs b/tests/steer-messages.test.cjs
+index 0e35c26..353a40a 100644
+--- a/scratchpad/i18/base/steer-messages.test.cjs
++++ b/tests/steer-messages.test.cjs
+@@ -490,7 +490,9 @@ test('session: a resumed turn cut again carries one note, not the notes of the e
+   assert.deepEqual(userMessages(run).map(message => message.status), ['read', 'read'])
+ })
+ 
+-test('session other provider: a resumed turn cut after it spoke is given its mail again (only Claude is known to keep a cut prompt)', async t => {
++// Claude and Antigravity keep a cut turn's prompt in their session (checked live, pause.KEEPS_CUT_PROMPT); a CLI not
++// known to keep it is given the mail again.
++for (const [providerId, keeps] of [['antigravity', true], ['codex', false]]) test(`session ${providerId}: a resumed turn cut after it spoke ${keeps ? 'leaves its mail in the session, not handed over again' : 'is given its mail again (not known to keep a cut prompt)'}`, async t => {
+   const calls = []
+   const runtime = new OrbitRuntime({ mcp: fakeMcp(), transportFor: () => 'session', runProvider: async options => {
+     calls.push(options)
+@@ -498,14 +500,17 @@ test('session other provider: a resumed turn cut after it spoke is given its mai
+     if (calls.length === 2) { options.onEvent({ kind: 'output', text: 'WORKING_2', partial: true }); return aborts(options) }
+     return { text: 'FINAL_ANSWER', sessionId: 'thread-1' }
+   } })
+-  const run = await start(t, runtime)
++  const run = await start(t, runtime, { providerId })
+   await until(() => calls.length === 2)
+   runtime.postUserMessage(run.runId, 'root', 'SECOND_MESSAGE')
+   await completed(runtime, run)
+   assert.equal(calls.length, 3)
+   assert.equal(calls[2].session.resume, true)
+   assert.equal(calls[2].session.id, 'thread-1')
+-  for (const text of ['FIRST_MESSAGE', 'SECOND_MESSAGE']) assert.ok(userBlock(calls[2].prompt).includes(text), text)
++  assert.ok(userBlock(calls[1].prompt).includes('FIRST_MESSAGE'), calls[1].prompt)
++  assert.ok(userBlock(calls[2].prompt).includes('SECOND_MESSAGE'), calls[2].prompt)
++  assert.equal(userBlock(calls[2].prompt).includes('FIRST_MESSAGE'), !keeps, calls[2].prompt)
++  assert.deepEqual(userMessages(run).map(message => message.status), ['read', 'read'])
+ })
+ 
+ test('session: mail a cut turn carried into its session reaches a fresh session again when that session cannot be resumed', async t => {
+diff --git a/scratchpad/i18/base/SESSION-MODE.md b/docs/SESSION-MODE.md
+index 5864503..e0e5995 100644
+--- a/scratchpad/i18/base/SESSION-MODE.md
++++ b/docs/SESSION-MODE.md
+@@ -156,9 +156,9 @@ not carry the task: a resume of the session from before a cut (`pausedSession`)
+ restart (`run.resumeSession`) whose stream names another session is stopped at once
+ (refunded, code `ORBIT_SESSION_ID`), and the session loop starts a fresh session with the
+ full prompt. An Antigravity conversation cut in its first turn resumes from a new folder,
+-as after an Orbit restart (the live check of 2026-09-30 resumed a finished turn from a new
+-folder; a cut one is not checked live). A continuation after `restart_orbit` still resumes
+-only Claude's first-turn session (`resume.rootSession`).
++as after an Orbit restart (checked live 2026-10-01: a first turn cut 11 ms after its first
++text resumed from a new folder, and the conversation held the cut prompt). A continuation
++after `restart_orbit` still resumes only Claude's first-turn session (`resume.rootSession`).
+ 
+ ### Per-call limits of MCP clients (2026-09-30)
+ 
+@@ -302,14 +302,20 @@ the existing `executeAgent`. The session loop:
+    throws `PauseInterrupt` with the note `INTERRUPTED FOR A MESSAGE`; the session loop resumes the
+    same session with it (`pause.interruptedSession`). A first Claude turn that already streamed
+    resumes the session Orbit proposed with `--session-id`, as a restart continuation does (a pause
+-   of such a turn too); Codex, Cursor and Antigravity name their sessions in the turn's result,
+-   so their cut first turns start fresh with the note. A resumed turn cut after its provider
++   of such a turn too); a cut first turn of Codex, Cursor or Antigravity resumes the session its
++   stream named (see "Session ids" above). A resumed turn cut after its provider
+    spoke (`PauseInterrupt.spoke`) keeps the session cursor: its prompt is in the session, so the
+-   repeat carries only the new note, not again the entries and the notes of earlier cuts. For
+-   Claude, the mail that prompt carried is held too (`held` in `sessionLoop`): the repeat does not
+-   hand it over again and marks it read with its own mail; a fresh session (the cut one could not
+-   be resumed, a handover) gets it again. Codex, Cursor and Antigravity are not known to keep a
+-   cut turn's prompt, so their resumed session is given the mail again.
++   repeat carries only the new note, not again the entries and the notes of earlier cuts. For a
++   CLI known to keep a cut turn's prompt (`pause.KEEPS_CUT_PROMPT`: Claude and Antigravity), the
++   mail that prompt carried is held too (`held` in `sessionLoop`): the repeat does not hand it over
++   again and marks it read with its own mail; a fresh session (the cut one could not be resumed, a
++   handover) gets it again. Claude's session log records the prompt as the turn begins;
++   Antigravity records the user input as the turn's first step, before any step of the model.
++   Checked live 2026-10-01 with Orbit's own provider call cut by its abort signal (Antigravity on
++   Claude Sonnet 4.6; Gemini was refused for the region): two first turns cut 11 ms and a resumed
++   turn cut 5 ms after their first text; each resumed session answered with the random code only
++   the cut prompt carried. Codex and Cursor are not checked yet (both were out of quota): their
++   resumed session is given the mail again, as a copy costs less than a lost message.
+ 
+ Every CLI process a provider turn starts, on both transports (Claude, Codex exec and App
+ Server, Cursor, Antigravity), gets `ProviderRunOptions.extraEnv` in its environment. The
+diff --git a/scratchpad/i18/base/CHANGELOG.md b/docs/CHANGELOG.md
+index 0f0087f..1ef4a2b 100644
+--- a/scratchpad/i18/base/CHANGELOG.md
++++ b/docs/CHANGELOG.md
+@@ -4,6 +4,8 @@
+ 
+ ## Не выпущено (после 0.5.0)
+ 
++- **Агент на Antigravity не получает одно и то же сообщение дважды после прерванного хода.** Если ваше сообщение или пауза прерывает ход, Orbit продолжает ту же сессию CLI. Почту, которую нёс запрос прерванного хода, у Claude он второй раз не передавал: известно, что Claude Code записывает запрос в сессию в начале хода. Остальным CLI почту передавали повторно, потому что не было проверено, сохраняют ли они такой запрос, а лишняя копия лучше потерянного сообщения. Теперь проверено живьём, что Antigravity сохраняет: запрос пользователя он записывает первым шагом хода, ещё до ответа модели. В проверке ход Orbit с секретным кодом обрывался через 5–11 мс после первого текста модели, тем же сигналом отмены, что у паузы. Это были два первых хода, причём продолжение шло уже из новой папки, и одно продолжение сессии. После этого продолжение сессии каждый раз называло код. Поэтому у Antigravity, как у Claude, такое сообщение больше не повторяется. Новая сессия (после смены подписки или если прежнюю нельзя продолжить) получает его снова. Gemini в Antigravity отклонялся по региону, поэтому проверка шла на Claude Sonnet 4.6. Сохранение запроса — свойство самого CLI, а не модели. Codex и Cursor пока не проверены (у обеих подписок кончилась квота), им сообщение по-прежнему передаётся повторно. Код: `electron/runtime/pause.mts` (`KEEPS_CUT_PROMPT`). Тест: `tests/steer-messages.test.cjs` (проверка «почта передаётся снова» стала парой: Antigravity её удерживает, Codex получает повторно).
++
+ - **Пути вложений не теряются после перезапуска и в длинном сообщении, а папка удалённого чата не остаётся из-за открытого файла.** Это три остатка ревью вложений. Первое: если агент перезапускал Orbit (`restart_orbit`), продолжение задачи не получало путей прикреплённых к ней файлов. Записка продолжения их не называла. Агент, начавший новую сессию (Codex, Cursor, Antigravity, смена подписки или неудачное возобновление), узнавал о файлах, только если пути случайно попали в дайджест прошлых ходов. Теперь запуск хранит файлы своего первого сообщения и сообщений агентам (последние 20). Записка продолжения перечисляет те из них, что ещё лежат в папке вложений, а продолжение хранит этот список на случай следующего перезапуска. Второе: в истории чата, которую получает следующая задача, строка путей стояла после текста сообщения, а запись обрезается с конца (до 8000 символов, в подсказке бывает меньше). У длинного сообщения пути пропадали. Теперь они идут перед текстом. Третье: если при удалении чата его файл был открыт в другой программе (например, PDF в просмотрщике), Windows не давала удалить этот файл, и папка чата оставалась навсегда. Теперь Orbit помечает такую папку и удаляет её позже: при следующем удалении чата или при запуске. Код: `electron/attachments.mts` (`sweepDiscarded`, `MAX_RUN_FILES`, предел у `trustedAttachments`), `electron/runtime/lifecycle.mts`, `electron/runtime/mailbox.mts`, `electron/runtime/restart.mts` (`prepareContinuation`), `electron/runtime/store.mts`, `electron/resume.mts`, `electron/runtime-api.mts`, `electron/runtime-host.mts`, `electron/types.mts`, `src/state-store.ts`. Тесты: `tests/attachments.test.cjs` (+2, уборка при старте runtime и проверка списка от окна), `tests/restart-orbit.test.cjs` (+1), `tests/state-store.test.cjs` (+1).
+ 
+ - **Сообщение, написанное агенту на паузе, доходит до него как ваше.** В режиме сессии агент на паузе мог как раз ждать сообщения или помощников (`wait_message`, `wait_agent`). Пауза обрывала ход, но само ожидание внутри Orbit продолжалось. Сообщение, написанное во время паузы, будило это брошенное ожидание и помечалось прочитанным, а ответ уходил в уже остановленный CLI. После «Продолжить» агент видел его только среди прошлых записей переписки, а не блоком `MESSAGE FROM THE USER`, то есть не как ваше указание. Так же брошенное `wait_agent` отмечало полученными результаты помощников, и агент мог закончить, не увидев их. Теперь ожидание заканчивается вместе со своим ходом. Найденное оно забирает (помечает сообщения прочитанными, результаты полученными), только когда ход вернул себе слот модели и ещё идёт. После «Продолжить» сообщение приходит блоком `MESSAGE FROM THE USER`, а результат помощника — как результат помощника. Это закрывает и редкий случай: ожидание уже нашло сообщение, но стояло в очереди за слотом (все слоты заняты другими агентами), и тут пришла пауза. Ожидание без идущего хода Orbit отклоняет: его ответ некому прочитать. Заодно ход, прерванный паузой или сообщением, повторяется сразу с результатами помощников, закончивших к этому моменту. Раньше они приходили лишним ходом после ответа. В режиме конверта ничего не меняется. Код: `electron/runtime/session.mts`, `electron/runtime/mailbox.mts`, `electron/runtime/tools.mts`, `electron/runtime/turn.mts`, `electron/runtime/loops.mts`, `electron/types.mts`, `electron/runtime.mts`. Тесты: `tests/pause-agents.test.cjs` (+7). Тесты ловят 16 из 18 намеренно внесённых ошибок. Две непойманные влияют только на задержку и на запасную проверку.
+diff --git a/scratchpad/i18/base/TECH-DEBT.md b/docs/TECH-DEBT.md
+index 447e0d7..c8aa913 100644
+--- a/scratchpad/i18/base/TECH-DEBT.md
++++ b/docs/TECH-DEBT.md
+@@ -85,8 +85,10 @@
+     ответом получает ещё один ход ради сообщения. Если этот ход падает без восстановления, отдаётся готовый ответ, а под
+     ним Orbit пишет, что сообщение осталось без ответа, и приводит его начало (`answerAsKept`,
+     `electron/runtime/mailbox.mts`). Заодно сообщение, которое прерванный ход Claude уже передал в сессию, при
+-    продолжении той же сессии не передаётся заново (`docs/CHANGELOG.md`, «Не выпущено»). Осталось: у Codex, Cursor и
+-    Antigravity оно передаётся повторно, пока живьём не проверено, что их CLI сохраняет запрос прерванного хода.
++    продолжении той же сессии не передаётся заново (`docs/CHANGELOG.md`, «Не выпущено»). 2026-10-01 то же сделано
++    для Antigravity: живая проверка показала, что его разговор сохраняет запрос прерванного хода. Осталось: у Codex и
++    Cursor сообщение передаётся повторно, пока живьём не проверено, что их CLI сохраняет такой запрос (обе подписки
++    тогда были исчерпаны; сценарий проверки описан в `docs/SESSION-MODE.md`, раздел про прерванный ход).
+ 16. **Сделано 2026-10-01: заголовок сообщения пользователя и руководителя нельзя подделать текстом.** Заголовок
+     настоящего сообщения несёт секрет агента: `[orbit:<секрет>] MESSAGE FROM THE USER` (`AgentRecord.mailMark`,
+     `electron/runtime/util.mts`), и секрет называют только инструкции самого агента: системный текст сессии, первый

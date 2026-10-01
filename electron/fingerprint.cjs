@@ -38,6 +38,7 @@ const SHELL_FILES = Object.freeze([
   'electron/git.mts',
   'electron/runtime-protocol.mts',
   'electron/skill-files.mts',
+  'electron/window-proxy.cjs',
   'package.json',
 ])
 

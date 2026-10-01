@@ -5,10 +5,17 @@ import type { AgentControlResult, AgentRecord, OrbitRuntimeLike, RunRecord } fro
 const STOPPED_BY_USER = 'Stopped by the user from the Orbit window. Not a failure of the task: do not start the same work again unless the user asks; continue with what you have and say what was left undone.'
 // Why a turn was cut off in the middle: the user's pause, or a message the agent is to read at once (steer.mts).
 type InterruptReason = 'pause' | 'message'
+// CLIs whose session keeps the prompt of a turn cut off after its model spoke. Claude's session log records it as the
+// turn begins; Antigravity records the user input as the turn's first step, before any step of the model (checked live
+// 2026-10-01 through Orbit's provider call: first and resumed turns cut 5-17 ms after the model's first text or the
+// start of its command, resumed at once or 3 s later; all 6 resumed sessions named the code only the cut prompt carried).
+// Codex and Cursor are not checked yet: both were out of quota.
+const KEEPS_CUT_PROMPT = new Set(['claude', 'antigravity'])
 class PauseInterrupt extends Error {
   note: string
   reason: InterruptReason
-  // The session a cut-off first session turn's CLI opened under Orbit's id (Claude), which the repeat resumes; else null.
+  // The session a cut-off first session turn's CLI opened after its model spoke (named by the stream, or Claude's under
+  // Orbit's id), which the repeat resumes; else null.
   sessionId: string | null
   // The provider had spoken in the cut turn, so its session holds that turn's prompt.
   spoke: boolean
@@ -96,6 +103,9 @@ function stopAgent(runtime: OrbitRuntimeLike, runId: string, agentId: string): A
   runtime.updateAgent(run, agent, { status: 'cancelled', paused: false, pausedAt: null, detail: 'Остановлен вами', error: STOPPED_BY_USER,
     result: actions ? bounded(`Последние действия до остановки:\n${actions}`, run.limits.maxOutputChars) : '', finishedAt: new Date().toISOString() })
   runtime.trace(run, agent.id, 'pause', STOPPED_BY_USER)
+  // The supervisor learns at once: a wait for mail ends naming the helper (mailbox.waitAgentMessage), a wait for the team
+  // with the helper's result.
+  if (agent.parentId) for (const wake of run.messageWaiters.get(agent.parentId) || []) wake()
   return controlResult(agent)
 }
 function pauseNote(agent: AgentRecord, holder: AgentRecord | null): string {
@@ -111,14 +121,18 @@ function pauseNote(agent: AgentRecord, holder: AgentRecord | null): string {
 // A session turn cut off by a pause or a message goes on in the same session with the note: the session of a resumed turn
 // (whose entries are carried again when it was cut before its provider spoke, as its prompt may not have reached the
 // session; a turn that had spoken has them there, and carrying them again piled up the note of every earlier cut), or
-// the one a first turn's CLI opened under Orbit's id (PauseInterrupt.sessionId; the cursor stays past the full prompt
-// that turn carried). A first turn without one starts afresh, the note in its full prompt. Returns the instruction the
-// next turn resumes with.
-function interruptedSession(runtime: OrbitRuntimeLike, agent: AgentRecord, error: PauseInterrupt, cursorBeforeTurn: number): string {
+// the one a first turn's CLI opened (PauseInterrupt.sessionId: named by its stream, or Claude's under Orbit's id; the
+// cursor stays past the full prompt that turn carried). A first turn without one starts afresh, the note in its full prompt. The mail the cut turn's prompt
+// carried (`delivered`) joins `held` when the session that goes on has it: resuming that session does not hand it over
+// again, a fresh session does (loops.sessionLoop). Only a CLI known to keep a cut turn's prompt (KEEPS_CUT_PROMPT) holds
+// it; another CLI's resumed session is given the mail again, as a copy costs less than a lost message. Returns the
+// instruction the next turn resumes with.
+function interruptedSession(runtime: OrbitRuntimeLike, agent: AgentRecord, error: PauseInterrupt, cursorBeforeTurn: number, delivered: string[] = [], held = new Set<string>()): string {
   if (!agent.sessionId && error.sessionId) agent.sessionId = error.sessionId
   else if (!error.spoke) agent.sessionCursor = cursorBeforeTurn
   agent.pausedSession = agent.sessionId
   if (!agent.sessionId) runtime.remember(agent, { type: 'instruction', content: error.note })
+  else if (error.spoke && KEEPS_CUT_PROMPT.has(agent.providerId)) for (const id of delivered) held.add(id)
   return error.note
 }
 export type { InterruptReason }

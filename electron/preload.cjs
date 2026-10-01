@@ -23,6 +23,7 @@ const CALLS = [
   ['messageAgent', 'runtime:message', 4],
   ['saveAttachments', 'attachments:save', 2],
   ['readAttachmentImage', 'attachments:image', 1],
+  ['discardAttachments', 'attachments:discard', 2],
   ['loadState', 'state:load', 0],
   ['saveState', 'state:save', 1],
   ['projectIndexStatus', 'project-index:status', 2],

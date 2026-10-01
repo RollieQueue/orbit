@@ -963,7 +963,8 @@ test('the envelope prompt takes its tool guide from the tool registry when one i
 test('in envelope mode a tool envelope being typed never streams to the chat, a plain answer does under the final message id', async t => {
   let turn = 0
   const runtime = new OrbitRuntime({ runProvider: async ({ onEvent }) => {
-    if (++turn === 1) { onEvent({ kind: 'output', text: '{"content":"x","tool_calls":[', messageId: 'a', partial: true }); return response(tool('list_agents')) }
+    // A session the stream names (Codex does in envelope mode too) is no session of the envelope transport.
+    if (++turn === 1) { onEvent({ kind: 'session', sessionId: 'envelope-thread' }); onEvent({ kind: 'output', text: '{"content":"x","tool_calls":[', messageId: 'a', partial: true }); return response(tool('list_agents')) }
     onEvent({ kind: 'output', text: 'Final ', messageId: 'b', partial: true }); onEvent({ kind: 'output', text: 'answer', messageId: 'b', partial: false })
     return { text: 'Final answer' }
   } })
@@ -976,6 +977,7 @@ test('in envelope mode a tool envelope being typed never streams to the chat, a 
   const timings = snapshot.agents[0].turnTimings
   assert.equal(timings.length, 2)
   assert.deepEqual([timings[0].transport, timings[0].orbitToolCalls, timings[1].orbitToolCalls, timings[0].sessionId], ['envelope', 1, 0, null])
+  assert.ok(!snapshot.traces.some(trace => trace.kind === 'session' || trace.text.includes('envelope-thread')), 'nor a trace')
   assert.ok(timings.every(timing => timing.startedAt && timing.endedAt && timing.firstEventAt && timing.promptChars > 0))
 })
 

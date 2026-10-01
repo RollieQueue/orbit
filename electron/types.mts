@@ -43,6 +43,9 @@ export interface UsageFigures {
 export interface TurnTiming {
   turn: number; transport: Transport; startedAt: string; firstEventAt: string | null; endedAt: string | null
   promptChars: number; nativeToolCalls: number; orbitToolCalls: number; sessionId: string | null
+  // While the model thinks: the provider's estimate of the thinking block so far, in tokens (turn.mts noteThinking).
+  // Live only: it goes when the thinking or the turn ends.
+  thinking?: number
 }
 
 // ---- Records a run publishes --------------------------------------------------------------------------------------
@@ -112,7 +115,7 @@ export type IndexOutline = import('./project-index.mts').Outline
 // here; the envelope path is not, so every callee keeps its coercions. `route` and `discussionId` are added by the
 // broadcast and ask_team paths; `__invalidArguments` marks a call whose arguments were not a JSON object.
 export interface ToolArgs {
-  task?: string; name?: string; reason?: string; providerId?: string; model?: string; reasoningEffort?: string; memoryProfile?: string; continueFrom?: string; id?: string
+  task?: string; name?: string; reason?: string; kind?: string; providerId?: string; model?: string; reasoningEffort?: string; memoryProfile?: string; continueFrom?: string; id?: string
   agentId?: string; agentIds?: string[]; timeout_ms?: number; message?: string; replyTo?: string; discussionId?: string; route?: MessageRoute
   afterId?: string; limit?: number; unread_only?: boolean; topic?: string; files?: string[]; query?: string; path?: string; runId?: string; agent?: string
   start_line?: number; recursive?: boolean; content?: string; old_text?: string; new_text?: string; command?: string; args?: string[]; cwd?: string
@@ -156,7 +159,9 @@ export interface InterruptedTurn { text: string; actions: string[] }
 export interface PartialTurn { messages: Map<string, string>; tools: Map<string, string> }
 export interface StreamState { messageId: string; parts: Map<string, string>; lastAt: number; timer: ReturnType<typeof setTimeout> | null; dirty: boolean }
 export interface TurnSlot { held: boolean }
-export interface ActiveTurn { slot: TurnSlot; timing: TurnTiming; changed: boolean; nativeSeen: Set<string>; stream: StreamState | null; delivered: Set<string>; interrupt: (reason?: import('./runtime/pause.mts').InterruptReason) => void; watch?: import('./runtime/watchdog.mts').TurnWatch | null }
+export interface ActiveTurn { slot: TurnSlot; timing: TurnTiming; changed: boolean; nativeSeen: Set<string>; stream: StreamState | null; delivered: Set<string>; signal: AbortSignal; interrupt: (reason?: import('./runtime/pause.mts').InterruptReason) => void; watch?: import('./runtime/watchdog.mts').TurnWatch | null }
+// An answer kept while an optional extra turn runs, and the ids of the user's messages the model had read when it wrote it.
+export interface DraftAnswer { text: string; read: Set<string> }
 export interface AgentRecord {
   paused?: boolean; pausedAt?: string | null; stoppedByUser?: boolean; pausedSession?: string | null
   id: string; parentId: string | null; depth: number; name: string; role: string; task: string; reason: string
@@ -167,15 +172,20 @@ export interface AgentRecord {
   files: AgentFiles; workDone: number
   handovers: HandoverRecord[]; failedCandidates: Set<string>; trial: { key: string } | null; partialTurn: PartialTurn | null; quotaWarned: string
   transport: Transport; sessionId: string | null; sessionToken: string | null; sessionCursor: number; turnTimings: TurnTiming[]; activeTurn: ActiveTurn | null; stream: StreamState | null
+  // The secret mark of the user's and a supervisor's messages to this agent (util.mailTag).
+  mailMark: string
   // Set later in an agent's life: the answer kept for an optional extra turn, the limit and loop-guard marks, prompt size.
-  draftAnswer?: string | null; budgetLimited?: boolean; stalled?: boolean; promptChars?: number
+  draftAnswer?: DraftAnswer | null; budgetLimited?: boolean; stalled?: boolean; promptChars?: number
 }
 // The fields that stay inside the runtime; snapshots and events carry the rest (util.INTERNAL_AGENT_FIELDS).
-export type InternalAgentField = 'inbox' | 'seenChildren' | 'requestedModel' | 'transcript' | 'previousWork' | 'ledger' | 'ledgerDropped' | 'workDone' | 'failedCandidates' | 'trial' | 'partialTurn' | 'quotaWarned' | 'draftAnswer' | 'activeTurn' | 'stream' | 'sessionToken' | 'sessionCursor' | 'transcriptChars' | 'pausedSession'
+export type InternalAgentField = 'inbox' | 'seenChildren' | 'requestedModel' | 'transcript' | 'previousWork' | 'ledger' | 'ledgerDropped' | 'workDone' | 'failedCandidates' | 'trial' | 'partialTurn' | 'quotaWarned' | 'draftAnswer' | 'activeTurn' | 'stream' | 'sessionToken' | 'sessionCursor' | 'transcriptChars' | 'pausedSession' | 'mailMark'
 export type PublicAgent = Omit<AgentRecord, InternalAgentField>
 // What an agent's execution resolves to (completeAgent), or the error a scheduled agent ended with.
 export interface AgentResult { agentId: string; generation: number; status: AgentStatus; result?: string; error?: string; budgetLimited?: boolean }
-export interface SpawnResult { ok: boolean; reason?: string; instruction?: string; reused?: boolean; agentId?: string; status?: AgentStatus; agent?: PublicAgent }
+// spawn_agent {kind}: the model Orbit chose for that kind of work (`model` provider/model, null when none could take it)
+// and the better candidates it passed over, with why.
+export interface RoutedSpawn { kind: string; model: string | null; skipped?: string[]; note?: string }
+export interface SpawnResult { ok: boolean; reason?: string; instruction?: string; reused?: boolean; agentId?: string; status?: AgentStatus; agent?: PublicAgent; routed?: RoutedSpawn }
 export interface FollowupResult { ok: true; agentId: string; generation: number; status: AgentStatus }
 export interface TeamDigest { running: string[]; finished: string[] }
 export interface AgentDirectoryEntry {
@@ -218,7 +228,8 @@ export interface RunRecord {
   // Restarts (resume.mts): what a continuation starts again from, the run this one continues and how many restarts in a
   // row led here, and for a run that ended `restarting`, why and when the restart was asked for. `resumeSession`: the
   // old root's provider session a continuation is resuming, until its first turn answers (runtime/restart.mts).
-  startPayload?: StartPayload; resumedFrom?: string; resumeChain?: number; restart?: RestartMark; resumeSession?: string
+  // `attachments`: the files the user attached in this run (and in the runs it continues), named to its continuation.
+  startPayload?: StartPayload; resumedFrom?: string; resumeChain?: number; restart?: RestartMark; resumeSession?: string; attachments?: Attachment[]
   // The improvement loop (runtime/improvement.mts): the loop's task number the renderer gave this run, what the next task
   // must know, the closed task keys (`id|title`) the run started with, and whether restart_orbit applied this run's change
   // or was refused in a way the next task's restart resolves (cycle limit, other chats working, declined).
@@ -226,7 +237,8 @@ export interface RunRecord {
 }
 // `note`: what the root of the continuation is told about the run the restart ended (work log, files, helpers, cut-off turn);
 // `intentId`: the id of the intent (pending-resume.json) that marked it, the only one that continues it (resume.mts).
-export interface RestartMark { reason: string; requestedAt: string; source: 'tool' | 'script'; note?: string; intentId?: string }
+// `mailMark`: the root's (util.mailTag), for the continuation that resumes its session.
+export interface RestartMark { reason: string; requestedAt: string; source: 'tool' | 'script'; note?: string; intentId?: string; mailMark?: string }
 // A run as others see it: the snapshot the UI, the run store and the chat memory get.
 export interface RunSnapshot {
   runId: string; projectId: string; chatId: string; prompt: string; workspace: string; status: RunStatus; providerId: string; model: string
@@ -234,7 +246,7 @@ export interface RunSnapshot {
   startedAt: string; finishedAt: string | null; limits: RunLimits; usage: Usage; agents: PublicAgent[]
   traces: Trace[]; messages: Message[]; communications: Communication[]; summary: RunSummary | null; error: string | null
   files: FileActivitySnapshot[]; changes: FileChange[]; router: RouterStats
-  startPayload?: StartPayload; resumedFrom?: string; resumeChain?: number; restart?: RestartMark
+  startPayload?: StartPayload; resumedFrom?: string; resumeChain?: number; restart?: RestartMark; attachments?: Attachment[]
   loopTask?: number; improvementHandoff?: string
 }
 // An earlier turn of the chat as chat-memory presents it (a live run or a saved snapshot): chat-memory's own RunView.
@@ -247,6 +259,8 @@ export interface StoredRun {
   startedAt?: string; finishedAt?: string | null; updatedAt?: string; error?: string | null
   agents?: StoredAgent[]; changes?: FileChange[]
   startPayload?: StartPayload; resumedFrom?: string; resumeChain?: number; restart?: RestartMark
+  // The run's attached files as saved (checked again before a continuation names them: resume.mts).
+  attachments?: unknown
   // The improvement plan an improvement-mode run left (read back by runtime/improvement.mts loadPlan).
   improvements?: unknown; improvementStatus?: unknown; improvementHandoff?: unknown; loopTask?: number
 }
@@ -260,8 +274,10 @@ export interface StartPayload {
   // Files the user attached to the message that starts the run (saved first with attachments:save).
   attachments?: Attachment[]
   // A continuation after a restart (resume.mts): the run it continues, how many restarts in a row led to it, the note its
-  // root starts with, and the old root's provider session to resume when the root keeps that provider.
-  resumedFrom?: string; resumeChain?: number; restartNote?: string; resumeSession?: { id: string; providerId: string }
+  // root starts with, the old root's provider session (with the mark of its mail) to resume when the root keeps that
+  // provider, and the files the user attached in the run it continues (the note names them).
+  resumedFrom?: string; resumeChain?: number; restartNote?: string; resumeSession?: { id: string; providerId: string; mailMark?: string }
+  resumeAttachments?: Attachment[]
 }
 export type RuntimeEventData = Record<string, unknown>
 export interface RuntimeEvent { type: string; runId: string; projectId: string; chatId: string; [extra: string]: unknown }
@@ -288,6 +304,10 @@ export interface ProviderEvent {
   kind: string; providerId?: string; text?: string; message?: string; messageId?: string; partial?: boolean; replace?: boolean; parentToolId?: string | null
   native?: boolean; tool?: string; toolId?: string; status?: string; changes?: unknown; input?: unknown; output?: unknown; exitCode?: number | null
   mcp?: boolean; server?: string; orbitTool?: string; images?: ToolImage[]
+  // kind thinking: the estimate of the thinking block so far, or `done` when it ends.
+  tokens?: number; done?: boolean
+  // kind session: the id the provider's CLI gave its session, named as the turn began (turn.mts providerTurn).
+  sessionId?: string
   // `usage` is the vendor's figures, unchecked (providers.mts types it unknown): read it as UsageFigures only defensively.
   usage?: unknown; quota?: QuotaUpdate; source?: string
   // No index signature: every member of providers.mts's ProviderEvent union (interfaces) must fit this shape, since
@@ -482,7 +502,8 @@ export interface CommandResult { ok: boolean; exitCode?: number | null; signal?:
 export interface PromptBase { required: string; optional: string }
 // `fromUser`: how many of the delivered messages the user wrote (runtime:message); they lead the text as the user's own words.
 export interface MailboxContext { text: string; deliveredIds: string[]; fromUser: number }
-export interface ReadMessagesResult { messages: Communication[]; remainingUnread: number; timedOut?: boolean }
+export interface StoppedHelper { agentId: string; name: string; status: AgentStatus }
+export interface ReadMessagesResult { messages: Communication[]; remainingUnread: number; timedOut?: boolean; stopped?: StoppedHelper[]; note?: string }
 export interface SendResult { ok: true; communicationId: string; agentId: string; status: CommunicationStatus; delivery: CommunicationDelivery }
 export interface AskTeamResult { ok: true; discussionId: string; via: string; routedTo: { agentId: string; name: string; reason?: string; status?: CommunicationStatus; error?: string }[] }
 export interface NoteSummary { key: string; summary: string; stale?: boolean; files: string[] }
@@ -548,7 +569,7 @@ export interface OrbitRuntimeLike {
   // agents
   createAgent(run: RunRecord, parent: AgentRecord | null, spec: ToolArgs): AgentRecord
   scheduleAgent(run: RunRecord, agent: AgentRecord): Promise<AgentResult>
-  spawnSubAgent(runId: string, parentId: string, spec?: ToolArgs): SpawnResult
+  spawnSubAgent(runId: string, parentId: string, spec?: ToolArgs): Promise<SpawnResult>
   resolveAgent(run: RunRecord, reference: unknown): AgentRecord
   resultKey(agent: { id: string; generation: number }): string
   followupAgent(run: RunRecord, sender: AgentRecord, args: ToolArgs): FollowupResult
@@ -568,9 +589,9 @@ export interface OrbitRuntimeLike {
   sendAgentMessage(run: RunRecord, sender: AgentRecord, args: ToolArgs): SendResult
   recordCommunication(run: RunRecord, sender: AgentRef, target: AgentRef, text: string, extra?: Partial<Communication>): Communication
   readAgentMessages(run: RunRecord, agent: AgentRecord, args?: ToolArgs): ReadMessagesResult
-  waitForTeam(run: RunRecord, agent: AgentRecord, participants: { id: string }[], timeout?: number): Promise<string>
-  waitAgentMessage(run: RunRecord, agent: AgentRecord, args: ToolArgs): Promise<ReadMessagesResult>
-  mailboxContext(run: RunRecord, agent: AgentRecord): MailboxContext
+  waitForTeam(run: RunRecord, agent: AgentRecord, participants: { id: string }[], timeout?: number, signal?: AbortSignal): Promise<string>
+  waitAgentMessage(run: RunRecord, agent: AgentRecord, args: ToolArgs, signal?: AbortSignal, ready?: () => Promise<void>): Promise<ReadMessagesResult>
+  mailboxContext(run: RunRecord, agent: AgentRecord, held?: ReadonlySet<string>): MailboxContext
   askTeam(run: RunRecord, sender: AgentRecord, args: ToolArgs): AskTeamResult
   postUserMessage(runId: string, agentId: string, text: unknown): SendResult
   userMail(run: RunRecord, agent: AgentRecord): string
@@ -594,7 +615,7 @@ export interface OrbitRuntimeLike {
   runTrackedCommand(run: RunRecord, agent: AgentRecord, args: ToolArgs, context: WorkspaceContext): Promise<unknown>
   // tools and knowledge
   approve(run: RunRecord, agent: AgentRecord, request: ApprovalRequest, signal?: AbortSignal): Promise<boolean>
-  executeTool(run: RunRecord, agent: AgentRecord, name: string, args: ToolArgs, signal?: AbortSignal): Promise<Observation>
+  executeTool(run: RunRecord, agent: AgentRecord, name: string, args: ToolArgs, signal?: AbortSignal, ready?: () => Promise<void>): Promise<Observation>
   markMemoryUse(run: RunRecord, entries: MemoryEntry[]): void
   // ledger
   recordLedger(agent: AgentRecord, name: string, text: string): void
@@ -618,6 +639,7 @@ export interface OrbitRuntimeLike {
   preflightQuota(run: RunRecord, agent: AgentRecord): Promise<void>
   handover(run: RunRecord, agent: AgentRecord, request: HandoverRequest): Promise<boolean>
   recoverProvider(run: RunRecord, agent: AgentRecord, error: unknown): Promise<boolean>
+  routeSpawn(run: RunRecord, parent: AgentRecord, spec: ToolArgs): Promise<{ spec: ToolArgs; routed: RoutedSpawn }>
   // loops
   executeAgent(run: RunRecord, agent: AgentRecord): Promise<AgentResult>
   envelopeLoop(run: RunRecord, agent: AgentRecord, signal: AbortSignal): Promise<AgentResult | typeof SWITCH_TRANSPORT>

@@ -5,7 +5,11 @@
     "The first rules are measured: models the model audit of 2026-09-30 (docs/MODEL-AUDIT.md) placed away from what their names suggest. Each says why in 'measured'. The rest follow naming conventions, not measured quality.",
     "When unsure, a model is placed LOWER: a replacement is then only rarely chosen, never wrongly trusted.",
     "Weak (0.5) models replace only weak ones, or light ones when the run allows weaker models. Unknown or unreliable models (tier 0) are used as replacements only when the user listed them in the provider pool.",
-    "baseline is the tier assumed for the model that is being replaced when its name is not known yet (the CLI default) or its tier is 0. It is deliberately high: an unknown model is not swapped for a weaker one."
+    "baseline is the tier assumed for the model that is being replaced when its name is not known yet (the CLI default) or its tier is 0. It is deliberately high: an unknown model is not swapped for a weaker one.",
+    "excluded names models that are never chosen as a replacement on their own, whatever their tier: only when the user listed them in the provider pool. Their tier still judges an agent that runs on them."
+  ],
+  "excluded": [
+    { "match": "(?:^|[-_/. ])fable(?=$|[-_/.:@ ])", "why": "Claude Fable (claude-fable-5-1, Cursor's claude-fable-5-thinking-high): the user's rule of 2026-09-30, it spends far more quota and is not better than Opus." }
   ],
   "rules": [
     { "tier": 2, "match": "(?:^|[-_/. ])gpt-6-luna(?=$|[-_/.:@ ])", "measured": "GPT-6 Luna: 96.9 of 100, code, review, logic and repository questions without a mistake in 2.0 min; only its Russian text was weak. A light name, strong work." },

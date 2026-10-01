@@ -1,0 +1,161 @@
+diff --git "a/C:\\Users\\ROMANA~1\\AppData\\Local\\Temp\\orbit-i15-base-kOsvdF\\electron\\main.cjs" "b/C:\\Users\\Roman Andreevich\\Desktop\\smth\\electron\\main.cjs"
+index b57717a..d309fcb 100644
+--- "a/C:\\Users\\ROMANA~1\\AppData\\Local\\Temp\\orbit-i15-base-kOsvdF\\electron\\main.cjs"
++++ "b/C:\\Users\\Roman Andreevich\\Desktop\\smth\\electron\\main.cjs"	
+@@ -70,13 +70,14 @@ delete process.env.ELECTRON_RUN_AS_NODE
+ // watcher inherits them from the agent's command. They describe a run of an earlier process, never this one, and
+ // without a restart host nothing would override them in the next agents' shells.
+ for (const name of ['ORBIT_RUN_ID', 'ORBIT_CHAT_ID', 'ORBIT_PROJECT_ID', 'ORBIT_AGENT_ID', 'ORBIT_RESUME_FILE', 'ORBIT_RESTART_SOURCE']) delete process.env[name]
+ // Self-upgrade health report: one per generation (the start, then every runtime restart and renderer reload), written
+-// once that generation is healthy or at its first failure. ORBIT_HEALTH_FILE overrides the path; "0" (smoke, tests)
+-// disables the file (the checks still run: the runtime is told when a start was healthy either way).
++// once that generation is healthy or at its first failure. ORBIT_HEALTH_FILE overrides the path (a relative one is from
++// the repository, whatever folder Orbit started in, as scripts/self-upgrade.cjs and the runtime read it); "0" (smoke,
++// tests) disables the file (the checks still run: the runtime is told when a start was healthy either way).
+ const healthFile = process.env.ORBIT_HEALTH_FILE === undefined
+   ? path.join(repoRoot, 'artifacts', 'self-upgrade-health.json')
+-  : (process.env.ORBIT_HEALTH_FILE && process.env.ORBIT_HEALTH_FILE !== '0' ? path.resolve(process.env.ORBIT_HEALTH_FILE) : null)
++  : (process.env.ORBIT_HEALTH_FILE && process.env.ORBIT_HEALTH_FILE !== '0' ? path.resolve(repoRoot, process.env.ORBIT_HEALTH_FILE) : null)
+ const startedAt = Date.now()
+ 
+ /** @param {unknown} error @returns {string} */
+ const errorMessage = (error) => (error instanceof Error ? error.message : String(error))
+diff --git "a/C:\\Users\\ROMANA~1\\AppData\\Local\\Temp\\orbit-i15-base-kOsvdF\\electron\\resume.mts" "b/C:\\Users\\Roman Andreevich\\Desktop\\smth\\electron\\resume.mts"
+index c0c75f4..cb200d7 100644
+--- "a/C:\\Users\\ROMANA~1\\AppData\\Local\\Temp\\orbit-i15-base-kOsvdF\\electron\\resume.mts"
++++ "b/C:\\Users\\Roman Andreevich\\Desktop\\smth\\electron\\resume.mts"	
+@@ -290,14 +290,14 @@ function releaseLock(file: string, pid: number | undefined): void {
+     if (holder && typeof holder === 'object' && Number((holder as { pid?: unknown }).pid) === pid) fs.rmSync(file, { force: true })
+   } catch { /* No lock, or not one to release. */ }
+ }
+ 
+-// Where main writes its health report (main.cjs healthFile): ORBIT_HEALTH_FILE ("0": nowhere), else the repository's
+-// artifacts/self-upgrade-health.json.
++// Where main writes its health report (main.cjs healthFile): ORBIT_HEALTH_FILE (a relative path from the repository;
++// "0": nowhere), else the repository's artifacts/self-upgrade-health.json.
+ function healthFilePath(root: string, env: NodeJS.ProcessEnv = process.env): string | null {
+   const value = env.ORBIT_HEALTH_FILE
+   if (value === undefined) return path.join(root, 'artifacts', 'self-upgrade-health.json')
+-  return value && value !== '0' ? path.resolve(value) : null
++  return value && value !== '0' ? path.resolve(root, value) : null
+ }
+ // The parts of Orbit's code on disk the running Orbit does not run yet, as the self-upgrade tells them to pick its
+ // restart level: the code fingerprints of the files against those main's health report gives for the code it runs.
+ // Whatever wrote a file (a tool, a shell command, git) counts, and a change undone counts no more. [] when it runs all
+diff --git "a/C:\\Users\\ROMANA~1\\AppData\\Local\\Temp\\orbit-i15-base-kOsvdF\\tests\\restart-orbit.test.cjs" "b/C:\\Users\\Roman Andreevich\\Desktop\\smth\\tests\\restart-orbit.test.cjs"
+index 0f5324a..856c744 100644
+--- "a/C:\\Users\\ROMANA~1\\AppData\\Local\\Temp\\orbit-i15-base-kOsvdF\\tests\\restart-orbit.test.cjs"
++++ "b/C:\\Users\\Roman Andreevich\\Desktop\\smth\\tests\\restart-orbit.test.cjs"	
+@@ -205,8 +205,9 @@ test('the host tells which parts of the code on disk the running Orbit does not
+   assert.equal(resume.healthFilePath(repo, {}), healthFile)
+   assert.equal(resume.healthFilePath(repo, { ORBIT_HEALTH_FILE: '0' }), null)
+   assert.equal(resume.healthFilePath(repo, { ORBIT_HEALTH_FILE: '' }), null)
+   assert.equal(resume.healthFilePath(repo, { ORBIT_HEALTH_FILE: path.join(repo, 'elsewhere.json') }), path.join(repo, 'elsewhere.json'))
++  assert.equal(resume.healthFilePath(repo, { ORBIT_HEALTH_FILE: 'elsewhere.json' }), path.join(repo, 'elsewhere.json'), 'a relative path is from the repository, not the current folder')
+ })
+ 
+ test('restart_orbit waits for other chats: it is refused while they work, its own helpers do not count', async t => {
+   const repo = repository(t), userData = folder(t)
+diff --git "a/C:\\Users\\ROMANA~1\\AppData\\Local\\Temp\\orbit-i15-base-kOsvdF\\tests\\main-load.test.cjs" "b/C:\\Users\\Roman Andreevich\\Desktop\\smth\\tests\\main-load.test.cjs"
+index fe07a81..2605229 100644
+--- "a/C:\\Users\\ROMANA~1\\AppData\\Local\\Temp\\orbit-i15-base-kOsvdF\\tests\\main-load.test.cjs"
++++ "b/C:\\Users\\Roman Andreevich\\Desktop\\smth\\tests\\main-load.test.cjs"	
+@@ -560,8 +560,30 @@ test('restart signals that arrive before the start is reported wait for that rep
+     fs.rmSync(folder, { recursive: true, force: true })
+   }
+ })
+ 
++test('health: a relative ORBIT_HEALTH_FILE is from the repository, where the self-upgrade script reads it, whatever folder Orbit started in', async () => {
++  const name = `orbit-main-health-${process.pid}-${Date.now().toString(36)}`
++  const started = fs.mkdtempSync(path.join(os.tmpdir(), 'orbit-main-cwd-'))
++  const healthFile = path.join(repo, 'artifacts', name, 'health.json')
++  const cwd = process.cwd()
++  process.chdir(started)
++  let loaded
++  try { loaded = loadMain({ ready: true, healthFile: path.join('artifacts', name, 'health.json') }) } finally { process.chdir(cwd) }
++  const { windows, exported } = loaded
++  try {
++    await until(() => windows.length === 1, 'window created')
++    windows[0].webContents.fire('did-finish-load')
++    await until(() => fs.existsSync(healthFile), 'start reported in the repository')
++    assert.equal(readJson(healthFile).ok, true)
++    assert.equal(fs.existsSync(path.join(started, 'artifacts')), false, 'nothing in the folder Orbit started in')
++    await exported.shutdownRuntime('quit')
++  } finally {
++    fs.rmSync(path.join(repo, 'artifacts', name), { recursive: true, force: true })
++    fs.rmSync(started, { recursive: true, force: true })
++  }
++})
++
+ test('health: after a runtime restart the window is checked again; one reload is allowed, a second failure makes the restart unhealthy', async () => {
+   const folder = fs.mkdtempSync(path.join(os.tmpdir(), 'orbit-main-health-'))
+   const healthFile = path.join(folder, 'health.json')
+   const { forks, windows, handlers, exported, spawned } = loadMain({ ready: true, healthFile })
+diff --git "a/C:\\Users\\ROMANA~1\\AppData\\Local\\Temp\\orbit-i15-base-kOsvdF\\electron\\runtime\\restart.mts" "b/C:\\Users\\Roman Andreevich\\Desktop\\smth\\electron\\runtime\\restart.mts"
+index af1449e..504e569 100644
+--- "a/C:\\Users\\ROMANA~1\\AppData\\Local\\Temp\\orbit-i15-base-kOsvdF\\electron\\runtime\\restart.mts"
++++ "b/C:\\Users\\Roman Andreevich\\Desktop\\smth\\electron\\runtime\\restart.mts"	
+@@ -23,8 +23,9 @@ const HINTS: Record<string, string> = {
+   'cycle-limit': 'Orbit was restarted too many times in a short while (ORBIT_UPGRADE_MAX_CYCLES); nothing was restarted. Tell the user, or try again later.',
+   locked: 'Another self-upgrade is already running; wait for it to finish, then call restart_orbit again if it is still needed.',
+   busy: 'Another restart is already in progress; wait for it to finish.',
+   'spawn-failed': 'The self-upgrade script could not be started; nothing was restarted.',
++  'no-health-report': 'Orbit runs with ORBIT_HEALTH_FILE=0 and writes no health report, so a restart could be neither checked nor rolled back; nothing was restarted. Do not call restart_orbit again in this Orbit: tell the user to restart Orbit to apply the change.',
+ }
+ // Where a rolled-back upgrade keeps the failed change (scripts/self-upgrade.cjs), when its report does not say.
+ const FAILED_PATCH = 'artifacts/self-upgrade-failed.patch'
+ const FAILED_REF = 'refs/orbit/self-upgrade/failed'
+@@ -170,10 +171,10 @@ async function executeRestart(runtime: OrbitRuntimeLike, run: RunRecord, agent:
+   const reason = checkedText(args.reason, 'a reason', REASON_CHARS)
+   const continueWith = checkedText(args.continueWith, 'continueWith (what to do after the restart)', CONTINUE_CHARS)
+   if (args.verify !== undefined && args.verify !== null && typeof args.verify !== 'boolean') throw new Error('restart_orbit: verify must be a boolean')
+   const verify = args.verify !== false
+-  // A refusal the agent cannot fix (other chats working, the user declined, the cycle limit) defers the change to the
+-  // next restart: improvement mode then accepts the answer without one (improvement.mts).
++  // A refusal the agent cannot fix (other chats working, the user declined, the cycle limit, no health report) defers
++  // the change to the next restart: improvement mode then accepts the answer without one (improvement.mts).
+   const deferred = (error: Error): Error => { run.restartDeferred = true; return error }
+   try { refuseWhileOthersWork(runtime, run) } catch (error) { throw deferred(error as Error) }
+   if (run.approvalPolicy === 'on-request' && !await runtime.approve(run, agent, { tool: 'restart_orbit', arguments: { reason, continueWith, verify } })) throw deferred(new Error('User declined this operation'))
+   // A chat started while the user was asked: checked again, with nothing awaited between here and the script's start
+@@ -191,9 +192,9 @@ async function executeRestart(runtime: OrbitRuntimeLike, run: RunRecord, agent:
+   let result: RestartResult | null
+   try { result = await Promise.race([host.request({ run, agent, reason, continueWith, verify, onLine: progress.line, signal: stop.signal }), restarting]) }
+   finally { signal.removeEventListener('abort', onAbort); progress.close() }
+   if (!result || stop.signal.aborted) throw abortError()
+-  if (!result.ok) throw result.status === 'cycle-limit' ? deferred(failure(result, run)) : failure(result, run)
++  if (!result.ok) throw result.status === 'cycle-limit' || result.status === 'no-health-report' ? deferred(failure(result, run)) : failure(result, run)
+   run.restartApplied = true
+   return observation(result)
+ }
+ 
+diff --git "a/C:\\Users\\ROMANA~1\\AppData\\Local\\Temp\\orbit-i15-base-kOsvdF\\tests\\improvement-loop-runtime.test.cjs" "b/C:\\Users\\Roman Andreevich\\Desktop\\smth\\tests\\improvement-loop-runtime.test.cjs"
+index 7ead952..adc8df1 100644
+--- "a/C:\\Users\\ROMANA~1\\AppData\\Local\\Temp\\orbit-i15-base-kOsvdF\\tests\\improvement-loop-runtime.test.cjs"
++++ "b/C:\\Users\\Roman Andreevich\\Desktop\\smth\\tests\\improvement-loop-runtime.test.cjs"	
+@@ -214,8 +214,25 @@ test('a restart refused for the cycle limit defers the change: the hint says so
+   assert.equal(live.restartDeferred, true); assert.equal(live.restartApplied, undefined)
+   assert.equal(result.summary.text, 'Verified, not applied yet')
+ })
+ 
++test('a restart refused because Orbit writes no health report (ORBIT_HEALTH_FILE=0) defers the change too: no retry, the user restarts Orbit', async t => {
++  const { workspace } = fixture(t)
++  const host = fakeHost(fs.realpathSync(workspace), { ok: false, status: 'no-health-report', exitCode: 2, output: '' })
++  let turn = 0, observed = ''
++  const runtime = new OrbitRuntime({ restartHost: host, runProvider: async ({ prompt }) => {
++    switch (++turn) {
++      case 1: return calls(['write_file', { path: 'fix.txt', content: 'fixed' }], ['improvement_plan', { status: 'implementing', tasks: [task('t1', 'done')] }], ['restart_orbit', { reason: 'apply', continueWith: 'confirm' }])
++      default: observed = prompt; return { text: 'Not applied: restart Orbit by hand' }
++    }
++  } })
++  const { result, live } = await run(runtime, { workspace })
++  assert.match(observed, /ORBIT_HEALTH_FILE=0 and writes no health report/)
++  assert.doesNotMatch(observed, /Fix what the output shows/)
++  assert.equal(live.restartDeferred, true); assert.equal(live.restartApplied, undefined)
++  assert.deepEqual([result.summary.text, host.requests.length], ['Not applied: restart Orbit by hand', 1], 'no reminder asks for another restart')
++})
++
+ test('a restart continuation keeps loopTask and is not asked to close another task', async t => {
+   const { workspace } = fixture(t)
+   let turn = 0
+   const runtime = new OrbitRuntime({ runProvider: async () => ++turn === 1 ? calls(['improvement_plan', { status: 'implementing', tasks: [task('a', 'done'), task('b', 'pending')] }]) : { text: 'ok' } })

@@ -920,6 +920,53 @@ test('under npm run dev (ORBIT_DEV=1) the script restarts nothing: status dev-mo
   assert.notEqual(readJsonFile(path.join(copy, 'artifacts', 'self-upgrade-last.json')).status, 'dev-mode', checks.stderr)
 })
 
+test('the health report is read where main writes it: ORBIT_HEALTH_FILE names the file, and with "0" (no report) nothing restarts', (t) => {
+  // A test's paths ignore the environment; the script's own follow ORBIT_HEALTH_FILE the way electron/main.cjs does.
+  const base = temporary(t)
+  const custom = path.join(base, 'elsewhere', 'health.json')
+  const files = (env) => [upgradePaths(base, env).health, upgradePaths(base, env).healthPrev]
+  const ambient = process.env.ORBIT_HEALTH_FILE
+  process.env.ORBIT_HEALTH_FILE = '0' // as in the commands of an Orbit started with it
+  try { assert.deepEqual(files(), [path.join(base, 'artifacts', 'self-upgrade-health.json'), path.join(base, 'artifacts', 'self-upgrade-health-prev.json')]) } finally {
+    if (ambient === undefined) delete process.env.ORBIT_HEALTH_FILE
+    else process.env.ORBIT_HEALTH_FILE = ambient
+  }
+  assert.deepEqual(files({ ORBIT_HEALTH_FILE: custom }), [custom, path.join(base, 'elsewhere', 'health-prev.json')])
+  assert.deepEqual(files({ ORBIT_HEALTH_FILE: path.join('elsewhere', 'health.json') }), [custom, path.join(base, 'elsewhere', 'health-prev.json')], 'a relative path is from the repository, as main resolves it')
+  for (const value of ['0', '']) assert.deepEqual(files({ ORBIT_HEALTH_FILE: value }), [null, null])
+  const none = upgrade.observeOrbit({ paths: upgradePaths(base, { ORBIT_HEALTH_FILE: '0' }), system: { findOrbitProcesses: () => [{ pid: 80 }] } })
+  assert.deepEqual([none.health, none.runningHealth, none.healthNote], [null, null, 'Orbit writes no health report (ORBIT_HEALTH_FILE=0)'])
+  assert.deepEqual(decideLevel({ running: true, health: none.runningHealth, healthNote: none.healthNote, fingerprint: { shell: 'S', runtime: 'R' } }), { level: 'full', reason: none.healthNote })
+
+  // The script itself, from a copy in a temporary folder (its report never touches the repository's artifacts/).
+  const copy = temporary(t, 'orbit-upgrade-health-')
+  for (const file of ['scripts/self-upgrade.cjs', 'electron/fingerprint.cjs']) {
+    fs.mkdirSync(path.dirname(path.join(copy, file)), { recursive: true })
+    fs.copyFileSync(path.join(__dirname, '..', file), path.join(copy, file))
+  }
+  const script = (healthFile, ...args) => spawnSync(process.execPath, [path.join(copy, 'scripts', 'self-upgrade.cjs'), ...args], { cwd: os.tmpdir(), encoding: 'utf8', windowsHide: true, env: { ...process.env, ORBIT_DEV: '', ORBIT_HEALTH_FILE: healthFile } })
+  const report = () => readJsonFile(path.join(copy, 'artifacts', 'self-upgrade-last.json'))
+  const elsewhere = path.join(copy, 'profile', 'health.json')
+  writeHealth(elsewhere, { ok: true, pid: 4242, startedAt: 1, writtenAt: 2 })
+  writeHealth(path.join(copy, 'artifacts', 'self-upgrade-health.json'), { ok: true, pid: 1717, startedAt: 1, writtenAt: 2 })
+  const planned = script(elsewhere, '--dry-run')
+  assert.deepEqual([report().healthFile, report().health?.pid], [elsewhere, 4242], planned.stderr)
+  const refused = script('0', '--no-verify')
+  assert.equal(refused.status, 2, refused.stderr)
+  assert.match(refused.stderr, /ORBIT_HEALTH_FILE=0/)
+  assert.deepEqual([report().ok, report().status, report().nextAction, report().error], [false, 'no-health-report', 'restart-orbit-by-hand', upgrade.NO_HEALTH_MESSAGE])
+  assert.equal(fs.existsSync(path.join(copy, 'artifacts', 'self-upgrade.lock')), false, 'refused before the lock')
+  // Runs that restart nothing go past that check (and stop here only for want of the build tools).
+  const dry = script('0', '--dry-run')
+  assert.deepEqual([report().mode, report().healthFile, report().health, report().healthNote], ['dry-run', null, null, none.healthNote], dry.stderr)
+  for (const flag of ['--no-relaunch', '--verify-only']) {
+    fs.rmSync(path.join(copy, 'artifacts', 'self-upgrade-last.json'))
+    const checks = script('0', flag)
+    assert.notEqual(checks.status, 2, `${flag}: ${checks.stderr}`)
+    assert.notEqual(report().status, 'no-health-report', `${flag}: ${checks.stderr}`)
+  }
+})
+
 test('the lock is kept fresh by its holder; one whose heartbeat stopped is stale whatever its pid; the restart host removes a killed script\'s lock', async (t) => {
   const base = temporary(t)
   const file = upgrade.lockFile(base)
@@ -1113,4 +1160,70 @@ test('the rollback base part by part: src/ only from a snapshot with the rendere
   assert.deepEqual(base({ running: { ...record, rendererHash: null }, previous, parts: ['src'] }), [null, [], ['src']], 'a record without a renderer hash never puts src/ back')
   assert.deepEqual(base({ running: record, previous: { ...previous, rendererHash: null }, parts: ['src'] }), [null, [], ['src']])
   assert.match(upgrade.rollbackBase({ running: record, previous: { ...previous, rendererHash: null }, parts: ['src'] }).reason, /reported no renderer hash/)
+})
+
+// node:test's TAP as a check prints it: the YAML block quotes its values with util.inspect.
+function tapFailures(base) {
+  const { inspect } = require('node:util')
+  const at = (file, line) => inspect(`${path.join(base, file)}:${line}:3`)
+  return [
+    'TAP version 13', '# Subtest: passes', 'ok 1 - passes', '  ---', '  duration_ms: 0.5', '  ...',
+    '# Subtest: group', '    # Subtest: inner fails', '    not ok 1 - inner fails', '      ---',
+    `      location: ${at(path.join('tests', 'a.test.cjs'), 5)}`, "      failureType: 'testCodeFailure'", `      error: ${inspect("it's 1, not 2")}`,
+    '      stack: |-', '        TestContext.<anonymous> (a.test.cjs:5:46)', '      ...', '    1..1',
+    'not ok 2 - group', '  ---', `  location: ${at(path.join('tests', 'a.test.cjs'), 4)}`, "  failureType: 'subtestsFailed'", "  error: '1 subtest failed'", '  ...',
+    'not ok 3 - later # TODO', '  ---', "  failureType: 'testCodeFailure'", '  ...',
+    'not ok 4 - multi-line error', '  ---', `  location: ${at(path.join('tests', 'b.test.cjs'), 9)}`, "  failureType: 'testCodeFailure'", '  error: |-', '    Expected values to be strictly equal:', '    ', '    1 !== 2', '  ...',
+    '1..4', '# fail 2',
+  ].join('\r\n')
+}
+
+test('a failed check names what failed: TAP not ok entries with error and place, and TypeScript errors', () => {
+  const base = path.join(os.tmpdir(), 'orbit-repo')
+  const collector = upgrade.failureCollector(base)
+  const text = tapFailures(base)
+  // Chunks cut through lines, a multi-byte character and a line ending.
+  for (const chunk of [text.slice(0, 57), text.slice(57, 300), text.slice(300)]) collector.feed(Buffer.from(chunk))
+  collector.feed(Buffer.from('\nsrc/App.tsx(12,5): error TS2322: Type \'string\' is not assignable to type \'number\'.\n'))
+  collector.feed('error TS5112: tsconfig.json is present but will not be loaded if files are specified on commandline.\n')
+  const split = Buffer.from('electron/x.mts:3:1 - error TS2304: Cannot find name \'é\'.')
+  collector.feed(split.subarray(0, split.length - 3)); collector.feed(split.subarray(split.length - 3))
+  const { failures, total } = collector.result()
+  assert.equal(total, 5, 'a parent whose subtest failed and a TODO test do not count')
+  assert.deepEqual(failures, [
+    { name: 'inner fails', error: "it's 1, not 2", location: 'tests/a.test.cjs:5:3' },
+    { name: 'multi-line error', error: 'Expected values to be strictly equal:', location: 'tests/b.test.cjs:9:3' },
+    { name: 'src/App.tsx:12:5', error: "TS2322: Type 'string' is not assignable to type 'number'." },
+    { name: 'tsc', error: 'TS5112: tsconfig.json is present but will not be loaded if files are specified on commandline.' },
+    { name: 'electron/x.mts:3:1', error: "TS2304: Cannot find name 'é'." },
+  ])
+  const limited = upgrade.failureCollector(base, 1)
+  limited.feed(text)
+  assert.deepEqual(limited.result(), { failures: [failures[0]], total: 2 })
+  assert.deepEqual(upgrade.failureSummary({ failures: [failures[0]], failuresTotal: 2, checksLog: 'L' }), [
+    'Failed: 2, the first 1:', "  - inner fails — it's 1, not 2 (tests/a.test.cjs:5:3)", 'Whole output of the checks: L',
+  ])
+  assert.deepEqual(upgrade.failureSummary({}), [])
+})
+
+test('a check passes its output through, appends it to the log and rejects with what failed', async (t) => {
+  const dir = temporary(t)
+  const log = upgrade.startChecksLog(path.join(dir, 'artifacts', 'checks.log'), 'run-1')
+  const sink = () => { const seen = []; return { seen, write: (chunk) => { seen.push(String(chunk)) } } }
+  const stdout = sink(), stderr = sink()
+  const script = `process.stdout.write(${JSON.stringify(tapFailures(dir))}); process.stderr.write('some warning\\n'); process.exitCode = 1`
+  await assert.rejects(upgrade.run('test', process.execPath, ['-e', script], { log, cwd: dir, stdout, stderr }), (error) => {
+    assert.equal(error.message, 'test exited with 1 (2 failed: inner fails, multi-line error)')
+    assert.equal(error.failuresTotal, 2)
+    assert.deepEqual(error.failures.map((item) => item.location), ['tests/a.test.cjs:5:3', 'tests/b.test.cjs:9:3'])
+    return true
+  })
+  await upgrade.run('smoke', process.execPath, ['-e', 'console.log("all good")'], { log, cwd: dir, stdout, stderr })
+  assert.match(stdout.seen.join(''), /not ok 1 - inner fails[\s\S]*all good/)
+  assert.equal(stderr.seen.join(''), 'some warning\n')
+  const written = fs.readFileSync(log, 'utf8')
+  assert.match(written, /^Orbit self-upgrade run-1: /)
+  assert.match(written, /\n==> test\n[\s\S]*not ok 4 - multi-line error[\s\S]*some warning\n[\s\S]*\n==> smoke\nall good/)
+  // Without a log the step still runs and reports.
+  await assert.rejects(upgrade.run('typecheck', process.execPath, ['-e', 'process.exit(2)'], { cwd: dir, stdout, stderr }), { message: 'typecheck exited with 2', failuresTotal: 0 })
 })

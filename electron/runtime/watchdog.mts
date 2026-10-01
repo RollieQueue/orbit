@@ -16,7 +16,7 @@ const FINISHED = /^(?:completed?|done|succeeded|success|failed|failure|errored|e
 // Silent turns in a row per agent; a completed turn clears the count.
 const silentTurns = new WeakMap<AgentRecord, number>()
 // Events of the model itself; an observation can be a CLI's stderr line or a note from before the CLI started.
-const MODEL_EVENTS = new Set<unknown>(['output', 'reasoning', 'tool'])
+const MODEL_EVENTS = new Set<unknown>(['output', 'reasoning', 'thinking', 'tool'])
 
 // The silence that stops a turn: ORBIT_STALL_MS (0 turns the watchdog off), else 10 minutes.
 function stallLimit(): number {

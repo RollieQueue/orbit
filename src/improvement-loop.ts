@@ -176,8 +176,10 @@ export function nextLoopStep(chat: ChatThread, chatRuns: RunSnapshot[], options:
 // A loop start that startTask refused: the task number goes back and the same start is repeated later. No run was made,
 // so `failures` (how the previous run ended) stays as it is. Orbit being busy is waited out in seconds without a note;
 // any other refusal backs off 1, 3, 10, 30 minutes on its own count and is shown in the chat.
-export function loopStartFailed(started: ImprovementLoop, previousIteration: number, error: string, now: number): { loop: ImprovementLoop; note?: string } {
-  const loop: ImprovementLoop = { ...started, iteration: previousIteration }
+// `started` is the saved loop of the refused start, its iteration the refused task (startStep): one back, the due retry
+// (iteration + 1) repeats that task, also for a repeated lost start, whose loop already had the number before it.
+export function loopStartFailed(started: ImprovementLoop, error: string, now: number): { loop: ImprovementLoop; note?: string } {
+  const loop: ImprovementLoop = { ...started, iteration: started.iteration - 1 }
   delete loop.startingAt
   if (isBusyRefusal(error)) {
     loop.busyStarts = (started.busyStarts ?? 0) + 1

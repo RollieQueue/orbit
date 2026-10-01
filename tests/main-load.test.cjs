@@ -76,12 +76,17 @@ class FakeRuntime extends EventEmitter {
 
 // `runtime`: the behaviour of every fake runtime process, or a list of them (one per fork, the last one repeats).
 // `fingerprint`: a replacement for electron/fingerprint.cjs (the code hashes main compares).
-function loadMain({ lock = true, ready = false, healthFile = '0', mode, argv = [], userData = os.tmpdir(), runtime = 'ok', isPackaged = false, loaded = [], fingerprint } = {}) {
+// `proxyEnv`: the proxy variables main starts with (none otherwise, whatever this machine has); `systemRoute`: what
+// the system's proxy settings answer for any URL.
+const PROXY_NAMES = ['HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY', 'http_proxy', 'https_proxy', 'all_proxy', 'no_proxy']
+function loadMain({ lock = true, ready = false, healthFile = '0', mode, argv = [], userData = os.tmpdir(), runtime = 'ok', isPackaged = false, loaded = [], fingerprint, proxyEnv = {}, systemRoute = 'PROXY main-session.example:8080; DIRECT' } = {}) {
   const handlers = new Map(), appEvents = [], appHandlers = new Map(), calls = { relaunch: [], exit: [], quit: 0, lock: [] }
-  const windows = [], forks = [], dialogs = [], opened = [], spawned = [], proxyLookups = [], executed = []
+  const windows = [], forks = [], dialogs = [], opened = [], spawned = [], proxyLookups = [], proxySets = [], executed = []
   const privileged = [], protocols = new Map(), webRequests = []
   const behaviourOf = (index) => (Array.isArray(runtime) ? runtime[Math.min(index, runtime.length - 1)] : runtime)
-  const saved = { ORBIT_USER_DATA: process.env.ORBIT_USER_DATA, ORBIT_HEALTH_FILE: process.env.ORBIT_HEALTH_FILE, ORBIT_RUNTIME_MODE: process.env.ORBIT_RUNTIME_MODE }
+  const saved = { ORBIT_USER_DATA: process.env.ORBIT_USER_DATA, ORBIT_HEALTH_FILE: process.env.ORBIT_HEALTH_FILE, ORBIT_RUNTIME_MODE: process.env.ORBIT_RUNTIME_MODE, ...Object.fromEntries(PROXY_NAMES.map(name => [name, process.env[name]])) }
+  for (const name of PROXY_NAMES) delete process.env[name]
+  Object.assign(process.env, proxyEnv)
   delete process.env.ORBIT_USER_DATA
   process.env.ORBIT_HEALTH_FILE = healthFile // '0': no health report file and no crash hook from a test process
   if (mode) process.env.ORBIT_RUNTIME_MODE = mode; else delete process.env.ORBIT_RUNTIME_MODE
@@ -150,7 +155,11 @@ function loadMain({ lock = true, ready = false, healthFile = '0', mode, argv = [
       BrowserWindow: FakeWindow,
       dialog: { showMessageBox: async (_window, options) => { dialogs.push(options); return { response: 1 } }, showOpenDialog: async () => ({ canceled: true, filePaths: [] }), showErrorBox() {} },
       shell: { openExternal: async (url) => { opened.push(url) }, openPath: async (target) => { opened.push(`path:${target}`); return '' } },
-      session: { defaultSession: { resolveProxy: async (url) => { proxyLookups.push(url); return 'PROXY main-session.example:8080; DIRECT' }, webRequest: { onBeforeSendHeaders: (filter, listener) => { webRequests.push({ filter, listener }) } } } },
+      // The window's session, which main may set the environment's proxy on, and a partition left on the system's settings.
+      session: {
+        defaultSession: { resolveProxy: async (url) => { proxyLookups.push(`window ${url}`); return 'DIRECT' }, setProxy: async (config) => { proxySets.push(config) }, webRequest: { onBeforeSendHeaders: (filter, listener) => { webRequests.push({ filter, listener }) } } },
+        fromPartition: (partition) => ({ resolveProxy: async (url) => { proxyLookups.push(`${partition} ${url}`); return systemRoute } }),
+      },
       protocol: { registerSchemesAsPrivileged: (schemes) => { schemes.forEach(scheme => privileged.push(scheme)) }, handle: (scheme, handler) => { protocols.set(scheme, handler) } },
       ipcMain: { handle: (channel, handler) => handlers.set(channel, handler) },
       utilityProcess: { fork: (modulePath, args, options) => { const child = new FakeRuntime(modulePath, args, options, behaviourOf(forks.length)); forks.push(child); return child } },
@@ -161,7 +170,7 @@ function loadMain({ lock = true, ready = false, healthFile = '0', mode, argv = [
     // With a health file main.cjs installs a process-wide crash hook that exits the process; a test must not keep it.
     for (const listener of process.listeners('uncaughtException')) if (!crashHooks.includes(listener)) process.removeListener('uncaughtException', listener)
   }
-  return { handlers, appEvents, appHandlers, calls, exported, windows, forks, dialogs, opened, spawned, proxyLookups, executed, privileged, protocols, webRequests }
+  return { handlers, appEvents, appHandlers, calls, exported, windows, forks, dialogs, opened, spawned, proxyLookups, proxySets, executed, privileged, protocols, webRequests }
 }
 
 const trusted = { sender: { isDestroyed: () => false, getURL: () => 'file:///C:/orbit/dist/index.html' }, senderFrame: { url: 'file:///C:/orbit/dist/index.html', parent: null } }
@@ -432,11 +441,12 @@ test('child mode: the runtime process is forked, a runtime channel is forwarded,
   await until(() => runtime.of('approval-result').length === 1, 'approval answered')
   assert.ok(dialogs[0].message.includes('Проверка') && dialogs[0].detail.includes('approved.txt'))
   assert.deepEqual(runtime.of('approval-result'), [{ t: 'approval-result', id: 'q1', approved: true }])
-  // The runtime has no Electron session: main resolves the system proxy for it with its own.
+  // The runtime has no Electron session: main resolves the system proxy for it with a session left on the system's
+  // settings (the window's may go through the environment's proxy).
   runtime.emit('message', { t: 'resolve-proxy', id: 'p1', url: 'https://daily-cloudcode-pa.googleapis.com' })
   await until(() => runtime.of('proxy-result').length === 1, 'proxy answered')
   assert.deepEqual(runtime.of('proxy-result'), [{ t: 'proxy-result', id: 'p1', route: 'PROXY main-session.example:8080; DIRECT' }])
-  assert.deepEqual(proxyLookups, ['https://daily-cloudcode-pa.googleapis.com'])
+  assert.deepEqual(proxyLookups, ['orbit-system-proxy https://daily-cloudcode-pa.googleapis.com'])
   // Quitting waits for the runtime once: before-quit is held, the runtime shuts down, then Orbit quits.
   let prevented = 0
   appHandlers.get('before-quit')({ preventDefault: () => { prevented++ } })
@@ -551,6 +561,28 @@ test('restart signals that arrive before the start is reported wait for that rep
   }
 })
 
+test('health: a relative ORBIT_HEALTH_FILE is from the repository, where the self-upgrade script reads it, whatever folder Orbit started in', async () => {
+  const name = `orbit-main-health-${process.pid}-${Date.now().toString(36)}`
+  const started = fs.mkdtempSync(path.join(os.tmpdir(), 'orbit-main-cwd-'))
+  const healthFile = path.join(repo, 'artifacts', name, 'health.json')
+  const cwd = process.cwd()
+  process.chdir(started)
+  let loaded
+  try { loaded = loadMain({ ready: true, healthFile: path.join('artifacts', name, 'health.json') }) } finally { process.chdir(cwd) }
+  const { windows, exported } = loaded
+  try {
+    await until(() => windows.length === 1, 'window created')
+    windows[0].webContents.fire('did-finish-load')
+    await until(() => fs.existsSync(healthFile), 'start reported in the repository')
+    assert.equal(readJson(healthFile).ok, true)
+    assert.equal(fs.existsSync(path.join(started, 'artifacts')), false, 'nothing in the folder Orbit started in')
+    await exported.shutdownRuntime('quit')
+  } finally {
+    fs.rmSync(path.join(repo, 'artifacts', name), { recursive: true, force: true })
+    fs.rmSync(started, { recursive: true, force: true })
+  }
+})
+
 test('health: after a runtime restart the window is checked again; one reload is allowed, a second failure makes the restart unhealthy', async () => {
   const folder = fs.mkdtempSync(path.join(os.tmpdir(), 'orbit-main-health-'))
   const healthFile = path.join(folder, 'health.json')
@@ -591,6 +623,41 @@ test('health: a runtime that fails to start makes the start unhealthy', async ()
     assert.match(health.error, /^runtime failed to start: SyntaxError in runtime\.mts/)
     assert.equal(health.generation, 1)
     assert.deepEqual(spawned, [], 'a failed start records nothing')
+    await exported.shutdownRuntime('quit')
+  } finally {
+    fs.rmSync(folder, { recursive: true, force: true })
+  }
+})
+
+// Chromium reads only the system's proxy settings; the agents' CLIs go through HTTP(S)_PROXY (electron/window-proxy.cjs).
+test('with the system proxy off the window goes through the environment\'s proxy, the runtime still hears the system\'s; a frame inside the page failing is no failed renderer', async () => {
+  const folder = fs.mkdtempSync(path.join(os.tmpdir(), 'orbit-main-health-'))
+  const healthFile = path.join(folder, 'health.json')
+  const { windows, forks, proxyLookups, proxySets, exported } = loadMain({ ready: true, healthFile, proxyEnv: { HTTPS_PROXY: 'http://127.0.0.1:12334', NO_PROXY: '::1' }, systemRoute: 'DIRECT' })
+  try {
+    await until(() => proxySets.length === 1 && forks.length === 1 && windows.length === 1, 'the window\'s proxy set')
+    assert.deepEqual(proxySets, [{ mode: 'fixed_servers', proxyRules: 'https=http://127.0.0.1:12334,direct://', proxyBypassRules: '[::1]' }])
+    const [runtime] = forks
+    runtime.emit('message', { t: 'resolve-proxy', id: 'p1', url: 'https://daily-cloudcode-pa.googleapis.com' })
+    await until(() => runtime.of('proxy-result').length === 1, 'proxy answered')
+    assert.equal(runtime.of('proxy-result')[0].route, 'DIRECT', 'the system\'s route, not the window\'s proxy')
+    const { PROBE_URLS } = require('../electron/window-proxy.cjs')
+    assert.deepEqual(proxyLookups, [...PROBE_URLS, 'https://daily-cloudcode-pa.googleapis.com'].map(url => `orbit-system-proxy ${url}`))
+    // The video player's frame failing: the window is not brought over the others, and no failed renderer is reported.
+    const [win] = windows
+    let shown = 0
+    win.show = () => { shown++ }
+    win.webContents.fire('did-fail-load', {}, -105, 'ERR_NAME_NOT_RESOLVED', 'https://www.youtube.com/embed/x', false)
+    win.webContents.fire('did-fail-load', {}, -3, 'ERR_ABORTED', 'https://www.youtube.com/embed/y', false)
+    assert.deepEqual([shown, fs.existsSync(healthFile)], [0, false])
+    // The page itself: shown at once; an aborted navigation (replaced by another) is no broken build, a failure is.
+    win.webContents.fire('did-fail-load', {}, -3, 'ERR_ABORTED', 'file:///C:/orbit/dist/index.html', true)
+    assert.deepEqual([shown, fs.existsSync(healthFile)], [1, false])
+    win.webContents.fire('did-fail-load', {}, -6, 'ERR_FILE_NOT_FOUND', 'file:///C:/orbit/dist/index.html', true)
+    assert.equal(shown, 2)
+    const health = readJson(healthFile)
+    assert.equal(health.ok, false)
+    assert.match(health.error, /^renderer failed to load \(-6\): ERR_FILE_NOT_FOUND/)
     await exported.shutdownRuntime('quit')
   } finally {
     fs.rmSync(folder, { recursive: true, force: true })
