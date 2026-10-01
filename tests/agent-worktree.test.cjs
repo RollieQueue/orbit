@@ -1,49 +1,15 @@
 // Isolated copies of a workspace (electron/agent-worktree.mts): a copy starts from the parent's current state without
 // touching it, a finished helper's changes merge into the target file by file (conflicts leave the target alone), nested
 // copies work, and removing a copy never follows its links. Everything runs against real temporary git repositories.
+// The tests are spread over agent-worktree*.test.cjs, which run side by side (the fixtures are in helpers-worktree.cjs).
+// This part makes copies: of a parent with uncommitted work, of a repository without commits, of a folder below the
+// repository's top, several at once and without the user's hooks; a workspace outside any work tree is refused.
 const test = require('node:test')
 const assert = require('node:assert/strict')
 const fs = require('node:fs')
-const os = require('node:os')
 const path = require('node:path')
-const { execFileSync } = require('node:child_process')
 const worktree = require('../electron/agent-worktree.mts')
-
-// No git configuration is needed for the module itself; the fixtures commit with this identity. GIT_OPTIONAL_LOCKS keeps
-// `git status` from refreshing (rewriting) the index that a test compares byte for byte.
-const IDENTITY = { GIT_AUTHOR_NAME: 'T', GIT_AUTHOR_EMAIL: 't@t', GIT_COMMITTER_NAME: 'T', GIT_COMMITTER_EMAIL: 't@t', GIT_OPTIONAL_LOCKS: '0' }
-const git = (cwd, ...args) => execFileSync('git', args, { cwd, env: { ...process.env, ...IDENTITY }, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim()
-const crlf = text => text.replace(/\n/g, '\r\n')
-
-function folder(t, label) {
-  const directory = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), `orbit-copy-${label}-`)))
-  // Only this fixture's own temporary folder is removed (a link inside it is unlinked, not followed).
-  t.after(() => fs.rmSync(directory, { recursive: true, force: true }))
-  return directory
-}
-function put(directory, files) {
-  for (const [name, text] of Object.entries(files)) {
-    const file = path.join(directory, ...name.split('/'))
-    fs.mkdirSync(path.dirname(file), { recursive: true })
-    fs.writeFileSync(file, text)
-  }
-}
-const read = (directory, name) => fs.readFileSync(path.join(directory, ...name.split('/')), 'utf8')
-function repo(t, files = { 'a.txt': 'one\ntwo\nthree\n', 'b.txt': 'bee\n' }, { eol = false, commit = true } = {}) {
-  const directory = folder(t, 'repo')
-  git(directory, 'init', '-q')
-  git(directory, 'config', 'core.autocrlf', eol ? 'true' : 'false')
-  put(directory, { '.gitignore': 'node_modules/\n', ...files })
-  if (commit) { git(directory, 'add', '-A'); git(directory, 'commit', '-qm', 'init') }
-  return directory
-}
-let counter = 0
-async function copyOf(t, source, { root = folder(t, 'root'), runId = 'run-test', origin } = {}) {
-  const made = await worktree.createCopy({ source, kind: 'worktree', root, runId, agentId: `agent-${++counter}-fixture`, ...(origin ? { origin } : {}) })
-  assert.ok(made.ok, made.detail)
-  return { copy: made.copy, root }
-}
-const paths = files => files.map(file => file.path).sort()
+const { git, folder, put, read, repo, copyOf, paths } = require('./helpers-worktree.cjs')
 
 test('a copy starts from the parent\'s current state and leaves its HEAD, index and files untouched', async t => {
   const dir = repo(t)
@@ -73,190 +39,6 @@ test('a copy starts from the parent\'s current state and leaves its HEAD, index 
   assert.deepEqual(fs.readdirSync(root), [], 'the run folder went away with its last copy')
 })
 
-test('a finished helper\'s changes merge into the target: modified, added and deleted files', async t => {
-  const dir = repo(t, { 'a.txt': 'one\ntwo\nthree\n', 'b.txt': 'bee\n', 'keep.txt': 'keep\n' })
-  const { copy, root } = await copyOf(t, dir)
-  const head = git(dir, 'rev-parse', 'HEAD')
-  put(copy.workspace, { 'a.txt': 'one\n2\nthree\n', 'sub/c.txt': 'new file\n' })
-  fs.rmSync(path.join(copy.workspace, 'b.txt'))
-  const result = await worktree.mergeCopy(copy)
-  assert.equal(result.ok, true)
-  assert.deepEqual(result.merged.map(file => [file.path, file.kind]).sort(), [['a.txt', 'modify'], ['b.txt', 'delete'], ['sub/c.txt', 'create']])
-  assert.deepEqual(result.conflicts, [])
-  assert.equal(read(dir, 'a.txt'), 'one\n2\nthree\n')
-  assert.equal(read(dir, 'sub/c.txt'), 'new file\n')
-  assert.equal(fs.existsSync(path.join(dir, 'b.txt')), false)
-  assert.equal(read(dir, 'keep.txt'), 'keep\n', 'a file the helper did not touch stays')
-  const modified = result.merged.find(file => file.path === 'a.txt')
-  assert.deepEqual([modified.before, modified.after], ['one\ntwo\nthree\n', 'one\n2\nthree\n'], 'the texts for the change record')
-  assert.equal(result.merged.find(file => file.path === 'sub/c.txt').before, null)
-  assert.equal(result.merged.find(file => file.path === 'b.txt').after, null)
-  assert.equal(git(dir, 'diff', '--cached', '--name-only'), '', 'the merge stages nothing in the target')
-  assert.equal(git(dir, 'rev-parse', 'HEAD'), head)
-  const report = worktree.describeMerge(copy, result)
-  assert.match(report, /MERGED into .*: 3 file\(s\) \(created: sub\/c\.txt; modified: a\.txt; deleted: b\.txt\)/)
-  assert.doesNotMatch(report, /CONFLICTS/)
-  assert.equal((await worktree.removeCopy(copy, root)).patch, null)
-})
-
-test('a file both sides changed in different places is merged line by line', async t => {
-  const dir = repo(t, { 'a.txt': 'l1\nl2\nl3\nl4\nl5\n' })
-  const { copy } = await copyOf(t, dir)
-  put(dir, { 'a.txt': 'T1\nl2\nl3\nl4\nl5\n' })
-  put(copy.workspace, { 'a.txt': 'l1\nl2\nl3\nl4\nH5\n' })
-  const result = await worktree.mergeCopy(copy)
-  assert.deepEqual(result.conflicts, [])
-  assert.deepEqual(result.merged.map(file => file.kind), ['modify'])
-  assert.equal(read(dir, 'a.txt'), 'T1\nl2\nl3\nl4\nH5\n')
-})
-
-test('a conflict leaves the target\'s file untouched, names both versions, and is tried again next time', async t => {
-  const dir = repo(t, { 'a.txt': 'l1\nl2\nl3\n', 'other.txt': 'o\n' })
-  const { copy } = await copyOf(t, dir)
-  put(dir, { 'a.txt': 'l1\nTARGET\nl3\n' })
-  put(copy.workspace, { 'a.txt': 'l1\nHELPER\nl3\n', 'other.txt': 'o changed\n' })
-  const first = await worktree.mergeCopy(copy)
-  assert.deepEqual(first.conflicts.map(conflict => conflict.path), ['a.txt'])
-  assert.match(first.conflicts[0].reason, /overlap/)
-  assert.equal(read(dir, 'a.txt'), 'l1\nTARGET\nl3\n', 'the target\'s file is untouched')
-  assert.equal(read(dir, 'other.txt'), 'o changed\n', 'what merges cleanly is merged')
-  const report = worktree.describeMerge(copy, first)
-  assert.match(report, /CONFLICTS: 1 file\(s\) were NOT merged/)
-  assert.ok(report.includes(path.join(copy.dir, 'a.txt')) && report.includes(path.join(dir, 'a.txt')), 'both versions are named')
-  const command = /git -C "([^"]+)" diff ([0-9a-f]{7}) -- "([^"]+)"/.exec(report)
-  assert.ok(command, 'the report says how to see what the helper changed')
-  const shown = git(command[1], 'diff', command[2], '--', command[3])
-  assert.match(shown, /-l2/)
-  assert.match(shown, /\+HELPER/)
-  const origin = /git -C "([^"]+)" show ([0-9a-f]{7}):(\S+)/.exec(report)
-  assert.equal(git(origin[1], 'show', `${origin[2]}:${origin[3]}`), 'l1\nl2\nl3', 'and the version both started from')
-  const second = await worktree.mergeCopy(copy)
-  assert.deepEqual([second.merged.length, second.conflicts.map(conflict => conflict.path)], [0, ['a.txt']], 'a conflicting path is retried')
-  put(dir, { 'a.txt': 'l1\nHELPER\nl3\n' })
-  const third = await worktree.mergeCopy(copy)
-  assert.deepEqual([third.conflicts.length, third.identical], [0, 1], 'once the target has the helper\'s version the conflict is gone')
-})
-
-test('creating or deleting a file on both sides differently is a conflict; the same result on both sides is not', async t => {
-  const dir = repo(t, { 'a.txt': 'a\n', 'del.txt': 'to delete\n', 'gone.txt': 'gone\n', 'same.txt': 's\n' })
-  const { copy } = await copyOf(t, dir)
-  put(copy.workspace, { 'n.txt': 'helper\n', 'gone.txt': 'helper edit\n', 'twin.txt': 'twin\n' })
-  fs.rmSync(path.join(copy.workspace, 'del.txt')); fs.rmSync(path.join(copy.workspace, 'same.txt'))
-  put(dir, { 'n.txt': 'target\n', 'del.txt': 'target edit\n', 'twin.txt': 'twin\n' })
-  fs.rmSync(path.join(dir, 'gone.txt')); fs.rmSync(path.join(dir, 'same.txt'))
-  const result = await worktree.mergeCopy(copy)
-  const reasons = Object.fromEntries(result.conflicts.map(conflict => [conflict.path, conflict.reason]))
-  assert.deepEqual(Object.keys(reasons).sort(), ['del.txt', 'gone.txt', 'n.txt'])
-  assert.match(reasons['n.txt'], /created by the helper and, differently, in the target/)
-  assert.match(reasons['del.txt'], /deleted by the helper, but changed in the target/)
-  assert.match(reasons['gone.txt'], /deleted in the target, but changed by the helper/)
-  assert.equal(result.identical, 2, 'a twin file and a file deleted on both sides need nothing')
-  assert.deepEqual(result.merged, [])
-  assert.equal(read(dir, 'n.txt'), 'target\n')
-  assert.equal(read(dir, 'del.txt'), 'target edit\n')
-  assert.equal(fs.existsSync(path.join(dir, 'gone.txt')), false)
-})
-
-test('a binary file changed on both sides is a conflict, not a text merge', async t => {
-  const dir = repo(t, {})
-  fs.writeFileSync(path.join(dir, 'img.bin'), Buffer.from([0, 1, 2, 3]))
-  git(dir, 'add', '-A'); git(dir, 'commit', '-qm', 'binary')
-  const { copy } = await copyOf(t, dir)
-  fs.writeFileSync(path.join(copy.workspace, 'img.bin'), Buffer.from([0, 1, 2, 9]))
-  fs.writeFileSync(path.join(dir, 'img.bin'), Buffer.from([0, 1, 7, 3]))
-  const result = await worktree.mergeCopy(copy)
-  assert.match(result.conflicts[0].reason, /binary/)
-  assert.deepEqual([...fs.readFileSync(path.join(dir, 'img.bin'))], [0, 1, 7, 3])
-  // Changed only by the helper, a binary file is copied.
-  fs.writeFileSync(path.join(dir, 'img.bin'), Buffer.from([0, 1, 2, 3]))
-  const once = await worktree.mergeCopy(copy)
-  assert.deepEqual(once.merged.map(file => [file.path, file.before, file.after]), [['img.bin', undefined, undefined]])
-  assert.deepEqual([...fs.readFileSync(path.join(dir, 'img.bin'))], [0, 1, 2, 9])
-})
-
-test('a second merge after a follow-up applies only what is new and keeps the target\'s own edits', async t => {
-  const dir = repo(t, { 'a.txt': 'l1\nl2\nl3\nl4\nl5\nl6\n' })
-  const { copy } = await copyOf(t, dir)
-  put(copy.workspace, { 'a.txt': 'l1\nH2\nl3\nl4\nl5\nl6\n' })
-  const first = await worktree.mergeCopy(copy)
-  assert.equal(first.merged.length, 1)
-  const again = await worktree.mergeCopy(copy)
-  assert.deepEqual([again.merged.length, again.conflicts.length, again.identical], [0, 0, 0], 'nothing is merged twice')
-  put(dir, { 'a.txt': 'l1\nH2\nl3\nl4\nl5\nT6\n' })
-  put(copy.workspace, { 'a.txt': 'l1\nH2\nl3\nH4\nl5\nl6\n' })
-  const second = await worktree.mergeCopy(copy)
-  assert.deepEqual(second.conflicts, [])
-  assert.deepEqual(second.merged.map(file => file.path), ['a.txt'])
-  assert.equal(read(dir, 'a.txt'), 'l1\nH2\nl3\nH4\nl5\nT6\n', 'the follow-up\'s change lands on top of the target\'s own edit and the first merge')
-  assert.notEqual(copy.base, copy.startBase, 'the copy\'s base moved up with what merged')
-})
-
-test('a copy of a copy merges into its parent\'s copy first, and only that reaches the original', async t => {
-  const dir = repo(t, { 'a.txt': 'a\n' })
-  const { copy: parent, root } = await copyOf(t, dir)
-  put(parent.workspace, { 'mine.txt': 'parent\n' })
-  const { copy: child } = await copyOf(t, parent.workspace, { root, origin: parent.origin })
-  assert.equal(child.sourceTop, parent.dir)
-  assert.equal(child.origin, dir, 'git\'s bookkeeping stays with the original repository')
-  assert.equal(read(child.workspace, 'mine.txt'), 'parent\n', 'the child starts from the parent\'s uncommitted state')
-  put(child.workspace, { 'deep.txt': 'child\n' })
-  const inner = await worktree.mergeCopy(child)
-  assert.deepEqual(paths(inner.merged), ['deep.txt'])
-  assert.equal(read(parent.workspace, 'deep.txt'), 'child\n')
-  assert.equal(fs.existsSync(path.join(dir, 'deep.txt')), false, 'the original is not touched yet')
-  const outer = await worktree.mergeCopy(parent)
-  assert.deepEqual(paths(outer.merged), ['deep.txt', 'mine.txt'])
-  assert.equal(read(dir, 'deep.txt'), 'child\n')
-  assert.equal((await worktree.removeCopy(child, root)).removed, true)
-  assert.equal((await worktree.removeCopy(parent, root)).removed, true)
-  assert.equal(git(dir, 'worktree', 'list').split('\n').length, 1)
-})
-
-test('removing a copy saves what was never merged as a patch and refuses anything outside the worktrees folder', async t => {
-  const dir = repo(t)
-  put(dir, { 'node_modules/pkg.js': 'module\n' })
-  const { copy, root } = await copyOf(t, dir)
-  put(copy.workspace, { 'unmerged.txt': 'work in progress\n', 'a.txt': 'one\nchanged\nthree\n' })
-  const outside = folder(t, 'outside')
-  put(outside, { 'precious.txt': 'x' })
-  const strayLink = path.join(outside, 'stray')
-  fs.symlinkSync(path.join(dir, 'node_modules'), strayLink, process.platform === 'win32' ? 'junction' : 'dir')
-  const refused = await worktree.removeCopy({ ...copy, dir: outside }, root)
-  assert.equal(refused.removed, false)
-  assert.match(refused.error, /is not below/)
-  assert.equal(read(outside, 'precious.txt'), 'x')
-  // A link recorded outside the copy is not the copy's to remove.
-  const removed = await worktree.removeCopy({ ...copy, links: [...copy.links, strayLink] }, root, 'run-test')
-  assert.equal(removed.removed, true)
-  assert.ok(fs.lstatSync(strayLink).isSymbolicLink(), 'a link outside the copy is left')
-  assert.ok(removed.patch.startsWith(path.join(root, 'patches')), 'the patch is kept beside the copies')
-  const patch = fs.readFileSync(removed.patch, 'utf8')
-  assert.match(patch, /unmerged\.txt/)
-  assert.match(patch, /\+work in progress/)
-  assert.match(patch, /\+changed/)
-  git(dir, 'apply', removed.patch)
-  assert.equal(read(dir, 'unmerged.txt'), 'work in progress\n', 'the patch applies to the original')
-  assert.equal(fs.existsSync(copy.dir), false)
-  assert.equal(read(dir, 'node_modules/pkg.js'), 'module\n')
-  assert.deepEqual(fs.readdirSync(root), ['patches'])
-})
-
-test('removing a copy never deletes what a link in it leads to, even a link Orbit did not make or failed to unlink', async t => {
-  // git for Windows' `worktree remove --force` follows a junction and empties its target (seen with git 2.24): the
-  // source's node_modules. The copy goes by Node's rm instead, which unlinks links rather than following them.
-  const dir = repo(t)
-  put(dir, { 'node_modules/pkg.js': 'module\n' })
-  const { copy, root } = await copyOf(t, dir)
-  fs.mkdirSync(path.join(copy.workspace, 'sub'), { recursive: true })
-  fs.symlinkSync(path.join(dir, 'node_modules'), path.join(copy.workspace, 'sub', 'deps'), process.platform === 'win32' ? 'junction' : 'dir')
-  // `links: []`: Orbit's own node_modules link is still in the copy, as if unlinking it first had failed.
-  const removed = await worktree.removeCopy({ ...copy, links: [] }, root, 'run-test')
-  assert.equal(removed.removed, true, removed.error)
-  assert.equal(fs.existsSync(copy.dir), false)
-  assert.equal(read(dir, 'node_modules/pkg.js'), 'module\n', 'the source\'s node_modules is untouched')
-  assert.match(git(dir, 'worktree', 'list'), /^[^\n]*$/, 'git lists no worktree but the original')
-})
-
 test('a workspace outside any git work tree is refused and leaves nothing behind', async t => {
   const plain = folder(t, 'plain'), root = folder(t, 'root')
   const refused = await worktree.createCopy({ source: plain, kind: 'worktree', root, runId: 'run-test', agentId: 'agent-plain' })
@@ -266,21 +48,6 @@ test('a workspace outside any git work tree is refused and leaves nothing behind
   assert.equal(missing.ok, false)
   assert.match(missing.detail, /not a folder that exists/)
   assert.deepEqual(fs.readdirSync(root), [])
-})
-
-test('line endings are not changes: a CRLF working tree merges line by line and keeps its endings', async t => {
-  const dir = repo(t, { 'a.txt': crlf('l1\nl2\nl3\nl4\nl5\n'), 'b.txt': crlf('b1\nb2\n'), 'c.txt': crlf('c\n') }, { eol: true })
-  const { copy } = await copyOf(t, dir)
-  assert.ok(read(copy.workspace, 'a.txt').includes('\r\n'), 'the copy is checked out with the repository\'s line endings')
-  put(dir, { 'a.txt': crlf('T1\nl2\nl3\nl4\nl5\n') })
-  put(copy.workspace, { 'a.txt': crlf('l1\nl2\nl3\nl4\nH5\n'), 'c.txt': crlf('c edited\n') })
-  fs.rmSync(path.join(copy.workspace, 'b.txt'))
-  const result = await worktree.mergeCopy(copy)
-  assert.deepEqual(result.conflicts, [], 'an unchanged CRLF file is recognised as unchanged (b.txt deletes cleanly)')
-  assert.deepEqual(paths(result.merged), ['a.txt', 'b.txt', 'c.txt'])
-  assert.equal(read(dir, 'a.txt'), crlf('T1\nl2\nl3\nl4\nH5\n'), 'the merged file keeps the target\'s CRLF')
-  assert.equal(read(dir, 'c.txt'), crlf('c edited\n'))
-  assert.equal(fs.existsSync(path.join(dir, 'b.txt')), false)
 })
 
 test('a repository without commits can be copied and merged', async t => {
@@ -325,41 +92,6 @@ test('copies made at once and merges into one target are serialized, and the run
   assert.deepEqual(fs.readdirSync(root), [])
 })
 
-test('copies of runs that no longer exist are swept at start: unmerged work saved first, a live owner\'s left alone', async t => {
-  const dir = repo(t)
-  const { copy, root } = await copyOf(t, dir)
-  put(copy.workspace, { 'left.txt': 'unfinished\n' })
-  const meta = JSON.parse(fs.readFileSync(copy.meta, 'utf8'))
-  fs.writeFileSync(copy.meta, JSON.stringify({ ...meta, pid: process.ppid }))
-  const alive = await worktree.sweepLeftovers(root)
-  assert.deepEqual([alive.removed, alive.kept.length], [0, 1], 'the process that owns the folder still lives')
-  assert.ok(fs.existsSync(copy.dir))
-  fs.writeFileSync(copy.meta, '{ not json')
-  assert.equal((await worktree.sweepLeftovers(root)).removed, 0, 'what cannot be read is not known to be ours')
-  assert.ok(fs.existsSync(copy.dir))
-  fs.writeFileSync(copy.meta, JSON.stringify({ ...meta, pid: 2147483000 }))
-  const swept = await worktree.sweepLeftovers(root)
-  assert.equal(swept.removed, 1)
-  assert.equal(swept.patches.length, 1)
-  assert.match(fs.readFileSync(swept.patches[0], 'utf8'), /\+unfinished/)
-  assert.equal(fs.existsSync(copy.dir), false)
-  assert.equal(git(dir, 'worktree', 'list').split('\n').length, 1)
-})
-
-test('a merge whose target is gone fails with a message and merges nothing', async t => {
-  const dir = repo(t)
-  const { copy } = await copyOf(t, dir)
-  put(copy.workspace, { 'x.txt': 'x\n' })
-  const moved = `${dir}-moved`
-  fs.renameSync(dir, moved)
-  t.after(() => fs.rmSync(moved, { recursive: true, force: true }))
-  const result = await worktree.mergeCopy(copy)
-  assert.equal(result.ok, false)
-  assert.match(result.error, /no longer exists/)
-  assert.deepEqual([result.merged, result.conflicts], [[], []])
-  assert.match(worktree.describeMerge(copy, result), /MERGE FAILED/)
-})
-
 test('a hook of the user\'s repository does not run when a copy is made', async t => {
   const dir = repo(t)
   const marker = path.join(folder(t, 'marker'), 'ran.txt')
@@ -372,16 +104,4 @@ test('a hook of the user\'s repository does not run when a copy is made', async 
   const { copy } = await copyOf(t, dir)
   assert.equal(fs.existsSync(marker), false)
   assert.ok(fs.existsSync(path.join(copy.dir, 'a.txt')))
-})
-
-test('the merge report stays short however many files conflict, and says so when there is nothing to merge', () => {
-  const copy = { dir: path.join(os.tmpdir(), 'copy'), workspace: path.join(os.tmpdir(), 'copy'), sourceTop: path.join(os.tmpdir(), 'top'), target: path.join(os.tmpdir(), 'top'), base: 'a'.repeat(40) }
-  const conflicts = Array.from({ length: 30 }, (_, index) => ({ path: `f${index}.txt`, reason: 'changed on both sides and the changes overlap' }))
-  const text = worktree.describeMerge(copy, { ok: true, merged: [], conflicts, identical: 0 })
-  assert.ok(text.length < 4000, `${text.length} characters`)
-  assert.match(text, /30 file\(s\) were NOT merged/)
-  assert.match(text, /and 24 more: f6\.txt/)
-  assert.match(worktree.describeMerge(copy, { ok: true, merged: [], conflicts: [], identical: 0 }), /nothing to merge/)
-  const many = Array.from({ length: 20 }, (_, index) => ({ path: `m${index}.txt`, kind: 'modify' }))
-  assert.match(worktree.describeMerge(copy, { ok: true, merged: many, conflicts: [], identical: 3 }), /20 file\(s\) \(modified: m0\.txt, .*m7\.txt, and 12 more\)/)
 })

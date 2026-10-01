@@ -3,9 +3,10 @@
 /**
  * Orbit self-upgrade: the live loop for an app that runs from this repository (Orbit.cmd / npm start).
  *
- *   lock → typecheck (tsconfig.json and tsconfig.main.json) → node --experimental-strip-types --test tests/*.test.cjs
- *   → runtime smoke → main-load test [→ smoke:desktop]
- *     (skipped with --no-verify, and when dist/orbit-build.json records that exactly these sources passed them)
+ *   lock → typecheck (tsconfig.json and tsconfig.main.json), node --experimental-strip-types --test tests/*.test.cjs,
+ *   the runtime smoke and the main-load test, all at once [→ smoke:desktop, alone] (see "The checks side by side": they
+ *     share no state; the first failure stops the others; skipped with --no-verify, and when dist/orbit-build.json
+ *     records that exactly these sources passed them)
  *   → dist/ saved to dist-prev/, the verified electron/ + src/ snapshotted as refs/orbit/self-upgrade/candidate
  *   → vite build, only when the renderer inputs (src/, index.html, vite.config.ts, tsconfig.json, package.json) differ
  *     from the ones dist/orbit-build.json says dist/ was built from: a runtime-only change costs no build
@@ -57,7 +58,8 @@
  * One upgrade at a time: artifacts/self-upgrade.lock, kept fresh by its holder (see the Lock section; the restart host
  * removes the lock of a script it killed with releaseLockOf). A stop: when the user stops the run whose restart is
  * under way, the restart host writes artifacts/self-upgrade-cancel.json { requestedAt, reason }; the script looks for
- * it before every step, the watcher right before it writes the intent and right before it signals. A marker from the
+ * it before every step and every 250 ms while the checks run (all of them end, process trees included), the watcher
+ * right before it writes the intent and right before it signals. A marker from the
  * script's start or later ends it with status `cancelled`: no intent, no signal, the lock released. Under `npm run
  * dev` (ORBIT_DEV=1) the script restarts nothing (status `dev-mode`): a relaunch would stop the dev server;
  * --dry-run, --no-relaunch and --verify-only still run.
@@ -89,9 +91,10 @@
  *
  * Exit: 0 applied or up to date; 1 failure (arguments, tools, checks, build, rolled back); 2 cycle limit, lock, dev
  *       mode, no health report (ORBIT_HEALTH_FILE=0), cancelled, or a watcher that has not reported in time.
- * Reports: artifacts/self-upgrade-last.json (status, level, step timings, health, rollback, intentFile, intentWritten,
- *          failures of a failed check), artifacts/self-upgrade-checks.log (the whole output of the checks and the build),
- *          artifacts/self-upgrade-watch.log.
+ * Reports: artifacts/self-upgrade-last.json (status, level, step timings — a check another one's failure or a stop ended
+ *          is `stopped`, not failed —, health, rollback, intentFile, intentWritten, failures of a failed check),
+ *          artifacts/self-upgrade-checks.log (the whole output of the checks and the build, each check's output as one
+ *          section), artifacts/self-upgrade-watch.log.
  */
 const crypto = require('node:crypto')
 const fs = require('node:fs')
@@ -585,12 +588,30 @@ function createTimer(log = console.log, beforeStep = null) {
 }
 
 /**
+ * Ends `child` and everything it started. A check is a tree (node --test runs a process per test file, the tests start
+ * git and node again), and a stopped check must leave none of it behind: taskkill /t on Windows. Elsewhere the restart
+ * host stops the script's whole process group, which holds every check; a check the script stops itself gets a SIGTERM.
+ */
+function killTree(child) {
+  if (!child.pid || child.exitCode !== null) return
+  if (process.platform === 'win32') {
+    try { spawn('taskkill.exe', ['/pid', String(child.pid), '/t', '/f'], { windowsHide: true, stdio: 'ignore' }).on('error', () => child.kill()) } catch { child.kill() }
+    return
+  }
+  child.kill('SIGTERM')
+}
+
+/**
  * A check or the build, with its output passed through, appended to `log` (the whole output of this run's steps: the
  * console and the agent's error show only its end) and searched for what failed: a failed step's error names the failed
  * tests and carries them as `failures` (failureCollector). Asynchronous, so that the lock's heartbeat goes on meanwhile.
+ * `signal` stops it (the process tree ends): the promise then rejects with an error marked `stopped`, unless it had
+ * succeeded by then.
  */
-function run(label, command, commandArgs, { log = null, cwd = root, stdout = process.stdout, stderr = process.stderr } = {}) {
+function run(label, command, commandArgs, { log = null, cwd = root, stdout = process.stdout, stderr = process.stderr, signal = null } = {}) {
   return new Promise((resolve, reject) => {
+    const stopped = () => Object.assign(new Error(`${label} stopped`), { stopped: true })
+    if (signal?.aborted) return reject(stopped())
     const found = failureCollector(cwd)
     let fd = null
     const closeLog = () => { if (fd !== null) { try { fs.closeSync(fd) } catch { /* Closed already. */ } fd = null } }
@@ -598,15 +619,19 @@ function run(label, command, commandArgs, { log = null, cwd = root, stdout = pro
     if (log) { try { fd = fs.openSync(log, 'a') } catch { fd = null } }
     toLog(`\n==> ${label}\n`)
     const child = spawn(command, commandArgs, { cwd, stdio: ['ignore', 'pipe', 'pipe'], shell: false, windowsHide: true, env: process.env })
+    const stop = () => killTree(child)
+    signal?.addEventListener('abort', stop, { once: true })
     child.stdout.on('data', (chunk) => { stdout.write(chunk); toLog(chunk); found.feed(chunk) })
     child.stderr.on('data', (chunk) => { stderr.write(chunk); toLog(chunk) })
-    child.on('error', (error) => { closeLog(); reject(error) })
-    child.on('close', (code, signal) => {
+    child.on('error', (error) => { signal?.removeEventListener('abort', stop); closeLog(); reject(error) })
+    child.on('close', (code, exitSignal) => {
+      signal?.removeEventListener('abort', stop)
       closeLog()
       if (code === 0) return resolve(undefined)
+      if (signal?.aborted) return reject(stopped())
       const { failures, total } = found.result()
       const names = failures.map((item) => item.name).join(', ')
-      const error = new Error(`${label} exited with ${code ?? signal}${total ? ` (${total} failed: ${names.length > 300 ? `${names.slice(0, 300)}…` : names})` : ''}`)
+      const error = new Error(`${label} exited with ${code ?? exitSignal}${total ? ` (${total} failed: ${names.length > 300 ? `${names.slice(0, 300)}…` : names})` : ''}`)
       reject(Object.assign(error, { failures, failuresTotal: total }))
     })
   })
@@ -701,6 +726,128 @@ function startChecksLog(file, runId) {
     fs.writeFileSync(file, `Orbit self-upgrade ${runId}: the output of the checks and the build, ${new Date().toISOString()}\n`)
     return file
   } catch { return null }
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// The checks side by side
+//
+// typecheck, test, smoke and main-load share no state, so they run at once (the wall time is the longest one's, not their
+// sum): tsc only reads the sources (both tsconfig files say noEmit and keep no build info); the tests, the smoke and
+// main-load work in folders of their own made with mkdtemp, listen on port 0 only, and write nothing inside the
+// repository (a whole test run leaves its tree as it found it); main-load also being one of the test files, two copies
+// of it run at once, each with folders of its own. smoke:desktop stays after them (see main()): it starts a real Electron
+// window with a profile of its own and measures the interface, which the load of the test run would disturb. The build,
+// the snapshots and the restart come after the checks: they change dist/ and the refs the checks must not see change.
+
+/** The steps of checkSteps, in the report's order. */
+const CHECKS_TOGETHER = Object.freeze(['typecheck', 'test', 'smoke', 'main-load'])
+const CHECKS_POLL_MS = 250
+const CHECKS_HEARTBEAT_MS = 10000
+const CHECKS_STOP_GRACE_MS = 5000
+
+/**
+ * The checks that run side by side, as steps of commands (node scripts, run with the Node that runs this script): the
+ * names are the ones the report lists, a step with several commands (typecheck: tsconfig.json and tsconfig.main.json)
+ * gets a section of the log for each.
+ */
+function checkSteps({ tools, base = root } = {}) {
+  const strip = ['--experimental-strip-types', '--disable-warning=ExperimentalWarning']
+  return [
+    { name: 'typecheck', commands: [{ label: 'typecheck', args: [tools.tsc, '--noEmit'] }, { label: 'typecheck:main', args: [tools.tsc, '-p', 'tsconfig.main.json'] }] },
+    { name: 'test', commands: [{ label: 'test', args: [...strip, '--test', ...testFiles(base)] }] },
+    { name: 'smoke', commands: [{ label: 'smoke', args: [...strip, path.join('scripts', 'smoke-runtime.cjs')] }] },
+    { name: 'main-load', commands: [{ label: 'main-load', args: [...strip, '--test', path.join('tests', 'main-load.test.cjs')] }] },
+  ]
+}
+
+/**
+ * Runs the commands of `steps` ({ name, commands: [{ label, args, command? }] }) all at once and settles when each has ended.
+ *
+ * Output: a command's output is kept until it ends and then written as one section, to the console (`say` for the
+ * heading and the result line, `stdout`/`stderr` for the output) and to `log` ("==> label", the output, a result line),
+ * so that the sections of different checks never mix. While they run, `say` gets a line every `heartbeatMs` naming the
+ * checks still running. A command that was stopped writes its section to the log only.
+ *
+ * Failure: the first command that fails on its own stops all the others (their process trees end), and its error is
+ * thrown once everything has ended — the error of `run`, with the `failures` it found. `shouldStop` is called every
+ * `pollMs`; what it throws (the user's stop: CancelledError) stops the commands and is thrown the same way. A command
+ * that has not ended `graceMs` after the stop is given up on.
+ *
+ * `timings` (the timer's array) gets one entry per step, in the order of `steps`, whether the run succeeded or not:
+ * { step, ms, ok } — ms from the first start to the last end of its commands — plus `error` for a failed step, and
+ * `stopped: true` (and `error`: why) for one that was stopped by another's failure or the user's stop.
+ */
+async function runChecks(steps, { timings = [], cwd = root, log = null, stdout = process.stdout, stderr = process.stderr, say = console.log, shouldStop = null, pollMs = CHECKS_POLL_MS, heartbeatMs = CHECKS_HEARTBEAT_MS, graceMs = CHECKS_STOP_GRACE_MS } = {}) {
+  const controller = new AbortController()
+  const units = steps.flatMap((step) => step.commands.map((item) => ({ step: step.name, item, label: item.label, state: 'running', parts: [], began: 0, ended: 0, error: null, promise: null })))
+  let failure = null
+  const stopAll = (error) => {
+    if (!failure) failure = error
+    controller.abort()
+  }
+  const asBuffer = (chunk) => (Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk)))
+  const seconds = (ms) => `${(ms / 1000).toFixed(1)} s`
+  const flush = (unit) => {
+    const result = `(${unit.label} ${{ ok: 'ok', failed: 'FAILED', stopped: 'stopped' }[unit.state]}, ${seconds(unit.ended - unit.began)})`
+    const last = unit.parts.length ? asBuffer(unit.parts[unit.parts.length - 1].chunk) : null
+    const newline = !last || !last.length || last[last.length - 1] === 10 ? '' : '\n'
+    if (log) {
+      try { fs.appendFileSync(log, Buffer.concat([Buffer.from(`\n==> ${unit.label}\n`), ...unit.parts.map((part) => asBuffer(part.chunk)), Buffer.from(`${newline}${result}\n`)])) } catch { /* The log is a convenience. */ }
+    }
+    if (unit.state === 'stopped') return
+    say(`\n==> ${unit.label}`)
+    for (const part of unit.parts) (part.isError ? stderr : stdout).write(part.chunk)
+    if (newline) stdout.write(newline)
+    say(result)
+  }
+  say(`\n==> ${steps.map((step) => step.name).join(', ')}: side by side`)
+  const began = Date.now()
+  for (const unit of units) {
+    const sink = (isError) => ({ write: (chunk) => { unit.parts.push({ isError, chunk }) } })
+    unit.began = Date.now()
+    unit.promise = run(unit.label, unit.item.command || process.execPath, unit.item.args, { cwd, stdout: sink(false), stderr: sink(true), signal: controller.signal })
+      .then(() => { unit.state = 'ok' }, (error) => {
+        unit.state = error.stopped ? 'stopped' : 'failed'
+        unit.error = error
+        if (unit.state === 'failed') stopAll(error)
+      })
+      .then(() => {
+        unit.ended = Date.now()
+        try { flush(unit) } catch { /* A broken console or log must not turn into a failed check. */ }
+      })
+  }
+  const timers = []
+  if (shouldStop) timers.push(setInterval(() => { try { shouldStop() } catch (error) { stopAll(error) } }, Math.max(10, pollMs)))
+  if (heartbeatMs > 0) {
+    timers.push(setInterval(() => {
+      const running = units.filter((unit) => unit.state === 'running').map((unit) => `${unit.label} ${Math.round((Date.now() - unit.began) / 1000)} s`)
+      if (running.length && !failure) say(`  … still running: ${running.join(', ')}`)
+    }, heartbeatMs))
+  }
+  for (const timer of timers) timer.unref?.()
+  let giveUp = null
+  const given = new Promise((resolve) => {
+    controller.signal.addEventListener('abort', () => { giveUp = setTimeout(resolve, graceMs); giveUp.unref?.() }, { once: true })
+  })
+  try {
+    await Promise.race([Promise.all(units.map((unit) => unit.promise)), given])
+  } finally {
+    for (const timer of timers) clearInterval(timer)
+    clearTimeout(giveUp)
+  }
+  const ended = Date.now()
+  for (const step of steps) {
+    const mine = units.filter((unit) => unit.step === step.name)
+    const failed = mine.find((unit) => unit.state === 'failed')
+    // A command still "running" now was given up on after the stop.
+    const stopped = !failed && mine.some((unit) => unit.state !== 'ok')
+    const ms = Math.max(...mine.map((unit) => unit.ended || ended)) - Math.min(...mine.map((unit) => unit.began))
+    timings.push({ step: step.name, ms, ok: !failed && !stopped, ...(failed ? { error: failed.error.message } : stopped ? { stopped: true, error: `stopped: ${failure?.message || 'the checks were stopped'}` } : {}) })
+  }
+  if (failure) throw failure
+  const wall = ended - began
+  say(`\nChecks done in ${seconds(wall)} (one after another: ${seconds(units.reduce((sum, unit) => sum + (unit.ended - unit.began), 0))})`)
+  return { wallMs: wall }
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -1160,7 +1307,7 @@ function cycleLimitReached({ file = CYCLES_FILE, now = Date.now(), limit = maxCy
 // Plan and report
 
 function planSteps({ verifyOnly: onlyVerify = false, noRelaunch: skipRelaunch = false, desktop = false, verify = true, build = true } = {}) {
-  const steps = verify ? ['typecheck', 'test', 'smoke', 'main-load', ...(desktop ? ['smoke:desktop'] : [])] : []
+  const steps = verify ? [...CHECKS_TOGETHER, ...(desktop ? ['smoke:desktop'] : [])] : []
   if (onlyVerify) return steps
   if (build) steps.push('save-previous', 'build')
   if (!skipRelaunch) steps.push('relaunch', 'health')
@@ -1208,7 +1355,7 @@ async function awaitWatcher(runId, timeoutMs) {
 
 function summarize(report) {
   const lines = [`\nSelf-upgrade ${report.status}${report.level ? ` (level ${report.level})` : ''}${report.ok ? '' : ` — ${report.error || 'see report'}`}`]
-  for (const timing of report.timings || []) lines.push(`  ${timing.ok ? 'ok  ' : 'FAIL'} ${timing.step.padEnd(14)} ${timing.ms} ms`)
+  for (const timing of report.timings || []) lines.push(`  ${timing.ok ? 'ok  ' : timing.stopped ? 'stop' : 'FAIL'} ${timing.step.padEnd(14)} ${timing.ms} ms`)
   const attempt = report.relaunch
   if (attempt) lines.push(`  ${attempt.flag || RELAUNCH_FLAG}: health ${attempt.health ? (attempt.health.ok ? 'ok' : 'failed') : 'missing'} after ${attempt.waitedMs} ms${attempt.startedFresh && attempt.level !== 'runtime' && attempt.level !== 'renderer' ? ' (started a new instance)' : ''}`)
   if (report.intentWritten || report.intentError) lines.push(`  intent: ${report.intentWritten ? `written to ${report.intentFile}` : `not written (${report.intentError})`}${report.verdictWritten ? ', verdict relaunched' : ''}${report.rollback?.intentMarked ? ', marked rolled-back' : ''}`)
@@ -1653,6 +1800,8 @@ async function main() {
   const plan = {
     runId, root, dryRun, force, noVerify, forcedLevel,
     steps: planSteps({ verifyOnly, noRelaunch: noRelaunch || predicted.level === 'none', desktop: runDesktop, verify: verify.needed, build: build.needed }),
+    // What runs at once among the steps (the rest, smoke:desktop included, one after another).
+    ...(verify.needed ? { checksTogether: CHECKS_TOGETHER } : {}),
     tools, toolchainError, ...levelFields(predicted, intentPreview), build, verify,
     fingerprint, rendererHash: renderer.hash, fingerprintMs, distPresent, newestSource: sourceAtStart.file, marker,
     running: observed.running, healthFile: PATHS.health, health: healthSummary(observed.health), healthIsRunning: !!observed.runningHealth,
@@ -1714,10 +1863,10 @@ async function main() {
 
   try {
     if (verify.needed) {
-      await step('typecheck', async () => { await check('typecheck', process.execPath, [tools.tsc, '--noEmit']); await check('typecheck:main', process.execPath, [tools.tsc, '-p', 'tsconfig.main.json']) })
-      await step('test', () => check('test', process.execPath, ['--experimental-strip-types', '--disable-warning=ExperimentalWarning', '--test', ...testFiles()]))
-      await step('smoke', () => check('smoke', process.execPath, ['--experimental-strip-types', '--disable-warning=ExperimentalWarning', path.join('scripts', 'smoke-runtime.cjs')]))
-      await step('main-load', () => check('main-load', process.execPath, ['--experimental-strip-types', '--disable-warning=ExperimentalWarning', '--test', path.join('tests', 'main-load.test.cjs')]))
+      // typecheck, test, smoke and main-load at once (see "The checks side by side"); a stop is looked for before them and every 250 ms meanwhile.
+      stopIfCancelled('before the checks')
+      await runChecks(checkSteps({ tools }), { timings, log: checksLog, shouldStop: () => stopIfCancelled('while the checks were running') })
+      // After them, alone: it opens a real Electron window and times the interface, which the load of the others would skew.
       if (runDesktop) await step('smoke:desktop', () => check('smoke:desktop', process.execPath, [path.join('scripts', 'run-electron.cjs'), path.join('scripts', 'smoke-desktop.cjs')]))
     } else console.log(`Skipping the checks: ${verify.reason}.`)
     if (verifyOnly) {
@@ -1834,6 +1983,6 @@ module.exports = {
   cancelRequested, requestCancel, clearCancel, CancelledError, watch,
   // --mark-build (npm run build).
   markBuild,
-  // A check's output: its log and what failed in it.
-  run, failureCollector, failureSummary, startChecksLog,
+  // A check's output: its log and what failed in it; the checks that run side by side, and stopping a process tree.
+  run, failureCollector, failureSummary, startChecksLog, checkSteps, runChecks, killTree, CHECKS_TOGETHER,
 }

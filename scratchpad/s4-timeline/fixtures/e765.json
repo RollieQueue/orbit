@@ -1,0 +1,393 @@
+{
+ "runId": "e765fbc0-17b4-4e3b-9dc5-74babc46b4f0",
+ "projectId": "project-local",
+ "chatId": "01575bfe-088e-400f-a605-f798af380572",
+ "status": "completed",
+ "startedAt": "2026-10-01T07:51:36.280Z",
+ "finishedAt": "2026-10-01T09:13:53.545Z",
+ "updatedAt": "2026-10-01T09:13:53.552Z",
+ "providerId": "claude",
+ "model": "claude-opus-5-5",
+ "workspace": ".",
+ "prompt": "Пример запуска",
+ "agents": [
+  {
+   "id": "root",
+   "parentId": null,
+   "depth": 0,
+   "name": "Orbit",
+   "role": "Agent",
+   "status": "done",
+   "providerId": "claude",
+   "model": "claude-opus-5-5",
+   "startedAt": "2026-10-01T07:51:40.749Z",
+   "finishedAt": "2026-10-01T09:13:53.544Z",
+   "turns": 3,
+   "generation": 0,
+   "task": "Пример запуска",
+   "handovers": [],
+   "turnTimings": [
+    {
+     "turn": 1,
+     "transport": "session",
+     "startedAt": "2026-10-01T07:51:40.749Z",
+     "firstEventAt": "2026-10-01T07:52:57.626Z",
+     "endedAt": "2026-10-01T09:12:35.796Z",
+     "promptChars": 13471,
+     "nativeToolCalls": 102,
+     "orbitToolCalls": 30
+    },
+    {
+     "turn": 2,
+     "transport": "session",
+     "startedAt": "2026-10-01T09:12:35.808Z",
+     "firstEventAt": "2026-10-01T09:12:40.057Z",
+     "endedAt": "2026-10-01T09:12:55.181Z",
+     "promptChars": 9714,
+     "nativeToolCalls": 1,
+     "orbitToolCalls": 0
+    },
+    {
+     "turn": 3,
+     "transport": "session",
+     "startedAt": "2026-10-01T09:12:55.182Z",
+     "firstEventAt": "2026-10-01T09:12:58.700Z",
+     "endedAt": "2026-10-01T09:13:53.537Z",
+     "promptChars": 6783,
+     "nativeToolCalls": 1,
+     "orbitToolCalls": 2
+    }
+   ]
+  },
+  {
+   "id": "agent-7e08179b-6b10-4164-ab44-1dc673df82da",
+   "parentId": "root",
+   "depth": 1,
+   "name": "tokens",
+   "role": "Agent",
+   "status": "done",
+   "providerId": "claude",
+   "model": "claude-sonnet-5-5",
+   "startedAt": "2026-10-01T07:59:40.960Z",
+   "finishedAt": "2026-10-01T08:25:51.816Z",
+   "turns": 1,
+   "generation": 0,
+   "task": "Задача помощника",
+   "handovers": [],
+   "turnTimings": [
+    {
+     "turn": 1,
+     "transport": "session",
+     "startedAt": "2026-10-01T07:59:40.960Z",
+     "firstEventAt": "2026-10-01T07:59:45.492Z",
+     "endedAt": "2026-10-01T08:25:51.796Z",
+     "promptChars": 19624,
+     "nativeToolCalls": 162,
+     "orbitToolCalls": 4
+    }
+   ]
+  },
+  {
+   "id": "agent-c82a85c2-c0e0-4299-b8ee-0be05daf332f",
+   "parentId": "root",
+   "depth": 1,
+   "name": "isolation",
+   "role": "Agent",
+   "status": "cancelled",
+   "providerId": "claude",
+   "model": "claude-sonnet-5-5",
+   "startedAt": "2026-10-01T08:54:23.723Z",
+   "finishedAt": "2026-10-01T09:06:59.179Z",
+   "turns": 2,
+   "generation": 1,
+   "paused": false,
+   "pausedAt": null,
+   "stoppedByUser": true,
+   "task": "Задача помощника",
+   "handovers": [],
+   "turnTimings": [
+    {
+     "turn": 1,
+     "transport": "session",
+     "startedAt": "2026-10-01T08:00:15.668Z",
+     "firstEventAt": "2026-10-01T08:00:18.648Z",
+     "endedAt": "2026-10-01T08:16:48.487Z",
+     "promptChars": 22598,
+     "nativeToolCalls": 52,
+     "orbitToolCalls": 0
+    },
+    {
+     "turn": 1,
+     "transport": "session",
+     "startedAt": "2026-10-01T08:16:48.487Z",
+     "firstEventAt": "2026-10-01T08:16:54.155Z",
+     "endedAt": "2026-10-01T08:36:53.067Z",
+     "promptChars": 3501,
+     "nativeToolCalls": 118,
+     "orbitToolCalls": 1
+    },
+    {
+     "turn": 2,
+     "transport": "session",
+     "startedAt": "2026-10-01T08:54:23.723Z",
+     "firstEventAt": "2026-10-01T08:54:33.781Z",
+     "endedAt": "2026-10-01T09:06:59.179Z",
+     "promptChars": 5535,
+     "nativeToolCalls": 38,
+     "orbitToolCalls": 0
+    }
+   ]
+  },
+  {
+   "id": "agent-72925fc9-1876-4897-95ee-b5d08389ed62",
+   "parentId": "root",
+   "depth": 1,
+   "name": "self-improve",
+   "role": "Agent",
+   "status": "done",
+   "providerId": "claude",
+   "model": "claude-sonnet-5-5",
+   "startedAt": "2026-10-01T08:00:37.813Z",
+   "finishedAt": "2026-10-01T08:14:59.405Z",
+   "turns": 2,
+   "generation": 1,
+   "task": "Задача помощника",
+   "handovers": [],
+   "turnTimings": [
+    {
+     "turn": 1,
+     "transport": "session",
+     "startedAt": "2026-10-01T08:00:37.813Z",
+     "firstEventAt": "2026-10-01T08:00:40.527Z",
+     "endedAt": "2026-10-01T08:12:26.438Z",
+     "promptChars": 20458,
+     "nativeToolCalls": 129,
+     "orbitToolCalls": 0
+    },
+    {
+     "turn": 2,
+     "transport": "session",
+     "startedAt": "2026-10-01T08:13:53.726Z",
+     "firstEventAt": "2026-10-01T08:13:57.065Z",
+     "endedAt": "2026-10-01T08:14:59.400Z",
+     "promptChars": 1112,
+     "nativeToolCalls": 6,
+     "orbitToolCalls": 0
+    }
+   ]
+  },
+  {
+   "id": "agent-610d1420-e7d0-4a60-9904-eaf57171a807",
+   "parentId": "root",
+   "depth": 1,
+   "name": "perf-audit",
+   "role": "Agent",
+   "status": "done",
+   "providerId": "codex",
+   "model": "gpt-6-luna",
+   "startedAt": "2026-10-01T08:00:46.861Z",
+   "finishedAt": "2026-10-01T08:13:34.501Z",
+   "turns": 1,
+   "generation": 0,
+   "task": "Задача помощника",
+   "handovers": [],
+   "turnTimings": [
+    {
+     "turn": 1,
+     "transport": "session",
+     "startedAt": "2026-10-01T08:00:46.861Z",
+     "firstEventAt": "2026-10-01T08:00:54.790Z",
+     "endedAt": "2026-10-01T08:13:34.496Z",
+     "promptChars": 16161,
+     "nativeToolCalls": 27,
+     "orbitToolCalls": 0
+    }
+   ]
+  },
+  {
+   "id": "agent-4955a48b-a42d-4ec1-a96b-5076c6adacd1",
+   "parentId": "root",
+   "depth": 1,
+   "name": "review-w1w3",
+   "role": "Agent",
+   "status": "done",
+   "providerId": "antigravity",
+   "model": "gemini-3.1-pro-high",
+   "startedAt": "2026-10-01T08:35:37.654Z",
+   "finishedAt": "2026-10-01T08:53:23.373Z",
+   "turns": 2,
+   "generation": 1,
+   "task": "Задача помощника",
+   "handovers": [
+    {
+     "id": "aa8a68eb-16cc-4d28-babd-9fafa418154e",
+     "time": "2026-10-01T08:38:04.213Z",
+     "reason": "exhausted",
+     "from": {
+      "providerId": "codex",
+      "model": "gpt-6-astra",
+      "reasoningEffort": "xhigh"
+     },
+     "to": {
+      "providerId": "antigravity",
+      "model": "gemini-3.1-pro-high",
+      "reasoningEffort": ""
+     },
+     "fresh": false,
+     "interrupted": true,
+     "usedPercent": 100,
+     "resetsAt": null,
+     "turn": 0
+    }
+   ],
+   "turnTimings": [
+    {
+     "turn": 1,
+     "transport": "session",
+     "startedAt": "2026-10-01T08:35:37.654Z",
+     "firstEventAt": "2026-10-01T08:35:46.362Z",
+     "endedAt": "2026-10-01T08:37:52.563Z",
+     "promptChars": 17127,
+     "nativeToolCalls": 19,
+     "orbitToolCalls": 4
+    },
+    {
+     "turn": 1,
+     "transport": "session",
+     "startedAt": "2026-10-01T08:38:04.223Z",
+     "firstEventAt": "2026-10-01T08:38:16.749Z",
+     "endedAt": "2026-10-01T08:45:53.309Z",
+     "promptChars": 38198,
+     "nativeToolCalls": 48,
+     "orbitToolCalls": 1
+    },
+    {
+     "turn": 2,
+     "transport": "session",
+     "startedAt": "2026-10-01T08:53:04.001Z",
+     "firstEventAt": "2026-10-01T08:53:18.321Z",
+     "endedAt": "2026-10-01T08:53:23.368Z",
+     "promptChars": 5602,
+     "nativeToolCalls": 0,
+     "orbitToolCalls": 0
+    }
+   ]
+  },
+  {
+   "id": "agent-c7dcf5a5-9c0b-462e-877d-db9816b9d534",
+   "parentId": "root",
+   "depth": 1,
+   "name": "review-isolation",
+   "role": "Agent",
+   "status": "done",
+   "providerId": "claude",
+   "model": "claude-opus-5-5",
+   "startedAt": "2026-10-01T08:37:59.326Z",
+   "finishedAt": "2026-10-01T08:53:47.962Z",
+   "turns": 1,
+   "generation": 0,
+   "task": "Задача помощника",
+   "handovers": [],
+   "turnTimings": [
+    {
+     "turn": 1,
+     "transport": "session",
+     "startedAt": "2026-10-01T08:37:59.326Z",
+     "firstEventAt": "2026-10-01T08:38:03.980Z",
+     "endedAt": "2026-10-01T08:53:47.958Z",
+     "promptChars": 17812,
+     "nativeToolCalls": 34,
+     "orbitToolCalls": 1
+    }
+   ]
+  }
+ ],
+ "communications": [
+  {
+   "id": "2ff5e6c5-df74-444b-b38a-328fd44b4e1d",
+   "kind": "spawn",
+   "fromAgentId": "user",
+   "toAgentId": "root",
+   "fromAgentName": "Вы",
+   "toAgentName": "Orbit",
+   "time": "2026-10-01T07:51:36.281Z",
+   "status": "read",
+   "delivery": "mailbox",
+   "text": ""
+  },
+  {
+   "id": "77bfd785-b71e-42a6-88de-44970d468712",
+   "kind": "spawn",
+   "fromAgentId": "root",
+   "toAgentId": "agent-7e08179b-6b10-4164-ab44-1dc673df82da",
+   "fromAgentName": "Orbit",
+   "toAgentName": "tokens",
+   "time": "2026-10-01T07:59:40.934Z",
+   "status": "read",
+   "delivery": "next-turn",
+   "text": ""
+  },
+  {
+   "id": "c31a6741-72d5-46da-8ef7-a5be036f07fb",
+   "kind": "spawn",
+   "fromAgentId": "root",
+   "toAgentId": "agent-c82a85c2-c0e0-4299-b8ee-0be05daf332f",
+   "fromAgentName": "Orbit",
+   "toAgentName": "isolation",
+   "time": "2026-10-01T08:00:15.659Z",
+   "status": "read",
+   "delivery": "next-turn",
+   "text": ""
+  },
+  {
+   "id": "5095278e-8782-42aa-ade8-5e6078c6511b",
+   "kind": "spawn",
+   "fromAgentId": "root",
+   "toAgentId": "agent-72925fc9-1876-4897-95ee-b5d08389ed62",
+   "fromAgentName": "Orbit",
+   "toAgentName": "self-improve",
+   "time": "2026-10-01T08:00:37.804Z",
+   "status": "read",
+   "delivery": "next-turn",
+   "text": ""
+  },
+  {
+   "id": "0f741d7c-d3ac-4937-8d8d-e3df698def1d",
+   "kind": "spawn",
+   "fromAgentId": "root",
+   "toAgentId": "agent-610d1420-e7d0-4a60-9904-eaf57171a807",
+   "fromAgentName": "Orbit",
+   "toAgentName": "perf-audit",
+   "time": "2026-10-01T08:00:46.841Z",
+   "status": "read",
+   "delivery": "next-turn",
+   "text": ""
+  },
+  {
+   "id": "e7fe237c-f741-4c6c-accb-8189e4750c78",
+   "kind": "spawn",
+   "fromAgentId": "root",
+   "toAgentId": "agent-4955a48b-a42d-4ec1-a96b-5076c6adacd1",
+   "fromAgentName": "Orbit",
+   "toAgentName": "review-w1w3",
+   "time": "2026-10-01T08:35:37.634Z",
+   "status": "read",
+   "delivery": "next-turn",
+   "text": ""
+  },
+  {
+   "id": "a4f58896-e938-49be-9d34-79d751591f9e",
+   "kind": "spawn",
+   "fromAgentId": "root",
+   "toAgentId": "agent-c7dcf5a5-9c0b-462e-877d-db9816b9d534",
+   "fromAgentName": "Orbit",
+   "toAgentName": "review-isolation",
+   "time": "2026-10-01T08:37:59.298Z",
+   "status": "read",
+   "delivery": "next-turn",
+   "text": ""
+  }
+ ],
+ "traces": [],
+ "messages": []
+}

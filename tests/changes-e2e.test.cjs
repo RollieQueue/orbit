@@ -1,65 +1,15 @@
+// The whole path of a file change: an agent's tool → the runtime → the events, the snapshot and the saved run.
+// Real Git repository, real RunStore, only the provider is fake.
+// The races (a change still being made when the agent answers, a command that runs while another agent writes) are in
+// changes-e2e-races.test.cjs; the fixtures of both are in helpers-changes-e2e.cjs.
 const test = require('node:test')
 const assert = require('node:assert/strict')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
-const { execFileSync } = require('node:child_process')
-const { OrbitRuntime } = require('../electron/runtime.mts')
 const { RunStore } = require('../electron/run-store.mts')
 const { nativeChange, commandChange } = require('../electron/change-log.mts')
-
-// The whole path of a file change: an agent's tool → the runtime → the events, the snapshot and the saved run.
-// Real Git repository, real RunStore, only the provider is fake.
-
-function folder(t, prefix = 'orbit-e2e-') {
-  const directory = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), prefix)))
-  t.after(() => fs.rmSync(directory, { recursive: true, force: true, maxRetries: 8, retryDelay: 150 }))
-  return directory
-}
-const write = (workspace, rel, text) => {
-  fs.mkdirSync(path.dirname(path.join(workspace, rel)), { recursive: true })
-  fs.writeFileSync(path.join(workspace, rel), text)
-}
-const git = (workspace, ...args) => execFileSync('git', ['-C', workspace, '-c', 'user.name=t', '-c', 'user.email=t@example.com', ...args], { stdio: 'ignore' })
-// A repository whose committed files have LF while the working copy has CRLF (core.autocrlf=true), as on this project's machine.
-function repo(t, files) {
-  const workspace = folder(t)
-  try { git(workspace, 'init', '-q') } catch { t.skip('git is not available'); return null }
-  git(workspace, 'config', 'core.autocrlf', 'true')
-  for (const [rel, text] of Object.entries(files)) write(workspace, rel, text)
-  git(workspace, 'add', '-A'); git(workspace, 'commit', '-q', '-m', 'base')
-  return workspace
-}
-const call = (name, args = {}) => ({ id: `${name}-${Math.random()}`, name, arguments: args })
-const envelope = (...calls) => ({ text: JSON.stringify({ content: '', tool_calls: calls }) })
-const waitFor = async (predicate, what) => {
-  const deadline = Date.now() + 10000
-  while (!predicate()) {
-    if (Date.now() > deadline) assert.fail(`timed out waiting for ${what}`)
-    await new Promise(resolve => setTimeout(resolve, 20))
-  }
-}
-const native = (tool, toolId, status, extra = {}) => ({ kind: 'tool', native: true, tool, toolId, status, text: tool, ...extra })
-
-// Runs one root agent. `seen` is what was known the moment the terminal event arrived.
-async function run(t, { workspace, provider, runStore, onEvent }) {
-  const events = [], seen = {}
-  const runtime = new OrbitRuntime({ runProvider: args => provider({ ...args, runtime, events }), runStore })
-  let finished
-  const done = new Promise(resolve => { finished = resolve })
-  runtime.onEvent(event => {
-    if (event.type === 'change.added') events.push(event.change)
-    onEvent?.(event)
-    if (['run.finished', 'run.failed', 'run.cancelled'].includes(event.type)) { seen.changes = events.length; finished(event) }
-  })
-  const runId = await runtime.start({ providerId: 'test', prompt: 'Change files', projectId: 'p', chatId: 'c', accessMode: 'workspace-write', workspace })
-  const timer = setTimeout(() => runtime.stop(runId), 20000)
-  t.after(() => clearTimeout(timer))
-  const terminal = await done
-  assert.equal(terminal.type, 'run.finished')
-  return { runtime, runId, events, seen, snapshot: runtime.getRun(runId) }
-}
-const plain = list => list.map(change => ({ ...change, id: undefined, time: undefined }))
+const { folder, write, repo, call, envelope, waitFor, native, run, plain } = require('./helpers-changes-e2e.cjs')
 
 test('every kind of change reaches the events, the snapshot, the saved run and the lists', async t => {
   const workspace = repo(t, {
@@ -246,45 +196,6 @@ test('Claude Code stream-json and Codex exec events, fed through the real parser
   assert.deepEqual(listed.changes.map(change => [change.hasDiff, 'diff' in change]), events.map(() => [true, false]), 'the list marks hasDiff and carries no text')
   assert.deepEqual(listed.agents[0].files.wrote, ['src/FilesTab.tsx', 'docs/notes.md', 'README.md', 'lib/added.txt', 'lib/gone.txt'])
   assert.deepEqual(await reopened.recoverChanges(runId, runtime.getRunChanges(runId)), [], 'every reported write has its record: nothing to recover')
-})
-
-test('a change still being made when the agent answers is part of the finished run', async t => {
-  const workspace = folder(t)
-  const saved = []
-  const { events, seen, snapshot } = await run(t, { workspace, runStore: { save: item => saved.push(item) }, provider: async ({ onEvent }) => {
-    write(workspace, 'late.txt', 'a\nb\n')
-    onEvent(native('Write', 'late', 'running', { input: { file_path: 'late.txt', content: 'a\nb\n' } }))
-    onEvent({ kind: 'tool', native: true, toolId: 'late', status: 'completed', text: 'ok' })
-    return { text: 'done' } // no waiting: the record is made in the background
-  } })
-  assert.equal(seen.changes, 1, 'it was there when run.finished was announced')
-  assert.deepEqual(events.map(change => [change.path, change.kind, change.added]), [['late.txt', 'create', 2]])
-  assert.equal(snapshot.changes.length, 1)
-  assert.equal(saved.at(-1).status, 'completed')
-  assert.equal(saved.at(-1).changes.length, 1, 'and in the record saved with the terminal event')
-})
-
-test('a command does not claim a file another agent wrote while it ran', async t => {
-  const workspace = repo(t, { 'shared.txt': 'one\n', 'quiet.txt': 'q\n' })
-  if (!workspace) return
-  let turned = false
-  const { events } = await run(t, {
-    workspace,
-    provider: async ({ runtime }) => {
-      if (!turned) {
-        turned = true
-        // Another agent's write_file lands while the command below is running.
-        setTimeout(() => {
-          const live = [...runtime.runs.values()][0]
-          write(workspace, 'shared.txt', 'one\ntwo\n')
-          runtime.reportWrite(live, live.agentNodes.get('root'), 'edit_file', { path: 'shared.txt', before: 'one\n', after: 'one\ntwo\n' })
-        }, 600)
-        return envelope(call('run_command', { command: process.execPath, args: ['-e', 'setTimeout(() => {}, 1500)'] }))
-      }
-      return { text: 'done' }
-    },
-  })
-  assert.deepEqual(events.map(change => [change.path, change.tool, change.source]), [['shared.txt', 'edit_file', 'exact']], 'one change, made by the tool that made it')
 })
 
 test('a path that leads out of the workspace through a link reads nothing from outside', async t => {

@@ -4,12 +4,22 @@ import { RunHistoryList } from './AgentHistory'
 import { AgentInspector, type AgentControls, type MessageAgent } from './AgentInspector'
 import { Icon } from './Icon'
 import { handoverLabel } from './QuotaPanel'
+import { AgentFilterBar, AgentFilterEmpty, useAgentFilter } from './AgentFilter'
+import { AgentsViewSwitch, RunTimeline, useAgentsView } from './RunTimeline'
+import { effortLabels } from './ReasoningPicker'
 import { plural, statusText } from './format'
 import { providerName, providers } from './providers'
+import { activityLabel, countActivities, effortSourceNames, visibleAgents } from './agent-activity'
 import { agentTokens, isActiveStatus, resumeLinks, shortRunId, shownStatus, tokenCount, usageTitle } from './run-events'
 import './agent-tokens.css'
 
-type TreeOptions = { run: RunSnapshot; selectedId?: string; onSelect: (id: string) => void }
+type TreeOptions = { run: RunSnapshot; selectedId?: string; onSelect: (id: string) => void; visible: Map<string, 'match' | 'context'> }
+// The model line of a row: provider · model · reasoning level (when the agent has one).
+const effortName = (agent: Agent) => agent.reasoningEffort ? effortLabels[agent.reasoningEffort] || agent.reasoningEffort : ''
+const effortTitle = (agent: Agent) => {
+  const source = effortSourceNames[agent.effortSource || '']
+  return agent.reasoningEffort ? `Уровень мышления: ${effortName(agent)}${source ? ` (${source})` : ''}` : ''
+}
 const handoverTitle = (agent: Agent) =>
   (agent.handovers || []).map(item => `${handoverLabel(providers, item.from)} → ${handoverLabel(providers, item.to)}`).join('\n')
 // The copy an agent works in: where it is and, if a merge back left any, how many files conflict.
@@ -19,20 +29,22 @@ const isolationTitle = ({ kind, path, base, conflicts }: AgentIsolation) =>
 // The agents of a run as rows, each parent followed by its children. An agent whose parent is missing is shown at the top.
 function agentTree(items: Agent[], options: TreeOptions, parentId: string | null = null, depth = 0, seen = new Set<string>()): ReactNode {
   const orphan = (a: Agent) => parentId === null && !!a.parentId && !items.some(p => p.id === a.parentId)
-  const children = items.filter(a => (a.parentId || null) === parentId || orphan(a)).filter(a => !seen.has(a.id))
+  const children = items.filter(a => (a.parentId || null) === parentId || orphan(a)).filter(a => !seen.has(a.id) && options.visible.has(a.id))
   return children.map(agent => {
     const nextSeen = new Set(seen).add(agent.id)
     const providerId = agent.providerId || options.run.providerId
     const modelLabel = `${providerName(providerId) || providerId || 'Провайдер не указан'} · ${agent.model || 'Модель: авто (ещё не определена)'}`
+    const rowTitle = [modelLabel, effortTitle(agent)].filter(Boolean).join('\n')
     const files = agent.files
     const tokens = agentTokens(agent)
     return <div key={agent.id}>
-      <button className={`agent-row ${options.selectedId === agent.id ? 'selected' : ''}`} style={{ paddingLeft: 14 + Math.min(depth, 8) * 16 }}
+      <button className={`agent-row ${options.selectedId === agent.id ? 'selected' : ''}${options.visible.get(agent.id) === 'context' ? ' context' : ''}`}
+        style={{ paddingLeft: 14 + Math.min(depth, 8) * 16 }} title={rowTitle}
         onClick={() => options.onSelect(agent.id)}>
         <span className={`status-dot ${shownStatus(agent)}`} />
         <span className="agent-row-label">
           <strong>{agent.name || agent.id}</strong>
-          <small title={modelLabel}>{modelLabel}</small>
+          <small className="agent-model" title={rowTitle}><span>{modelLabel}</span>{agent.reasoningEffort && <span className="agent-effort">{effortName(agent)}</span>}</small>
           {agent.role && <small>{agent.role}</small>}
           {!!files && files.wrote.length + files.read.length > 0 && <small>Файлы: изменил {files.wrote.length}, читал {files.read.length}</small>}
           {!!agent.handovers?.length && <small className="handover-badge" title={handoverTitle(agent)}>⇄ Сменил подписку: {agent.handovers.length}</small>}
@@ -41,7 +53,7 @@ function agentTree(items: Agent[], options: TreeOptions, parentId: string | null
             {agent.isolation && <span className={`isolation-badge ${agent.isolation.conflicts?.length ? 'conflict' : ''}`} title={isolationTitle(agent.isolation)}>Изолированная копия</span>}
           </small>}
         </span>
-        <span className="agent-state">{statusText(shownStatus(agent))}</span>
+        <span className="agent-state">{activityLabel(agent)}</span>
       </button>
       {agentTree(items, options, agent.id, depth + 1, nextSeen)}
     </div>
@@ -65,6 +77,11 @@ export function AgentsPanel({ chatRuns, currentRun, selectedAgent, inspectorRequ
   const routerRow = !!currentRun && (currentRun.agents.length > 1 || !!currentRun.communications?.length)
   // Runs around an Orbit restart: the run this one continues, and the run that continued this one.
   const resume = resumeLinks(chatRuns, currentRun)
+  const [view, setView] = useAgentsView()
+  const [filter, setFilter] = useAgentFilter()
+  const agents = currentRun?.agents || []
+  const counts = countActivities(agents)
+  const visible = visibleAgents(agents, filter)
   return <aside className="agents-panel">
     <header>
       <div><Icon name="agents" /><strong>Агенты</strong></div>
@@ -94,14 +111,17 @@ export function AgentsPanel({ chatRuns, currentRun, selectedAgent, inspectorRequ
           Продолжен в {shortRunId(resume.next.runId)}
         </button>}
       </div>}
-      <div className="agent-tree">
-        {agentTree(currentRun.agents, { run: currentRun, selectedId: selected?.id, onSelect: onSelectAgent })}
-        {routerRow && <button className={`agent-row router-row ${selected?.id === 'router' ? 'selected' : ''}`} onClick={() => onSelectAgent('router')}>
+      <AgentFilterBar filter={filter} counts={counts} onChange={setFilter} />
+      <AgentsViewSwitch view={view} onChange={setView} />
+      {filter !== 'all' && !counts[filter] ? <AgentFilterEmpty filter={filter} onReset={() => setFilter('all')} />
+        : view === 'timeline' ? <RunTimeline run={currentRun} selectedId={selected?.id} onSelect={onSelectAgent} visible={visible} /> : <div className="agent-tree">
+        {agentTree(currentRun.agents, { run: currentRun, selectedId: selected?.id, onSelect: onSelectAgent, visible })}
+        {routerRow && filter === 'all' && <button className={`agent-row router-row ${selected?.id === 'router' ? 'selected' : ''}`} onClick={() => onSelectAgent('router')}>
           <span className={`status-dot ${routerAgent.status}`} />
           <span className="agent-row-label"><strong>{routerAgent.name}</strong><small>Адресует сообщения и следит за общими файлами</small></span>
           <span className="agent-state">{(currentRun.router?.routed ?? 0) + (currentRun.router?.notices ?? 0)}</span>
         </button>}
-      </div>
+      </div>}
       {selected && <AgentInspector key={requested ? `${currentRun.runId}:${requested.seq}` : currentRun.runId} run={currentRun} agent={selected}
         onSelect={onSelectAgent} quotas={quotas} initialTab={requested?.tab} onMessage={onMessage} controls={controls} />}
     </>}

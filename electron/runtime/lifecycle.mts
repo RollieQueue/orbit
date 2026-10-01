@@ -127,6 +127,10 @@ async function start(runtime: OrbitRuntimeLike, payload: StartPayload = {}): Pro
   run.priorRuns = runtime.previousRuns(run)
   // An improvement-mode run continues the plan of the chat's earlier runs (each task is one run in a fresh context).
   loadPlan(runtime, run)
+  // What it must apply with restart_orbit is what changes on disk from here on (improvement.mts), not what another chat
+  // already left unapplied. Unless what is unapplied may be this chat's own: a continuation (its restart may have rolled
+  // back) and a run after a restart this chat deferred compare all of the code, as before.
+  if (run.improvementMode) run.codeAtStart = run.resumedFrom || leftUnapplied(run.priorRuns) ? null : runtime.restartHost?.codeOnDisk?.() ?? null
   runtime.setSharing(workspace, run.globalMemoryEnabled)
   // The scan runs while the root agent starts; the first prompt waits for it only briefly.
   run.indexReady = Promise.resolve().then(() => runtime.projectIndex?.refresh(workspace)).catch(error => { diagnostics(runtime, run, 'projectIndex.refresh', error); return null })
@@ -162,6 +166,14 @@ function previousRuns(runtime: OrbitRuntimeLike, run: RunRecord): ChatRunView[] 
   } catch (error) { diagnostics(runtime, run, 'previousRuns', error) /* Saved history is a convenience; a damaged file must not block a new task. */ }
   for (const live of runtime.runs.values()) if (sameChat(live)) found.set(live.runId, live)
   return [...found.values()].sort((a, b) => String(a.startedAt).localeCompare(String(b.startedAt))).slice(-8).map(chatMemory.view)
+}
+// Whether this chat left a change of Orbit's code for a later restart: a run since its last applied restart deferred one.
+function leftUnapplied(prior: ChatRunView[]): boolean {
+  for (const view of [...prior].reverse()) {
+    if (view.restartApplied || view.status === 'restarting') return false
+    if (view.restartDeferred) return true
+  }
+  return false
 }
 // The isolated copies of the run's helpers are taken away once it has ended (unmerged changes are saved first); nothing waits for it.
 const releaseCopies = (runtime: OrbitRuntimeLike, run: RunRecord): void => { void runtime.cleanupIsolation(run).catch(() => undefined) }

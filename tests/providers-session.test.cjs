@@ -3,82 +3,11 @@ const assert = require('node:assert/strict')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
-const { runProvider, transportFor, mcpCallLimit, closeSession, _testing, terminateProcess } = require('../electron/providers.mts')
-const { buildClaudeSessionArgs, buildCodexSessionArgs, buildClaudeArgs, normalizeSession, inactivityValue, runCli } = _testing
+const { runProvider, transportFor, mcpCallLimit, closeSession, _testing } = require('../electron/providers.mts')
 const codexServer = require('../electron/codex-server.mts')
 const { classifyQuotaError } = require('../electron/quota.mts')
-
-const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
-const SESSION = { id: '11111111-2222-4333-8444-555555555555', token: 'tok-secret', mcpUrl: 'http://127.0.0.1:4321/mcp', systemAppend: 'You are an Orbit agent.' }
-const after = (values, flag) => values[values.indexOf(flag) + 1]
-const count = (values, flag) => values.filter(item => item === flag).length
-
-function withEnv(t, changes) {
-  const previous = Object.fromEntries(Object.keys(changes).map(key => [key, process.env[key]]))
-  for (const [key, value] of Object.entries(changes)) { if (value === undefined) delete process.env[key]; else process.env[key] = value }
-  t.after(() => { for (const [key, value] of Object.entries(previous)) { if (value === undefined) delete process.env[key]; else process.env[key] = value } })
-}
-// A fake CLI: a .cmd shim resolveLaunch turns into `node cli.cjs …`, a script that records what it was given.
-function fakeCli(t, envKey, body) {
-  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'orbit-session-fixture-'))
-  t.after(() => { assert.equal(path.dirname(directory), path.resolve(os.tmpdir())); fs.rmSync(directory, { recursive: true, force: true }) })
-  const record = path.join(directory, 'record.json')
-  fs.writeFileSync(path.join(directory, 'cli.cmd'), '@"%dp0%\\node.exe" "%dp0%\\cli.cjs" %*')
-  fs.writeFileSync(path.join(directory, 'cli.cjs'), `
-    const fs = require('node:fs');
-    const args = process.argv.slice(2);
-    const out = message => console.log(JSON.stringify(message));
-    let input = ''; process.stdin.setEncoding('utf8'); process.stdin.on('data', part => { input += part });
-    process.stdin.on('end', () => {
-      const appendAt = args.indexOf('--append-system-prompt-file');
-      const appendFile = appendAt >= 0 ? args[appendAt + 1] : null;
-      const record = { args, input, appendFile, appendText: appendFile ? fs.readFileSync(appendFile, 'utf8') : null, env: { idle: process.env.CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT, token: process.env.ORBIT_MCP_TOKEN, noProxy: process.env.NO_PROXY }, cwd: process.cwd() };
-      fs.writeFileSync(${JSON.stringify(record)}, JSON.stringify(record));
-      ${body}
-    });
-  `)
-  withEnv(t, { [envKey]: path.join(directory, 'cli.cmd') })
-  return { directory, read: () => JSON.parse(fs.readFileSync(record, 'utf8')) }
-}
-
-// A fake CLI that appends one record per invocation: arguments, stdin, working folder, the environment variables Orbit
-// sets, and the MCP configuration files Cursor (--plugin-dir) or Antigravity (.agents/plugins/orbit in its cwd) would read.
-function recordingCli(t, envKey, body) {
-  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'orbit-session-fixture-'))
-  t.after(() => { assert.equal(path.dirname(directory), path.resolve(os.tmpdir())); fs.rmSync(directory, { recursive: true, force: true }) })
-  const records = path.join(directory, 'records.jsonl')
-  fs.writeFileSync(path.join(directory, 'cli.cmd'), '@"%dp0%\\node.exe" "%dp0%\\cli.cjs" %*')
-  fs.writeFileSync(path.join(directory, 'cli.cjs'), `
-    const fs = require('node:fs'), path = require('node:path');
-    const args = process.argv.slice(2);
-    const out = message => console.log(JSON.stringify(message));
-    const read = file => { try { return fs.readFileSync(file, 'utf8') } catch { return null } };
-    let input = ''; process.stdin.setEncoding('utf8'); process.stdin.on('data', part => { input += part });
-    process.stdin.on('end', () => {
-      const pluginDir = args.includes('--plugin-dir') ? args[args.indexOf('--plugin-dir') + 1] : null;
-      const agy = path.join(process.cwd(), '.agents', 'plugins', 'orbit');
-      const record = { args, input, cwd: process.cwd(), pluginDir,
-        env: { token: process.env.ORBIT_MCP_TOKEN, noProxy: process.env.NO_PROXY, runId: process.env.ORBIT_RUN_ID, extra: process.env.ORBIT_TEST_EXTRA, idle: process.env.CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT },
-        cursorPlugin: pluginDir && read(path.join(pluginDir, '.cursor-plugin', 'plugin.json')), cursorMcp: pluginDir && read(path.join(pluginDir, 'mcp.json')),
-        agyPlugin: read(path.join(agy, 'plugin.json')), agyMcp: read(path.join(agy, 'mcp_config.json')), agyRules: read(path.join(agy, 'rules', 'AGENTS.md')) };
-      fs.appendFileSync(${JSON.stringify(records)}, JSON.stringify(record) + '\\n');
-      ${body}
-    });
-  `)
-  withEnv(t, { [envKey]: path.join(directory, 'cli.cmd') })
-  return { directory, records: () => fs.existsSync(records) ? fs.readFileSync(records, 'utf8').split('\n').filter(Boolean).map(line => JSON.parse(line)) : [] }
-}
-function workspaceFolder(t) {
-  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'orbit-session-ws-'))
-  fs.writeFileSync(path.join(directory, 'README.md'), 'hello\n')
-  t.after(() => fs.rmSync(directory, { recursive: true, force: true }))
-  return directory
-}
-const samePath = (left, right) => fs.realpathSync(left).toLowerCase() === fs.realpathSync(right).toLowerCase()
-async function until(check, ms = 5000) {
-  const started = Date.now()
-  while (!check()) { if (Date.now() - started > ms) throw new Error('condition not reached'); await new Promise(resolve => setTimeout(resolve, 20)) }
-}
+const { UUID, SESSION, after, withEnv, fakeCli, recordingCli, workspaceFolder, samePath, until, appServerFixture } = require('./helpers-providers-session.cjs')
+const { buildClaudeSessionArgs, buildCodexSessionArgs, buildClaudeArgs, normalizeSession, inactivityValue } = _testing
 
 test('transportFor: Antigravity keeps a session in Full access without on-request approvals, Cursor only when opted in; the call limits', t => {
   withEnv(t, { ORBIT_LEGACY_ENVELOPE: undefined, ORBIT_MCP_CALL_LIMIT_MS: undefined, ORBIT_CURSOR_SESSION: undefined })
@@ -414,22 +343,6 @@ test('normalizeSession chooses a UUID for Claude, keeps ids, and refuses half-co
   assert.throws(() => inactivityValue(-5), /inactivity timeout/)
 })
 
-test('runCli inactivity: a silent process is killed, output resets the clock, isBusy defers the verdict, null disables it', async t => {
-  withEnv(t, { ORBIT_PROVIDER_INACTIVITY_MS: undefined })
-  const silent = runCli(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { inactivityMs: 600, timeoutMs: null })
-  await assert.rejects(silent, error => error.name === 'TimeoutError' && /no output for 600 ms/.test(error.message))
-  const chatty = await runCli(process.execPath, ['-e', 'let n = 0; const i = setInterval(() => { console.log(n++); if (n > 6) { clearInterval(i) } }, 60)'], { inactivityMs: 1000, timeoutMs: null })
-  assert.match(chatty.stdout, /6/)
-  let checks = 0
-  const started = Date.now()
-  await assert.rejects(runCli(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { inactivityMs: 400, timeoutMs: null, isBusy: () => ++checks <= 2 }), { name: 'TimeoutError' })
-  assert.equal(checks, 3)
-  assert.ok(Date.now() - started >= 1120, 'two busy verdicts each bought another window')
-  await assert.rejects(runCli(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { inactivityMs: null, timeoutMs: 800 }), error => error.name === 'TimeoutError' && /timed out after 800 ms/.test(error.message))
-  process.env.ORBIT_PROVIDER_INACTIVITY_MS = '480'
-  await assert.rejects(runCli(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { timeoutMs: null }), /no output for 480 ms/)
-})
-
 test('Claude session run: fixture CLI receives the session flags, the prompt on stdin and the temp system file; ids and MCP tool events come back', async t => {
   withEnv(t, { ORBIT_LEGACY_ENVELOPE: undefined, CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT: undefined })
   const cli = fakeCli(t, 'ORBIT_CLAUDE_COMMAND', `
@@ -483,23 +396,6 @@ test('Claude session run: fixture CLI receives the session flags, the prompt on 
   assert.ok(cli.read().args.includes('--no-session-persistence'))
 })
 
-test('Claude session run: an explicit total deadline still applies; without one only inactivity does', async t => {
-  withEnv(t, { ORBIT_LEGACY_ENVELOPE: undefined })
-  const cli = fakeCli(t, 'ORBIT_CLAUDE_COMMAND', `
-    out({ type: 'system', subtype: 'init', session_id: 's' });
-    if (input === 'hang') setInterval(() => {}, 1000); else { const i = setInterval(() => out({ type: 'stream_event', event: {} }), 50); setTimeout(() => { clearInterval(i); out({ type: 'result', subtype: 'success', result: 'late but fine', session_id: 's' }) }, 1500) }
-  `)
-  const session = { token: 'tok', mcpUrl: 'http://127.0.0.1:9/mcp' }
-  await assert.rejects(runProvider({ providerId: 'claude', workspace: cli.directory, accessMode: 'read-only', prompt: 'hang', session, inactivityMs: 400 }), /no output for 400 ms/)
-  await assert.rejects(runProvider({ providerId: 'claude', workspace: cli.directory, accessMode: 'read-only', prompt: 'hang', session, inactivityMs: 5000, timeoutMs: 150 }), /timed out after 150 ms/)
-  let busy = 0
-  await assert.rejects(runProvider({ providerId: 'claude', workspace: cli.directory, accessMode: 'read-only', prompt: 'hang', session: { ...session, activity: () => ({ pending: ++busy <= 2 ? 1 : 0, lastAt: Date.now() }) }, inactivityMs: 400 }), /no output for 400 ms/)
-  assert.equal(busy, 3, 'an Orbit tool call in flight defers the inactivity verdict')
-  // Streaming for 1.5 s with a 700 ms window: every chunk resets the clock (Node itself needs a few hundred ms to start).
-  const slow = await runProvider({ providerId: 'claude', workspace: cli.directory, accessMode: 'read-only', prompt: 'stream', session, inactivityMs: 700 })
-  assert.equal(slow.text, 'late but fine')
-})
-
 test('Codex exec session run: config overrides and token in the environment, thread id from thread.started, resume by id', async t => {
   withEnv(t, { ORBIT_LEGACY_ENVELOPE: undefined })
   const cli = fakeCli(t, 'ORBIT_CODEX_COMMAND', `
@@ -528,184 +424,6 @@ test('Codex exec session run: config overrides and token in the environment, thr
   assert.deepEqual(record.args.slice(-2), ['thread-fixture-1', '-'])
   assert.equal(record.cwd.toLowerCase(), fs.realpathSync(cli.directory).toLowerCase(), 'resume has no -C: the process cwd is the workspace')
   assert.equal(second.sessionId, 'thread-fixture-1'); assert.equal(second.text, 'Answer: again')
-})
-
-const appServerFixture = `
-  const send = message => console.log(JSON.stringify(message));
-  let turns = 0;
-  require('node:readline').createInterface({ input: process.stdin }).on('line', line => {
-    const m = JSON.parse(line);
-    // FIXTURE_LOG: the thread and turn requests, one JSON line each.
-    if (process.env.FIXTURE_LOG && /^(thread|turn)\\//.test(m.method)) require('node:fs').appendFileSync(process.env.FIXTURE_LOG, JSON.stringify({ method: m.method, params: m.params }) + '\\n');
-    // A request the test holds: the fixture writes its pid to FIXTURE_MARK when it arrives and answers it 400 ms later.
-    if (process.env.FIXTURE_HOLD && m.method === process.env.FIXTURE_HOLD) {
-      require('node:fs').writeFileSync(process.env.FIXTURE_MARK, String(process.pid));
-      const result = m.method === 'initialize' ? {} : { thread: { id: m.params.threadId || 'thread-' + process.pid }, model: 'fixture-model' };
-      return setTimeout(() => send({ id: m.id, result }), 400);
-    }
-    if (m.method === 'initialize') return send({ id: m.id, result: {} });
-    if (m.method === 'thread/resume') return send({ id: m.id, error: { code: -32602, message: 'unknown thread' } });
-    if (m.method === 'thread/start') {
-      if (m.params.ephemeral !== false || m.params.approvalPolicy !== 'on-request') throw new Error('session threads persist and ask');
-      const answer = JSON.stringify({ id: m.id, result: { thread: { id: 'thread-' + process.pid }, model: 'fixture-model' } });
-      // FIXTURE_TRAIL: a rate-limit notice follows the answer in the same write, so Orbit reads both at once.
-      return process.stdout.write(answer + '\\n' + (process.env.FIXTURE_TRAIL ? JSON.stringify({ method: 'account/rateLimits/updated', params: { rateLimits: {} } }) + '\\n' : ''));
-    }
-    if (m.method === 'turn/start') {
-      turns++;
-      send({ id: m.id, result: { turn: { id: 'turn-' + turns } } });
-      const text = m.params.input[0].text;
-      if (text === 'crash') return process.exit(3);
-      if (text === 'hang') return;
-      if (turns === 2) return send({ id: 900, method: 'item/commandExecution/requestApproval', params: { threadId: m.params.threadId, itemId: 'cmd', command: 'npm test' } });
-      send({ method: 'item/started', params: { threadId: m.params.threadId, item: { id: 'mcp', type: 'mcpToolCall', server: 'orbit', tool: 'memory_search', arguments: { query: 'q' } } } });
-      send({ method: 'item/completed', params: { threadId: m.params.threadId, item: { id: 'msg' + turns, type: 'agentMessage', phase: 'final_answer', text: 'Turn ' + turns + ': ' + text } } });
-      send({ method: 'turn/completed', params: { threadId: m.params.threadId, turn: { status: 'completed' } } });
-    }
-    if (m.id === 900) {
-      send({ method: 'item/completed', params: { item: { id: 'msg2', type: 'agentMessage', text: 'Decision: ' + m.result.decision } } });
-      send({ method: 'turn/completed', params: { turn: { status: 'completed' } } });
-    }
-  });
-`
-const helpers = (launches, env = {}) => ({
-  resolveLaunch: (_command, args) => { launches.push(args); return { executable: process.execPath, args: ['-e', appServerFixture], env: { ...process.env, ...env } } },
-  terminateProcess, createLineReader: _testing.createLineReader, busyCheck: () => () => false,
-})
-
-test('Codex App Server session: one process and thread across turns, MCP overrides, approvals, close kills the process', async t => {
-  const launches = []
-  const events = []
-  const session = { id: null, resume: false, token: 'app-token', mcpUrl: 'http://127.0.0.1:9/mcp' }
-  const base = { workspace: process.cwd(), accessMode: 'workspace-write', approvalPolicy: 'on-request', onEvent: event => events.push(event), onApproval: async () => true, inactivityMs: 3000 }
-  const first = await codexServer.runCodexSessionTurn({ ...base, prompt: 'one' }, session, helpers(launches))
-  assert.equal(first.transport, 'session'); assert.equal(first.client, 'Codex App Server'); assert.equal(first.text, 'Turn 1: one'); assert.equal(first.model, 'fixture-model')
-  const pid = Number(first.sessionId.replace('thread-', ''))
-  assert.ok(pid > 0)
-  t.after(async () => { await codexServer.closeSession(first.sessionId) })
-  assert.deepEqual(events.filter(event => event.kind === 'session').map(event => event.sessionId), [first.sessionId], 'the thread is named before the turn runs')
-  assert.ok(events.findIndex(event => event.kind === 'session') < events.findIndex(event => event.kind === 'tool'))
-  assert.ok(launches[0].includes('mcp_servers.orbit.url="http://127.0.0.1:9/mcp"') && launches[0].includes('mcp_servers.orbit.bearer_token_env_var="ORBIT_MCP_TOKEN"') && launches[0].includes('features.multi_agent=false'))
-  assert.equal(launches[0][launches[0].indexOf('mcp_servers.orbit.tool_timeout_sec=3600') - 1], '-c', 'the App Server gets the same per-call tool timeout as exec')
-  const orbitCall = events.find(event => event.kind === 'tool' && event.toolId === 'mcp')
-  assert.ok(orbitCall.orbitTool === 'memory_search' && orbitCall.native === false)
-  let approvals = 0
-  const second = await codexServer.runCodexSessionTurn({ ...base, prompt: 'two', onApproval: async request => { approvals++; assert.equal(request.arguments.command, 'npm test'); return false } }, { ...session, id: first.sessionId, resume: true }, helpers(launches))
-  assert.equal(second.sessionId, first.sessionId, 'the same thread'); assert.equal(second.text, 'Decision: decline'); assert.equal(approvals, 1)
-  assert.equal(launches.length, 1, 'a resume reuses the live process instead of spawning one')
-  assert.doesNotThrow(() => process.kill(pid, 0), 'the App Server stays alive between turns')
-  const live = codexServer.sessions.get(first.sessionId)
-  const concurrent = live.turn('three')
-  await assert.rejects(live.turn('four'), /already running/)
-  assert.equal((await concurrent).text, 'Turn 3: three')
-  assert.equal(await codexServer.closeSession(first.sessionId), true)
-  assert.equal(codexServer.sessions.has(first.sessionId), false)
-  assert.throws(() => process.kill(pid, 0), { code: 'ESRCH' }, 'closeSession resolves once the process tree is gone')
-  assert.equal(await codexServer.closeSession(first.sessionId), false)
-  assert.equal(await closeSession('never-existed'), false)
-  // A resume whose process is gone starts a new one; the fixture cannot resume the recorded thread, so a fresh thread answers.
-  const revived = await codexServer.runCodexSessionTurn({ ...base, prompt: 'five' }, { ...session, id: first.sessionId, resume: true }, helpers(launches))
-  assert.equal(launches.length, 2)
-  assert.notEqual(revived.sessionId, first.sessionId); assert.equal(revived.text, 'Turn 1: five')
-  await codexServer.closeSession(revived.sessionId)
-})
-
-test('Codex App Server session: the stable Orbit block is the thread\'s developer instructions, on thread/start and thread/resume', async t => {
-  const launches = []
-  const folder = fs.mkdtempSync(path.join(os.tmpdir(), 'orbit-codex-threads-'))
-  t.after(() => fs.rmSync(folder, { recursive: true, force: true }))
-  const fixture = helpers(launches, { FIXTURE_LOG: path.join(folder, 'requests.jsonl') })
-  const requests = prefix => fs.readFileSync(path.join(folder, 'requests.jsonl'), 'utf8').trim().split('\n').map(line => JSON.parse(line)).filter(entry => entry.method.startsWith(prefix))
-  const base = { workspace: process.cwd(), accessMode: 'workspace-write', approvalPolicy: 'on-request', inactivityMs: 3000 }
-  const session = { id: null, resume: false, token: 't', mcpUrl: 'http://127.0.0.1:9/mcp', systemAppend: 'STABLE ORBIT BLOCK "quoted"\nline two' }
-  const first = await codexServer.runCodexSessionTurn({ ...base, prompt: 'one' }, session, fixture)
-  await codexServer.closeSession(first.sessionId)
-  // The process is gone: the resume asks thread/resume (the fixture refuses it) and then starts a thread, both with the block.
-  const revived = await codexServer.runCodexSessionTurn({ ...base, prompt: 'two' }, { ...session, id: first.sessionId, resume: true }, fixture)
-  await codexServer.closeSession(revived.sessionId)
-  const plain = await codexServer.runCodexSessionTurn({ ...base, prompt: 'three' }, { ...session, systemAppend: '' }, fixture)
-  await codexServer.closeSession(plain.sessionId)
-  assert.deepEqual(requests('thread/').map(entry => [entry.method, entry.params.developerInstructions]), [
-    ['thread/start', session.systemAppend], ['thread/resume', session.systemAppend], ['thread/start', session.systemAppend], ['thread/start', undefined],
-  ])
-  assert.ok(launches.flat().every(arg => !arg.includes('developer_instructions')), 'the App Server gets the block in its requests, not on its command line')
-  // A string bounded inside an emoji (an agent's name, a chat message) goes out well-formed: Codex drops a JSON-RPC line
-  // with an escaped lone surrogate and never answers it.
-  const cut = await codexServer.runCodexSessionTurn({ ...base, prompt: 'cut \ud83d' }, { ...session, systemAppend: 'name \ud83d' }, fixture)
-  await codexServer.closeSession(cut.sessionId)
-  assert.equal(requests('thread/').at(-1).params.developerInstructions, 'name �')
-  assert.equal(requests('turn/').at(-1).params.input[0].text, 'cut �')
-})
-
-test('Codex App Server session: a dying process fails the turn and forgets the session; cancellation kills it', async () => {
-  const launches = []
-  const base = { workspace: process.cwd(), accessMode: 'workspace-write', approvalPolicy: 'on-request', inactivityMs: 3000 }
-  const session = { id: null, resume: false, token: 't', mcpUrl: 'http://127.0.0.1:9/mcp' }
-  await assert.rejects(codexServer.runCodexSessionTurn({ ...base, prompt: 'crash' }, session, helpers(launches)), /closed/)
-  assert.equal(codexServer.sessions.size, 0)
-  const controller = new AbortController()
-  const first = await codexServer.runCodexSessionTurn({ ...base, prompt: 'one' }, session, helpers(launches))
-  const pid = Number(first.sessionId.replace('thread-', ''))
-  const pending = codexServer.runCodexSessionTurn({ ...base, prompt: 'two', signal: controller.signal, onApproval: () => { controller.abort(); return new Promise(() => {}) } }, { ...session, id: first.sessionId, resume: true }, helpers(launches))
-  await assert.rejects(pending, { name: 'AbortError' })
-  assert.throws(() => process.kill(pid, 0), { code: 'ESRCH' }, 'cancellation settles after the process tree is gone')
-  assert.equal(codexServer.sessions.has(first.sessionId), false)
-  // A turn the server never answers is ended by the inactivity guard, which also ends the session.
-  const silent = await codexServer.runCodexSessionTurn({ ...base, prompt: 'one' }, session, helpers(launches))
-  const silentPid = Number(silent.sessionId.replace('thread-', ''))
-  await assert.rejects(codexServer.runCodexSessionTurn({ ...base, prompt: 'hang', inactivityMs: 300 }, { ...session, id: silent.sessionId, resume: true }, helpers(launches)), error => error.name === 'TimeoutError' && /no output for 300 ms/.test(error.message))
-  assert.throws(() => process.kill(silentPid, 0), { code: 'ESRCH' })
-  assert.equal(codexServer.sessions.size, 0)
-})
-
-test('Codex App Server session: a cancellation while the session opens kills the process and keeps no session; one at the thread\'s event closes only a session the call opened', async t => {
-  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'orbit-open-cancel-'))
-  // Fixture processes not yet shown to be gone: a failed assertion leaves none running. One shown gone is dropped, as
-  // Windows reuses pids.
-  const unproven = new Set()
-  t.after(async () => {
-    for (const pid of unproven) { try { process.kill(pid) } catch { /* Already gone. */ } }
-    for (const id of [...codexServer.sessions.keys()]) await codexServer.closeSession(id)
-    fs.rmSync(directory, { recursive: true, force: true })
-  })
-  const gone = (pid, message) => { assert.throws(() => process.kill(pid, 0), { code: 'ESRCH' }, message); unproven.delete(pid) }
-  const launches = []
-  const base = { workspace: process.cwd(), accessMode: 'workspace-write', approvalPolicy: 'on-request', inactivityMs: 3000 }
-  const session = { id: null, resume: false, token: 't', mcpUrl: 'http://127.0.0.1:9/mcp' }
-  const pidIn = file => { try { return Number(fs.readFileSync(file, 'utf8')) } catch { return 0 } }
-  for (const [hold, opening] of [['initialize', session], ['thread/start', session], ['thread/resume', { ...session, id: 'thread-gone', resume: true }]]) {
-    const mark = path.join(directory, hold.replace('/', '-'))
-    const controller = new AbortController(), events = []
-    const pending = codexServer.runCodexSessionTurn({ ...base, prompt: 'one', signal: controller.signal, onEvent: event => events.push(event) }, opening, helpers(launches, { FIXTURE_HOLD: hold, FIXTURE_MARK: mark }))
-    await until(() => pidIn(mark) > 0)
-    const pid = pidIn(mark); unproven.add(pid)
-    controller.abort()
-    await assert.rejects(pending, { name: 'AbortError' }, `cancelled during ${hold}`)
-    gone(pid, `the open fails once the process tree is gone (${hold})`)
-    assert.equal(codexServer.sessions.size, 0, `no session is kept (${hold})`)
-    assert.ok(!events.some(event => event.kind === 'session'), `no thread is named (${hold})`)
-  }
-  const started = launches.length
-  await assert.rejects(codexServer.openCodexSession({ ...base, signal: AbortSignal.abort() }, session, helpers(launches)), { name: 'AbortError' })
-  assert.equal(launches.length, started, 'a cancelled open starts nothing')
-  // Cancelled in the same read as the thread's answer (by the rate-limit notice that follows it): nothing is kept either.
-  const sameRead = new AbortController()
-  await assert.rejects(codexServer.runCodexSessionTurn({ ...base, prompt: 'one', signal: sameRead.signal, onEvent: event => { if (event.kind === 'quota') sameRead.abort() } }, session, helpers(launches, { FIXTURE_TRAIL: '1' })), { name: 'AbortError' })
-  assert.equal(codexServer.sessions.size, 0, 'no session is kept after a cancellation in the same read')
-  // The runtime stops the turn on the thread's event when the server opened another thread than the one to resume: the
-  // session this call opened is closed; a live session the call reused stays for the next turn.
-  const stray = new AbortController()
-  let strayPid = 0
-  const strayed = codexServer.runCodexSessionTurn({ ...base, prompt: 'one', signal: stray.signal, onEvent: event => { if (event.kind === 'session') { strayPid = Number(event.sessionId.replace('thread-', '')); unproven.add(strayPid); stray.abort() } } }, { ...session, id: 'thread-gone', resume: true }, helpers(launches))
-  await assert.rejects(strayed, { name: 'AbortError' })
-  gone(strayPid, 'the opened session is closed')
-  assert.equal(codexServer.sessions.size, 0)
-  const live = await codexServer.runCodexSessionTurn({ ...base, prompt: 'one' }, session, helpers(launches))
-  const livePid = Number(live.sessionId.replace('thread-', ''))
-  const reused = new AbortController()
-  await assert.rejects(codexServer.runCodexSessionTurn({ ...base, prompt: 'two', signal: reused.signal, onEvent: event => { if (event.kind === 'session') reused.abort() } }, { ...session, id: live.sessionId, resume: true }, helpers(launches)), { name: 'AbortError' })
-  assert.ok(codexServer.sessions.has(live.sessionId), 'the reused session stays')
-  assert.doesNotThrow(() => process.kill(livePid, 0))
 })
 
 test('extraEnv reaches every CLI process Orbit starts, and Orbit\'s own transport variables win over it', async t => {

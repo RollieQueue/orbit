@@ -1,7 +1,7 @@
 import { assess } from './quota.mts'
 import type { QuotaAssessable, QuotaLevel } from './quota.mts'
 import TIERS from './model-tiers.json' with { type: 'json' }
-import REASONING from './reasoning-defaults.json' with { type: 'json' }
+import { offeredLevels, clampEffort } from './reasoning-levels.mts'
 
 // Replacing an agent whose subscription is running out: which model may take over, and what the newcomer is told.
 // Pure functions; the runtime decides when to call them and applies the result.
@@ -36,7 +36,6 @@ interface HandoverNoteInput extends HandoverReasonInput {
 }
 
 const tiers: ModelTiers = TIERS
-const reasoningLevels: Record<string, string[] | undefined> = REASONING
 const RULES = tiers.rules.map(rule => ({ tier: rule.tier, pattern: new RegExp(rule.match, 'i') }))
 const EXCLUDED = (tiers.excluded || []).map(rule => new RegExp(rule.match, 'i'))
 // Local models and arbitrary endpoints have no comparable quality; they are replacements only when the user listed them.
@@ -68,12 +67,12 @@ const baselineTier = (providerId: string, model: unknown): number => tierOf(mode
 const targetKey = (providerId: string, model: unknown): string => `${providerId}:${String(model || '').toLowerCase()}`
 const targetLabel = (target: Target): string => `${target.providerId}${target.model ? ` / ${target.model}` : ''}`
 
-// Cursor and Antigravity encode or ignore the level themselves; the others keep the agent's level only where the target offers it.
+// The agent's level follows it to the target as the nearest one the target offers (reasoning-levels.mts): asking for more
+// than the model has gives its top level. Antigravity has none; Cursor offers the levels its model-name variants spell out
+// (the catalog lists them per model). The user's pool entry for the target is used as it is.
 function effortFor(providerId: string, model: string, wanted: string | null | undefined, entry: CatalogEntry | undefined, poolEffort: string | null | undefined): string {
   if (poolEffort !== undefined && poolEffort !== null) return providerId === 'antigravity' ? '' : poolEffort
-  if (!wanted || providerId === 'antigravity' || providerId === 'cursor') return ''
-  const levels = entry?.reasoningLevels?.[model] || reasoningLevels[providerId] || []
-  return levels.includes(wanted) ? wanted : ''
+  return clampEffort(wanted, offeredLevels(providerId, model, entry)).level
 }
 
 // Ranked replacements for `agent`, best first. `quota` is a QuotaMonitor (only cached readings are used here) and

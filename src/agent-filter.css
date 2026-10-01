@@ -1,0 +1,16 @@
+/* The activity filter of the agents panel (AgentFilter.tsx): a wrapping row of chips under the run summary, and the dimmed context rows. */
+.agent-filter{display:flex;flex-wrap:wrap;gap:5px;flex-shrink:0;margin:0 14px 8px}
+.agent-filter-chip{padding:4px 8px;border:1px solid #30393a;border-radius:11px;font-size:10px;line-height:14px;color:#899b92;background:#1c2122;white-space:nowrap}
+.agent-filter-chip b{margin-left:2px;font-weight:600;font-variant-numeric:tabular-nums;color:#b3c3b9}
+.agent-filter-chip:hover:not(:disabled){background:#252c2d}
+.agent-filter-chip.active{background:#344137;border-color:#4a5d4f;color:#d8e8de}
+.agent-filter-chip.active b{color:#fff}
+.agent-filter-empty{margin:0 14px 8px;padding:10px 12px;border:1px dashed #30393a;border-radius:8px;font-size:11px;line-height:1.6;color:var(--muted)}
+.agent-filter-empty button{margin-left:4px;color:#a7c5b0;text-decoration:underline;text-underline-offset:3px;font-size:11px}
+.agent-row.context,.run-timeline-row.context{opacity:.5}
+.agent-row.context:hover,.run-timeline-row.context:hover{opacity:.85}
+/* The model line of a row: provider and model shorten with an ellipsis, the reasoning level after them stays whole. */
+.agent-row small.agent-model{display:flex;gap:4px}
+.agent-row small.agent-model>span:first-child{min-width:0;overflow:hidden;text-overflow:ellipsis}
+.agent-row small.agent-model>.agent-effort{flex-shrink:0}
+.agent-row small.agent-model>.agent-effort:before{content:"· "}

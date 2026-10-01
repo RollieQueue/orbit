@@ -1,6 +1,6 @@
 {
   "name": "orbit-ide",
-  "version": "0.6.0",
+  "version": "0.6.2",
   "type": "module",
   "private": true,
   "author": "Orbit",
@@ -12,7 +12,7 @@
     "start": "node scripts/run-electron.cjs",
     "typecheck": "tsc --noEmit && npm run typecheck:main",
     "typecheck:main": "tsc -p tsconfig.main.json",
-    "test": "node --experimental-strip-types --disable-warning=ExperimentalWarning --test tests/*.test.cjs",
+    "test": "node --experimental-strip-types --disable-warning=ExperimentalWarning --test-reporter=./scripts/test-reporter.mjs --test tests/*.test.cjs",
     "smoke": "node --experimental-strip-types --disable-warning=ExperimentalWarning scripts/smoke-runtime.cjs",
     "smoke:desktop": "node scripts/run-electron.cjs scripts/smoke-desktop.cjs",
     "package:win": "npm run build && node --experimental-strip-types --disable-warning=ExperimentalWarning scripts/package-win.cjs",

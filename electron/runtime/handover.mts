@@ -32,9 +32,36 @@ async function providerCatalog(runtime: OrbitRuntimeLike, run: RunRecord): Promi
   // The promise itself is cached, so agents switching at the same moment share one provider inspection.
   if (!run.catalogCache || runtime.clock() - run.catalogCache.at >= CATALOG_MAX_AGE_MS) {
     // Without a health list the user's own pool is still used. (`catalog` was checked on entry.)
-    run.catalogCache = { at: runtime.clock(), value: Promise.resolve().then(() => runtime.catalog!(run.providerOptions)).then(list => list || [], (): CatalogEntry[] => []) }
+    const value = Promise.resolve().then(() => runtime.catalog!(run.providerOptions)).then(list => list || [], (): CatalogEntry[] => [])
+    // `list`: the settled answer, for what has to read it without waiting (the reasoning levels a helper may get).
+    // The list read before stays in use until the new one arrives (and when the new reading fails): levels and routing never fall back to defaults in between.
+    const earlier = run.catalogCache?.list ?? runtime.lastCatalog?.list
+    const cache: NonNullable<RunRecord['catalogCache']> = { at: runtime.clock(), value, ...(earlier ? { list: earlier } : {}), ...(run.catalogCache?.waited ? { waited: true } : {}) }
+    void value.then(list => {
+      if (list.length || !earlier) cache.list = list
+      if (list.length) runtime.lastCatalog = { at: cache.at, list }
+    })
+    run.catalogCache = cache
   }
   return run.catalogCache.value
+}
+// Waits (at most ROUTE_WAIT_MS) until the provider list has been read once for this run, so the reasoning levels of its
+// models are known; the answer is cached on the run, and a list that does not come in time is simply not used (and not
+// waited for again: every turn of a run would otherwise pay the wait for a provider that never answers).
+// A list an earlier run of this runtime read is taken at once for the levels, marked stale so that routing and failover
+// still read their own: a fresh inspection runs every provider's CLI for seconds, and every message would wait for it.
+async function settleCatalog(runtime: OrbitRuntimeLike, run: RunRecord): Promise<void> {
+  if (!runtime.catalog || run.catalogCache?.list || run.catalogCache?.waited) return
+  const known = runtime.lastCatalog
+  if (known) {
+    if (run.catalogCache) run.catalogCache.list = known.list
+    else run.catalogCache = { at: Number.NEGATIVE_INFINITY, value: Promise.resolve(known.list), list: known.list }
+    return
+  }
+  const timers: NodeJS.Timeout[] = []
+  await Promise.race([runtime.providerCatalog(run), new Promise<null>(resolve => { timers.push(setTimeout(resolve, routeWait(), null)) })]).catch(() => null)
+  timers.forEach(clearTimeout)
+  if (run.catalogCache && !run.catalogCache.list) run.catalogCache.waited = true
 }
 // Before a turn: is this agent's subscription so close to its limit that the turn should run elsewhere?
 async function preflightQuota(runtime: OrbitRuntimeLike, run: RunRecord, agent: AgentRecord): Promise<void> {
@@ -184,11 +211,9 @@ async function routeSpawn(runtime: OrbitRuntimeLike, run: RunRecord, parent: Age
   })
   const passed = skipped.length ? { skipped } : {}
   if (!choice) return { spec, routed: { kind, model: null, ...passed, note: 'No model of the routing table can take this work now; the helper got the model it gets without a kind.' } }
-  // The measured level only where nothing else names one: the caller, the pool (createAgent), the provider's settings, or
-  // the parent's own model, whose level the helper inherits.
-  const inherits = choice.providerId === parent.providerId && [parent.requestedModel, parent.model].includes(choice.model)
-  const effort = spec.reasoningEffort === undefined && !inherits && !run.providerOptions[choice.providerId]?.reasoningEffort && choice.reasoningEffort ? { reasoningEffort: choice.reasoningEffort } : {}
-  return { spec: { ...spec, providerId: choice.providerId, model: choice.model, ...effort }, routed: { kind, model: `${choice.providerId}/${choice.model}`, ...passed } }
+  // The level the audit measured for this model goes along as `routed.reasoningEffort`; createAgent ranks it under the
+  // caller's and the user's pool level and above the parent's and the provider settings' (agents.decideEffort).
+  return { spec: { ...spec, providerId: choice.providerId, model: choice.model }, routed: { kind, model: `${choice.providerId}/${choice.model}`, ...passed, ...(choice.reasoningEffort ? { reasoningEffort: choice.reasoningEffort } : {}) } }
 }
 
-export { failoverActive, providerCatalog, preflightQuota, handover, recoverProvider, routeSpawn }
+export { failoverActive, providerCatalog, settleCatalog, preflightQuota, handover, recoverProvider, routeSpawn }

@@ -37,6 +37,7 @@ function describeCall(call: ToolCall, observation: Loose, failure: string | null
   else if (call.name === 'index_search') { subject = ` "${clip(args.query, 60)}"`; outcome = `${observation.results?.length ?? 0} hits` }
   else if (call.name === 'index_outline') outcome = `${observation.symbols?.length ?? 0} symbols, ${observation.importedBy?.length ?? 0} importers`
   else if (call.name === 'team_history') outcome = `${Array.isArray(observation) ? observation.length : 0} earlier turns`
+  else if (call.name === 'run_profile') { subject = args.runId ? ` ${clip(args.runId, 8)}` : ''; outcome = `${observation.wallClock} wall-clock, ${observation.helpers ?? 0} helpers` }
   else if (call.name === 'list_agents') outcome = `${observation.length} participants`
   else if (call.name === 'context_read') outcome = observation.notes ? `${observation.notes.length} notes listed` : `note ${observation.key}`
   else if (['read_messages', 'wait_message'].includes(call.name)) outcome = `${observation.messages?.length ?? 0} messages${observation.timedOut ? ', timed out' : ''}${observation.stopped?.length ? `, stopped by the user: ${observation.stopped.map((item: Loose) => clip(item.name, 40)).join(', ')}` : ''}`

@@ -92,7 +92,7 @@ The stable Orbit block (`systemAppend`) is the thread's developer instructions (
 before, Codex never received it): `-c developer_instructions="<block as a TOML string>"` on
 every `codex exec` process, new and resumed, and `developerInstructions` in `thread/start` and
 `thread/resume` of the App Server. Codex has no system-prompt file option, so the block rides
-on the command line (at most 6000 characters). Checked against codex-cli 0.155 with a stub
+on the command line (at most 7500 characters). Checked against codex-cli 0.155 with a stub
 Responses server (`scratchpad/i22/live-*.cjs`): the model's request carries the block once as
 a `developer` message, unchanged; a resumed thread keeps the block it started with, and a
 changed or missing block on resume is ignored. The override replaces a `developer_instructions`
@@ -268,7 +268,7 @@ providers see the same text as before.
 the existing `executeAgent`. The session loop:
 
 1. Build `systemAppend` (stable: identity, access rules, delegation rules, memory/skill
-   etiquette, "how Orbit tools differ from native tools"; ≤ 6 000 chars; nothing
+   etiquette, "how Orbit tools differ from native tools"; ≤ 7 500 chars; nothing
    volatile) and `userPrompt` (the task plus everything `context()` produces today:
    memory block, skills, shared context, index overview, chat digest, team roster,
    FILE MAP). Session mode sends no `ORBIT_RESPONSE_SCHEMA` and no envelope guide.

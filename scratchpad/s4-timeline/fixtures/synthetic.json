@@ -1,0 +1,640 @@
+{
+ "runId": "synthetic-run",
+ "projectId": "project-local",
+ "chatId": "synthetic-chat",
+ "status": "working",
+ "startedAt": "2026-10-01T10:00:00.000Z",
+ "updatedAt": "2026-10-01T10:42:00.000Z",
+ "providerId": "claude",
+ "model": "opus",
+ "workspace": ".",
+ "prompt": "Пример запуска",
+ "agents": [
+  {
+   "id": "root",
+   "parentId": null,
+   "depth": 0,
+   "name": "Orbit",
+   "role": "Agent",
+   "status": "waiting",
+   "providerId": "claude",
+   "model": "opus",
+   "task": "Пример запуска",
+   "startedAt": "2026-10-01T10:00:06.000Z",
+   "turns": 3,
+   "generation": 0,
+   "turnTimings": [
+    {
+     "turn": 1,
+     "transport": "session",
+     "startedAt": "2026-10-01T10:00:06.000Z",
+     "firstEventAt": "2026-10-01T10:00:12.000Z",
+     "endedAt": "2026-10-01T10:12:00.000Z",
+     "promptChars": 9000,
+     "nativeToolCalls": 61,
+     "orbitToolCalls": 9
+    },
+    {
+     "turn": 2,
+     "transport": "session",
+     "startedAt": "2026-10-01T10:20:00.000Z",
+     "firstEventAt": "2026-10-01T10:20:06.000Z",
+     "endedAt": "2026-10-01T10:21:30.000Z",
+     "promptChars": 10500,
+     "nativeToolCalls": 8,
+     "orbitToolCalls": 3
+    },
+    {
+     "turn": 3,
+     "transport": "session",
+     "startedAt": "2026-10-01T10:34:00.000Z",
+     "firstEventAt": "2026-10-01T10:34:06.000Z",
+     "endedAt": null,
+     "promptChars": 12000,
+     "nativeToolCalls": 14,
+     "orbitToolCalls": 2
+    }
+   ]
+  },
+  {
+   "id": "h-done",
+   "parentId": "root",
+   "depth": 1,
+   "name": "implement-tokens",
+   "role": "Agent",
+   "status": "done",
+   "providerId": "claude",
+   "model": "claude-sonnet-5-5",
+   "task": "Synthetic helper implement-tokens",
+   "startedAt": "2026-10-01T10:03:03.000Z",
+   "finishedAt": "2026-10-01T10:16:42.000Z",
+   "turns": 1,
+   "generation": 0,
+   "turnTimings": [
+    {
+     "turn": 1,
+     "transport": "session",
+     "startedAt": "2026-10-01T10:03:03.000Z",
+     "firstEventAt": "2026-10-01T10:03:09.000Z",
+     "endedAt": "2026-10-01T10:16:42.000Z",
+     "promptChars": 9000,
+     "nativeToolCalls": 52,
+     "orbitToolCalls": 1
+    }
+   ]
+  },
+  {
+   "id": "h-error",
+   "parentId": "root",
+   "depth": 1,
+   "name": "fix-flaky-test",
+   "role": "Agent",
+   "status": "error",
+   "providerId": "codex",
+   "model": "gpt-6-astra",
+   "task": "Synthetic helper fix-flaky-test",
+   "startedAt": "2026-10-01T10:04:15.000Z",
+   "finishedAt": "2026-10-01T10:11:06.000Z",
+   "turns": 2,
+   "generation": 0,
+   "turnTimings": [
+    {
+     "turn": 1,
+     "transport": "session",
+     "startedAt": "2026-10-01T10:04:15.000Z",
+     "firstEventAt": "2026-10-01T10:04:21.000Z",
+     "endedAt": "2026-10-01T10:09:45.000Z",
+     "promptChars": 9000,
+     "nativeToolCalls": 33,
+     "orbitToolCalls": 0
+    },
+    {
+     "turn": 2,
+     "transport": "session",
+     "startedAt": "2026-10-01T10:10:18.000Z",
+     "firstEventAt": "2026-10-01T10:10:24.000Z",
+     "endedAt": "2026-10-01T10:11:06.000Z",
+     "promptChars": 10500,
+     "nativeToolCalls": 4,
+     "orbitToolCalls": 0
+    }
+   ]
+  },
+  {
+   "id": "h-cancelled",
+   "parentId": "root",
+   "depth": 1,
+   "name": "review-docs",
+   "role": "Agent",
+   "status": "cancelled",
+   "providerId": "antigravity",
+   "model": "gemini-3.1-pro-high",
+   "task": "Synthetic helper review-docs",
+   "startedAt": "2026-10-01T10:06:03.000Z",
+   "finishedAt": "2026-10-01T10:15:30.000Z",
+   "turns": 1,
+   "generation": 0,
+   "stoppedByUser": true,
+   "turnTimings": [
+    {
+     "turn": 1,
+     "transport": "session",
+     "startedAt": "2026-10-01T10:06:03.000Z",
+     "firstEventAt": "2026-10-01T10:06:09.000Z",
+     "endedAt": "2026-10-01T10:15:30.000Z",
+     "promptChars": 9000,
+     "nativeToolCalls": 40,
+     "orbitToolCalls": 2
+    }
+   ]
+  },
+  {
+   "id": "h-queued",
+   "parentId": "root",
+   "depth": 1,
+   "name": "queued-lint-check",
+   "role": "Agent",
+   "status": "waiting",
+   "providerId": "codex",
+   "model": "gpt-6-luna",
+   "task": "Synthetic helper queued-lint-check",
+   "turns": 0,
+   "generation": 0,
+   "turnTimings": []
+  },
+  {
+   "id": "h-paused",
+   "parentId": "root",
+   "depth": 1,
+   "name": "migrate-settings",
+   "role": "Agent",
+   "status": "paused",
+   "providerId": "claude",
+   "model": "claude-sonnet-5-5",
+   "task": "Synthetic helper migrate-settings",
+   "startedAt": "2026-10-01T10:08:03.000Z",
+   "turns": 2,
+   "generation": 0,
+   "paused": true,
+   "pausedAt": "2026-10-01T10:30:00.000Z",
+   "turnTimings": [
+    {
+     "turn": 1,
+     "transport": "session",
+     "startedAt": "2026-10-01T10:08:03.000Z",
+     "firstEventAt": "2026-10-01T10:08:09.000Z",
+     "endedAt": "2026-10-01T10:19:00.000Z",
+     "promptChars": 9000,
+     "nativeToolCalls": 21,
+     "orbitToolCalls": 2
+    },
+    {
+     "turn": 2,
+     "transport": "session",
+     "startedAt": "2026-10-01T10:27:00.000Z",
+     "firstEventAt": "2026-10-01T10:27:06.000Z",
+     "endedAt": null,
+     "promptChars": 10500,
+     "nativeToolCalls": 3,
+     "orbitToolCalls": 0
+    }
+   ]
+  },
+  {
+   "id": "h-legacy",
+   "parentId": "root",
+   "depth": 1,
+   "name": "legacy-record",
+   "role": "Agent",
+   "status": "done",
+   "providerId": "codex",
+   "model": "gpt-6-luna",
+   "task": "Synthetic helper legacy-record",
+   "startedAt": "2026-10-01T10:02:19.800Z",
+   "finishedAt": "2026-10-01T10:08:30.000Z",
+   "turns": 1,
+   "generation": 0
+  },
+  {
+   "id": "h-nest",
+   "parentId": "root",
+   "depth": 1,
+   "name": "orchestrate-refactor",
+   "role": "Agent",
+   "status": "working",
+   "providerId": "claude",
+   "model": "claude-opus-5-5",
+   "task": "Synthetic helper orchestrate-refactor",
+   "startedAt": "2026-10-01T10:12:33.000Z",
+   "turns": 3,
+   "generation": 0,
+   "turnTimings": [
+    {
+     "turn": 1,
+     "transport": "session",
+     "startedAt": "2026-10-01T10:12:33.000Z",
+     "firstEventAt": "2026-10-01T10:12:39.000Z",
+     "endedAt": "2026-10-01T10:22:12.000Z",
+     "promptChars": 9000,
+     "nativeToolCalls": 30,
+     "orbitToolCalls": 8
+    },
+    {
+     "turn": 2,
+     "transport": "session",
+     "startedAt": "2026-10-01T10:30:12.000Z",
+     "firstEventAt": "2026-10-01T10:30:18.000Z",
+     "endedAt": "2026-10-01T10:33:00.000Z",
+     "promptChars": 10500,
+     "nativeToolCalls": 6,
+     "orbitToolCalls": 1
+    },
+    {
+     "turn": 3,
+     "transport": "session",
+     "startedAt": "2026-10-01T10:38:00.000Z",
+     "firstEventAt": "2026-10-01T10:38:06.000Z",
+     "endedAt": null,
+     "promptChars": 12000,
+     "nativeToolCalls": 9,
+     "orbitToolCalls": 2
+    }
+   ]
+  },
+  {
+   "id": "h-nest-sub",
+   "parentId": "h-nest",
+   "depth": 2,
+   "name": "refactor-store",
+   "role": "Agent",
+   "status": "done",
+   "providerId": "claude",
+   "model": "claude-sonnet-5-5",
+   "task": "Synthetic helper refactor-store",
+   "startedAt": "2026-10-01T10:13:03.000Z",
+   "finishedAt": "2026-10-01T10:24:00.000Z",
+   "turns": 1,
+   "generation": 0,
+   "turnTimings": [
+    {
+     "turn": 1,
+     "transport": "session",
+     "startedAt": "2026-10-01T10:13:03.000Z",
+     "firstEventAt": "2026-10-01T10:13:09.000Z",
+     "endedAt": "2026-10-01T10:24:00.000Z",
+     "promptChars": 9000,
+     "nativeToolCalls": 61,
+     "orbitToolCalls": 0
+    }
+   ]
+  },
+  {
+   "id": "h-nest-subsub",
+   "parentId": "h-nest-sub",
+   "depth": 3,
+   "name": "refactor-store-tests",
+   "role": "Agent",
+   "status": "done",
+   "providerId": "codex",
+   "model": "gpt-6-luna",
+   "task": "Synthetic helper refactor-store-tests",
+   "startedAt": "2026-10-01T10:15:03.000Z",
+   "finishedAt": "2026-10-01T10:21:48.000Z",
+   "turns": 1,
+   "generation": 0,
+   "turnTimings": [
+    {
+     "turn": 1,
+     "transport": "session",
+     "startedAt": "2026-10-01T10:15:03.000Z",
+     "firstEventAt": "2026-10-01T10:15:09.000Z",
+     "endedAt": "2026-10-01T10:21:48.000Z",
+     "promptChars": 9000,
+     "nativeToolCalls": 18,
+     "orbitToolCalls": 0
+    }
+   ]
+  },
+  {
+   "id": "h-long",
+   "parentId": "root",
+   "depth": 1,
+   "name": "review-isolation-of-the-parallel-helpers-and-merge-back",
+   "role": "Agent",
+   "status": "done",
+   "providerId": "claude",
+   "model": "claude-opus-5-5",
+   "task": "Synthetic helper review-isolation-of-the-parallel-helpers-and-merge-back",
+   "startedAt": "2026-10-01T10:21:03.000Z",
+   "finishedAt": "2026-10-01T10:29:42.000Z",
+   "turns": 1,
+   "generation": 0,
+   "turnTimings": [
+    {
+     "turn": 1,
+     "transport": "session",
+     "startedAt": "2026-10-01T10:21:03.000Z",
+     "firstEventAt": "2026-10-01T10:21:09.000Z",
+     "endedAt": "2026-10-01T10:29:42.000Z",
+     "promptChars": 9000,
+     "nativeToolCalls": 44,
+     "orbitToolCalls": 3
+    }
+   ]
+  },
+  {
+   "id": "h-handover",
+   "parentId": "root",
+   "depth": 1,
+   "name": "tests-for-timeline",
+   "role": "Agent",
+   "status": "done",
+   "providerId": "antigravity",
+   "model": "gemini-3.1-pro-high",
+   "task": "Synthetic helper tests-for-timeline",
+   "startedAt": "2026-10-01T10:23:03.000Z",
+   "finishedAt": "2026-10-01T10:35:12.000Z",
+   "turns": 2,
+   "generation": 1,
+   "handovers": [
+    {
+     "id": "handover-1",
+     "time": "2026-10-01T10:26:36.000Z",
+     "reason": "exhausted",
+     "from": {
+      "providerId": "codex",
+      "model": "gpt-6-astra",
+      "reasoningEffort": "xhigh"
+     },
+     "to": {
+      "providerId": "antigravity",
+      "model": "gemini-3.1-pro-high",
+      "reasoningEffort": ""
+     },
+     "fresh": false,
+     "interrupted": true,
+     "usedPercent": 100,
+     "resetsAt": null,
+     "turn": 0
+    }
+   ],
+   "turnTimings": [
+    {
+     "turn": 1,
+     "transport": "session",
+     "startedAt": "2026-10-01T10:23:03.000Z",
+     "firstEventAt": "2026-10-01T10:23:09.000Z",
+     "endedAt": "2026-10-01T10:26:30.000Z",
+     "promptChars": 9000,
+     "nativeToolCalls": 20,
+     "orbitToolCalls": 1
+    },
+    {
+     "turn": 1,
+     "transport": "session",
+     "startedAt": "2026-10-01T10:26:40.200Z",
+     "firstEventAt": "2026-10-01T10:26:46.200Z",
+     "endedAt": "2026-10-01T10:35:12.000Z",
+     "promptChars": 10500,
+     "nativeToolCalls": 41,
+     "orbitToolCalls": 1
+    }
+   ]
+  },
+  {
+   "id": "h-live",
+   "parentId": "root",
+   "depth": 1,
+   "name": "live-worker",
+   "role": "Agent",
+   "status": "working",
+   "providerId": "claude",
+   "model": "claude-sonnet-5-5",
+   "task": "Synthetic helper live-worker",
+   "startedAt": "2026-10-01T10:28:03.000Z",
+   "turns": 2,
+   "generation": 0,
+   "turnTimings": [
+    {
+     "turn": 1,
+     "transport": "session",
+     "startedAt": "2026-10-01T10:28:03.000Z",
+     "firstEventAt": "2026-10-01T10:28:09.000Z",
+     "endedAt": "2026-10-01T10:31:00.000Z",
+     "promptChars": 9000,
+     "nativeToolCalls": 22,
+     "orbitToolCalls": 1
+    },
+    {
+     "turn": 2,
+     "transport": "session",
+     "startedAt": "2026-10-01T10:36:30.000Z",
+     "firstEventAt": "2026-10-01T10:36:36.000Z",
+     "endedAt": null,
+     "promptChars": 10500,
+     "nativeToolCalls": 7,
+     "orbitToolCalls": 0
+    }
+   ]
+  },
+  {
+   "id": "h-crashed",
+   "parentId": "root",
+   "depth": 1,
+   "name": "crashed-helper",
+   "role": "Agent",
+   "status": "interrupted",
+   "providerId": "claude",
+   "model": "claude-sonnet-5-5",
+   "task": "Synthetic helper crashed-helper",
+   "startedAt": "2026-10-01T10:14:03.000Z",
+   "finishedAt": "2026-10-01T10:18:00.000Z",
+   "turns": 1,
+   "generation": 0,
+   "turnTimings": [
+    {
+     "turn": 1,
+     "transport": "session",
+     "startedAt": "2026-10-01T10:14:03.000Z",
+     "firstEventAt": "2026-10-01T10:14:09.000Z",
+     "endedAt": null,
+     "promptChars": 9000,
+     "nativeToolCalls": 12,
+     "orbitToolCalls": 0
+    }
+   ]
+  }
+ ],
+ "communications": [
+  {
+   "id": "spawn-user",
+   "kind": "spawn",
+   "fromAgentId": "user",
+   "toAgentId": "root",
+   "fromAgentName": "Вы",
+   "toAgentName": "Orbit",
+   "time": "2026-10-01T10:00:00.000Z",
+   "status": "read",
+   "delivery": "mailbox",
+   "text": ""
+  },
+  {
+   "id": "spawn-h-done",
+   "kind": "spawn",
+   "fromAgentId": "root",
+   "toAgentId": "h-done",
+   "fromAgentName": "Orbit",
+   "toAgentName": "implement-tokens",
+   "time": "2026-10-01T10:03:00.000Z",
+   "status": "read",
+   "delivery": "next-turn",
+   "text": ""
+  },
+  {
+   "id": "spawn-h-error",
+   "kind": "spawn",
+   "fromAgentId": "root",
+   "toAgentId": "h-error",
+   "fromAgentName": "Orbit",
+   "toAgentName": "fix-flaky-test",
+   "time": "2026-10-01T10:04:12.000Z",
+   "status": "read",
+   "delivery": "next-turn",
+   "text": ""
+  },
+  {
+   "id": "spawn-h-cancelled",
+   "kind": "spawn",
+   "fromAgentId": "root",
+   "toAgentId": "h-cancelled",
+   "fromAgentName": "Orbit",
+   "toAgentName": "review-docs",
+   "time": "2026-10-01T10:06:00.000Z",
+   "status": "read",
+   "delivery": "next-turn",
+   "text": ""
+  },
+  {
+   "id": "spawn-h-queued",
+   "kind": "spawn",
+   "fromAgentId": "root",
+   "toAgentId": "h-queued",
+   "fromAgentName": "Orbit",
+   "toAgentName": "queued-lint-check",
+   "time": "2026-10-01T10:36:00.000Z",
+   "status": "read",
+   "delivery": "next-turn",
+   "text": ""
+  },
+  {
+   "id": "spawn-h-paused",
+   "kind": "spawn",
+   "fromAgentId": "root",
+   "toAgentId": "h-paused",
+   "fromAgentName": "Orbit",
+   "toAgentName": "migrate-settings",
+   "time": "2026-10-01T10:08:00.000Z",
+   "status": "read",
+   "delivery": "next-turn",
+   "text": ""
+  },
+  {
+   "id": "spawn-h-legacy",
+   "kind": "spawn",
+   "fromAgentId": "root",
+   "toAgentId": "h-legacy",
+   "fromAgentName": "Orbit",
+   "toAgentName": "legacy-record",
+   "time": "2026-10-01T10:02:18.000Z",
+   "status": "read",
+   "delivery": "next-turn",
+   "text": ""
+  },
+  {
+   "id": "spawn-h-nest",
+   "kind": "spawn",
+   "fromAgentId": "root",
+   "toAgentId": "h-nest",
+   "fromAgentName": "Orbit",
+   "toAgentName": "orchestrate-refactor",
+   "time": "2026-10-01T10:12:30.000Z",
+   "status": "read",
+   "delivery": "next-turn",
+   "text": ""
+  },
+  {
+   "id": "spawn-h-nest-sub",
+   "kind": "spawn",
+   "fromAgentId": "h-nest",
+   "toAgentId": "h-nest-sub",
+   "fromAgentName": "orchestrate-refactor",
+   "toAgentName": "refactor-store",
+   "time": "2026-10-01T10:13:00.000Z",
+   "status": "read",
+   "delivery": "next-turn",
+   "text": ""
+  },
+  {
+   "id": "spawn-h-nest-subsub",
+   "kind": "spawn",
+   "fromAgentId": "h-nest-sub",
+   "toAgentId": "h-nest-subsub",
+   "fromAgentName": "refactor-store",
+   "toAgentName": "refactor-store-tests",
+   "time": "2026-10-01T10:15:00.000Z",
+   "status": "read",
+   "delivery": "next-turn",
+   "text": ""
+  },
+  {
+   "id": "spawn-h-long",
+   "kind": "spawn",
+   "fromAgentId": "root",
+   "toAgentId": "h-long",
+   "fromAgentName": "Orbit",
+   "toAgentName": "review-isolation-of-the-parallel-helpers-and-merge-back",
+   "time": "2026-10-01T10:21:00.000Z",
+   "status": "read",
+   "delivery": "next-turn",
+   "text": ""
+  },
+  {
+   "id": "spawn-h-handover",
+   "kind": "spawn",
+   "fromAgentId": "root",
+   "toAgentId": "h-handover",
+   "fromAgentName": "Orbit",
+   "toAgentName": "tests-for-timeline",
+   "time": "2026-10-01T10:23:00.000Z",
+   "status": "read",
+   "delivery": "next-turn",
+   "text": ""
+  },
+  {
+   "id": "spawn-h-live",
+   "kind": "spawn",
+   "fromAgentId": "root",
+   "toAgentId": "h-live",
+   "fromAgentName": "Orbit",
+   "toAgentName": "live-worker",
+   "time": "2026-10-01T10:28:00.000Z",
+   "status": "read",
+   "delivery": "next-turn",
+   "text": ""
+  },
+  {
+   "id": "spawn-h-crashed",
+   "kind": "spawn",
+   "fromAgentId": "root",
+   "toAgentId": "h-crashed",
+   "fromAgentName": "Orbit",
+   "toAgentName": "crashed-helper",
+   "time": "2026-10-01T10:14:00.000Z",
+   "status": "read",
+   "delivery": "next-turn",
+   "text": ""
+  }
+ ],
+ "traces": [],
+ "messages": []
+}

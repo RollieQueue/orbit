@@ -50,11 +50,11 @@ test('the table leaves out what the user or the audit ruled out: Fable, Haiku, G
 // ---- The choice ---------------------------------------------------------------------------------------------------
 
 test('with every subscription healthy each kind gets its first choice at the level the audit measured', () => {
-  const expected = { code: ['claude/sonnet', 'high'], review: ['codex/gpt-6-astra', 'high'], lookup: ['codex/gpt-6-luna', ''], text: ['claude/opus', 'high'] }
+  const expected = { code: ['claude/sonnet', 'high'], review: ['codex/gpt-6-astra', 'high'], lookup: ['codex/gpt-6-luna', 'medium'], text: ['claude/opus', 'high'] }
   for (const [kind, [model, effort]] of Object.entries(expected)) {
     const result = route(input({ kind }))
     assert.equal(picked(result), model, kind)
-    assert.equal(result.choice.reasoningEffort, effort, `${kind}: a level the target does not offer is dropped (Luna lists only low and medium here)`)
+    assert.equal(result.choice.reasoningEffort, effort, `${kind}: a level the target does not offer becomes its nearest one (Luna lists only low and medium here: high -> medium)`)
     assert.deepEqual(result.skipped, [], kind)
   }
   assert.equal(route(input({ kind: 'code', quota: fakeQuota({ claude: { windows: [w(100)] } }) })).choice.reasoningEffort, 'high', 'Astra offers high')
@@ -193,14 +193,14 @@ test('an explicit model wins over the kind, and providerId alone keeps the routi
   assert.deepEqual([helperOf(second).providerId, helperOf(second).model, helperOf(second).reasoningEffort], ['codex', 'gpt-6-astra', 'high'])
 })
 
-test('the level: the caller\'s, else the provider settings\', else the parent\'s own model\'s, else the measured one', async t => {
+test('the level: the caller\'s, else the measured one, which beats the provider settings and the parent\'s level', async t => {
   const caller = world(t)
   assert.equal(helperOf(await finished(caller.make({ kind: 'review', reasoningEffort: 'low' }), payload(folder(t)))).reasoningEffort, 'low')
   const settings = world(t)
-  assert.equal(helperOf(await finished(settings.make({ kind: 'review' }), payload(folder(t), { providerOptions: { codex: { reasoningEffort: 'xhigh' } } }))).reasoningEffort, 'xhigh')
+  assert.equal(helperOf(await finished(settings.make({ kind: 'review' }), payload(folder(t), { providerOptions: { codex: { reasoningEffort: 'xhigh' } } }))).reasoningEffort, 'high', 'the routing table\'s level, not the provider settings\'')
   const same = world(t)
   const inherited = helperOf(await finished(same.make({ kind: 'text' }), payload(folder(t), { reasoningEffort: 'max' })))
-  assert.deepEqual([inherited.providerId, inherited.model, inherited.reasoningEffort], ['claude', 'opus', 'max'], "the parent's own model keeps the parent's level")
+  assert.deepEqual([inherited.providerId, inherited.model, inherited.reasoningEffort, inherited.effortSource], ['claude', 'opus', 'high', 'routing'], 'the routing table\'s level also beats the parent\'s level on the parent\'s own model')
 })
 
 test('without a usable candidate, or without the provider list, the helper gets what it would get without a kind', async t => {
@@ -321,6 +321,9 @@ test('a provider list that does not come is waited for only so long; then only t
 })
 
 test('a subscription without candidates for the kind is not waited for, and the note says so', async t => {
+  const previous = process.env.ORBIT_ROUTE_WAIT_MS
+  process.env.ORBIT_ROUTE_WAIT_MS = '50'
+  t.after(() => { if (previous === undefined) delete process.env.ORBIT_ROUTE_WAIT_MS; else process.env.ORBIT_ROUTE_WAIT_MS = previous })
   let spawned = null
   const runtime = new OrbitRuntime({ quota: quietQuota(t), catalog: () => new Promise(() => {}), runProvider: async options => {
     const [, name] = identity(options.prompt)
@@ -338,6 +341,9 @@ test('a subscription without candidates for the kind is not waited for, and the 
 })
 
 test('a pause that cuts the caller\'s turn while the model is chosen creates no helper behind its back', async t => {
+  const previous = process.env.ORBIT_ROUTE_WAIT_MS
+  process.env.ORBIT_ROUTE_WAIT_MS = '50'
+  t.after(() => { if (previous === undefined) delete process.env.ORBIT_ROUTE_WAIT_MS; else process.env.ORBIT_ROUTE_WAIT_MS = previous })
   let release = null, spawning = null, turns = 0
   const runtime = new OrbitRuntime({ quota: quietQuota(t), catalog: () => new Promise(resolve => { release = () => resolve(CATALOG) }), runProvider: async options => {
     const [, name] = identity(options.prompt)

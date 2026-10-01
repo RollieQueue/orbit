@@ -2,7 +2,7 @@
   "notes": [
     "The model spawn_agent gives a helper when the caller names the kind of work and no model: the candidates of that kind are tried top to bottom, and the first one that is connected, allowed by the user's provider pool and not near its quota limit takes the work.",
     "The order follows the model audit of 2026-09-30 (docs/MODEL-AUDIT.md, «Кратко: кого звать»): the first choice, then the other subscriptions, as a reserve and to spread the quota. 'why' says what the audit measured.",
-    "reasoningEffort is the level the audit ran at. The helper gets it only when neither the caller, the provider pool nor the provider's own settings name a level and it is not simply its parent's model.",
+    "reasoningEffort is the level the audit ran at. The helper gets it unless the caller or the provider pool name a level; it beats the parent's level and the provider settings, and is moved to the nearest level the model offers.",
     "Left out on purpose: Claude Fable 5.1 (the user's rule of 2026-09-30: it spends far more quota and is not better than Opus), Claude Haiku 4.5 and GPT-OSS 120B (failed the audit), GPT-5.6 Luna (failed the logic part) and Cursor (not measured: its free plan was used up).",
     "Claude models are named by the CLI aliases the provider list shows (sonnet, opus); an alias follows the newest model of its family."
   ],

@@ -13,6 +13,8 @@ export type Agent = {
   detail?: string
   model?: string
   reasoningEffort?: string
+  // Who picked the reasoning level: 'caller' (the parent's spawn call: Orbit), 'routing', 'pool', 'parent', 'settings', or '' (unknown).
+  effortSource?: string
   parentId?: string | null
   depth?: number
   providerId?: string | null

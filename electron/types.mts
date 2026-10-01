@@ -170,10 +170,15 @@ export interface TurnSlot { held: boolean }
 export interface ActiveTurn { slot: TurnSlot; timing: TurnTiming; changed: boolean; nativeSeen: Set<string>; stream: StreamState | null; delivered: Set<string>; signal: AbortSignal; interrupt: (reason?: import('./runtime/pause.mts').InterruptReason) => void; watch?: import('./runtime/watchdog.mts').TurnWatch | null }
 // An answer kept while an optional extra turn runs, and the ids of the user's messages the model had read when it wrote it.
 export interface DraftAnswer { text: string; read: Set<string> }
+// Where a helper's reasoning level came from, strongest first: the spawn_agent call, the user's provider pool, the routing
+// table's level for the kind of work, the parent running the same model, the provider's settings; '' when none gave one.
+export type EffortSource = 'caller' | 'pool' | 'routing' | 'parent' | 'settings' | ''
 export interface AgentRecord {
   paused?: boolean; pausedAt?: string | null; stoppedByUser?: boolean; pausedSession?: string | null
   id: string; parentId: string | null; depth: number; name: string; role: string; task: string; reason: string
   providerId: string; model: string; memoryProfile: MemoryProfile; reasoningEffort: string; requestedModel: string
+  // Which rule gave the helper its level (agents.decideEffort), and the short reason spawn_agent reports (internal).
+  effortSource?: EffortSource; effortNote?: string
   status: AgentStatus; progress: number; detail: string; startedAt: string | null; finishedAt: string | null; result: string; error: string | null
   turns: number; generation: number; inbox: unknown[]; seenChildren: Set<string>; transcript: TranscriptEntry[]; transcriptChars: number
   previousWork: PreviousWork[]; ledger: LedgerEntry[]; ledgerDropped: Record<string, number>
@@ -199,14 +204,22 @@ export interface AgentIsolation { kind: 'worktree' | 'orbit'; path: string; base
 // record starts with, or why there is none.
 export type IsolationPrepared = { ok: true; id: string; fields: Partial<AgentRecord> } | { ok: false; reason: string; instruction?: string }
 // The fields that stay inside the runtime; snapshots and events carry the rest (util.INTERNAL_AGENT_FIELDS).
-export type InternalAgentField = 'inbox' | 'seenChildren' | 'requestedModel' | 'transcript' | 'previousWork' | 'ledger' | 'ledgerDropped' | 'workDone' | 'failedCandidates' | 'trial' | 'partialTurn' | 'quotaWarned' | 'draftAnswer' | 'activeTurn' | 'stream' | 'sessionToken' | 'sessionCursor' | 'transcriptChars' | 'pausedSession' | 'mailMark'
+export type InternalAgentField = 'inbox' | 'seenChildren' | 'requestedModel' | 'transcript' | 'previousWork' | 'ledger' | 'ledgerDropped' | 'workDone' | 'failedCandidates' | 'trial' | 'partialTurn' | 'quotaWarned' | 'draftAnswer' | 'activeTurn' | 'stream' | 'sessionToken' | 'sessionCursor' | 'transcriptChars' | 'pausedSession' | 'mailMark' | 'effortNote'
 export type PublicAgent = Omit<AgentRecord, InternalAgentField>
 // What an agent's execution resolves to (completeAgent), or the error a scheduled agent ended with.
 export interface AgentResult { agentId: string; generation: number; status: AgentStatus; result?: string; error?: string; budgetLimited?: boolean }
 // spawn_agent {kind}: the model Orbit chose for that kind of work (`model` provider/model, null when none could take it)
 // and the better candidates it passed over, with why.
-export interface RoutedSpawn { kind: string; model: string | null; skipped?: string[]; note?: string }
-export interface SpawnResult { ok: boolean; reason?: string; instruction?: string; reused?: boolean; agentId?: string; status?: AgentStatus; agent?: PublicAgent; routed?: RoutedSpawn }
+// `reasoningEffort`: the routing table's level for the chosen model (empty when it offers none), applied under the caller's
+// and the pool's levels (agents.decideEffort); it is not part of what the model is told.
+export interface RoutedSpawn { kind: string; model: string | null; skipped?: string[]; note?: string; reasoningEffort?: string }
+// What spawn_agent answers: who the helper is and which model and level it runs on, not the task, result or traces the
+// caller already has or can ask for (wait_agent, list_agents). `effort` says why the level is what it is.
+export interface SpawnResult {
+  ok: boolean; reason?: string; instruction?: string; reused?: boolean; agentId?: string; status?: AgentStatus
+  name?: string; providerId?: string; model?: string; reasoningEffort?: string; effortSource?: EffortSource; effort?: string
+  isolation?: AgentIsolation; routed?: RoutedSpawn
+}
 export interface FollowupResult { ok: true; agentId: string; generation: number; status: AgentStatus }
 export interface TeamDigest { running: string[]; finished: string[] }
 export interface AgentDirectoryEntry {
@@ -236,7 +249,7 @@ export interface RunRecord {
   memoryEnabled: boolean; globalMemoryEnabled: boolean; memoryContext: MemoryEntry[]
   improvementMode: boolean; improvements: ImprovementTask[]; improvementStatus: ImprovementStatus
   providerOptions: Record<string, ProviderOptions>; providerPool: PoolMember[]; sharedContext: SharedContext; evaluations: Set<string>
-  failover: FailoverConfig; models: Record<string, unknown>; catalogCache: { at: number; value: Promise<CatalogEntry[]> } | null; brokenProviders: Map<string, number>
+  failover: FailoverConfig; models: Record<string, unknown>; catalogCache: { at: number; value: Promise<CatalogEntry[]>; list?: CatalogEntry[]; waited?: boolean } | null; brokenProviders: Map<string, number>
   history: HistoryEntry[]; agentInstructions: string; accessMode: AccessMode; reasoningEffort: string; approvalPolicy: ApprovalPolicy
   status: RunStatus; startedAt: string; limits: RunLimits; contextExplicit: boolean; usage: Usage
   agentNodes: Map<string, AgentRecord>; agentControllers: Map<string, AgentController>; agentOperations: Map<string, Set<Promise<unknown>>>
@@ -257,6 +270,9 @@ export interface RunRecord {
   // must know, the closed task keys (`id|title`) the run started with, and whether restart_orbit applied this run's change
   // or was refused in a way the next task's restart resolves (cycle limit, other chats working, declined).
   loopTask?: number; improvementHandoff?: string; improvementBaseline?: Map<string, ImprovementTask>; restartApplied?: boolean; restartDeferred?: boolean
+  // Orbit's code on disk when an improvement-mode run started (RestartHost.codeOnDisk): a part another chat changed before
+  // is not this run's to apply.
+  codeAtStart?: import('./resume.mts').CodeHashes | null
   // The isolated copies of this run's helpers by agent id (runtime/isolation.mts): taken away when the run ends.
   copies?: Map<string, import('./agent-worktree.mts').AgentCopy>
 }
@@ -272,7 +288,7 @@ export interface RunSnapshot {
   traces: Trace[]; messages: Message[]; communications: Communication[]; summary: RunSummary | null; error: string | null
   files: FileActivitySnapshot[]; changes: FileChange[]; router: RouterStats
   startPayload?: StartPayload; resumedFrom?: string; resumeChain?: number; restart?: RestartMark; attachments?: Attachment[]
-  loopTask?: number; improvementHandoff?: string
+  loopTask?: number; improvementHandoff?: string; restartApplied?: boolean; restartDeferred?: boolean
 }
 // An earlier turn of the chat as chat-memory presents it (a live run or a saved snapshot): chat-memory's own RunView.
 export type ChatRunView = import('./chat-memory.mts').RunView
@@ -288,6 +304,8 @@ export interface StoredRun {
   attachments?: unknown
   // The improvement plan an improvement-mode run left (read back by runtime/improvement.mts loadPlan).
   improvements?: unknown; improvementStatus?: unknown; improvementHandoff?: unknown; loopTask?: number
+  // Whether restart_orbit applied the run's change of Orbit's code, or was refused so that a later restart applies it.
+  restartApplied?: boolean; restartDeferred?: boolean
 }
 export interface StartPayload {
   prompt?: string; providerId?: string; workspace?: string; projectId?: string; chatId?: string; mode?: string; accessMode?: string; approvalPolicy?: string
@@ -555,6 +573,8 @@ export interface OrbitRuntimeOptions {
 export interface OrbitRuntimeLike {
   runProvider: RunProvider; memoryStore: MemoryStoreLike | null; capabilityStore: CapabilityStoreLike | null; runStore: RunStoreLike | null
   requestApproval: ApprovalHandler | null; clock: () => number; projectIndex: ProjectIndexLike | null; quota: QuotaMonitorLike | null; catalog: CatalogLike | null
+  // The provider list a run of this runtime last read: the next runs' root prompts take the reasoning levels from it at once.
+  lastCatalog?: { at: number; list: CatalogEntry[] } | null
   contextStore: ContextStoreLike | null; sharing: Map<string, boolean>; lastShare: number
   mcp: McpServerLike | null | false; mcpStarted: Promise<McpServerLike | null> | null; mcpError: Error | null
   transportFor: TransportFor | null; closeSession: CloseSession | null; toolRegistry: ToolRegistryLike | null | undefined; sessions: Map<string, SessionRef>
@@ -600,7 +620,7 @@ export interface OrbitRuntimeLike {
   // restart
   setRestartHost(host: import('./resume.mts').RestartHost | null): void
   // agents
-  createAgent(run: RunRecord, parent: AgentRecord | null, spec: ToolArgs, extra?: Partial<AgentRecord>): AgentRecord
+  createAgent(run: RunRecord, parent: AgentRecord | null, spec: ToolArgs, extra?: Partial<AgentRecord>, routedEffort?: string): AgentRecord
   scheduleAgent(run: RunRecord, agent: AgentRecord): Promise<AgentResult>
   spawnSubAgent(runId: string, parentId: string, spec?: ToolArgs): Promise<SpawnResult>
   resolveAgent(run: RunRecord, reference: unknown): AgentRecord
@@ -671,6 +691,7 @@ export interface OrbitRuntimeLike {
   // handover
   failoverActive(run: RunRecord): boolean
   providerCatalog(run: RunRecord): Promise<CatalogEntry[]>
+  settleCatalog(run: RunRecord): Promise<void>
   preflightQuota(run: RunRecord, agent: AgentRecord): Promise<void>
   handover(run: RunRecord, agent: AgentRecord, request: HandoverRequest): Promise<boolean>
   recoverProvider(run: RunRecord, agent: AgentRecord, error: unknown): Promise<boolean>

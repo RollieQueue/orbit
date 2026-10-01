@@ -4,7 +4,7 @@ const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
 const quota = require('../electron/quota.mts')
-const { OrbitRuntime } = require('../electron/runtime.mts')
+const { OrbitRuntime } = require('./helpers-runtime.cjs')
 const { _testing } = require('../electron/providers.mts')
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
@@ -128,7 +128,7 @@ test('a native tool that is still running is not silence, however long it takes'
   const runtime = new OrbitRuntime({ runProvider: async options => {
     calls++
     options.onEvent({ kind: 'tool', native: true, toolId: 'build-1', tool: 'commandExecution', text: 'npm run build', status: 'started' })
-    await sleep(STALL_MS * 5)
+    await sleep(STALL_MS * 3)
     options.onEvent({ kind: 'tool', native: true, toolId: 'build-1', tool: 'commandExecution', text: 'npm run build', status: 'completed' })
     return { text: 'FINAL_ANSWER' }
   } })
@@ -143,7 +143,7 @@ test('a pending Orbit tool call over MCP is not silence', async t => {
   let calls = 0
   const runtime = new OrbitRuntime({ mcp: fakeMcp(() => ({ pending: 1, lastAt: Date.now() })), transportFor: () => 'session', runProvider: async options => {
     calls++
-    await sleep(STALL_MS * 5)
+    await sleep(STALL_MS * 3)
     return { text: 'FINAL_ANSWER', sessionId: options.session.id }
   } })
   const run = await start(t, runtime)
@@ -157,7 +157,7 @@ test('ORBIT_STALL_MS=0 switches the watchdog off', async t => {
   let calls = 0
   const runtime = new OrbitRuntime({ runProvider: async options => {
     calls++
-    await sleep(STALL_MS * 5)
+    await sleep(STALL_MS * 3)
     assert.equal(options.signal.aborted, false)
     return { text: 'FINAL_ANSWER' }
   } })

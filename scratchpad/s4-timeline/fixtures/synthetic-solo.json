@@ -1,0 +1,56 @@
+{
+ "runId": "synthetic-solo-run",
+ "projectId": "project-local",
+ "chatId": "synthetic-chat",
+ "status": "working",
+ "startedAt": "2026-10-01T10:00:00.000Z",
+ "updatedAt": "2026-10-01T10:03:00.000Z",
+ "providerId": "claude",
+ "model": "opus",
+ "workspace": ".",
+ "prompt": "Пример запуска",
+ "agents": [
+  {
+   "id": "root",
+   "parentId": null,
+   "depth": 0,
+   "name": "Orbit",
+   "role": "Agent",
+   "status": "working",
+   "providerId": "claude",
+   "model": "opus",
+   "task": "Пример запуска",
+   "startedAt": "2026-10-01T10:00:06.000Z",
+   "turns": 1,
+   "generation": 0,
+   "turnTimings": [
+    {
+     "turn": 1,
+     "transport": "session",
+     "startedAt": "2026-10-01T10:00:06.000Z",
+     "firstEventAt": "2026-10-01T10:00:12.000Z",
+     "endedAt": null,
+     "promptChars": 9000,
+     "nativeToolCalls": 23,
+     "orbitToolCalls": 4
+    }
+   ]
+  }
+ ],
+ "communications": [
+  {
+   "id": "spawn-user",
+   "kind": "spawn",
+   "fromAgentId": "user",
+   "toAgentId": "root",
+   "fromAgentName": "Вы",
+   "toAgentName": "Orbit",
+   "time": "2026-10-01T10:00:00.000Z",
+   "status": "read",
+   "delivery": "mailbox",
+   "text": ""
+  }
+ ],
+ "traces": [],
+ "messages": []
+}

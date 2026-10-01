@@ -5,11 +5,34 @@ import { setMaxListeners } from 'node:events'
 import { saveNote } from '../shared-context.mts'
 import * as chatMemory from '../chat-memory.mts'
 import { ROUTING_KINDS } from '../model-routing.mts'
-import type { AgentDirectoryEntry, AgentRecord, AgentResult, ChildResultEntry, FollowupResult, IsolationPrepared, ModelTarget, OrbitRuntimeLike, PublicAgent, RoutedSpawn, RunRecord, SpawnResult, TeamDigest, ToolArgs, TurnWaiter, WorkedModel } from '../types.mts'
+import { RANK, offeredLevels, clampEffort } from '../reasoning-levels.mts'
+import type { AgentDirectoryEntry, AgentRecord, EffortSource, AgentResult, ChildResultEntry, FollowupResult, IsolationPrepared, ModelTarget, OrbitRuntimeLike, PublicAgent, RoutedSpawn, RunRecord, SpawnResult, TeamDigest, ToolArgs, TurnWaiter, WorkedModel } from '../types.mts'
 import { TERMINAL, AGENT_TERMINAL, ceiling, USER, newMailMark, withoutGoogleReasoning, answerLimit, publicAgent, agentTokens, bounded, clip, abortError } from './util.mts'
 
+// The reasoning level of a helper and why. The first rule that names one wins: the level the caller passed to spawn_agent, the
+// user's provider pool entry for the model (its empty level means "auto"), the routing table's level for the kind of work,
+// the parent's level when the helper runs the parent's model, the provider's settings. Whatever won is moved to the nearest
+// level the model offers (reasoning-levels.mts), never refused. `note` is the short reason spawn_agent reports.
+interface EffortChoice { level: string; source: EffortSource; note: string }
+function decideEffort(run: RunRecord, spec: ToolArgs, providerId: string, model: string, poolEffort: string | undefined, routedEffort: string | undefined, inheritedEffort: string | undefined): EffortChoice {
+  const ranked: [EffortSource, string | undefined][] = [['caller', spec.reasoningEffort || undefined], ['pool', poolEffort], ['routing', routedEffort || undefined], ['parent', inheritedEffort || undefined], ['settings', run.providerOptions[providerId]?.reasoningEffort || undefined]]
+  const [source, asked = ''] = ranked.find(([, level]) => level !== undefined) || ['', '']
+  const entry = run.catalogCache?.list?.find(item => item.id === providerId)
+  const offered = offeredLevels(providerId, model, entry)
+  const why = { caller: 'as asked', pool: asked ? 'your provider pool setting' : 'your provider pool: the provider default', routing: `routing table for ${spec.kind || 'this kind of work'}`, parent: 'same level as the parent, same model', settings: 'provider settings', '': 'none set: the provider default' }[source]
+  // A provider the catalog does not list and Orbit has no default levels for (Ollama, Cursor before the list is known) keeps what was asked: its own check decides.
+  if (!asked || (!entry && !offered.length && providerId !== 'antigravity')) return { level: asked, source, note: why }
+  const { level, clamped } = clampEffort(asked, offered)
+  if (!clamped) return { level, source, note: why }
+  const where = `${providerId}${model ? `/${model}` : ''}`
+  const gives = !offered.length ? 'has no reasoning levels' : level && offered.includes(level) && rankOf(level) < rankOf(asked) && offered.every(item => rankOf(item) <= rankOf(level)) ? `offers up to ${level}` : `offers ${offered.join(', ')}`
+  return { level, source, note: `asked ${asked}; ${where} ${gives}` }
+}
+// A level's step on the ladder, 'enabled' (Ollama's thinking switch) included.
+const rankOf = (level: string): number => RANK[level] ?? -1
 // `extra`: fields the record starts with beyond what the spec says (an isolated helper's id, workspace and isolation).
-function createAgent(runtime: OrbitRuntimeLike, run: RunRecord, parent: AgentRecord | null, spec: ToolArgs, extra: Partial<AgentRecord> = {}): AgentRecord {
+// `routedEffort`: the level of the routing table for the model Orbit chose for the helper's kind of work.
+function createAgent(runtime: OrbitRuntimeLike, run: RunRecord, parent: AgentRecord | null, spec: ToolArgs, extra: Partial<AgentRecord> = {}, routedEffort?: string): AgentRecord {
   const sameProvider = !spec.providerId || spec.providerId === (parent?.providerId || run.providerId)
   const providerId = spec.providerId || parent?.providerId || run.providerId
   const model = spec.model || (sameProvider ? parent?.model || run.model : '')
@@ -17,12 +40,13 @@ function createAgent(runtime: OrbitRuntimeLike, run: RunRecord, parent: AgentRec
   const poolMatches = run.providerPool.filter(item => item.providerId === providerId && item.model === selectedRequestModel)
   const poolMember = poolMatches.find(item => item.reasoningEffort === spec.reasoningEffort) || poolMatches[0]
   const inheritedEffort = sameProvider && (!spec.model || spec.model === parent?.requestedModel || spec.model === parent?.model) ? parent?.reasoningEffort : undefined
+  const effort: EffortChoice = parent ? decideEffort(run, spec, providerId, selectedRequestModel || model, poolMember?.reasoningEffort, routedEffort, inheritedEffort) : { level: withoutGoogleReasoning(providerId, run.reasoningEffort), source: run.reasoningEffort && providerId !== 'antigravity' ? 'settings' : '', note: 'the run level' }
   const agent: AgentRecord = {
     id: parent ? `agent-${randomUUID()}` : 'root', parentId: parent?.id || null, depth: parent ? parent.depth + 1 : 0,
     name: bounded(spec.name || 'Agent', 80), role: 'Agent', task: String(spec.task || ''), reason: bounded(spec.reason, 2000),
     providerId, model,
     memoryProfile: parent ? (spec.memoryProfile === 'project-global' ? 'project-global' : 'project') : 'project-global',
-    reasoningEffort: withoutGoogleReasoning(providerId, parent ? poolMember?.reasoningEffort ?? spec.reasoningEffort ?? inheritedEffort ?? run.providerOptions[providerId]?.reasoningEffort ?? '' : run.reasoningEffort),
+    reasoningEffort: effort.level, effortSource: effort.source, effortNote: effort.note,
     requestedModel: selectedRequestModel,
     status: 'waiting', progress: 0, detail: 'Queued', startedAt: null, finishedAt: null, result: '', error: null,
     turns: 0, generation: 0, inbox: [], seenChildren: new Set(), transcript: [], transcriptChars: 0, previousWork: [], ledger: [], ledgerDropped: {},
@@ -69,11 +93,16 @@ async function spawnSubAgent(runtime: OrbitRuntimeLike, runId: string, parentId:
   // A session call runs inside its caller's turn. A pause that cut the turn meanwhile lost this call's result for the
   // model, so no helper is made behind its back: the resumed model decides again.
   const turn = parent?.activeTurn
-  let routedSpec = spec, routed: RoutedSpawn | null = null
+  let routedSpec = spec, routed: RoutedSpawn | null = null, listed = false
   if (run && parent && ROUTING_KINDS.includes(String(spec.kind)) && !spec.model && !TERMINAL.has(run.status) && !['done', 'error', 'cancelled'].includes(parent.status)
     && String(spec.task || '').trim() && String(spec.reason || '').trim() && !(spec.name && [...run.agentNodes.values()].some(agent => agent.name === bounded(spec.name, 80)))) {
-    ({ spec: routedSpec, routed } = await runtime.routeSpawn(run, parent, spec))
+    ({ spec: routedSpec, routed } = await runtime.routeSpawn(run, parent, spec)); listed = true
     if (turn && parent.activeTurn !== turn) return { ok: false, reason: 'turn_interrupted', instruction: 'Your turn was cut off (a pause) while the helper\'s model was being chosen, so no helper was created; spawn it again if it is still needed.' }
+  }
+  // A level the caller names is moved to what the model offers, which the provider list says (routing has waited for it already).
+  if (run && !listed && spec.reasoningEffort) {
+    await runtime.settleCatalog(run)
+    if (turn && parent && parent.activeTurn !== turn) return { ok: false, reason: 'turn_interrupted', instruction: 'Your turn was cut off (a pause) while the provider list was being read, so no helper was created; spawn it again if it is still needed.' }
   }
   let prepared: Extract<IsolationPrepared, { ok: true }> | undefined, copyRun: RunRecord | undefined
   if (isolation) {
@@ -89,7 +118,10 @@ async function spawnSubAgent(runtime: OrbitRuntimeLike, runId: string, parentId:
   }
   const result = registerSubAgent(runtime, runId, parentId, routedSpec, routed, prepared)
   if (prepared && copyRun && (!result.ok || result.reused)) await runtime.discardIsolation(copyRun, prepared.id)
-  return routed && result.ok && !result.reused ? { ...result, routed } : result
+  // `routed.reasoningEffort` is already in the result as the helper's level.
+  if (!routed || !result.ok || result.reused) return result
+  const { reasoningEffort: _level, ...shown } = routed
+  return { ...result, routed: shown }
 }
 // "Model for review work: claude/opus (passed over codex/gpt-6-astra: quota 93% used)", for the delegation trace.
 function routedLine({ kind, model, skipped }: RoutedSpawn): string {
@@ -129,11 +161,12 @@ function registerSubAgent(runtime: OrbitRuntimeLike, runId: string, parentId: st
   const vetted = vetSpawn(runtime, runId, parentId, spec)
   if (!('run' in vetted)) return vetted
   const { run, parent, prior } = vetted
-  const agent = runtime.createAgent(run, parent, vetted.spec, prepared?.fields)
+  const agent = runtime.createAgent(run, parent, vetted.spec, prepared?.fields, routed?.reasoningEffort)
   if (prior) agent.previousWork.push({ generation: prior.generation ?? 0, task: prior.task, result: prior.result, error: prior.error, files: prior.files })
   runtime.trace(run, parent.id, 'delegation', `${agent.name}: ${agent.task}\nReason: ${agent.reason}${routed ? `\n${routedLine(routed)}` : ''}${agent.isolation ? `\nIsolated copy: ${agent.isolation.path}; its changes merge into ${agent.isolation.target} when it finishes` : ''}`)
   runtime.scheduleAgent(run, agent)
-  return { ok: true, agentId: agent.id, agent: runtime.snapshot(run).agents.find((item) => item.id === agent.id) }
+  // Compact on purpose: the caller wrote the task itself, and the result and traces come through wait_agent.
+  return { ok: true, agentId: agent.id, name: agent.name, status: agent.status, providerId: agent.providerId, model: agent.model, reasoningEffort: agent.reasoningEffort, effortSource: agent.effortSource ?? '', effort: `${agent.reasoningEffort || 'provider default'} (${agent.effortNote})`, ...(agent.isolation ? { isolation: { ...agent.isolation } } : {}) }
 }
 function resolveAgent(runtime: OrbitRuntimeLike, run: RunRecord, reference: unknown): AgentRecord {
   const id = String(reference || '')

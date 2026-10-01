@@ -4,6 +4,7 @@ import { randomUUID } from 'node:crypto'
 import { ORBIT_RESPONSE_SCHEMA } from '../tool-schema.mts'
 import { TERMINAL, ceiling, MCP_TOOL_PREFIX, answerLimit, bounded, clip, isRecord, TurnBudgetError, abortError, abortable, agentWorkspace, diagnostics, markProviderFailure } from './util.mts'
 import { agentEnv } from './restart.mts'
+import { noteCompaction } from './tools.mts'
 import { pauseGate, pausedBy, PauseInterrupt, pauseNote } from './pause.mts'
 import type { InterruptReason } from './pause.mts'
 import { watchTurn, clearSilentTurns, isStall } from './watchdog.mts'
@@ -16,6 +17,11 @@ const STREAM_INTERVAL_MS = 250
 // while the turn runs: a change is published at most once a second, and the delayed update carries the latest state.
 const PROGRESS_INTERVAL_MS = 1000
 const progressTimers = new WeakMap<AgentRecord, ReturnType<typeof setTimeout>>()
+// Claude Code reminds a model that has written nothing to its user for several turns to say what it is doing (checked
+// on 2.1.284: a sonnet session of tool calls only gets it, `CLAUDE_CODE_SILENT_TURN_REMINDER=0` turns it off). A helper's
+// reader is its parent, who takes the result, not status lines: in the batch of 2026-10-01 each reminder cost a helper
+// a text step, about a minute, three times per long helper. The root keeps it: the user does read the root.
+const quietHelperEnv = (agent: AgentRecord): Record<string, string> => agent.id !== 'root' && agent.providerId === 'claude' ? { CLAUDE_CODE_SILENT_TURN_REMINDER: '0' } : {}
 function publishProgress(runtime: OrbitRuntimeLike, run: RunRecord, agent: AgentRecord): void {
   if (progressTimers.has(agent)) return
   const timer = setTimeout(() => {
@@ -239,7 +245,7 @@ async function providerTurn(runtime: OrbitRuntimeLike, run: RunRecord, agent: Ag
     agent.promptChars = (agent.promptChars || 0) + resolvedPrompt.length
     timing.promptChars = resolvedPrompt.length
     // The provider's CLI (and every shell it opens) learns which run it serves: a self-upgrade started there continues it.
-    const extraEnv = agentEnv(runtime, run, agent)
+    const extraEnv = { ...agentEnv(runtime, run, agent), ...quietHelperEnv(agent) }
     // A turn that reports nothing for too long is stopped (watchdog.mts); recoverProvider repeats it or hands it over.
     const turnWatch = watch = agent.activeTurn.watch = watchTurn(agent, session, () => controller.abort())
     providerTask = runtime.trackOperation(run, Promise.resolve().then(() => runtime.runProvider({
@@ -255,6 +261,8 @@ async function providerTurn(runtime: OrbitRuntimeLike, run: RunRecord, agent: Ag
         if (controller.signal.aborted) return
         // The stream naming its session is not the model speaking: the turn's record names that session at once, and a cut
         // first turn resumes it (below).
+        // A compacted session is another context for the results it was shown (tools.mts); it is no trace.
+        if (event?.kind === 'compaction') { noteCompaction(agent); return }
         if (event?.kind !== 'session') return runtime.providerEvent(run, agent, event)
         if (!session || !event.sessionId || !timing) return
         timing.sessionId = named = event.sessionId

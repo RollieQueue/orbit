@@ -3,6 +3,8 @@ import path from 'node:path'
 import { createHash } from 'node:crypto'
 import { workspacePath, BUILD_OUTPUT } from './runtime-tools.mts'
 import { redact } from './storage.mts'
+import { projectProfile, hasProfile } from './project-profile.mts'
+import type { ProjectProfile } from './project-profile.mts'
 import type { ContextNote, ContextRecord } from './project-context.mts'
 const fileHashes = new Map<string, { version: string; hash: string }>()
 
@@ -10,7 +12,7 @@ const fileHashes = new Map<string, { version: string; hash: string }>()
 interface NoteStore { getLatest(workspace: string): Partial<ContextRecord> | null; set(workspace: string, snapshot: { notes: ContextNote[] }): unknown }
 // A note with whether the files it depends on still hash the same.
 interface PacketNote extends ContextNote { stale: boolean }
-interface ProjectPacket { updatedAt?: string; overview: { entries: string[]; scripts: Record<string, unknown> }; notes: PacketNote[] }
+interface ProjectPacket { updatedAt?: string; overview: { profile?: ProjectProfile; entries: string[]; scripts: Record<string, unknown> }; notes: PacketNote[] }
 // The arguments of `context_save` after the tool registry validated them: `files` is checked again here.
 interface NoteInput { key?: string | null; summary?: string | null; files?: unknown }
 
@@ -40,7 +42,11 @@ function bootstrap(workspace: string): ProjectPacket['overview'] {
   let scripts: Record<string, unknown> = {}
   // package.json is whatever the project wrote; its `scripts` is shown as found.
   try { scripts = (JSON.parse(fs.readFileSync(path.join(workspace, 'package.json'), 'utf8')) as { scripts?: Record<string, unknown> }).scripts || {} } catch {}
-  return { entries, scripts }
+  // How the project is built, tested, linted and run, whatever its language; first, so that a size cut of the prompt takes
+  // the folder list or the notes before it. Absent when nothing is recognized. Cached by the manifests' modification times.
+  let profile: ProjectProfile | null = null
+  try { profile = projectProfile(workspace, all) } catch { /* A manifest the detector chokes on costs the profile, not the turn. */ }
+  return { ...(profile && hasProfile(profile) ? { profile } : {}), entries, scripts }
 }
 // The notes with their staleness, plus the folder overview. Nothing else: an older version stored a Git fingerprint
 // and file counts next to the notes, and they went out to every agent that asked without telling it anything.

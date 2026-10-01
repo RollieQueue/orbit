@@ -23,7 +23,7 @@ const SKILL_REVIEW_TURNS = 10
 const POLL_TOOLS = new Set(['list_agents', 'read_messages', 'context_read', 'wait_agent', 'wait_message'])
 const POLL_NUDGE_TURNS = 6
 // The stable block appended to a session provider's system prompt never exceeds this (nothing volatile goes in it).
-const SYSTEM_APPEND_LIMIT = 6000
+const SYSTEM_APPEND_LIMIT = 7500
 // Returned by a transport loop when a handover moved the agent to a provider of the other transport.
 export const SWITCH_TRANSPORT = Symbol('switch-transport')
 

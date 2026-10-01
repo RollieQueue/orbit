@@ -144,7 +144,7 @@ npm install
 npm run build          # tsc --noEmit + vite build → dist/ + запись сборки dist/orbit-build.json
 npm start              # Orbit из репозитория (то же, что Orbit.cmd)
 npm run dev            # Vite с HMR + Electron (ORBIT_DEV=1)
-npm test
+npm test              # одна итоговая строка, провалы целиком; полный вывод: $env:ORBIT_TEST_REPORTER='spec'; npm test
 npm run smoke
 npm run smoke:desktop
 npm run verify

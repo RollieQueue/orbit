@@ -1,0 +1,41 @@
+{
+ "runId": "synthetic-empty-run",
+ "projectId": "project-local",
+ "chatId": "synthetic-chat",
+ "status": "working",
+ "startedAt": "2026-10-01T10:00:00.000Z",
+ "updatedAt": "2026-10-01T10:00:00.000Z",
+ "providerId": "claude",
+ "model": "opus",
+ "workspace": ".",
+ "prompt": "Пример запуска",
+ "agents": [
+  {
+   "id": "root",
+   "parentId": null,
+   "depth": 0,
+   "name": "Orbit",
+   "role": "Agent",
+   "status": "waiting",
+   "providerId": "claude",
+   "model": "opus",
+   "task": "Пример запуска"
+  }
+ ],
+ "communications": [
+  {
+   "id": "spawn-user",
+   "kind": "spawn",
+   "fromAgentId": "user",
+   "toAgentId": "root",
+   "fromAgentName": "Вы",
+   "toAgentName": "Orbit",
+   "time": "2026-10-01T10:00:00.000Z",
+   "status": "read",
+   "delivery": "mailbox",
+   "text": ""
+  }
+ ],
+ "traces": [],
+ "messages": []
+}

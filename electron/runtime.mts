@@ -130,7 +130,7 @@ class OrbitRuntime implements OrbitRuntimeLike {
   // ---- restart: restart_orbit's host ----
   setRestartHost(host: RestartHost | null) { return restart.setRestartHost(this, host) }
   // ---- agents: the tree, scheduling, slots, completion ----
-  createAgent(run: RunRecord, parent: AgentRecord | null, spec: ToolArgs, extra?: Partial<AgentRecord>) { return agents.createAgent(this, run, parent, spec, extra) }
+  createAgent(run: RunRecord, parent: AgentRecord | null, spec: ToolArgs, extra?: Partial<AgentRecord>, routedEffort?: string) { return agents.createAgent(this, run, parent, spec, extra, routedEffort) }
   scheduleAgent(run: RunRecord, agent: AgentRecord) { return agents.scheduleAgent(this, run, agent) }
   spawnSubAgent(runId: string, parentId: string, spec?: ToolArgs) { return agents.spawnSubAgent(this, runId, parentId, spec) }
   resolveAgent(run: RunRecord, reference: unknown) { return agents.resolveAgent(this, run, reference) }
@@ -200,6 +200,7 @@ class OrbitRuntime implements OrbitRuntimeLike {
   // ---- handover: subscription failover, model routing ----
   failoverActive(run: RunRecord) { return handovers.failoverActive(this, run) }
   providerCatalog(run: RunRecord) { return handovers.providerCatalog(this, run) }
+  settleCatalog(run: RunRecord) { return handovers.settleCatalog(this, run) }
   preflightQuota(run: RunRecord, agent: AgentRecord) { return handovers.preflightQuota(this, run, agent) }
   handover(run: RunRecord, agent: AgentRecord, request: HandoverRequest) { return handovers.handover(this, run, agent, request) }
   recoverProvider(run: RunRecord, agent: AgentRecord, error: unknown) { return handovers.recoverProvider(this, run, agent, error) }

@@ -361,6 +361,8 @@ test('a second instance started with --relaunch makes the running one shut its r
   assert.deepEqual([calls.relaunch.length, calls.exit.length], [0, 0], 'an ordinary second instance only focuses the window')
   secondInstance({}, ['electron.exe', 'C:\\repo', '--relaunch'], 'C:\\', { relaunch: true })
   secondInstance({}, ['electron.exe', 'C:\\repo', '--relaunch'], 'C:\\', { relaunch: true })
+  // The relaunch comes on a timer: wait for it (a loaded machine delays it), then give a second one the same time to show.
+  await until(() => calls.relaunch.length >= 1, 'the relaunch')
   await delay(100)
   assert.equal(calls.relaunch.length, 1, 'a repeated signal while the relaunch runs does not relaunch twice')
   assert.deepEqual(calls.relaunch[0], { args: process.argv.slice(1).filter((arg) => !['--relaunch', '--restart-runtime', '--reload-renderer'].includes(arg)) })
@@ -392,7 +394,7 @@ test('app:relaunch from the window replies first and then restarts the process',
   const reply = handlers.get('app:relaunch')(trusted)
   assert.deepEqual(reply, { ok: true, pid: process.pid })
   assert.equal(calls.relaunch.length, 0, 'the reply leaves before the relaunch starts')
-  await delay(100)
+  await until(() => calls.relaunch.length >= 1, 'the relaunch')
   assert.equal(calls.relaunch.length, 1)
   assert.deepEqual(calls.exit, [0])
 })
@@ -697,6 +699,8 @@ test('health: a quit during the first start is no failed start; nothing is repor
     windows[0].webContents.fire('did-finish-load')
     appHandlers.get('before-quit')({ preventDefault() {} })
     await until(() => calls.quit === 1, 'quit once the runtime was stopped')
+    // The faked taskkill runs a moment after the quit; a report, if one were wrongly written, would come in the same time.
+    await until(() => executed.length >= 1, 'its tree killed')
     await delay(150)
     assert.equal(fs.existsSync(healthFile), false, 'a report would read as a failed start to the self-upgrade watcher')
     assert.deepEqual([forks[0].exited, forks[0].of('shutdown').length], [true, 0], 'a runtime that was not ready is ended at once')

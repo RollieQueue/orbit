@@ -1,0 +1,87 @@
+/* The run timeline in the agents panel (RunTimeline.tsx): a Gantt chart of the agents' turns, and the «Список | Таймлайн» switch above it.
+   Bar colours follow the status dots of styles.css; the side margin --tl-pad is mirrored by PAD in RunTimeline.tsx. */
+.agents-view-switch{display:flex;gap:4px;flex-shrink:0;margin:0 14px 8px;padding:3px;background:#1c2122;border:1px solid #30393a;border-radius:8px}
+.agents-view-switch button{flex:1;padding:6px 8px;border-radius:5px;font-size:11px;color:#899b92}
+.agents-view-switch button.active{background:#344137;color:#d8e8de}
+
+.run-timeline{--tl-pad:14px;--tl-track:#1c1f23;position:relative;flex-shrink:0;max-height:min(440px,54vh);overflow:auto;border-top:1px solid #292d32;border-bottom:1px solid #292d32;font-size:11px;color:#a2abb5}
+.run-timeline-empty{margin:0;padding:16px var(--tl-pad);line-height:1.5;color:var(--muted)}
+
+.run-timeline-summary{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:8px 12px;margin:0;padding:10px var(--tl-pad) 8px}
+.run-timeline-summary>div{min-width:0}
+.run-timeline-summary dt{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:10px;color:var(--muted)}
+.run-timeline-summary dd{margin:2px 0 0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px;font-weight:600;color:#d3dbd6;font-variant-numeric:tabular-nums}
+
+/* The minutes axis stays on top while the rows scroll; its labels sit on the same scale as the tracks below. */
+.run-timeline-axis{position:sticky;top:0;z-index:3;height:20px;background:#15171a;border-bottom:1px solid #22262a}
+.run-timeline-axis>span{position:absolute;top:3px;transform:translateX(-50%);font-size:10px;line-height:14px;white-space:nowrap;color:var(--muted);font-variant-numeric:tabular-nums}
+.run-timeline-axis>span.first{transform:none}
+.run-timeline-axis>span.last{transform:translateX(-100%)}
+
+.run-timeline-rows{position:relative;padding:8px 0 2px}
+
+.run-timeline-parallel{padding:0 0 8px}
+.run-timeline-parallel-head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin:0 var(--tl-pad) 5px;font-size:10px;color:var(--muted)}
+.run-timeline-parallel-head>span:first-child{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.run-timeline-shades{display:flex;flex-shrink:0;gap:7px;font-variant-numeric:tabular-nums}
+.run-timeline-shades>span{display:flex;align-items:center;gap:3px}
+.run-timeline-shade{display:block;width:8px;height:8px;border-radius:2px}
+.run-timeline-track{position:relative;display:block;height:10px;margin:0 var(--tl-pad);border-radius:3px;background:var(--tl-track)}
+.run-timeline-track.strip{height:8px}
+.run-timeline-grid{position:absolute;top:0;bottom:0;width:1px;background:#262b2f;pointer-events:none}
+.run-timeline-restart{position:absolute;top:-4px;bottom:-4px;z-index:2;width:0;border-left:1px dashed #9fc3d6;pointer-events:none}
+.run-timeline-seg{position:absolute;top:0;bottom:0}
+.run-timeline .h0{background:repeating-linear-gradient(135deg,#4a4230 0 3px,#2a261d 3px 6px)}
+.run-timeline .h1{background:#35523f}
+.run-timeline .h2{background:#4a7a5a}
+.run-timeline .h3{background:#62a074}
+.run-timeline .h4{background:#86cf9d}
+
+.run-timeline-row{display:block;width:100%;padding:5px 0 6px;text-align:left;color:#a2abb5}
+.run-timeline-row:hover{background:#1e2326}
+.run-timeline-row.selected{background:#28312b}
+.run-timeline-row:focus-visible{outline-offset:-2px}
+.run-timeline-name{display:flex;align-items:center;gap:7px;min-width:0;margin:0 var(--tl-pad) 7px;line-height:14px}
+.run-timeline-name strong{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px;font-weight:500;color:#cdd5d0}
+.run-timeline-row.selected .run-timeline-name strong{color:#e6efe9}
+.run-timeline-name em{flex-shrink:0;font-style:normal;font-size:10px;color:#9aa8a0;font-variant-numeric:tabular-nums}
+
+/* A turn is a bar: bright and breathing while it runs, muted once it is over, tinted by how the agent ended. */
+.run-timeline [data-state=working]{--bar:#bfe3cd}
+.run-timeline [data-state=done]{--bar:#6f9e85}
+.run-timeline [data-state=waiting]{--bar:#ceb889}
+.run-timeline [data-state=paused]{--bar:#e3a45c}
+.run-timeline [data-state=error]{--bar:#dc8f8f}
+.run-timeline [data-state=cancelled],.run-timeline [data-state=interrupted]{--bar:#a69c92}
+.run-timeline [data-state=restarting]{--bar:#8fb6cb}
+.run-timeline-bar{position:absolute;top:0;bottom:0;min-width:2px;border-radius:2px;background:var(--bar);opacity:.82;box-shadow:0 0 0 1px var(--tl-track)}
+.run-timeline-bar:hover{opacity:1}
+.run-timeline-bar[data-open]{opacity:1;animation:run-timeline-live 1.7s ease-in-out infinite}
+.run-timeline-bar[data-estimated],.run-timeline-swatch[data-estimated]{background-image:repeating-linear-gradient(135deg,#0000 0 3px,#0006 3px 6px)}
+@keyframes run-timeline-live{50%{opacity:.62}}
+@media (prefers-reduced-motion:reduce){.run-timeline-bar[data-open]{animation:none}}
+
+/* Created but not working yet: a dotted line from the creation to the first turn. */
+.run-timeline-queue{position:absolute;top:0;bottom:0;background:repeating-linear-gradient(90deg,#a9b8af 0 3px,#0000 3px 6px) 0 50%/100% 2px no-repeat}
+
+/* Markers: a pin where a parent created a helper, a dot where a helper ended, a diamond for a change of subscription. */
+.run-timeline-mark{position:absolute;z-index:1}
+.run-timeline-mark.spawned{top:-7px;width:11px;height:7px;margin-left:-5px}
+.run-timeline-mark.spawned::before{content:"";position:absolute;top:0;left:1.5px;border:solid transparent;border-width:6px 4px 0;border-top-color:#eef2ef;filter:drop-shadow(0 0 1px #0f1113)}
+.run-timeline-mark.finished{top:50%;width:8px;height:8px;margin:-4px 0 0 -4px;border-radius:50%;background:var(--bar);box-shadow:0 0 0 2px var(--tl-track)}
+.run-timeline-mark.handover{top:50%;width:8px;height:8px;margin:-4px 0 0 -4px;border:1px solid #0f1113;background:#9fc3d6;transform:rotate(45deg)}
+
+.run-timeline-legend{display:flex;flex-wrap:wrap;gap:3px 12px;margin:0;padding:0 var(--tl-pad) 8px;list-style:none;font-size:10px;color:#8a9a91}
+.run-timeline-legend li{display:flex;align-items:center;gap:5px;white-space:nowrap}
+.run-timeline-swatch{width:10px;height:6px;border-radius:2px;background:var(--bar)}
+.run-timeline-pin{border:solid transparent;border-width:6px 4px 0;border-top-color:#eef2ef}
+.run-timeline-dot{width:8px;height:8px;border-radius:50%;background:#6f9e85}
+.run-timeline-diamond{width:7px;height:7px;border:1px solid #0f1113;background:#9fc3d6;transform:rotate(45deg)}
+.run-timeline-queue-sample{width:14px;height:2px;background:repeating-linear-gradient(90deg,#a9b8af 0 3px,#0000 3px 6px)}
+.run-timeline-restart-note{margin:0;padding:0 var(--tl-pad) 8px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px;color:#9fc3d6}
+
+/* The tooltip is fixed to the window, so the scrolling chart cannot clip it; the component keeps its centre inside the window. */
+.run-timeline-tip{position:fixed;z-index:60;display:flex;flex-direction:column;gap:2px;width:max-content;max-width:256px;max-height:260px;overflow:hidden;padding:8px 10px;border:1px solid #3a3e45;border-radius:8px;background:#24272c;box-shadow:0 8px 24px #0009;font-size:11px;line-height:1.45;color:#b9c1bc;pointer-events:none;transform:translate(-50%,calc(-100% - 8px))}
+.run-timeline-tip.below{transform:translate(-50%,8px)}
+.run-timeline-tip strong{font-size:12px;font-weight:600;color:#e6efe9;overflow-wrap:anywhere}
+.run-timeline-tip span{overflow-wrap:anywhere}

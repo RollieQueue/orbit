@@ -22,7 +22,7 @@ import type { SubscriptionId } from './subscription-providers.mts'
 
 type AccessMode = 'read-only' | 'workspace-write' | 'danger-full-access'
 type Transport = 'session' | 'envelope'
-type ProviderEventKind = 'output' | 'reasoning' | 'thinking' | 'tool' | 'observation' | 'quota' | 'session' | 'usage'
+type ProviderEventKind = 'output' | 'reasoning' | 'thinking' | 'tool' | 'observation' | 'quota' | 'session' | 'usage' | 'compaction'
 interface ProviderEventBase { providerId: string; kind: ProviderEventKind }
 // A text delta of the assistant's answer; `replace` rewrites the message instead of appending.
 interface OutputEvent extends ProviderEventBase { kind: 'output'; text: string; messageId?: string; partial?: boolean; replace?: boolean; parentToolId?: string | null }
@@ -43,7 +43,10 @@ interface SessionEvent extends ProviderEventBase { kind: 'session'; sessionId: s
 // Tokens the model spent since the last usage event, in the vendor's own spelling: a growth, never a running total (the
 // parsers deal with repeated figures and cumulative totals), which the runtime adds to the agent (runtime/turn.mts).
 interface UsageEvent extends ProviderEventBase { kind: 'usage'; usage: unknown }
-type ProviderEvent = OutputEvent | ReasoningEvent | ThinkingEvent | ToolEvent | ObservationEvent | QuotaEvent | SessionEvent | UsageEvent
+// Claude Code compacted the session's context (a `compact_boundary` system event): what the model read before is summarized,
+// its id is unchanged (runtime/tools.mts wait_agent shows results again after it).
+interface CompactionEvent extends ProviderEventBase { kind: 'compaction' }
+type ProviderEvent = OutputEvent | ReasoningEvent | ThinkingEvent | ToolEvent | ObservationEvent | QuotaEvent | SessionEvent | UsageEvent | CompactionEvent
 // The same union with `providerId` removed from every member (a plain Omit would collapse the union).
 type WithoutProvider<E> = E extends ProviderEvent ? Omit<E, 'providerId'> : never
 type ParserEvent = WithoutProvider<ProviderEvent>
@@ -720,6 +723,7 @@ function createClaudeParser(onEvent: ProviderEventListener | null | undefined, r
           dispatch({ kind: 'tool', text: output, output, toolId: tool.tool_use_id, parentToolId, status: tool.is_error ? 'failed' : 'completed', ...(name ? { tool: name } : {}), ...(images.length ? { images } : {}), ...toolFlags(orbitToolName(name)) })
         }
       }
+      if (event.type === 'system' && event.subtype === 'compact_boundary') dispatch({ kind: 'compaction' })
       if (event.type === 'system' && event.subtype === 'permission_denied') dispatch({ kind: 'observation', text: errorText(event.message || 'Claude denied a tool permission'), status: 'denied' })
       if (event.type === 'system' && event.subtype === 'thinking_tokens' && thinkingBlock !== null) {
         const tokens = event.estimated_tokens

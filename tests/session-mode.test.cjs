@@ -1,52 +1,18 @@
 const test = require('node:test')
 const assert = require('node:assert/strict')
 const fs = require('node:fs')
-const os = require('node:os')
 const path = require('node:path')
 const { OrbitRuntime } = require('../electron/runtime.mts')
 const { OrbitMemoryStore } = require('../electron/memory.mts')
 const { CapabilityStore } = require('../electron/capabilities.mts')
 const quota = require('../electron/quota.mts')
 const providers = require('../electron/providers.mts')
+const { folder, fakeMcp, finished, payload, agentOf, session, callLimit, cursorFull } = require('./helpers-session.cjs')
 
 // The session transport is driven here with a fake provider that records the `session` options it is given and plays
 // the model: it makes Orbit tool calls the way the MCP server would, through runtime.dispatchMcp, in the middle of a
 // "turn", then returns its answer text. A fake MCP server issues and revokes tokens. No CLI is ever started.
-
-function folder(t) {
-  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'orbit-session-test-'))
-  t.after(() => fs.rmSync(directory, { recursive: true, force: true }))
-  return directory
-}
-function fakeMcp() {
-  const issued = [], revoked = []
-  return {
-    issued, revoked, started: 0, url: 'http://127.0.0.1:65500/mcp',
-    async start() { this.started++ },
-    issueToken({ runId, agentId }) { const token = `token-${agentId}-${issued.length}`; issued.push({ token, runId, agentId }); return token },
-    revoke(token) { revoked.push(token) },
-    stop() {},
-  }
-}
-async function finished(runtime, payload, wait = 5000) {
-  const events = []
-  let resolve
-  const terminal = new Promise(done => { resolve = done })
-  const unsub = runtime.onEvent(event => {
-    events.push(event)
-    if (['run.finished', 'run.failed', 'run.cancelled'].includes(event.type)) resolve(event)
-  })
-  const runId = await runtime.start(payload)
-  const timer = setTimeout(() => { runtime.stop(runId); resolve({ type: 'test.timeout' }) }, wait)
-  const event = await terminal
-  clearTimeout(timer); unsub()
-  assert.notEqual(event.type, 'test.timeout', 'the run must complete without deadlock')
-  return { snapshot: runtime.getRun(runId), events, event, runId }
-}
-const payload = (workspace, extra = {}) => ({ workspace, projectId: 'project-1', chatId: 'chat-1', providerId: 'claude', prompt: 'Current task', ...extra })
-// Which agent a session turn belongs to: the identity is in the stable system block, not in the user prompt.
-const agentOf = options => options.session.systemAppend.match(/running as agent "([^"]+)" \(id=([^;]+); parent=([^;]+); depth=(\d+)\)/)
-const session = (extra = {}) => ({ mcp: fakeMcp(), transportFor: () => 'session', ...extra })
+// Parked calls of a provider with an MCP call limit: session-mode-parked.test.cjs and session-mode-stale.test.cjs.
 
 test('the first turn opens a session with a stable system block and the full task prompt; later turns resume it with what is new', async t => {
   const root = folder(t), workspace = path.join(root, 'ws'); fs.mkdirSync(workspace)
@@ -77,7 +43,7 @@ test('the first turn opens a session with a stable system block and the full tas
   assert.equal(first.session.mcpUrl, mcp.url)
   assert.equal(first.session.token, mcp.issued[0].token)
   assert.deepEqual(mcp.issued[0], { token: first.session.token, runId: snapshot.runId, agentId: 'root' })
-  assert.ok(first.session.systemAppend.length <= 6000, `system block is ${first.session.systemAppend.length} chars`)
+  assert.ok(first.session.systemAppend.length <= 7500, `system block is ${first.session.systemAppend.length} chars`)
   assert.match(first.session.systemAppend, /running as agent "Orbit" \(id=root; parent=none; depth=0\)/)
   assert.ok(first.session.systemAppend.includes(`workspace=${workspace}`))
   assert.doesNotMatch(first.session.systemAppend, /tool_calls|Orbit tool protocol|inputSchema|LIVE TURN BUDGET|turn \d/)
@@ -527,7 +493,7 @@ test('Antigravity and Cursor agents outside Full access, and Cursor ones without
 
 test('a Cursor session agent is answered within its MCP call limit: waits are cut with "still running", a slow call is collected by repeating it', async t => {
   const previous = process.env.ORBIT_MCP_CALL_LIMIT_MS
-  process.env.ORBIT_MCP_CALL_LIMIT_MS = '300'
+  process.env.ORBIT_MCP_CALL_LIMIT_MS = '150'
   t.after(() => { if (previous === undefined) delete process.env.ORBIT_MCP_CALL_LIMIT_MS; else process.env.ORBIT_MCP_CALL_LIMIT_MS = previous })
   const workspace = folder(t)
   let release
@@ -548,7 +514,7 @@ test('a Cursor session agent is answered within its MCP call limit: waits are cu
     const quick = JSON.parse((await runtime.dispatchMcp(token, 'wait_message', { timeout_ms: 50 })).text)
     assert.deepEqual([quick.timedOut, quick.stillWaiting], [true, undefined], 'a wait shorter than the limit is untouched')
     // A command slower than the limit keeps running; repeating the call collects its one result.
-    const command = { command: process.execPath, args: ['-e', 'setTimeout(() => { require("fs").appendFileSync("ran.txt", "x"); console.log("slow done") }, 900)'] }
+    const command = { command: process.execPath, args: ['-e', 'setTimeout(() => { require("fs").appendFileSync("ran.txt", "x"); console.log("slow done") }, 450)'] }
     const answers = []
     for (let attempt = 0; attempt < 30; attempt++) {
       const answer = JSON.parse((await runtime.dispatchMcp(token, 'run_command', { ...command, timeout_ms: 120000 + attempt })).text)
@@ -558,7 +524,7 @@ test('a Cursor session agent is answered within its MCP call limit: waits are cu
     assert.ok(answers.length >= 2 && answers[0].stillRunning === true && /Repeat exactly the same call/.test(answers[0].hint), JSON.stringify(answers[0]))
     assert.match(answers.at(-1).stdout, /slow done/)
     assert.equal(answers.at(-1).collected, true, 'the collected result says it comes from the run started earlier')
-    assert.ok(Date.parse(answers.at(-1).startedAt) <= Date.now() - 300, answers.at(-1).startedAt)
+    assert.ok(Date.parse(answers.at(-1).startedAt) <= Date.now() - 150, answers.at(-1).startedAt)
     assert.equal(fs.readFileSync(path.join(workspace, 'ran.txt'), 'utf8'), 'x', 'the repeats waited for the running command instead of starting it again')
     release()
     const done = JSON.parse((await runtime.dispatchMcp(token, 'wait_agent', {})).text)
@@ -568,7 +534,7 @@ test('a Cursor session agent is answered within its MCP call limit: waits are cu
   const { snapshot, runId } = await finished(runtime, payload(workspace, { providerId: 'cursor', accessMode: 'danger-full-access', approvalPolicy: 'never' }), 20000)
   assert.equal(snapshot.status, 'completed', snapshot.error)
   const ledger = runtime.runs.get(runId).agentNodes.get('root').ledger.map(entry => entry.text)
-  assert.ok(ledger.some(text => /^#1 wait_agent → .*\(cut at 300 ms, still running\)$/.test(text)), ledger.join('\n'))
+  assert.ok(ledger.some(text => /^#1 wait_agent → .*\(cut at 150 ms, still running\)$/.test(text)), ledger.join('\n'))
   assert.ok(ledger.some(text => /^#1 run_command .* → still running after/.test(text)), ledger.join('\n'))
   assert.equal(ledger.filter(text => /^#1 run_command .* → exit 0/.test(text)).length, 1, 'one command, collected once')
 })
@@ -580,8 +546,8 @@ test('the call limit belongs to the provider: a Claude session agent\'s waits ar
   const workspace = folder(t)
   const runtime = new OrbitRuntime({ ...session(), runProvider: async options => {
     const started = Date.now()
-    const mail = JSON.parse((await runtime.dispatchMcp(options.session.token, 'wait_message', { timeout_ms: 600 })).text)
-    assert.ok(Date.now() - started >= 550, 'the full wait')
+    const mail = JSON.parse((await runtime.dispatchMcp(options.session.token, 'wait_message', { timeout_ms: 300 })).text)
+    assert.ok(Date.now() - started >= 250, 'the full wait')
     assert.deepEqual([mail.timedOut, mail.stillWaiting], [true, undefined])
     return { text: 'ok' }
   } })
@@ -611,135 +577,6 @@ test('runtime.shutdown stops the MCP server and forgets the tokens', async t => 
   await runtime.shutdown()
   assert.equal(stopped, 1)
   assert.equal(runtime.sessions.size, 0)
-})
-
-// ---- Calls of a provider with an MCP call limit (Cursor), parked and collected ------------------------------------
-function callLimit(t, ms) {
-  const previous = process.env.ORBIT_MCP_CALL_LIMIT_MS
-  process.env.ORBIT_MCP_CALL_LIMIT_MS = String(ms)
-  t.after(() => { if (previous === undefined) delete process.env.ORBIT_MCP_CALL_LIMIT_MS; else process.env.ORBIT_MCP_CALL_LIMIT_MS = previous })
-}
-async function until(check, ms = 5000) {
-  const started = Date.now()
-  while (!check()) { if (Date.now() - started > ms) throw new Error('condition not reached'); await new Promise(resolve => setTimeout(resolve, 20)) }
-}
-const cursorFull = { providerId: 'cursor', accessMode: 'danger-full-access', approvalPolicy: 'never' }
-const commandAnswer = (runtime, token, args) => runtime.dispatchMcp(token, 'run_command', args).then(answer => JSON.parse(answer.text))
-
-test('parked calls made side by side each run once, an identical call joins the run under way, and each result is collected once', async t => {
-  callLimit(t, 300)
-  const workspace = folder(t)
-  const slow = tag => ({ command: process.execPath, args: ['-e', `require("fs").appendFileSync("${tag}.txt", "x"); setTimeout(() => console.log("${tag} done"), 900)`] })
-  let first, collected = []
-  const runtime = new OrbitRuntime({ ...session(), runProvider: async options => {
-    const token = options.session.token
-    // A client that sends its tool calls in parallel, one of them twice.
-    first = await Promise.all([commandAnswer(runtime, token, slow('A')), commandAnswer(runtime, token, slow('B')), commandAnswer(runtime, token, slow('A'))])
-    // Collected in the other order: A ends while B is waited for, and B's end may count A's file as its own change.
-    for (const tag of ['B', 'A']) {
-      for (let attempt = 0; attempt < 30; attempt++) { const answer = await commandAnswer(runtime, token, slow(tag)); if (!answer.stillRunning) { collected.push(answer); break } }
-    }
-    return { text: 'ok', sessionId: 'cursor-chat' }
-  } })
-  const { snapshot } = await finished(runtime, payload(workspace, cursorFull), 20000)
-  assert.equal(snapshot.status, 'completed', snapshot.error)
-  assert.ok(first.every(answer => answer.stillRunning === true), JSON.stringify(first))
-  assert.deepEqual(collected.map(answer => [answer.stdout.trim(), answer.collected]), [['B done', true], ['A done', true]])
-  assert.ok(collected.every(answer => !Number.isNaN(Date.parse(answer.startedAt))), JSON.stringify(collected))
-  assert.deepEqual(['A', 'B'].map(tag => fs.readFileSync(path.join(workspace, `${tag}.txt`), 'utf8')), ['x', 'x'], 'every command ran exactly once')
-})
-
-test('a parked call nobody collects is stopped when its agent ends: the command is killed, the operations drain, the chat takes the next message', async t => {
-  callLimit(t, 300)
-  const workspace = folder(t)
-  const late = tag => ({ command: process.execPath, args: ['-e', `setTimeout(() => require("fs").writeFileSync("${tag}-late.txt", "x"), 2000)`] })
-  let lastCommandAt = 0
-  const runtime = new OrbitRuntime({ ...session(), runProvider: async options => {
-    const [, name] = agentOf(options), token = options.session.token
-    if (options.prompt.includes('Next message')) return { text: 'next answer' }
-    const park = async tag => { lastCommandAt = Date.now(); assert.equal((await commandAnswer(runtime, token, late(tag))).stillRunning, true) }
-    if (name === 'Helper') { await park('helper'); return { text: 'Helper answered without waiting for its build' } }
-    const { run } = runtime.sessionFor(token)
-    await runtime.dispatchMcp(token, 'spawn_agent', { name: 'Helper', task: 'Start a build', reason: 'Independent' })
-    await park('root')
-    let helper
-    for (let attempt = 0; attempt < 40 && !Array.isArray(helper); attempt++) helper = JSON.parse((await runtime.dispatchMcp(token, 'wait_agent', {})).text)
-    // The helper ended: its build was stopped while the run goes on (a follow-up would be refused otherwise).
-    await until(() => run.agentOperations.get(helper[0].agentId).size === 0, 3000)
-    return { text: 'Root answered; its build still runs', sessionId: 'cursor-chat' }
-  } })
-  const { snapshot, runId } = await finished(runtime, payload(workspace, cursorFull), 20000)
-  assert.equal(snapshot.status, 'completed', snapshot.error)
-  const run = runtime.runs.get(runId)
-  await until(() => run.operations.size === 0, 3000)
-  const next = await finished(runtime, payload(workspace, { ...cursorFull, prompt: 'Next message' }))
-  assert.equal(next.snapshot.status, 'completed', next.snapshot.error)
-  await new Promise(resolve => setTimeout(resolve, Math.max(0, lastCommandAt + 3500 - Date.now())))
-  assert.deepEqual(['root', 'helper'].map(tag => fs.existsSync(path.join(workspace, `${tag}-late.txt`))), [false, false], 'the stopped commands never finished')
-})
-
-test('a parked result is not handed out once files changed: after an Orbit write or a native edit the repeat runs the command again', async t => {
-  callLimit(t, 300)
-  for (const how of ['write_file', 'native edit']) {
-    const workspace = folder(t)
-    fs.writeFileSync(path.join(workspace, 'f.txt'), 'BEFORE')
-    // Reads the file when it starts and answers 900 ms later, like a test run that loads the sources first.
-    const command = { command: process.execPath, args: ['-e', 'const fs = require("fs"); const seen = fs.readFileSync("f.txt", "utf8"); fs.appendFileSync("starts.txt", "s"); setTimeout(() => { fs.appendFileSync("ends.txt", "e"); console.log("SAW:" + seen) }, 900)'] }
-    const answers = []
-    const runtime = new OrbitRuntime({ ...session(), runProvider: async options => {
-      const token = options.session.token
-      answers.push(await commandAnswer(runtime, token, command))
-      if (how === 'write_file') {
-        assert.equal(JSON.parse((await runtime.dispatchMcp(token, 'write_file', { path: 'f.txt', content: 'AFTER' })).text).ok, true)
-        await new Promise(resolve => setTimeout(resolve, 1200)) // the first run finishes meanwhile, uncollected
-      } else {
-        // Cursor's own edit tool, reported in the stream while the first run is still going.
-        fs.writeFileSync(path.join(workspace, 'f.txt'), 'AFTER')
-        options.onEvent({ kind: 'tool', native: true, tool: 'write', toolId: 'edit-1', status: 'completed', input: { path: 'f.txt' } })
-      }
-      for (let attempt = 0; attempt < 30 && !answers.at(-1).stdout; attempt++) answers.push(await commandAnswer(runtime, token, command))
-      return { text: 'done', sessionId: 'cursor-chat' }
-    } })
-    const { snapshot } = await finished(runtime, payload(workspace, cursorFull), 20000)
-    assert.equal(snapshot.status, 'completed', snapshot.error)
-    assert.equal(answers[0].stillRunning, true)
-    assert.equal(answers[1].stillRunning, true, `${how}: the repeat started a fresh run`)
-    assert.match(answers.at(-1).stdout, /SAW:AFTER/, `${how}: the result is from after the change`)
-    assert.equal(answers.at(-1).collected, true)
-    assert.equal(fs.readFileSync(path.join(workspace, 'starts.txt'), 'utf8'), 'ss', how)
-    // The first run had ended before the write was followed up; the one a native edit overtook was stopped instead.
-    assert.equal(fs.readFileSync(path.join(workspace, 'ends.txt'), 'utf8'), how === 'write_file' ? 'ee' : 'e', how)
-  }
-})
-
-test('a command that changed files after a parked one finished makes it stale; one that ran alongside it does not', async t => {
-  callLimit(t, 300)
-  const workspace = folder(t)
-  // Every command that runs alone is seen to change one file (runTrackedCommand then counts it as the agent's work).
-  let changes = 0
-  const projectIndex = { refresh: async (_, options) => ({ added: options?.force ? [`generated-${++changes}.txt`] : [], changed: [], removed: [] }), search: () => ({ results: [] }), outline: () => null, overview: () => '', touch: async () => {} }
-  const sleeper = (tag, ms) => ({ command: process.execPath, args: ['-e', `require("fs").appendFileSync("${tag}.txt", "x"); setTimeout(() => console.log("${tag} done"), ${ms})`] })
-  const results = {}
-  const runtime = new OrbitRuntime({ ...session(), projectIndex, runProvider: async options => {
-    const token = options.session.token
-    const collect = async args => { for (let attempt = 0; attempt < 30; attempt++) { const answer = await commandAnswer(runtime, token, args); if (!answer.stillRunning) return answer } }
-    // A and B side by side: B ends last, alone, and the change it is credited with is counted after A ended.
-    await Promise.all([commandAnswer(runtime, token, sleeper('A', 400)), commandAnswer(runtime, token, sleeper('B', 700))])
-    await new Promise(resolve => setTimeout(resolve, 1000))
-    results.B = await collect(sleeper('B', 700))
-    results.A = await collect(sleeper('A', 400))
-    // C ends; then D runs on its own and changes a file: C's result predates that change.
-    assert.equal((await commandAnswer(runtime, token, sleeper('C', 400))).stillRunning, true)
-    await new Promise(resolve => setTimeout(resolve, 800))
-    results.D = await collect(sleeper('D', 10))
-    results.C = await collect(sleeper('C', 400))
-    return { text: 'ok', sessionId: 'cursor-chat' }
-  } })
-  const { snapshot } = await finished(runtime, payload(workspace, cursorFull), 20000)
-  assert.equal(snapshot.status, 'completed', snapshot.error)
-  assert.deepEqual(['A', 'B', 'C', 'D'].map(tag => fs.readFileSync(path.join(workspace, `${tag}.txt`), 'utf8')), ['x', 'x', 'xx', 'x'], 'only C ran again')
-  assert.deepEqual(['A', 'B', 'C'].map(tag => [results[tag].stdout.trim(), results[tag].collected]), [['A done', true], ['B done', true], ['C done', true]])
-  assert.match(results.D.stdout, /D done/)
 })
 
 test('a cut wait does not hold its answer for a busy slot: it returns within the call limit, and the slot comes back once one frees', async t => {

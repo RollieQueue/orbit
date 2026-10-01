@@ -25,7 +25,7 @@ const USER = Object.freeze({ id: 'user', name: 'Вы' })
 const newMailMark = (): string => randomBytes(5).toString('hex')
 const isMailMark = (value: unknown): value is string => typeof value === 'string' && /^[0-9a-f]{10}$/.test(value)
 const mailTag = (agent: Pick<AgentRecord, 'mailMark'>): string => `[orbit:${agent.mailMark}]`
-const INTERNAL_AGENT_FIELDS: readonly InternalAgentField[] = ['inbox', 'seenChildren', 'requestedModel', 'transcript', 'previousWork', 'ledger', 'ledgerDropped', 'workDone', 'failedCandidates', 'trial', 'partialTurn', 'quotaWarned', 'draftAnswer', 'activeTurn', 'stream', 'sessionToken', 'sessionCursor', 'transcriptChars', 'pausedSession', 'mailMark']
+const INTERNAL_AGENT_FIELDS: readonly InternalAgentField[] = ['inbox', 'seenChildren', 'requestedModel', 'transcript', 'previousWork', 'ledger', 'ledgerDropped', 'workDone', 'failedCandidates', 'trial', 'partialTurn', 'quotaWarned', 'draftAnswer', 'activeTurn', 'stream', 'sessionToken', 'sessionCursor', 'transcriptChars', 'pausedSession', 'mailMark', 'effortNote']
 // Google models (Antigravity) have reasoning built in: Orbit never sends an effort for them,
 // whatever was persisted in settings, the provider pool or a spawn request.
 const withoutGoogleReasoning = (providerId: string, effort: string): string => providerId === 'antigravity' ? '' : effort

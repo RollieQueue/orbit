@@ -54,6 +54,8 @@ type RestartSource = 'tool' | 'script'
 type RestartLevel = 'none' | 'renderer' | 'runtime' | 'full'
 // The parts of Orbit's code a restart loads anew (electron/fingerprint.cjs): the main process, the runtime, the window.
 type CodePart = 'shell' | 'runtime' | 'renderer'
+// The fingerprints of those parts as they are on disk (codeOnDisk).
+type CodeHashes = Record<CodePart, string>
 // pending-resume.json as the script writes it (version 1), normalised: every field present, blanks as null. The
 // script's detached watcher adds its verdict: `verdict: 'relaunched'` once the new code is healthy,
 // `outcome: 'rolled-back'` before it starts the restored code, or `verdict: 'failed'` (with the error) when the watcher
@@ -106,8 +108,10 @@ interface RestartHost {
   // The run whose restart_orbit request the script serves right now (checks, build, restart), or null.
   inFlight(): RestartRunRef | null
   // The parts of the code on disk this Orbit does not run yet (unappliedCode), null when it cannot tell; a host without
-  // it cannot tell.
-  unapplied?(): CodePart[] | null
+  // it cannot tell. With `baseline`, only the parts that also changed since it was taken.
+  unapplied?(baseline?: CodeHashes | null): CodePart[] | null
+  // The fingerprints of the code on disk now, null when they cannot be taken: a run takes them when it starts.
+  codeOnDisk?(): CodeHashes | null
 }
 // The part of a child process the host uses; `spawn` is injectable so tests can script the process.
 interface RestartChild {
@@ -303,8 +307,10 @@ function healthFilePath(root: string, env: NodeJS.ProcessEnv = process.env): str
 // restart level: the code fingerprints of the files against those main's health report gives for the code it runs.
 // Whatever wrote a file (a tool, a shell command, git) counts, and a change undone counts no more. [] when it runs all
 // of it; null when it cannot tell: no report, a failed one, one about another runtime process than `pid` (another
-// Orbit, a restart not reported yet) or older than `since` (a reused pid), or one without fingerprints.
-function unappliedCode({ root, healthFile, pid = process.pid, since = Date.now() - process.uptime() * 1000 }: { root: string; healthFile: string | null; pid?: number; since?: number }): CodePart[] | null {
+// Orbit, a restart not reported yet) or older than `since` (a reused pid), or one without fingerprints. `baseline`
+// (codeOnDisk when a run started) leaves out a part that has not changed on disk since: whoever changed it before, such
+// as another chat, applies it, not the run that asks.
+function unappliedCode({ root, healthFile, pid = process.pid, since = Date.now() - process.uptime() * 1000, baseline = null }: { root: string; healthFile: string | null; pid?: number; since?: number; baseline?: CodeHashes | null }): CodePart[] | null {
   if (!healthFile) return null
   try {
     const report: Record<string, unknown> | null = JSON.parse(fs.readFileSync(healthFile, 'utf8'))
@@ -313,10 +319,11 @@ function unappliedCode({ root, healthFile, pid = process.pid, since = Date.now()
     const about = (report?.runtime as { pid?: unknown } | null | undefined)?.pid, writtenAt = report?.writtenAt
     if (report?.ok !== true || about !== pid || typeof writtenAt !== 'number' || writtenAt < since) return null
     if (!running.shell || !running.runtime || !running.renderer) return null
-    const disk = { ...fingerprints(root), renderer: rendererHash(root) }
-    return (['shell', 'runtime', 'renderer'] as const).filter(part => disk[part] !== running[part])
+    const disk = codeOnDisk(root)
+    return (['shell', 'runtime', 'renderer'] as const).filter(part => disk[part] !== running[part] && (!baseline || disk[part] !== baseline[part]))
   } catch { return null }
 }
+const codeOnDisk = (root: string): CodeHashes => ({ ...fingerprints(root), renderer: rendererHash(root) })
 
 // Runs `node scripts/self-upgrade.cjs [--no-verify] --reason <r> --continue-with <c>` in the repository for restart_orbit.
 // One restart at a time: a second request for the same run (a model retrying after its MCP client gave up waiting)
@@ -414,8 +421,9 @@ function createRestartHost({ repoRoot, userData, healthFile, nodeCommand = null,
     return job
   }
   const inFlight = (): RestartRunRef | null => current ? { ...current.run } : null
-  const unapplied = (): CodePart[] | null => available ? unappliedCode({ root, healthFile: health }) : null
-  return { available, repoRoot: root, resumeFile, userData, request, inFlight, unapplied }
+  const unapplied = (baseline: CodeHashes | null = null): CodePart[] | null => available ? unappliedCode({ root, healthFile: health, baseline }) : null
+  const onDisk = (): CodeHashes | null => { if (!available) return null; try { return codeOnDisk(root) } catch { return null } }
+  return { available, repoRoot: root, resumeFile, userData, request, inFlight, unapplied, codeOnDisk: onDisk }
 }
 
 // Shutting down for a restart: the run the intent names ends with the status `restarting` (not cancelled or
@@ -583,4 +591,4 @@ async function resumeOnce(file: string, { runtime, userData, runStore = runtime.
 }
 
 export { resumeFilePath, readResumeIntent, deleteResumeIntent, restartEnv, createRestartHost, healthFilePath, unappliedCode, markRestartingRuns, resumePending, continuationPrompt }
-export type { RestartNotice, ResumeIntent, RestartHost, RestartRequest, RestartResult, RestartRollback, RestartLevel, CodePart, RestartSource, ResumeInfo, RestartRunRef, RestartChild, SpawnRestart, RestartHostOptions, ResumeOptions }
+export type { RestartNotice, ResumeIntent, RestartHost, RestartRequest, RestartResult, RestartRollback, RestartLevel, CodePart, CodeHashes, RestartSource, ResumeInfo, RestartRunRef, RestartChild, SpawnRestart, RestartHostOptions, ResumeOptions }

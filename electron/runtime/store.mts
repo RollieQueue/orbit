@@ -25,8 +25,10 @@ function snapshot(runtime: OrbitRuntimeLike, run: RunRecord): RunSnapshot {
     ...(run.startPayload ? { startPayload: run.startPayload } : {}), ...(run.attachments?.length ? { attachments: run.attachments } : {}),
     ...(run.resumedFrom ? { resumedFrom: run.resumedFrom } : {}), ...(run.resumeChain !== undefined ? { resumeChain: run.resumeChain } : {}),
     ...(run.restart ? { restart: run.restart } : {}),
-    // The improvement loop: the task number of this run and what the next task must know.
+    // The improvement loop: the task number of this run, what the next task must know, and whether its change of Orbit's
+    // code was applied or left for a later restart (the next run of the chat checks all of the code then).
     ...(run.loopTask ? { loopTask: run.loopTask } : {}), ...(run.improvementHandoff ? { improvementHandoff: run.improvementHandoff } : {}),
+    ...(run.restartApplied ? { restartApplied: true } : {}), ...(run.restartDeferred ? { restartDeferred: true } : {}),
   })
 }
 // A run's file changes with their diff text: the live run first, then the saved one.

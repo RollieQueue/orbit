@@ -7,6 +7,7 @@
 import { saveNote } from '../shared-context.mts'
 import { ellipsis } from '../text.mts'
 import { clip, oneOf, diagnostics } from './util.mts'
+import { previousRunProfile } from './run-profile.mts'
 import { restartOffered, runOnOrbitRepository } from './restart.mts'
 import type { CodePart } from '../resume.mts'
 import type { ImprovementStatus, ImprovementTask, OrbitRuntimeLike, RunRecord, StoredRun, TaskStatus, ToolArgs } from '../types.mts'
@@ -20,7 +21,7 @@ const HANDOFF_CHARS = 2000
 const DONE_KEPT = 30
 // How many earlier runs of the chat are searched for the plan.
 const EARLIER_RUNS = 12
-const PROGRESS_CHARS = 5000
+const PROGRESS_CHARS = 6500
 
 const isClosed = (task: ImprovementTask): boolean => task.status === 'done' || task.status === 'blocked'
 // Closed in this run: a closed task that is new or whose status changed in this run (a blocked task done now). A task
@@ -141,20 +142,21 @@ function updatePlan(runtime: OrbitRuntimeLike, run: RunRecord, args: ToolArgs): 
   }
 }
 
-// CURRENT IMPROVEMENT PROGRESS of an improvement-mode run: counts, open tasks first, the last done ones, the handoff.
-function progressBlock(run: RunRecord): string {
+// CURRENT IMPROVEMENT PROGRESS of an improvement-mode run: counts, open tasks first (with the brief a pending task
+// carries), the last done ones, the handoff and, for the root, the profile of the chat's previous run.
+function progressBlock(run: RunRecord, withProfile = true): string {
   const count = (status: TaskStatus) => run.improvements.filter(task => task.status === status).length
   const lines = [`Plan status: ${run.improvementStatus}; tasks: ${count('working')} working, ${count('pending')} pending, ${count('done')} done, ${count('blocked')} blocked.`]
   const open = run.improvements.filter(task => task.status === 'working' || task.status === 'pending')
   const blocked = run.improvements.filter(task => task.status === 'blocked')
   const done = run.improvements.filter(task => task.status === 'done').slice(-8)
   const line = (task: ImprovementTask, evidence: number) => `- [${task.status}] ${task.id}: ${clip(task.title, 200)}${task.evidence.trim() ? ` — ${clip(task.evidence, evidence)}` : ''}`
-  if (open.length) lines.push('Open tasks:', ...open.map(task => line(task, 300)))
+  if (open.length) lines.push('Open tasks:', ...open.map(task => line(task, 600)))
   if (blocked.length) lines.push('Blocked tasks:', ...blocked.map(task => line(task, 200)))
   if (done.length) lines.push(`Last ${done.length} done:`, ...done.map(task => line(task, 200)))
   if (!run.improvements.length) lines.push('No tasks recorded yet.')
   const handoff = run.improvementHandoff ? `\nHANDOFF FROM THE PREVIOUS TASK: ${ellipsis(run.improvementHandoff, HANDOFF_CHARS)}` : ''
-  return `CURRENT IMPROVEMENT PROGRESS:\n${ellipsis(lines.join('\n'), PROGRESS_CHARS - handoff.length)}${handoff}`
+  return `CURRENT IMPROVEMENT PROGRESS:\n${ellipsis(lines.join('\n'), PROGRESS_CHARS - handoff.length)}${handoff}${withProfile ? previousRunProfile(run.priorRuns) : ''}`
 }
 
 // What the root's answer still misses, first thing first: a task left working, no task closed in this run, or Orbit's
@@ -169,10 +171,11 @@ function missing(runtime: OrbitRuntimeLike, run: RunRecord): Missing | null {
   // inherited plan completed without new work is not a task.
   if (!closed && run.improvementStatus !== 'blocked' && !run.resumedFrom) return { kind: 'none' }
   if (run.restartApplied || run.restartDeferred || !restartOffered(runtime, run, { id: 'root' })) return null
-  // The code on disk against the code the running Orbit runs, whatever changed it; when that cannot be told, the files
-  // this run's agents wrote with the tools Orbit sees, but only in Orbit's own repository: in another project's chat they
-  // are that project's files, which no restart applies, so an unknown state asks for nothing there.
-  const parts = runtime.restartHost?.unapplied?.() ?? null
+  // The code on disk against the code the running Orbit runs, whatever changed it, but only the parts that changed since
+  // this run started: what another chat left unapplied before is that chat's to apply. When that cannot be told, the
+  // files this run's agents wrote with the tools Orbit sees, but only in Orbit's own repository: in another project's
+  // chat they are that project's files, which no restart applies, so an unknown state asks for nothing there.
+  const parts = runtime.restartHost?.unapplied?.(run.codeAtStart ?? null) ?? null
   const wrote = (): boolean => [...run.agentNodes.keys()].some(id => run.fileActivity.forAgent(id).wrote.length > 0)
   const changed = parts ? parts.length > 0 : runOnOrbitRepository(runtime, run) && wrote()
   return changed ? { kind: 'restart', parts } : null

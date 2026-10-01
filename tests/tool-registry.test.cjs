@@ -127,6 +127,7 @@ test('the envelope response schema is unchanged by the registry refactor', () =>
     },
     // Added after the refactor (TECH-DEBT item 1): tools outside the historical order follow it.
     stop_agent: { agentId: string, reason: string },
+    run_profile: { runId: optional(string) },
     restart_orbit: { reason: string, continueWith: string, verify: optional(boolean) },
   }
   const expected = object({ content: string, tool_calls: { type: 'array', items: { anyOf: Object.entries(toolArguments).map(([name, properties]) => object({ id: string, name: { type: 'string', enum: [name] }, arguments: object(properties) })) } } })
@@ -185,6 +186,9 @@ test('policy flags match the runtime: root-only, waiting, mutating and write-acc
     assert.deepEqual(named('mutating'), expected)
   }
   assert.ok(named('mutating').includes('spawn_agent') && !named('mutating').includes('read_file'))
+  // run_profile reads timings and names like team_history and list_agents: every agent, read-only access, no waiting, no writes.
+  const profile = registry.tool('run_profile')
+  assert.ok(!profile.rootOnly && !profile.waits && !profile.mutating && profile.minAccess === 'read-only' && !profile.internal)
 })
 
 test('allowedFor hides root-only tools from workers and write tools from read-only agents', () => {
@@ -192,6 +196,7 @@ test('allowedFor hides root-only tools from workers and write tools from read-on
   const worker = names({ root: false, accessMode: 'read-only' })
   assert.ok(!worker.includes('improvement_plan') && !worker.includes('model_evaluate') && !worker.includes('write_file') && !worker.includes('run_command'))
   assert.ok(worker.includes('spawn_agent') && worker.includes('memory_save') && worker.includes('read_file'))
+  assert.ok(worker.includes('run_profile'), 'a read-only worker may profile the run, as it may read team_history')
   const root = names({ root: true, accessMode: 'danger-full-access' })
   assert.equal(root.length, PUBLIC_TOOLS.length)
   assert.ok(!root.includes('approve'))

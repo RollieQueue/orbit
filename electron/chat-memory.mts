@@ -1,8 +1,11 @@
 import { clip, ellipsis } from './text.mts'
+import { profileSummary } from './runtime/run-profile.mts'
+import type { ProfileSource } from './runtime/run-profile.mts'
 
 // What the agent team did in EARLIER turns of the same chat. The chat transcript kept by the UI holds only the
 // root agent's words, so without this the next turn's orchestrator has no idea which helpers ran, what each
-// reported or which files they changed.
+// reported or which files they changed. Each earlier turn also carries a short profile of where its time went (the
+// improvement loop shows the latest one, runtime/run-profile.mts).
 
 // The files an agent touched, as the runtime publishes them on the agent.
 interface AgentFileList { wrote?: string[]; read?: string[] }
@@ -10,10 +13,12 @@ interface AgentFileList { wrote?: string[]; read?: string[] }
 interface AgentLike { id: string; name?: string; status?: string; task?: string; result?: string; error?: string | null; providerId?: string; model?: string; files?: AgentFileList | null }
 interface MessageLike { agentId?: string; text?: string }
 interface CommunicationLike { kind?: string; fromAgentName?: string; toAgentName?: string; text?: string }
-// A run held in memory (`agentNodes`, a Map) or a saved snapshot (`agents`, an array).
-interface RunLike { runId: string; prompt?: string; status?: string; startedAt?: string; summary?: { text?: string } | null; agentNodes?: Map<string, AgentLike> | null; agents?: AgentLike[]; messages?: MessageLike[]; communications?: CommunicationLike[] }
-// What `view` keeps of an earlier turn: the request, the answer, the helpers and their correspondence.
-interface RunView { runId: string; prompt: string; status?: string; startedAt?: string; answer: string; agents: AgentLike[]; communications: CommunicationLike[] }
+// A run held in memory (`agentNodes`, a Map) or a saved snapshot (`agents`, an array); the profile reads the rest of ProfileSource.
+interface RunLike extends ProfileSource { prompt?: string; resumedFrom?: string; restartApplied?: boolean; restartDeferred?: boolean; summary?: { text?: string } | null; agentNodes?: Map<string, AgentLike> | null; agents?: AgentLike[]; messages?: MessageLike[]; communications?: CommunicationLike[] }
+// What `view` keeps of an earlier turn: the request, the answer, the helpers and their correspondence; `resumedFrom`, the
+// run a continuation after restart_orbit continues; `profile`, where the turn's time went (null for a trivial turn);
+// `restartApplied`/`restartDeferred`, whether its change of Orbit's code was applied or left for a later restart.
+interface RunView { runId: string; prompt: string; status?: string; startedAt?: string; resumedFrom?: string; restartApplied?: boolean; restartDeferred?: boolean; profile?: string | null; answer: string; agents: AgentLike[]; communications: CommunicationLike[] }
 // The arguments of `team_history`, as the model sends them.
 interface HistoryArgs { runId?: unknown; agent?: unknown; limit?: unknown }
 interface HistoryAgent { name?: string; status?: string; provider?: string; model?: string; task: string; result: string; files: { wrote: string[]; read: string[] } }
@@ -36,6 +41,8 @@ function view(run: RunLike): RunView {
   const answers = (run.messages || []).filter(message => !message.agentId || message.agentId === 'root')
   return {
     runId: run.runId, prompt: run.prompt || '', status: run.status, startedAt: run.startedAt,
+    ...(run.resumedFrom ? { resumedFrom: run.resumedFrom } : {}), profile: profileSummary(run),
+    ...(run.restartApplied ? { restartApplied: true } : {}), ...(run.restartDeferred ? { restartDeferred: true } : {}),
     answer: answers.at(-1)?.text || run.summary?.text || '',
     agents: agents.filter(agent => agent.id !== 'root'), communications: run.communications || [],
   }

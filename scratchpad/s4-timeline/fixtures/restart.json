@@ -1,0 +1,104 @@
+{
+ "runId": "4cbc9c41-b98a-460a-b889-b1effefc9094",
+ "projectId": "project-local",
+ "chatId": "e582abbe-a96a-4d20-84f7-6458baadca0c",
+ "status": "restarting",
+ "startedAt": "2026-10-01T05:03:04.339Z",
+ "finishedAt": "2026-10-01T05:38:59.130Z",
+ "updatedAt": "2026-10-01T05:38:59.249Z",
+ "providerId": "claude",
+ "model": "opus",
+ "restart": {
+  "reason": "Apply I22: Codex sessions get Orbit's stable system block as the thread's developer instructions (exec -c developer_instructions, App Server developerInstructions), and App Server JSON-RPC lines go out without lone surrogates.",
+  "requestedAt": "2026-10-01T05:38:59.002Z",
+  "source": "tool"
+ },
+ "workspace": ".",
+ "prompt": "Пример запуска",
+ "agents": [
+  {
+   "id": "root",
+   "parentId": null,
+   "depth": 0,
+   "name": "Orbit",
+   "role": "Agent",
+   "status": "cancelled",
+   "providerId": "claude",
+   "model": "opus",
+   "startedAt": "2026-10-01T05:03:04.562Z",
+   "finishedAt": "2026-10-01T05:38:59.136Z",
+   "turns": 1,
+   "generation": 0,
+   "task": "Пример запуска",
+   "handovers": [],
+   "turnTimings": [
+    {
+     "turn": 1,
+     "transport": "session",
+     "startedAt": "2026-10-01T05:03:04.562Z",
+     "firstEventAt": "2026-10-01T05:03:07.916Z",
+     "endedAt": "2026-10-01T05:38:59.159Z",
+     "promptChars": 23404,
+     "nativeToolCalls": 131,
+     "orbitToolCalls": 10
+    }
+   ]
+  },
+  {
+   "id": "agent-c5a5df06-dc36-4e98-bddf-8c7949a546ce",
+   "parentId": "root",
+   "depth": 1,
+   "name": "review-i22",
+   "role": "Agent",
+   "status": "done",
+   "providerId": "claude",
+   "model": "claude-opus-5-5",
+   "startedAt": "2026-10-01T05:14:23.449Z",
+   "finishedAt": "2026-10-01T05:29:49.853Z",
+   "turns": 1,
+   "generation": 0,
+   "task": "Задача помощника",
+   "handovers": [],
+   "turnTimings": [
+    {
+     "turn": 1,
+     "transport": "session",
+     "startedAt": "2026-10-01T05:14:23.449Z",
+     "firstEventAt": "2026-10-01T05:14:25.442Z",
+     "endedAt": "2026-10-01T05:29:49.848Z",
+     "promptChars": 22033,
+     "nativeToolCalls": 62,
+     "orbitToolCalls": 0
+    }
+   ]
+  }
+ ],
+ "communications": [
+  {
+   "id": "848933b0-1888-49c2-8263-8c3c2d78713b",
+   "kind": "spawn",
+   "fromAgentId": "user",
+   "toAgentId": "root",
+   "fromAgentName": "Вы",
+   "toAgentName": "Orbit",
+   "time": "2026-10-01T05:03:04.410Z",
+   "status": "delivered",
+   "delivery": "next-turn",
+   "text": ""
+  },
+  {
+   "id": "31cc7972-2bb9-476b-a188-39f402873d65",
+   "kind": "spawn",
+   "fromAgentId": "root",
+   "toAgentId": "agent-c5a5df06-dc36-4e98-bddf-8c7949a546ce",
+   "fromAgentName": "Orbit",
+   "toAgentName": "review-i22",
+   "time": "2026-10-01T05:14:23.441Z",
+   "status": "read",
+   "delivery": "next-turn",
+   "text": ""
+  }
+ ],
+ "traces": [],
+ "messages": []
+}

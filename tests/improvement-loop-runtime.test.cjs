@@ -40,6 +40,8 @@ test('the ON text states the loop rules and the OFF text is unchanged', () => {
     assert.ok(text.startsWith('IMPROVEMENT MODE ON'))
     assert.match(text, /one BATCH of tasks/); assert.match(text, /up to about 4 that are independent/); assert.match(text, /Orbit starts the next run itself/); assert.match(text, /marked working first/); assert.match(text, /Never start a second batch/); assert.match(text, /goal reached: <what was done>/)
     assert.match(text, /spawn_agent \{kind:'code', isolation:'worktree'/)
+    // A pending task carries a ready brief, so the next run starts its helper without exploring again.
+    assert.match(text, /Give every task you leave pending a ready brief in its evidence/)
     // Speed rules (from the audit of real loop runs): helpers at once, no idle waiting, and, where restart_orbit runs the
     // full checks itself, only targeted tests (no full suite, no mutation runs) before it.
     assert.match(text, /Within the first minutes, spawn one isolated helper per task, all in one turn/); assert.match(text, /While helpers or a reviewer run, continue independent work instead of waiting/)

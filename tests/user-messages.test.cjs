@@ -81,7 +81,7 @@ test('session: the message rides on the next Orbit tool result, whole, and is no
   assert.equal(snapshot.status, 'completed', snapshot.error)
   assert.equal(calls.length, 1, 'no extra turn for a message the model already saw')
   assert.match(calls[0].session.systemAppend, /The user can write to you while you work/)
-  assert.ok(calls[0].session.systemAppend.length <= 6000)
+  assert.ok(calls[0].session.systemAppend.length <= 7500)
   // The mark on the result is the one the system block names as this session's secret, and no record shows it.
   const mark = calls[0].session.systemAppend.match(/"\[orbit:([0-9a-f]{10})\] MESSAGE FROM THE USER"/)?.[1]
   assert.ok(mark, 'the system block names the mark')

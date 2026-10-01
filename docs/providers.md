@@ -292,8 +292,13 @@ and compatible endpoints. A missing approval handler declines the action.
 
 Reasoning is saved separately for each provider and each model in the mixed
 provider pool. Root selection takes precedence over legacy provider defaults.
-Children use their pool entry, explicit `spawn_agent.reasoningEffort`, or inherit
-the parent effort when keeping its provider/model. An empty pool effort means auto.
+A helper's level is chosen by the first rule that names one: the `spawn_agent.reasoningEffort` the
+parent passes (the parent is told to choose it per helper), the pool entry for that model (an empty
+pool effort means auto), the routing table's level for the `kind` (`model-routing.json`), the
+parent's level when the helper keeps its provider/model, the provider settings. The winner is kept
+as `effortSource`. A level the model does not offer is moved to the nearest one it does, below
+first (`reasoning-levels.mts`; handovers use the same rule), and `spawn_agent` answers with the
+level and why.
 The agent inspector displays the effective effort. Changes apply to new tasks.
 
 Codex uses `model_reasoning_effort` for exec and `effort` for App Server; levels
