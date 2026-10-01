@@ -315,7 +315,7 @@ test('loopPrompt: the header, the goal, the last 5 later user messages (steer in
   assert.ok(prompt.includes(`- ${'x'.repeat(599)}…`), 'each clipped to 600 chars')
   assert.ok(!prompt.includes('ответ') && !prompt.includes('заметка'))
   assert.ok(prompt.includes('Итог предыдущей попытки: Предыдущая попытка завершилась ошибкой: boom.'))
-  assert.match(lines.at(-1), /ОДНУ задачу/)
+  assert.match(lines.at(-1), /пачку независимых задач/)
   assert.match(lines.at(-1), /Orbit запустит сам/)
   const plain = loop.loopPrompt(activeLoop(), [messages[0]], 2)
   assert.ok(!plain.includes('Сообщения пользователя') && !plain.includes('Итог предыдущей попытки'), 'the goal message itself predates the loop')

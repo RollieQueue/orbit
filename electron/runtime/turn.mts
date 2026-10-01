@@ -2,14 +2,14 @@
 // of events it produces (buffered traces, the root's streamed answer, usage, native file events, the cut-off record).
 import { randomUUID } from 'node:crypto'
 import { ORBIT_RESPONSE_SCHEMA } from '../tool-schema.mts'
-import { TERMINAL, ceiling, MCP_TOOL_PREFIX, answerLimit, bounded, clip, TurnBudgetError, abortError, abortable, diagnostics, markProviderFailure } from './util.mts'
+import { TERMINAL, ceiling, MCP_TOOL_PREFIX, answerLimit, bounded, clip, isRecord, TurnBudgetError, abortError, abortable, agentWorkspace, diagnostics, markProviderFailure } from './util.mts'
 import { agentEnv } from './restart.mts'
 import { pauseGate, pausedBy, PauseInterrupt, pauseNote } from './pause.mts'
 import type { InterruptReason } from './pause.mts'
 import { watchTurn, clearSilentTurns, isStall } from './watchdog.mts'
 import type { TurnWatch } from './watchdog.mts'
 import { messageNote, stopSteer } from './steer.mts'
-import type { AgentRecord, OrbitRuntimeLike, ProviderEvent, ProviderResult, RunRecord, SessionInfo, StreamState, ToolImage, TraceImage, TurnTiming, UsageFigures } from '../types.mts'
+import type { AgentRecord, AgentUsage, OrbitRuntimeLike, ProviderEvent, ProviderResult, RunRecord, SessionInfo, StreamState, ToolImage, TraceImage, TurnTiming, UsageFigures } from '../types.mts'
 // The root agent's answer in progress is published at most four times a second.
 const STREAM_INTERVAL_MS = 250
 // A session turn can hold the whole task, so the window counts the agent's actions (tool calls) and shows its thinking
@@ -74,6 +74,8 @@ function providerEvent(runtime: OrbitRuntimeLike, run: RunRecord, agent: AgentRe
     try { runtime.quota?.ingest?.(agent.providerId, event.quota) } catch (error) { diagnostics(runtime, run, 'quota.ingest', error, agent.id) /* Quota bookkeeping never breaks the stream. */ }
     return
   }
+  // Tokens spent since the provider's last report: counted, but no trace and no sign of life for the watchdog.
+  if (event?.kind === 'usage') { runtime.recordUsage(run, agent, event.usage); return }
   runtime.notePartialTurn(agent, event)
   const counted = agent.activeTurn?.timing.nativeToolCalls, thinking = agent.activeTurn?.timing.thinking
   runtime.noteTurnEvent(agent, event)
@@ -82,7 +84,7 @@ function providerEvent(runtime: OrbitRuntimeLike, run: RunRecord, agent: AgentRe
   if (event?.kind === 'thinking') return
   // Bookkeeping about touched files must never break the provider stream it is read from.
   if (event?.native) { try { runtime.trackNativeFiles(run, agent, event) } catch (error) { diagnostics(runtime, run, 'trackNativeFiles', error, agent.id) } }
-  if (event?.usage) runtime.recordUsage(run, event.usage)
+  if (event?.usage) runtime.recordUsage(run, agent, event.usage)
   if (agent.id === 'root' && event?.kind === 'output' && !event.parentToolId && (event.partial || event.messageId)) runtime.streamOutput(run, agent, event)
   if (['output', 'reasoning'].includes(event?.kind) && (event.partial || event.messageId)) {
     const key = `${agent.id}:${agent.turns}:${event.parentToolId || 'main'}:${event.kind}:${event.messageId || 'output'}`
@@ -158,12 +160,36 @@ function flushStream(runtime: OrbitRuntimeLike, run: RunRecord, agent: AgentReco
   stream.lastAt = Date.now()
   runtime.emit(run, 'message.streaming', { agentId: agent.id, messageId: stream.messageId, content: bounded(content, answerLimit(run, agent)) }, false)
 }
-function recordUsage(runtime: OrbitRuntimeLike, run: RunRecord, usage: UsageFigures): void {
-  const input = Number(usage.input_tokens ?? usage.prompt_tokens), output = Number(usage.output_tokens ?? usage.completion_tokens)
-  if (Number.isFinite(input)) run.usage.inputTokens = (run.usage.inputTokens || 0) + input
-  if (Number.isFinite(output)) run.usage.outputTokens = (run.usage.outputTokens || 0) + output
-  const cached = Number(usage.cached_input_tokens ?? usage.cache_read_tokens ?? usage.cache_read_input_tokens ?? usage.prompt_tokens_details?.cached_tokens)
-  if (Number.isFinite(cached)) run.usage.cachedInputTokens = (run.usage.cachedInputTokens || 0) + cached
+// Token figures as vendors spell them, in one shape; null when they hold no number at all. `inputTokens` is everything the
+// model was sent, the cached part included: Anthropic and Cursor count the cache apart from the input, so it is added to
+// it, while OpenAI-style figures (Codex, endpoints, Ollama) already include it.
+function normalizeUsage(usage: unknown): AgentUsage | null {
+  if (!isRecord(usage)) return null
+  const figures: UsageFigures = usage
+  const first = (...values: unknown[]): number | undefined => {
+    for (const value of values) { const number = Number(value); if (value != null && Number.isFinite(number) && number >= 0) return number }
+    return undefined
+  }
+  const read = first(figures.cache_read_input_tokens, figures.cacheReadTokens, figures.cache_read_tokens), written = first(figures.cache_creation_input_tokens, figures.cacheWriteTokens)
+  const input = first(figures.input_tokens, figures.inputTokens, figures.prompt_tokens), output = first(figures.output_tokens, figures.outputTokens, figures.completion_tokens)
+  const apart = read !== undefined || written !== undefined
+  const cached = apart ? read : first(figures.cached_input_tokens, figures.prompt_tokens_details?.cached_tokens)
+  if (input === undefined && output === undefined && cached === undefined) return null
+  return { inputTokens: (input ?? 0) + (apart ? (read ?? 0) + (written ?? 0) : 0), outputTokens: output ?? 0, cachedInputTokens: cached ?? 0 }
+}
+// Adds what a provider reported to the agent and, as the sum of its agents, to the run. The window shows it while the turn
+// runs, but at most once a second (publishProgress), however often the provider's stream reports.
+function recordUsage(runtime: OrbitRuntimeLike, run: RunRecord, agent: AgentRecord, usage: unknown): void {
+  const figures = normalizeUsage(usage)
+  if (!figures) return
+  agent.usage = {
+    inputTokens: (agent.usage?.inputTokens ?? 0) + figures.inputTokens, outputTokens: (agent.usage?.outputTokens ?? 0) + figures.outputTokens,
+    cachedInputTokens: (agent.usage?.cachedInputTokens ?? 0) + figures.cachedInputTokens,
+  }
+  run.usage.inputTokens = (run.usage.inputTokens ?? 0) + figures.inputTokens
+  run.usage.outputTokens = (run.usage.outputTokens ?? 0) + figures.outputTokens
+  run.usage.cachedInputTokens = (run.usage.cachedInputTokens ?? 0) + figures.cachedInputTokens
+  publishProgress(runtime, run, agent)
 }
 function trackOperation<T>(runtime: OrbitRuntimeLike, run: RunRecord, operation: T | PromiseLike<T>, agent: { id: string }): Promise<Awaited<T>> {
   const pending = Promise.resolve(operation)
@@ -217,7 +243,7 @@ async function providerTurn(runtime: OrbitRuntimeLike, run: RunRecord, agent: Ag
     // A turn that reports nothing for too long is stopped (watchdog.mts); recoverProvider repeats it or hands it over.
     const turnWatch = watch = agent.activeTurn.watch = watchTurn(agent, session, () => controller.abort())
     providerTask = runtime.trackOperation(run, Promise.resolve().then(() => runtime.runProvider({
-      providerId: agent.providerId, model: agent.requestedModel, prompt: resolvedPrompt, workspace: run.workspace,
+      providerId: agent.providerId, model: agent.requestedModel, prompt: resolvedPrompt, workspace: agentWorkspace(run, agent),
       mode: run.accessMode, accessMode: run.accessMode, approvalPolicy: run.approvalPolicy,
       reasoningEffort: agent.reasoningEffort,
       providerOptions: run.providerOptions[agent.providerId] || {},
@@ -245,7 +271,7 @@ async function providerTurn(runtime: OrbitRuntimeLike, run: RunRecord, agent: Ag
     if (result?.model) { runtime.updateAgent(run, agent, { model: result.model }); if (agent.id === 'root') run.model = result.model }
     // A provider that could not apply the requested level (Cursor `auto` has no variants) reports the one that really ran.
     if (typeof result?.reasoningEffort === 'string' && result.reasoningEffort !== agent.reasoningEffort) { runtime.updateAgent(run, agent, { reasoningEffort: result.reasoningEffort }); if (agent.id === 'root') run.reasoningEffort = result.reasoningEffort }
-    if (result?.usage) runtime.recordUsage(run, result.usage)
+    if (result?.usage) runtime.recordUsage(run, agent, result.usage)
     timing.endedAt = new Date().toISOString()
     closeThinking(runtime, run, agent, timing)
     runtime.emit(run, 'run.info', { agentId: agent.id, providerId: agent.providerId, model: agent.model, usage: { ...run.usage }, timing: { ...timing } })

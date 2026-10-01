@@ -1,5 +1,6 @@
 // Helpers and constants shared by the runtime modules: bounded text, cancellation plumbing, the public view of an
 // agent, and the diagnostic trace. Every other runtime module may require this one; it requires none of them.
+import fs from 'node:fs'
 import path from 'node:path'
 import { randomBytes } from 'node:crypto'
 import { clip } from '../text.mts'
@@ -33,6 +34,8 @@ const withoutGoogleReasoning = (providerId: string, effort: string): string => p
 const answerLimit = (run: RunRecord, agent: AgentRecord): number => agent.id === 'root' ? Math.max(run.limits.maxOutputChars, 60000) : run.limits.maxOutputChars
 // Every field but the internal ones stays on the copy, which is what PublicAgent says.
 const publicAgent = (agent: AgentRecord): PublicAgent => { const copy: Partial<AgentRecord> = { ...agent }; for (const key of INTERNAL_AGENT_FIELDS) delete copy[key]; return copy as PublicAgent }
+// The tokens an agent has used (input + output), or undefined while no provider has reported any: what the directory shows.
+const agentTokens = (agent: Pick<AgentRecord, 'usage'>): number | undefined => agent.usage ? agent.usage.inputTokens + agent.usage.outputTokens : undefined
 // A plain JSON object: what a tool argument bag, an envelope or a parsed event must be before its fields are read.
 const isRecord = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === 'object' && !Array.isArray(value)
 // `values.includes(value)` that also narrows: the runtime checks model-supplied strings against small fixed lists.
@@ -49,6 +52,21 @@ function overlappingWorkspaces(left: string, right: string): boolean {
   if (relative === '' || (!path.isAbsolute(relative) && relative !== '..' && !relative.startsWith(`..${path.sep}`))) return true
   const reverse = path.relative(right, left)
   return reverse === '' || (!path.isAbsolute(reverse) && reverse !== '..' && !reverse.startsWith(`..${path.sep}`))
+}
+// Where an agent's files are: the isolated copy it works in (agent-worktree.mts) when it has one, else the run's workspace.
+const agentWorkspace = (run: Pick<RunRecord, 'workspace'>, agent: Pick<AgentRecord, 'workspace'>): string => agent.workspace || run.workspace
+// Whether two folders are the same one, as the file system names them (letter case and 8.3 short names aside).
+function sameFolder(left: string, right: string): boolean {
+  const real = (folder: string): string => { try { return fs.realpathSync.native(folder) } catch { return path.resolve(folder) } }
+  return path.relative(real(left), real(right)) === ''
+}
+// The tree an agent's files belong to in the project's own terms, whatever copy it works in: the run's workspace, or
+// Orbit's repository for a helper in an 'orbit' copy (isolation.target). The project index and the file map speak of it.
+function logicalWorkspace(run: Pick<RunRecord, 'workspace' | 'agentNodes'>, agent: AgentRecord): string {
+  for (let current: AgentRecord | undefined = agent; current?.workspace; current = current.parentId ? run.agentNodes.get(current.parentId) : undefined) {
+    if (current.isolation?.kind === 'orbit') return current.isolation.target
+  }
+  return run.workspace
 }
 function abortable<T>(promise: T | PromiseLike<T>, signal: AbortSignal | null | undefined, timeoutMs?: number | null, timeoutMessage = 'Operation timed out'): Promise<T> {
   return new Promise<T>((resolve, reject) => {
@@ -80,4 +98,4 @@ function diagnostics(runtime: Pick<OrbitRuntimeLike, 'trace'>, run: RunRecord, w
   try { runtime.trace(run, agentId, 'diagnostic', `${where}: ${(error as Error | null | undefined)?.message || String(error)}`) } catch { /* Reporting a failure must not add one. */ }
 }
 
-export { TERMINAL, AGENT_TERMINAL, ceiling, WORK_TOOLS, MUTATING_TOOLS, SKILL_READ_CHARS, MCP_TOOL_PREFIX, USER, newMailMark, isMailMark, mailTag, withoutGoogleReasoning, answerLimit, publicAgent, isRecord, oneOf, bounded, clip, TurnBudgetError, abortError, overlappingWorkspaces, abortable, diagnostics, markProviderFailure, fromProvider }
+export { TERMINAL, AGENT_TERMINAL, ceiling, WORK_TOOLS, MUTATING_TOOLS, SKILL_READ_CHARS, MCP_TOOL_PREFIX, USER, newMailMark, isMailMark, mailTag, withoutGoogleReasoning, answerLimit, publicAgent, agentTokens, isRecord, oneOf, bounded, clip, TurnBudgetError, abortError, overlappingWorkspaces, agentWorkspace, sameFolder, logicalWorkspace, abortable, diagnostics, markProviderFailure, fromProvider }

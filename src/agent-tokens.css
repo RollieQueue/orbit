@@ -1,0 +1,6 @@
+/* The token count and the «Изолированная копия» badge of an agent row (AgentsPanel.tsx): one line under the model, which the row's `small` rule already clips. */
+.agent-row .agent-row-meta{display:flex;align-items:center;gap:8px;white-space:nowrap}
+.agent-row .agent-tokens{color:#9fb3a7}
+.agent-row .isolation-badge{flex-shrink:0;padding:0 6px;border:1px solid #3d5646;border-radius:8px;font-size:9px;line-height:14px;color:#bbdcca}
+.agent-row .isolation-badge.conflict{border-color:#7a5a3a;color:#e6c79a}
+.agent-tokens-line{font-variant-numeric:tabular-nums}

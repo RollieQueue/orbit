@@ -508,3 +508,95 @@ test('Ollama requires explicit selection when installed models are equally suita
 test('Unsupported providers fail explicitly', async () => {
   await assert.rejects(runProvider({ providerId: 'unknown-provider', prompt: 'test' }), /not supported/)
 })
+
+// Token usage. The figures below are the ones Claude Code 2.1.285 (haiku) and codex-cli 0.155 really reported when they
+// were run against these scenarios: a turn with two API calls (the first with two tool_use blocks), a turn with a native
+// subagent that ended in two results, and a stub Responses API that answered 1000n input / 100n cached / 10n output.
+const sumUsage = events => events.filter(event => event.kind === 'usage').map(event => event.usage).reduce((sum, usage) => {
+  for (const [key, value] of Object.entries(usage)) sum[key] = (sum[key] || 0) + value
+  return sum
+}, {})
+const claudeStream = (event, parent = null) => ({ type: 'stream_event', event, session_id: 's', parent_tool_use_id: parent })
+const claudeMessage = (id, usage, parent = null) => ({ type: 'assistant', parent_tool_use_id: parent, message: { id, content: [{ type: 'text', text: 'x' }], usage } })
+const call = (input, created, read, output) => ({ input_tokens: input, cache_creation_input_tokens: created, cache_read_input_tokens: read, output_tokens: output })
+
+test('Claude counts each API call once while the turn runs, and a result adds only what the stream missed', () => {
+  const events = [], parser = createClaudeParser(event => events.push(event), 'haiku')
+  feed(parser, [
+    // One call's figures repeat on message_start, on every `assistant` event and on message_delta; output_tokens is final only on the last.
+    claudeStream({ type: 'message_start', message: { id: 'msg-1', usage: call(10, 9499, 17943, 3) } }),
+    claudeMessage('msg-1', call(10, 9499, 17943, 3)), claudeMessage('msg-1', call(10, 9499, 17943, 3)), claudeMessage('msg-1', call(10, 9499, 17943, 3)),
+    claudeStream({ type: 'message_delta', usage: call(10, 9499, 17943, 202) }),
+    claudeStream({ type: 'message_start', message: { id: 'msg-2', usage: call(8, 302, 27442, 1) } }),
+    claudeMessage('msg-2', call(8, 302, 27442, 1)), claudeMessage('msg-2', call(8, 302, 27442, 1)),
+    claudeStream({ type: 'message_delta', usage: call(8, 302, 27442, 29) }),
+  ])
+  assert.deepEqual(sumUsage(events), call(18, 9801, 45385, 231), 'live: both calls once, with their final output')
+  const before = events.length
+  feed(parser, [{ type: 'result', subtype: 'success', result: 'done', usage: { ...call(18, 9801, 45385, 231), output_tokens_details: { thinking_tokens: 97 }, iterations: [] } }])
+  const after = events.slice(before)
+  assert.equal(after.filter(event => event.kind === 'usage').length, 0, 'a result that agrees with the stream adds nothing')
+  assert.equal(after.find(event => event.kind === 'observation').usage, undefined, 'the completion note carries no figures: they would be counted twice')
+  assert.equal(parser.finish().text, 'done')
+})
+
+test('Claude counts a native subagent live, leaves it out of the results, and counts each result once, in either order', () => {
+  // Calls a, b and c of the agent and two of its subagent (whose output_tokens is stale on the `assistant` event).
+  const a = [claudeStream({ type: 'message_start', message: { id: 'a', usage: call(10, 5434, 22017, 3) } }), claudeStream({ type: 'message_delta', usage: call(10, 5434, 22017, 201) })]
+  const s1 = [claudeMessage('s1', call(10, 16798, 0, 8), 'task-1'), claudeMessage('s1', call(10, 16798, 0, 8), 'task-1')]
+  const b = [claudeStream({ type: 'message_start', message: { id: 'b', usage: call(8, 568, 27451, 3) } }), claudeStream({ type: 'message_delta', usage: call(8, 568, 27451, 92) })]
+  const s2 = [claudeMessage('s2', call(8, 1189, 16798, 2), 'task-1')]
+  const c = [claudeStream({ type: 'message_start', message: { id: 'c', usage: call(10, 519, 28019, 5) } }), claudeStream({ type: 'message_delta', usage: call(10, 519, 28019, 61) })]
+  // A result states the agent's own calls of its stretch only: the subagent is not in it, and the second result states c alone.
+  const first = { type: 'result', subtype: 'success', result: 'first', usage: call(18, 6002, 49468, 293), session_id: 's' }
+  const second = { type: 'result', subtype: 'success', result: 'done', usage: call(10, 519, 28019, 61), session_id: 's' }
+  const everything = call(46, 24508, 94285, 364)
+  // As the CLI really streamed it (Claude Code 2.1.285): both results came after all three calls...
+  const late = [], afterAll = createClaudeParser(event => late.push(event), 'haiku')
+  feed(afterAll, [...a, ...s1, ...b, ...s2, ...c])
+  assert.deepEqual(sumUsage(late), everything, 'live: every call once')
+  feed(afterAll, [first, second])
+  assert.deepEqual(sumUsage(late), everything, 'the results state calls already counted')
+  // ...and as it would if the first result came as soon as its calls were done.
+  const early = [], inOrder = createClaudeParser(event => early.push(event), 'haiku')
+  feed(inOrder, [...a, ...s1, ...b, ...s2, first, ...c, second])
+  assert.deepEqual(sumUsage(early), everything)
+})
+
+test('Claude without partial messages still ends exact: the result adds the output the assistant events could not show', () => {
+  const events = [], parser = createClaudeParser(event => events.push(event), 'haiku')
+  feed(parser, [
+    claudeMessage('msg-1', call(10, 9499, 17943, 3)), claudeMessage('msg-2', call(8, 302, 27442, 1)),
+    { type: 'result', subtype: 'success', result: 'done', usage: call(18, 9801, 45385, 231) },
+  ])
+  assert.deepEqual(sumUsage(events), call(18, 9801, 45385, 231))
+  // An error result reports its figures as well, and a stream with no figures reports none.
+  const failed = [], broken = createClaudeParser(event => failed.push(event))
+  feed(broken, [{ type: 'result', subtype: 'error_during_execution', is_error: true, result: 'boom', usage: call(5, 0, 100, 7) }])
+  assert.deepEqual(sumUsage(failed), call(5, 0, 100, 7))
+  const silent = [], plain = createClaudeParser(event => silent.push(event))
+  feed(plain, [claudeMessage('m', undefined), { type: 'result', subtype: 'success', result: 'ok' }])
+  assert.equal(silent.filter(event => event.kind === 'usage').length, 0)
+})
+
+test('Codex exec counts what the thread total grew by: the CLI reports the total, also when it resumes', () => {
+  const turn = (thread, usage, resumed) => {
+    const events = [], parser = createCodexParser(event => events.push(event), 'gpt-5.2', undefined, { resumed })
+    feed(parser, [{ type: 'thread.started', thread_id: thread }, { type: 'item.completed', item: { id: 'a', type: 'agent_message', text: 'ok' } }, { type: 'turn.completed', usage }])
+    assert.equal(events.find(event => event.kind === 'observation' && event.status === 'completed').usage, undefined, 'the completion note carries no figures')
+    return events.filter(event => event.kind === 'usage').map(event => event.usage)
+  }
+  const total = (input, cached, output) => ({ input_tokens: input, cached_input_tokens: cached, cache_write_input_tokens: 0, output_tokens: output, reasoning_output_tokens: 1 })
+  // exec, then exec resume twice, as the real CLI printed them (responses of 1000, 2000 and 3000 input tokens).
+  assert.deepEqual(turn('thread-usage-a', total(1000, 100, 10), false), [{ input_tokens: 1000, cached_input_tokens: 100, output_tokens: 10 }])
+  assert.deepEqual(turn('thread-usage-a', total(3000, 300, 30), true), [{ input_tokens: 2000, cached_input_tokens: 200, output_tokens: 20 }], 'the total of the first two, not the second alone')
+  assert.deepEqual(turn('thread-usage-a', total(6000, 600, 60), true), [{ input_tokens: 3000, cached_input_tokens: 300, output_tokens: 30 }])
+  assert.deepEqual(turn('thread-usage-a', total(6000, 600, 60), true), [], 'a repeated total adds nothing')
+  // A thread resumed in a process that never saw it (after an Orbit restart): its lifetime total is not this turn's.
+  assert.deepEqual(turn('thread-usage-unseen', total(900000, 800000, 4000), true), [])
+  assert.deepEqual(turn('thread-usage-unseen', total(950000, 840000, 4500), true), [{ input_tokens: 50000, cached_input_tokens: 40000, output_tokens: 500 }], 'the next turn counts from there')
+  // A thread whose first turn was cut off before its total arrived still starts from zero.
+  const cut = createCodexParser(() => {}, 'gpt-5.2')
+  feed(cut, [{ type: 'thread.started', thread_id: 'thread-usage-cut' }])
+  assert.deepEqual(turn('thread-usage-cut', total(1200, 0, 40), true), [{ input_tokens: 1200, cached_input_tokens: 0, output_tokens: 40 }])
+})

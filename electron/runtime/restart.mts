@@ -1,9 +1,11 @@
 // restart_orbit: the root agent asks Orbit to apply its own new code. The restart host (electron/resume.mts) runs the
 // self-upgrade script, which verifies and builds the code and restarts as little of Orbit as it must; this module checks
 // the call, keeps the script's progress in one trace of the agent, and turns the outcome into the tool's result or error.
-// It is offered only to root agents working in Orbit's own repository. It also gives every command the root agent runs
-// the environment that names its run (so a self-upgrade started from its own shell is continued the same way), writes
-// the restart note of a run a restart ends, and prepares the root agent of the continuation.
+// It is offered to the root agent of any run, whatever project the chat works on: Orbit improves itself from every chat,
+// and the self-upgrade always acts on the repository Orbit runs from (host.repoRoot), never on the run's workspace. It
+// also gives every command the root agent runs the environment that names its run (so a self-upgrade started from its own
+// shell is continued the same way), writes the restart note of a run a restart ends, and prepares the root agent of the
+// continuation.
 import { randomUUID } from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
@@ -42,20 +44,27 @@ function realFolder(folder: string): string {
   try { return fs.realpathSync.native(folder) } catch { return path.resolve(folder) }
 }
 // Whether the run works on Orbit's own code: its workspace is the repository Orbit runs from, a folder inside it, or a
-// folder that contains it (letter case aside on Windows, as path.relative compares there).
+// folder that contains it (letter case aside on Windows, as path.relative compares there). Not a condition of
+// restart_orbit (every project's run may use it), but of what the agent is told: in Orbit's repository its edits are
+// Orbit's code, elsewhere they belong to the project and Orbit's own code is a separate checkout (prompts.mts,
+// improvement.mts).
 function onOrbitRepository(host: RestartHost, run: RunRecord): boolean {
   return overlappingWorkspaces(realFolder(run.workspace), realFolder(host.repoRoot))
 }
-// Whether the root agent of this run can use restart_orbit at all (the prompt mentions it only then).
+// The same for a runtime that may have no restart host (a packaged build, a test): false then.
+function runOnOrbitRepository(runtime: OrbitRuntimeLike, run: RunRecord): boolean {
+  return !!runtime.restartHost?.available && onOrbitRepository(runtime.restartHost, run)
+}
+// Whether the root agent of this run can use restart_orbit at all (the prompt mentions it only then). In any project's
+// chat: the restart applies Orbit's own code, wherever the user is working when the agent changes it.
 function restartOffered(runtime: OrbitRuntimeLike, run: RunRecord, agent: { id: string }): boolean {
-  const host = runtime.restartHost
-  return agent.id === 'root' && run.accessMode !== 'read-only' && !devServer() && !!host?.available && onOrbitRepository(host, run)
+  return agent.id === 'root' && run.accessMode !== 'read-only' && !devServer() && !!runtime.restartHost?.available
 }
 
 // The environment of every command the root agent runs (its provider CLI and Orbit's run_command): what the self-upgrade
 // script needs to write the intent that continues this run, and to signal this Orbit's profile. Given exactly where
 // restart_orbit itself is offered: empty for helpers (only the orchestrator restarts Orbit), read-only runs, under the
-// Vite dev server (the script refuses it), without a host that can restart Orbit, and for runs on other projects.
+// Vite dev server (the script refuses it) and without a host that can restart Orbit.
 function agentEnv(runtime: OrbitRuntimeLike, run: RunRecord, agent: { id: string }): Record<string, string> {
   const host = runtime.restartHost
   if (!host || !restartOffered(runtime, run, agent)) return {}
@@ -135,8 +144,8 @@ function rolledBack(rollback: RestartRollback | undefined): string {
   const paths = rollback.restored.map(entry => `${entry}/`).join(' and ')
   return `${head}: your changes to ${paths} were reverted to the rollback base ${rollback.base || '(unknown)'}. They are kept in ${patch} and ${ref}: re-apply them before fixing (git restore --source=${ref} --worktree -- ${rollback.restored.join(' ')}), then fix what the output shows and call restart_orbit again.`
 }
-// Improvement mode: a restart refused for the cycle limit leaves the task done; the next task's restart applies it.
-const LOOP_CYCLE_LIMIT = ' Improvement mode: keep the task done with the evidence "verified, not applied yet (cycle limit)"; the next task\'s restart_orbit applies it.'
+// Improvement mode: a restart refused for the cycle limit leaves the batch's tasks done; the next restart applies them.
+const LOOP_CYCLE_LIMIT = ' Improvement mode: keep the batch\'s tasks done with the evidence "verified, not applied yet (cycle limit)"; the next restart_orbit applies them.'
 function failure(result: Extract<RestartResult, { ok: false }>, run: RunRecord): Error {
   const hint = HINTS[result.status] ? `${HINTS[result.status]}${result.status === 'cycle-limit' && run.improvementMode ? LOOP_CYCLE_LIMIT : ''}` : ''
   const advice = result.status === 'rolled-back' ? rolledBack(result.rollback) : hint || 'Nothing was restarted: the running Orbit keeps its current code. Fix what the output shows, then call restart_orbit again.'
@@ -157,9 +166,9 @@ function refuseWhileOthersWork(runtime: OrbitRuntimeLike, run: RunRecord): void 
   throw new Error(`restart_orbit refused: ${others.length} other chat(s) are still working and a restart would cut them off: ${listed}${others.length > 5 ? '; …' : ''}. Nothing was restarted. Wait for them to finish (wait_message {timeout_ms} waits without polling), then call restart_orbit again.`)
 }
 
-// The tool. Root only, in a run on Orbit's own repository, with write access (the script runs the checks and the
-// build), not under the Vite dev server, and not while other chats are working (a restart would cut them off; while the
-// script runs, lifecycle.start refuses new runs in other chats); `verify` (default true) runs the checks first, and a
+// The tool. Root only, in a run on any project, with write access (the script runs the checks and the build), not under
+// the Vite dev server, and not while other chats are working (a restart would cut them off; while the script runs,
+// lifecycle.start refuses new runs in other chats); `verify` (default true) runs the checks first, and a
 // failed check is an error carrying the output, after which the agent fixes the code and may call again. A runtime or
 // full restart shuts this process down while the call waits: the run then ends as `restarting`
 // (lifecycle.markRestarting), and the abort that brings must not stop the script (it is restarting Orbit), while the
@@ -169,7 +178,6 @@ async function executeRestart(runtime: OrbitRuntimeLike, run: RunRecord, agent: 
   if (agent.id !== 'root') throw new Error('Only the root agent (the orchestrator) can restart Orbit')
   const host = runtime.restartHost
   if (!host?.available) throw new Error('restart_orbit is available only when Orbit runs from its repository')
-  if (!onOrbitRepository(host, run)) throw new Error(`restart_orbit applies changes to Orbit's own code, so it is available only in a run whose workspace is Orbit's repository (${host.repoRoot}), a folder in it or a folder that contains it; this run works in ${run.workspace}. Nothing was restarted.`)
   if (devServer()) throw new Error('restart_orbit is unavailable while Orbit runs from the Vite dev server (ORBIT_DEV=1): a relaunch would stop npm run dev. Nothing was restarted; ask the user to restart Orbit.')
   if (run.accessMode === 'read-only') throw new Error('restart_orbit runs the checks and the build, so it needs workspace-write or full access')
   const reason = checkedText(args.reason, 'a reason', REASON_CHARS)
@@ -202,5 +210,5 @@ async function executeRestart(runtime: OrbitRuntimeLike, run: RunRecord, agent: 
   return observation(result)
 }
 
-export { setRestartHost, restartOffered, agentEnv, restartNote, prepareContinuation, executeRestart }
+export { setRestartHost, restartOffered, onOrbitRepository, runOnOrbitRepository, agentEnv, restartNote, prepareContinuation, executeRestart }
 export type { RestartObservation }

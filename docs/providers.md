@@ -376,7 +376,7 @@ closeSession(sessionId)           // ends a Codex App Server session or an Antig
 `extraEnv` reaches Claude, both Codex transports, Cursor and Antigravity on either transport; Orbit's own variables
 (the MCP token, `NO_PROXY`, the Google CLI proxy) win over it. The runtime passes `ORBIT_RUN_ID`, `ORBIT_CHAT_ID`,
 `ORBIT_PROJECT_ID`, `ORBIT_AGENT_ID`, `ORBIT_RESUME_FILE` and `ORBIT_USER_DATA` exactly where `restart_orbit` is offered
-(the root agent of a writable run on Orbit's own repository, when Orbit can restart itself and is not under the Vite dev
+(the root agent of a writable run on any project, when Orbit can restart itself and is not under the Vite dev
 server), so a self-upgrade run from that CLI's own shell names the run to continue and signals this Orbit's profile
 (README, "Самообновление"); every other agent gets none.
 

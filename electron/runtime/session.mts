@@ -216,7 +216,7 @@ function registry(runtime: OrbitRuntimeLike): ToolRegistryLike | null {
   return runtime.toolRegistry || null
 }
 // tools/list for one session: the registry's tools without root-only ones for workers and without writes in read-only
-// mode; restart_orbit only where the envelope guide offers it too (the root agent of a run on Orbit's own repository).
+// mode; restart_orbit only where the envelope guide offers it too (the root agent of a writable run on any project).
 function listToolsMcp(runtime: OrbitRuntimeLike, token: SessionToken): ToolSpec[] {
   const session = runtime.sessionFor(token)
   const registry = runtime.registry()
@@ -328,7 +328,9 @@ async function dispatchMcp(runtime: OrbitRuntimeLike, token: SessionToken, name:
   let answer = observation
   if (cut && !failure) {
     const again = `one Orbit tool call may take at most ${span(limit)} here. Call ${call.name} again to keep waiting.`
-    if (call.name === 'wait_agent' && Array.isArray(observation) && observation.some(child => !AGENT_TERMINAL.has(String((child as { status?: unknown } | null)?.status)))) answer = { ok: true, stillRunning: true, waitedMs: limit, agents: observation, hint: `Helpers are still running after ${span(limit)}: ${again}` }
+    // wait_agent may have returned before the limit (a helper finished, or its progress check came first).
+    const waited = Math.min(limit, Date.now() - calledAt)
+    if (call.name === 'wait_agent' && Array.isArray(observation) && observation.some(child => !AGENT_TERMINAL.has(String((child as { status?: unknown } | null)?.status)))) answer = { ok: true, stillRunning: true, waitedMs: waited, agents: observation, hint: `Helpers are still running after ${span(waited)}: ${again}` }
     else if (call.name === 'wait_message' && (observation as { timedOut?: unknown } | null)?.timedOut === true) answer = { ...(observation as object), stillWaiting: true, hint: `No message within ${span(limit)}: ${again}` }
   }
   // describeCall reads the observation's fields defensively, whatever the tool returned.

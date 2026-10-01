@@ -116,7 +116,7 @@ interface RuntimeEvent {
   // An endless-improvement loop task's number (run.started) and the handoff its plan leaves the next task (null: none).
   loopTask?: number
   improvementHandoff?: string | null
-  usage?: { providerTurns: number; workerTurns?: number }
+  usage?: import('./types').RunUsage
   router?: { routed: number; notices: number; refused: number }
   // run.started of a continuation after a restart; the terminal event of a run that ended 'restarting' carries `restart`.
   resumedFrom?: string

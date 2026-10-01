@@ -172,7 +172,10 @@ function createRuntimeService(options: RuntimeServiceOptions): RuntimeService {
     })
   }
 
-  const runtime = new OrbitRuntime({ runProvider, requestApproval })
+  // Isolated helpers' git copies live under <userData>/worktrees; those of runs a crash or a restart cut short are removed
+  // now (unmerged changes are saved as patches first).
+  const runtime = new OrbitRuntime({ runProvider, requestApproval, worktreeRoot: path.join(userData, 'worktrees') })
+  void runtime.sweepIsolation().then(swept => { if (swept.removed || swept.patches.length) log('info', `isolated copies from earlier runs: ${swept.removed} removed${swept.patches.length ? `, unmerged changes saved as ${swept.patches.join(', ')}` : ''}`) })
   // Subscription quotas belong to the account, not to a run: one monitor serves the window and every running agent.
   const quota = new QuotaMonitor()
   runtime.setQuota(quota)

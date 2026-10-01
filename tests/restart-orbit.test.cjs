@@ -331,14 +331,18 @@ test('shutting down for a restart ends exactly the run the intent names, as rest
   assert.equal(saved.startPayload.history, undefined, 'nor is the chat history')
 })
 
-test('restart_orbit end to end: the run ends as restarting and a new run in the same chat continues it', async t => {
-  const repo = repository(t), userData = folder(t), workspace = repo
+// The same in Orbit's repository and in another project's chat: the self-upgrade always runs in the repository, and the
+// continuation starts in the chat's own project and folder.
+for (const [where, elsewhere] of [['in Orbit\'s repository', false], ['in another project\'s chat', true]]) test(`restart_orbit end to end ${where}: the run ends as restarting and a new run in the same chat continues it`, async t => {
+  const repo = repository(t), userData = folder(t), workspace = elsewhere ? folder(t) : repo
+  const scripts = []
   // The script on the tool path: the checks pass, the intent is written from the environment the runtime gave it, the
   // restart is signalled, and this process is shut down before the script could report back.
   let signalled
   const restarted = new Promise(resolve => { signalled = resolve })
   const { spawn } = fakeSpawn((child, { args, options }) => {
     const env = options.env, flag = name => args[args.indexOf(name) + 1]
+    scripts.push({ cwd: options.cwd, project: env.ORBIT_PROJECT_ID, chat: env.ORBIT_CHAT_ID })
     fs.writeFileSync(env.ORBIT_RESUME_FILE, JSON.stringify({
       version: 1, id: 'upgrade-7', createdAt: new Date().toISOString(), source: env.ORBIT_RESTART_SOURCE, reason: flag('--reason'), continueWith: flag('--continue-with'),
       verify: !args.includes('--no-verify'), runId: env.ORBIT_RUN_ID, chatId: env.ORBIT_CHAT_ID, projectId: env.ORBIT_PROJECT_ID, agentId: env.ORBIT_AGENT_ID,
@@ -379,6 +383,9 @@ test('restart_orbit end to end: the run ends as restarting and a new run in the 
   assert.deepEqual([continuation.chatId, continuation.projectId, continuation.model, continuation.reasoningEffort], ['chat-a', 'project-1', 'model-a', 'high'])
   assert.equal(continuation.resumedFrom, oldRunId)
   assert.equal(continuation.resumeChain, 1)
+  assert.deepEqual(scripts, [{ cwd: repo, project: 'project-1', chat: 'chat-a' }], 'the script ran in Orbit\'s repository, for the chat\'s own project')
+  assert.equal(continuation.workspace, fs.realpathSync(workspace), 'the continuation works in the folder of the chat\'s project')
+  assert.equal(continuation.workspace === fs.realpathSync(repo), !elsewhere)
   assert.equal(continuation.startPayload.agentInstructions, 'Answer in English')
   assert.equal(continuation.startPayload.restartNote, undefined, 'a continuation does not pass its note on')
   const started = events.find(event => event.type === 'run.started' && event.runId === notice.resumedRunId)
@@ -707,11 +714,12 @@ test('the variables that name the run reach run_command and the provider CLI, an
   assert.deepEqual(seen[0], { ORBIT_RUN_ID: runId, ORBIT_CHAT_ID: 'chat-1', ORBIT_PROJECT_ID: 'project-1', ORBIT_AGENT_ID: 'root', ORBIT_RESUME_FILE: resumeFile, ORBIT_USER_DATA: userData })
   assert.deepEqual(resume.restartEnv({ runId: 'r', chatId: 'c', projectId: 'p' }, { id: 'a' }, null), {}, 'no resume file, no variables')
 
-  // The same host, a run on another project: restart_orbit is not offered there, and neither are the variables.
+  // The same host, a run on another project: restart_orbit is offered there too, so the variables are given, naming that run.
   const elsewhere = []
   const other = runtimeWith({ restartHost: host, runProvider: async options => { elsewhere.push(options.extraEnv); return { text: 'Done' } } })
-  assert.equal((await finished(other, payload(folder(t), { chatId: 'chat-elsewhere' }))).snapshot.status, 'completed')
-  assert.deepEqual(elsewhere.map(env => Object.keys(env || {})), [[]], 'a run on another project gets no restart variables')
+  const away = await finished(other, payload(folder(t), { chatId: 'chat-elsewhere' }))
+  assert.equal(away.snapshot.status, 'completed')
+  assert.deepEqual(elsewhere, [{ ORBIT_RUN_ID: away.runId, ORBIT_CHAT_ID: 'chat-elsewhere', ORBIT_PROJECT_ID: 'project-1', ORBIT_AGENT_ID: 'root', ORBIT_RESUME_FILE: resumeFile, ORBIT_USER_DATA: userData }], 'a run on another project gets the restart variables of its own run')
 
   const plainSeen = []
   let plainTurn = 0
@@ -728,17 +736,23 @@ test('the variables that name the run reach run_command and the provider CLI, an
 test('only the root agent of a writable run hears about restart_orbit, and only when Orbit can restart itself', async t => {
   const repo = repository(t), userData = folder(t), workspace = repo
   const host = resume.createRestartHost({ repoRoot: repo, userData, spawn: fakeSpawn(() => {}).spawn })
-  const prompts = new Map()
-  let rootTurns = 0
-  const runtime = runtimeWith({ restartHost: host, runProvider: async ({ prompt }) => {
-    const [, name] = identity(prompt)
-    prompts.set(name, [...(prompts.get(name) || []), prompt])
-    if (name === 'Orbit' && ++rootTurns === 1) return response(tool('spawn_agent', { name: 'Helper', task: 'Check the change', reason: 'Separate check' }), tool('wait_agent'))
-    return { text: 'Done' }
-  } })
-  assert.equal((await finished(runtime, payload(workspace))).snapshot.status, 'completed')
-  assert.match(prompts.get('Orbit')[0], /\nrestart_orbit \{reason,continueWith,verify\?\}: root only; applies changes to Orbit's OWN code/)
-  assert.doesNotMatch(prompts.get('Helper')[0], /restart_orbit/)
+  // The root of a run on Orbit's repository, and of one on another project; the helper of either never hears of the tool
+  // nor of the root's own-code block (it works on what its task names).
+  for (const [where, folderOf, ownBlock] of [['Orbit\'s repository', () => workspace, false], ['another project', () => folder(t), true]]) {
+    const prompts = new Map()
+    let rootTurns = 0
+    const runtime = runtimeWith({ restartHost: host, runProvider: async ({ prompt }) => {
+      const [, name] = identity(prompt)
+      prompts.set(name, [...(prompts.get(name) || []), prompt])
+      if (name === 'Orbit' && ++rootTurns === 1) return response(tool('spawn_agent', { name: 'Helper', task: 'Check the change', reason: 'Separate check' }), tool('wait_agent'))
+      return { text: 'Done' }
+    } })
+    assert.equal((await finished(runtime, payload(folderOf(), { chatId: `chat-${ownBlock}` }))).snapshot.status, 'completed', where)
+    assert.match(prompts.get('Orbit')[0], /\nrestart_orbit \{reason,continueWith,verify\?\}: root only; applies changes to Orbit's OWN code/, where)
+    assert.equal(prompts.get('Orbit')[0].includes('YOUR OWN CODE:'), ownBlock, where)
+    assert.doesNotMatch(prompts.get('Helper')[0], /restart_orbit/, where)
+    assert.doesNotMatch(prompts.get('Helper')[0], /YOUR OWN CODE/, where)
+  }
   for (const [options, extra] of [[{}, { chatId: 'chat-no-host' }], [{ restartHost: host }, { chatId: 'chat-read-only', accessMode: 'read-only' }], [{ restartHost: resume.createRestartHost({ repoRoot: folder(t), userData }) }, { chatId: 'chat-packaged' }]]) {
     const seen = []
     const other = runtimeWith({ ...options, runProvider: async ({ prompt }) => { seen.push(prompt); return { text: 'Done' } } })
@@ -1048,27 +1062,120 @@ test('a stop leaves the cancel marker for the script and its watcher and release
   await assert.rejects(cleared, /Run cancelled/)
 })
 
-test('restart_orbit is offered and accepted only in runs on Orbit\'s own repository', async t => {
+test('restart_orbit is offered and accepted in a run on any project; the script runs in the repository, and only another project\'s root is told where its own code lives', async t => {
   const repo = repository(t), userData = folder(t)
   const { spawn, calls } = fakeSpawn(async child => { writeReport(repo, { status: 'up-to-date' }); await child.exit(0) })
   const host = resume.createRestartHost({ repoRoot: repo, userData, spawn })
-  // Another project: its root never hears of the tool, and a call is refused.
+  const own = text => text.includes(`YOUR OWN CODE: you (Orbit) run from ${repo}.`)
+  // Another project: its root hears of the tool and of its own code (the block carries the repository, the helper route
+  // and, with full access only, the direct edit), and its call is accepted.
   const prompts = []
   const elsewhere = runtimeWith({ restartHost: host, runProvider: async ({ prompt }) => { prompts.push(prompt); return { text: 'Done' } } })
   assert.equal((await finished(elsewhere, payload(folder(t), { chatId: 'chat-elsewhere' }))).snapshot.status, 'completed')
-  assert.doesNotMatch(prompts[0], /restart_orbit/)
+  assert.equal((await finished(elsewhere, payload(folder(t), { chatId: 'chat-elsewhere-full', accessMode: 'danger-full-access' }))).snapshot.status, 'completed')
+  for (const prompt of prompts) {
+    assert.match(prompt, /\nrestart_orbit \{reason,continueWith,verify\?\}: root only; applies changes to Orbit's OWN code \(this Orbit runs from its repository, whichever project this chat works on\)/)
+    assert.doesNotMatch(prompt, /never for other projects/)
+    assert.ok(own(prompt), 'the block names the repository')
+    assert.ok(prompt.includes(`spawn_agent {isolation:'orbit', kind:'code', ...} — the helper works in an isolated copy of Orbit's repository and Orbit merges its changes into ${repo} when it finishes`))
+    assert.match(prompt, /\(docs\/ARCHITECTURE\.md there maps the code\)\. Then apply with restart_orbit: checks, build, restart; this chat continues with continueWith\. Keep this project's work and Orbit's changes apart\. Skills you install with capability_install serve this project \(scope project\) or every project \(scope global\)\./)
+  }
+  assert.ok(prompts[0].includes('your access does not reach that folder, so the helper is the way'))
+  assert.ok(prompts[1].includes(`or edit ${repo} yourself`))
   const other = await liveRun(t, { restartHost: host }, { workspace: folder(t), chatId: 'chat-other-project' })
-  assert.equal(restart.restartOffered(other.runtime, other.run, other.root), false)
-  await assert.rejects(other.runtime.executeTool(other.run, other.root, 'restart_orbit', { reason: 'r', continueWith: 'c' }), /available only in a run whose workspace is Orbit's repository \(.+\), a folder in it or a folder that contains it; this run works in .+\. Nothing was restarted\./)
-  assert.equal(calls.length, 0)
-  // A folder inside the repository, a folder that contains it and, on Windows, the repository in other letter case.
+  assert.equal(restart.restartOffered(other.runtime, other.run, other.root), true)
+  assert.equal(restart.onOrbitRepository(host, other.run), false)
+  assert.equal(restart.runOnOrbitRepository(other.runtime, other.run), false)
+  assert.deepEqual(Object.keys(restart.agentEnv(other.runtime, other.run, other.root)), ['ORBIT_RUN_ID', 'ORBIT_CHAT_ID', 'ORBIT_PROJECT_ID', 'ORBIT_AGENT_ID', 'ORBIT_RESUME_FILE', 'ORBIT_USER_DATA'])
+  assert.equal((await other.runtime.executeTool(other.run, other.root, 'restart_orbit', { reason: 'r', continueWith: 'c' })).level, 'none')
+  assert.equal(calls.length, 1)
+  assert.equal(calls[0].options.cwd, repo, 'the self-upgrade works on Orbit\'s repository, not on the run\'s folder')
+  assert.equal(calls[0].options.env.ORBIT_CHAT_ID, 'chat-other-project')
+  // A folder inside the repository, a folder that contains it and, on Windows, the repository in other letter case:
+  // offered as well, and Orbit's repository for the wording (no separate checkout to describe).
   fs.mkdirSync(path.join(repo, 'src'))
   const inside = await liveRun(t, { restartHost: host }, { workspace: path.join(repo, 'src'), chatId: 'chat-inside' })
-  assert.equal(restart.restartOffered(inside.runtime, inside.run, inside.root), true)
-  assert.equal(restart.restartOffered(inside.runtime, { ...inside.run, workspace: path.dirname(repo) }, inside.root), true)
-  if (process.platform === 'win32') assert.equal(restart.restartOffered(inside.runtime, { ...inside.run, workspace: repo.toUpperCase() }, inside.root), true)
+  const spellings = [inside.run, { ...inside.run, workspace: path.dirname(repo) }, ...(process.platform === 'win32' ? [{ ...inside.run, workspace: repo.toUpperCase() }] : [])]
+  for (const run of spellings) {
+    assert.equal(restart.restartOffered(inside.runtime, run, inside.root), true)
+    assert.equal(restart.runOnOrbitRepository(inside.runtime, run), true)
+  }
   assert.equal(restart.restartOffered(inside.runtime, inside.run, { id: 'helper-1' }), false, 'root only')
   assert.equal((await inside.runtime.executeTool(inside.run, inside.root, 'restart_orbit', { reason: 'r', continueWith: 'c' })).level, 'none')
+  // Not offered without a host that can restart Orbit, or in a read-only run: nor is the block.
+  assert.equal(restart.runOnOrbitRepository(runtimeWith({}), inside.run), false)
+  assert.equal(restart.restartOffered(runtimeWith({}), other.run, other.root), false)
+  assert.equal(restart.restartOffered(other.runtime, { ...other.run, accessMode: 'read-only' }, other.root), false)
+})
+
+test('improvement mode asks for restart_orbit in another project\'s chat only for Orbit\'s own unapplied code; in Orbit\'s repository written files count too', async t => {
+  const improvement = require('../electron/runtime/improvement.mts')
+  const repo = repository(t), userData = folder(t)
+  const base = resume.createRestartHost({ repoRoot: repo, userData, spawn: fakeSpawn(() => {}).spawn })
+  // The reminder a root's answer would get after closing a task (and writing a file in its folder, when `wrote`).
+  async function reminder({ unapplied, workspace, wrote = false, tasks = ['t1'] }) {
+    const live = await liveRun(t, { restartHost: { ...base, unapplied } }, { workspace, chatId: `chat-${Math.random()}`, improvementMode: true })
+    live.run.improvements = tasks.map(id => ({ id, title: `Task ${id}`, status: 'done', evidence: 'verified' }))
+    if (wrote) live.run.fileActivity.record('root', 'fix.txt', 'write')
+    return improvement.reminderFor(live.runtime, live.run)
+  }
+  const project = folder(t)
+  // Another project, state unknown (no health report): the files it wrote are the project's, nothing asks for a restart.
+  assert.equal(await reminder({ unapplied: () => null, workspace: project, wrote: true }), null)
+  assert.equal(await reminder({ unapplied: undefined, workspace: project, wrote: true }), null, 'a host that cannot tell the code state either')
+  // Another project, Orbit's code on disk differs from what runs (a helper merged a change into the repository): it does,
+  // and a restart applies the whole batch.
+  assert.match(await reminder({ unapplied: () => ['runtime'], workspace: project }), /^Improvement mode: Orbit's code on disk differs from the code the running Orbit runs \(runtime\), so a change is not applied yet\. Call restart_orbit now as the last step.*continueWith: "Task t1 was applied: confirm/)
+  assert.match(await reminder({ unapplied: () => ['runtime', 'renderer'], workspace: project, tasks: ['t1', 't2', 't3'] }), /continueWith: "Tasks t1, t2, t3 were applied: confirm/, 'one restart for the batch')
+  // Everything on disk already runs: no restart, whatever was written; a batch of several closed tasks is accepted as it is.
+  assert.equal(await reminder({ unapplied: () => [], workspace: project, wrote: true }), null)
+  assert.equal(await reminder({ unapplied: () => [], workspace: project, tasks: ['t1', 't2', 't3', 't4'] }), null)
+  // In Orbit's repository an unknown state falls back to the written files, as before.
+  assert.match(await reminder({ unapplied: () => null, workspace: repo, wrote: true }), /this run changed Orbit's own code, but the change is not applied yet\. Call restart_orbit now/)
+  assert.equal(await reminder({ unapplied: () => null, workspace: repo }), null, 'nothing written, nothing to apply')
+  // A restart already applied or deferred this run, or no restart host at all, asks for nothing, in any project.
+  const done = await liveRun(t, { restartHost: { ...base, unapplied: () => ['runtime'] } }, { workspace: project, chatId: 'chat-applied', improvementMode: true })
+  done.run.improvements = [{ id: 't1', title: 'Task 1', status: 'done', evidence: 'verified' }]
+  done.run.restartApplied = true
+  assert.equal(improvement.reminderFor(done.runtime, done.run), null)
+  const bare = await liveRun(t, {}, { workspace: project, chatId: 'chat-bare', improvementMode: true })
+  bare.run.improvements = [{ id: 't1', title: 'Task 1', status: 'done', evidence: 'verified' }]
+  assert.equal(improvement.reminderFor(bare.runtime, bare.run), null)
+})
+
+test('skills are installed from a run on another project: project scope, global scope from the project folder or the temp folder, and the scope guard holds', async t => {
+  const { CapabilityStore } = require('../electron/capabilities.mts')
+  const repo = repository(t), userData = folder(t), project = folder(t), somewhere = folder(t)
+  const host = resume.createRestartHost({ repoRoot: repo, userData, spawn: fakeSpawn(() => {}).spawn })
+  const skills = new CapabilityStore(userData)
+  const live = await liveRun(t, { restartHost: host, capabilityStore: skills }, { workspace: project, chatId: 'chat-skills' })
+  assert.equal(restart.runOnOrbitRepository(live.runtime, live.run), false)
+  const install = args => live.runtime.executeTool(live.run, live.root, 'capability_install', args)
+  // A project skill serves this project only; a global one about Orbit itself (it names Orbit's repository, not the project) every project.
+  const local = await install({ name: 'Local routine', description: 'd', whenToUse: 'w', instructions: 'Run the three steps of this project.', scope: 'project' })
+  assert.deepEqual([local.ok, local.scope, local.demoted], [true, 'project', undefined])
+  const shared = await install({ name: 'Change Orbit from a chat', description: 'd', whenToUse: 'w', instructions: `Edit ${repo} through an isolated helper, then call restart_orbit.`, scope: 'global' })
+  assert.deepEqual([shared.ok, shared.scope, shared.demoted], [true, 'global', undefined])
+  const seenFrom = workspace => skills.list(workspace).map(skill => skill.id)
+  assert.deepEqual([seenFrom(project).includes(local.id), seenFrom(project).includes(shared.id)], [true, true])
+  assert.deepEqual([seenFrom(somewhere).includes(local.id), seenFrom(somewhere).includes(shared.id)], [false, true], 'the project skill stays here, the global one reaches every project')
+  // A package from a folder in the project and one from the temp folder, each with its own skill.json saying "global".
+  const pack = (parent, name) => {
+    const dir = fs.mkdtempSync(path.join(parent, 'pack-')); t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
+    fs.writeFileSync(path.join(dir, 'page.html'), '<p>done</p>')
+    fs.writeFileSync(path.join(dir, 'skill.json'), JSON.stringify({ name, instructions: 'Shows the page.', scope: 'global', triggers: [{ on: 'task-completed', show: 'page.html' }] }))
+    return dir
+  }
+  for (const [where, parent] of [['the project folder', project], ['the temp folder', os.tmpdir()]]) {
+    const installed = await install({ fromDir: pack(parent, `Page from ${where.replace(/ /g, '-')}`) })
+    assert.deepEqual([installed.ok, installed.scope], [true, 'global'], where)
+    assert.deepEqual(skills.read(installed.id, somewhere).files.map(file => file.path), ['page.html', 'skill.json'], `${where}: the package reached every project`)
+  }
+  // The guard stays: a global skill that names this project is kept in it, and a folder elsewhere is refused.
+  const named = await install({ name: 'Names the project', description: 'd', whenToUse: 'w', instructions: `Open ${project} first.`, scope: 'global' })
+  assert.deepEqual([named.scope, named.demoted], ['project', true])
+  assert.equal(seenFrom(somewhere).includes(named.id), false)
+  await assert.rejects(install({ name: 'x', instructions: 'y', fromDir: os.homedir() }), /inside the project folder or the temp folder/)
 })
 
 test('only the intent that marked the run continues it: another intent, or a run no shutdown marked, gets a failed notice', async t => {

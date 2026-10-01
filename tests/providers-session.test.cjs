@@ -463,7 +463,9 @@ test('Claude session run: fixture CLI receives the session flags, the prompt on 
   const nativeCall = events.find(event => event.kind === 'tool' && event.toolId === 't2' && event.input)
   assert.ok(nativeCall.native === true && nativeCall.orbitTool === undefined)
   assert.equal(events.find(event => event.toolId === 't2' && event.status === 'completed').native, true)
-  assert.ok(events.some(event => event.kind === 'observation' && event.status === 'completed' && event.usage?.input_tokens === 3))
+  // The turn's figures reach the runtime as one usage event (a result nothing else reported), not on the completion note.
+  assert.deepEqual(events.filter(event => event.kind === 'usage').map(event => event.usage.input_tokens + event.usage.output_tokens), [5])
+  assert.equal(events.find(event => event.kind === 'observation' && event.status === 'completed').usage, undefined)
   const second = await runProvider({ providerId: 'claude', workspace: cli.directory, accessMode: 'workspace-write', prompt: 'Second', session: { id: first.sessionId, resume: true, token: 'tok', mcpUrl: 'http://127.0.0.1:9/mcp' } })
   assert.equal(second.sessionId, first.sessionId); assert.equal(second.text, 'Done: Second')
   record = cli.read()

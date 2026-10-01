@@ -33,10 +33,16 @@ export interface RunLimits {
 // What a start payload may say about the limits: raw values, normalised by `normalizeLimits`.
 export type LimitsInput = Partial<Record<keyof RunLimits | 'maxConcurrency', unknown>>
 export interface Usage { providerTurns: number; workerTurns: number; inputTokens: number | null; outputTokens: number | null; cachedInputTokens?: number; promptChars?: number }
-// Token figures as vendors report them (several spellings), read by `recordUsage`.
+// What one agent has used over its whole life (every turn, generation and subscription), normalised by turn.mts
+// normalizeUsage: `inputTokens` is everything the model was sent, the cached part included (`cachedInputTokens`), so
+// input + output is the agent's token count. The run's `Usage` tokens are the sum of its agents.
+export interface AgentUsage { inputTokens: number; outputTokens: number; cachedInputTokens: number }
+// Token figures as vendors report them (several spellings), read by `normalizeUsage`: Anthropic and Cursor count the
+// cache apart from the input, OpenAI-style figures include it.
 export interface UsageFigures {
   input_tokens?: number; prompt_tokens?: number; output_tokens?: number; completion_tokens?: number
-  cached_input_tokens?: number; cache_read_tokens?: number; cache_read_input_tokens?: number; prompt_tokens_details?: { cached_tokens?: number }
+  cached_input_tokens?: number; cache_read_tokens?: number; cache_read_input_tokens?: number; cache_creation_input_tokens?: number; prompt_tokens_details?: { cached_tokens?: number }
+  inputTokens?: number; outputTokens?: number; cacheReadTokens?: number; cacheWriteTokens?: number
   // No index signature: a provider's `usage` is unknown, and recordUsage takes it once narrowed to an object (every
   // field is optional and read through Number(), so any object is acceptable).
 }
@@ -122,6 +128,8 @@ export interface ToolArgs {
   title?: string; scope?: string; type?: string; confidence?: number; outcome?: string; note?: string; description?: string; whenToUse?: string; instructions?: string; source?: string
   key?: string; summary?: string; status?: string; tasks?: ImprovementTaskInput[]; taskType?: string; assessment?: string; evidence?: string
   continueWith?: string; verify?: boolean; handoff?: string
+  // spawn_agent: '' (the helper shares its parent's workspace), 'worktree' (an isolated git copy of it) or 'orbit' (of Orbit's own repository).
+  isolation?: string
   __invalidArguments?: boolean
   [extra: string]: unknown
 }
@@ -176,7 +184,20 @@ export interface AgentRecord {
   mailMark: string
   // Set later in an agent's life: the answer kept for an optional extra turn, the limit and loop-guard marks, prompt size.
   draftAnswer?: DraftAnswer | null; budgetLimited?: boolean; stalled?: boolean; promptChars?: number
+  // Tokens the agent has used so far, live during a turn where the provider's stream allows it; null until a provider
+  // reports figures. Public: snapshots, agent events and the run history carry it.
+  usage?: AgentUsage | null
+  // Where the agent works when that is not the run's workspace (util.agentWorkspace): the isolated copy of its parent's
+  // workspace it owns or inherited from its parent. `isolation` is set only on the helper that owns the copy.
+  workspace?: string; isolation?: AgentIsolation
 }
+// An isolated helper's copy as snapshots and events show it: `path` is its workspace inside the copy, `target` the folder
+// its changes merge into, `base` the snapshot commit it started from; `merged` counts the files merged so far and
+// `conflicts` lists those that could not be (electron/agent-worktree.mts).
+export interface AgentIsolation { kind: 'worktree' | 'orbit'; path: string; base: string; target: string; merged?: number; conflicts?: string[] }
+// What spawn_agent {isolation} makes before the helper exists: the copy (kept in run.copies) as the fields the helper's
+// record starts with, or why there is none.
+export type IsolationPrepared = { ok: true; id: string; fields: Partial<AgentRecord> } | { ok: false; reason: string; instruction?: string }
 // The fields that stay inside the runtime; snapshots and events carry the rest (util.INTERNAL_AGENT_FIELDS).
 export type InternalAgentField = 'inbox' | 'seenChildren' | 'requestedModel' | 'transcript' | 'previousWork' | 'ledger' | 'ledgerDropped' | 'workDone' | 'failedCandidates' | 'trial' | 'partialTurn' | 'quotaWarned' | 'draftAnswer' | 'activeTurn' | 'stream' | 'sessionToken' | 'sessionCursor' | 'transcriptChars' | 'pausedSession' | 'mailMark'
 export type PublicAgent = Omit<AgentRecord, InternalAgentField>
@@ -193,6 +214,8 @@ export interface AgentDirectoryEntry {
   id: string; name: string; parentId: string | null; status: AgentStatus; generation: number; providerId: string; model: string; task: string
   result: string; resultTruncated?: boolean; fullResult?: string; error: string | null; budgetLimited: boolean
   ranOn?: string[]
+  // Input + output tokens the agent has used (absent until a provider has reported any).
+  tokens?: number
 }
 export interface AgentController { controller: AbortController; parentSignal: AbortSignal | null; abort: () => void }
 export interface TurnWaiter { resolve: () => void; reject: (error: Error) => void; signal: AbortSignal; abort: () => void }
@@ -234,6 +257,8 @@ export interface RunRecord {
   // must know, the closed task keys (`id|title`) the run started with, and whether restart_orbit applied this run's change
   // or was refused in a way the next task's restart resolves (cycle limit, other chats working, declined).
   loopTask?: number; improvementHandoff?: string; improvementBaseline?: Map<string, ImprovementTask>; restartApplied?: boolean; restartDeferred?: boolean
+  // The isolated copies of this run's helpers by agent id (runtime/isolation.mts): taken away when the run ends.
+  copies?: Map<string, import('./agent-worktree.mts').AgentCopy>
 }
 // `note`: what the root of the continuation is told about the run the restart ended (work log, files, helpers, cut-off turn);
 // `intentId`: the id of the intent (pending-resume.json) that marked it, the only one that continues it (resume.mts).
@@ -299,7 +324,10 @@ export interface ProviderRunOptions {
   extraEnv?: Record<string, string>
 }
 // One event of a provider's stream: streamed text and reasoning, native tool activity, observations, quota figures.
-// `kind` is always present (output, reasoning, tool, observation, quota, provider, …); everything else depends on it.
+// `kind` is always present (output, reasoning, tool, observation, quota, usage, provider, …); everything else depends on it.
+// kind usage: tokens the provider spent since its last usage event (a growth, never a running total: the provider layer
+// has already dealt with repeated figures and cumulative totals), which `recordUsage` adds to the agent. An observation's
+// `usage` (Ollama, endpoints, Cursor, Antigravity: one report per turn) is added the same way.
 export interface ProviderEvent {
   kind: string; providerId?: string; text?: string; message?: string; messageId?: string; partial?: boolean; replace?: boolean; parentToolId?: string | null
   native?: boolean; tool?: string; toolId?: string; status?: string; changes?: unknown; input?: unknown; output?: unknown; exitCode?: number | null
@@ -517,6 +545,8 @@ export interface OrbitRuntimeOptions {
   requestApproval?: ApprovalHandler | null; clock?: () => number; projectIndex?: ProjectIndexLike | null; quota?: QuotaMonitorLike | null; catalog?: CatalogLike | null
   mcp?: McpServerLike | null | false; transportFor?: TransportFor | null; closeSession?: CloseSession | null; registry?: ToolRegistryLike | null
   restartHost?: import('./resume.mts').RestartHost | null
+  // Where isolated helpers' copies are made (the runtime host passes <userData>/worktrees); a folder under the OS temp folder without one.
+  worktreeRoot?: string | null
 }
 // The facade's whole surface (electron/runtime.mts): state, the public methods main.cjs and the tests use, and the
 // methods the modules call back through. Every module function takes this as its first argument; a module never
@@ -531,6 +561,7 @@ export interface OrbitRuntimeLike {
   runs: Map<string, RunRecord>; listeners: Set<RuntimeListener>
   // Runs the self-upgrade script for restart_orbit (resume.mts createRestartHost); null when Orbit cannot restart itself.
   restartHost: import('./resume.mts').RestartHost | null
+  worktreeRoot: string | null
   setQuota(monitor: QuotaMonitorLike | null): void
   setCatalog(catalog: CatalogLike | null): void
   onEvent(listener: RuntimeListener): () => void
@@ -569,7 +600,7 @@ export interface OrbitRuntimeLike {
   // restart
   setRestartHost(host: import('./resume.mts').RestartHost | null): void
   // agents
-  createAgent(run: RunRecord, parent: AgentRecord | null, spec: ToolArgs): AgentRecord
+  createAgent(run: RunRecord, parent: AgentRecord | null, spec: ToolArgs, extra?: Partial<AgentRecord>): AgentRecord
   scheduleAgent(run: RunRecord, agent: AgentRecord): Promise<AgentResult>
   spawnSubAgent(runId: string, parentId: string, spec?: ToolArgs): Promise<SpawnResult>
   resolveAgent(run: RunRecord, reference: unknown): AgentRecord
@@ -581,9 +612,10 @@ export interface OrbitRuntimeLike {
   teamDigest(run: RunRecord, agent: AgentRecord): TeamDigest
   agentDirectory(run: RunRecord): AgentDirectoryEntry[]
   cancelDescendants(run: RunRecord, agent: AgentRecord, detail: string): void
-  completeAgent(run: RunRecord, agent: AgentRecord, content: string, budgetLimited?: boolean, detail?: string, extra?: Partial<AgentRecord>): AgentResult
-  budgetHandoff(run: RunRecord, agent: AgentRecord): AgentResult
-  stallHandoff(run: RunRecord, agent: AgentRecord, turns: number): AgentResult
+  // An isolated helper's changes are merged first, so its completion is a promise; every other agent's is immediate.
+  completeAgent(run: RunRecord, agent: AgentRecord, content: string, budgetLimited?: boolean, detail?: string, extra?: Partial<AgentRecord>): AgentResult | Promise<AgentResult>
+  budgetHandoff(run: RunRecord, agent: AgentRecord): AgentResult | Promise<AgentResult>
+  stallHandoff(run: RunRecord, agent: AgentRecord, turns: number): AgentResult | Promise<AgentResult>
   // mailbox
   communicationsFor(run: RunRecord, agent: { id: string }, unreadOnly?: boolean): Communication[]
   pendingMail(run: RunRecord, agent: AgentRecord): Communication[]
@@ -591,7 +623,7 @@ export interface OrbitRuntimeLike {
   sendAgentMessage(run: RunRecord, sender: AgentRecord, args: ToolArgs): SendResult
   recordCommunication(run: RunRecord, sender: AgentRef, target: AgentRef, text: string, extra?: Partial<Communication>): Communication
   readAgentMessages(run: RunRecord, agent: AgentRecord, args?: ToolArgs): ReadMessagesResult
-  waitForTeam(run: RunRecord, agent: AgentRecord, participants: { id: string }[], timeout?: number, signal?: AbortSignal): Promise<string>
+  waitForTeam(run: RunRecord, agent: AgentRecord, participants: { id: string }[], timeout?: number, signal?: AbortSignal, any?: boolean): Promise<string>
   waitAgentMessage(run: RunRecord, agent: AgentRecord, args: ToolArgs, signal?: AbortSignal, ready?: () => Promise<void>): Promise<ReadMessagesResult>
   mailboxContext(run: RunRecord, agent: AgentRecord, held?: ReadonlySet<string>): MailboxContext
   askTeam(run: RunRecord, sender: AgentRecord, args: ToolArgs): AskTeamResult
@@ -605,7 +637,7 @@ export interface OrbitRuntimeLike {
   resumePrompt(run: RunRecord, agent: AgentRecord, instruction: string, entries: TranscriptEntry[], mailboxText: string, lastWorkerTurn: boolean | undefined): string
   toolGuide(run: RunRecord, agent: AgentRecord): string
   // changes
-  awaitIndex(run: RunRecord, options?: { refresh?: boolean }): Promise<void>
+  awaitIndex(run: RunRecord, options?: { refresh?: boolean; workspace?: string }): Promise<void>
   publishFiles(run: RunRecord, agent: AgentRecord): void
   touchFile(run: RunRecord, agent: AgentRecord, target: string, action: FileAction): { touch?: FileTouch; shared: { agent: string; how: string }[] }
   trackNativeFiles(run: RunRecord, agent: AgentRecord, event: ProviderEvent): void
@@ -613,6 +645,7 @@ export interface OrbitRuntimeLike {
   drainChanges(run: RunRecord, ms?: number): Promise<void>
   recordChange(run: RunRecord, agent: AgentRecord, input: ChangeInput): void
   reportWrite(run: RunRecord, agent: AgentRecord, tool: string, change: FileWrite): void
+  reportMerge(run: RunRecord, agent: AgentRecord, file: import('./agent-worktree.mts').MergedFile): void
   trackWorkspaceTool(run: RunRecord, agent: AgentRecord, name: string, args: ToolArgs, result: unknown): Promise<unknown>
   runTrackedCommand(run: RunRecord, agent: AgentRecord, args: ToolArgs, context: WorkspaceContext): Promise<unknown>
   // tools and knowledge
@@ -632,7 +665,7 @@ export interface OrbitRuntimeLike {
   noteTurnEvent(agent: AgentRecord, event: ProviderEvent): void
   streamOutput(run: RunRecord, agent: AgentRecord, event: ProviderEvent): void
   flushStream(run: RunRecord, agent: AgentRecord, stream: StreamState): void
-  recordUsage(run: RunRecord, usage: UsageFigures): void
+  recordUsage(run: RunRecord, agent: AgentRecord, usage: unknown): void
   trackOperation<T>(run: RunRecord, operation: T | PromiseLike<T>, agent: { id: string }): Promise<Awaited<T>>
   providerTurn(run: RunRecord, agent: AgentRecord, prompt: string | (() => string), sessionOptions?: SessionInfo | null): Promise<ProviderResult>
   // handover
@@ -642,6 +675,12 @@ export interface OrbitRuntimeLike {
   handover(run: RunRecord, agent: AgentRecord, request: HandoverRequest): Promise<boolean>
   recoverProvider(run: RunRecord, agent: AgentRecord, error: unknown): Promise<boolean>
   routeSpawn(run: RunRecord, parent: AgentRecord, spec: ToolArgs): Promise<{ spec: ToolArgs; routed: RoutedSpawn }>
+  // isolation
+  prepareIsolation(run: RunRecord, parent: AgentRecord, kind: string): Promise<IsolationPrepared>
+  discardIsolation(run: RunRecord, agentId: string): Promise<void>
+  mergeIsolated(run: RunRecord, agent: AgentRecord): Promise<string>
+  cleanupIsolation(run: RunRecord): Promise<void>
+  sweepIsolation(): Promise<import('./agent-worktree.mts').SweepResult>
   // loops
   executeAgent(run: RunRecord, agent: AgentRecord): Promise<AgentResult>
   envelopeLoop(run: RunRecord, agent: AgentRecord, signal: AbortSignal): Promise<AgentResult | typeof SWITCH_TRANSPORT>

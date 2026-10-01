@@ -1,4 +1,4 @@
-import type { Agent, AgentStatus, HandoverTarget, Message, RestartNotice, RunSnapshot, RunStatus, TurnTiming } from './types'
+import type { Agent, AgentStatus, AgentUsage, HandoverTarget, Message, RestartNotice, RunSnapshot, RunStatus, TurnTiming } from './types'
 
 // The renderer's view of runs: one snapshot per run id, updated by runtime events (applyRunEvent) and by the saved
 // run list on start-up (restoreRuns). Pure functions with an injectable clock, so tests can replay recorded sequences.
@@ -279,3 +279,41 @@ export function thinkingText(tokens?: number | null): string {
   return `думает · ~${amount}`
 }
 export const transportLabel = (transport?: string) => transport === 'session' ? 'сессия' : transport === 'envelope' ? 'конверт' : transport || ''
+
+// ---- Tokens: what an agent has used, and the run's sum ----
+
+// Input + output tokens of an agent; undefined while no provider has reported any (a zero is not shown either).
+export const agentTokens = (agent?: Agent): number | undefined => {
+  const tokens = agent?.usage ? agent.usage.inputTokens + agent.usage.outputTokens : 0
+  return tokens > 0 ? tokens : undefined
+}
+// A count for a line of the window, short, with the Russian decimal comma: «850», «1,2 тыс.», «48 тыс.», «1,2 млн», «12 млрд».
+export function tokenCount(tokens: number): string {
+  const n = Math.max(0, Math.round(tokens))
+  if (n < 1000) return String(n)
+  const [unit, divisor] = n < 999_500 ? ['тыс.', 1e3] as const : n < 999_500_000 ? ['млн', 1e6] as const : ['млрд', 1e9] as const
+  // Tenths as an integer, so that 1 150 000 reads «1,2 млн» whatever the floating point does.
+  const tenths = Math.round(n / (divisor / 10))
+  const amount = tenths < 100 ? `${Math.floor(tenths / 10)}${tenths % 10 ? `,${tenths % 10}` : ''}` : String(Math.round(n / divisor))
+  return `${amount} ${unit}`
+}
+const exactCount = (tokens: number) => Math.round(tokens).toLocaleString('ru-RU')
+// The exact figures behind a count, for a tooltip: «Вход 1 150 000 (из кэша 1 020 000) · выход 48 000».
+export function usageTitle(usage?: AgentUsage | null): string {
+  if (!usage) return ''
+  return `Вход ${exactCount(usage.inputTokens)}${usage.cachedInputTokens ? ` (из кэша ${exactCount(usage.cachedInputTokens)})` : ''} · выход ${exactCount(usage.outputTokens)}`
+}
+// The same breakdown in short counts, beside a total: «вход 1,2 млн (из кэша 1 млн) · выход 48 тыс.».
+export function usageBreakdown(usage: AgentUsage): string {
+  return `вход ${tokenCount(usage.inputTokens)}${usage.cachedInputTokens ? ` (из кэша ${tokenCount(usage.cachedInputTokens)})` : ''} · выход ${tokenCount(usage.outputTokens)}`
+}
+// The run's tokens as the sum of its agents', which is live (the run's own figures only arrive with a turn's end); null when
+// no agent has reported any.
+export function runUsage(agents: Agent[]): AgentUsage | null {
+  const total: AgentUsage = { inputTokens: 0, outputTokens: 0, cachedInputTokens: 0 }
+  for (const { usage } of agents) {
+    if (!usage) continue
+    total.inputTokens += usage.inputTokens; total.outputTokens += usage.outputTokens; total.cachedInputTokens += usage.cachedInputTokens
+  }
+  return total.inputTokens + total.outputTokens > 0 ? total : null
+}

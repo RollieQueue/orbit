@@ -35,11 +35,20 @@ async function run(runtime, payload) {
 test('the ON text states the loop rules and the OFF text is unchanged', () => {
   const { improvementModeText, IMPROVEMENT_OFF } = require('../electron/runtime/prompts.mts')
   assert.equal(IMPROVEMENT_OFF, 'IMPROVEMENT MODE OFF: discovery-only requests require findings, not automatic implementation. Explicit requests to fix or implement still authorize work.')
-  for (const applies of [true, false]) {
-    const text = improvementModeText(applies)
+  for (const [applies, elsewhere] of [[true, false], [true, true], [false, false]]) {
+    const text = improvementModeText(applies, elsewhere)
     assert.ok(text.startsWith('IMPROVEMENT MODE ON'))
-    assert.match(text, /ONE task/); assert.match(text, /Orbit starts the next run itself/); assert.match(text, /marked working first/); assert.match(text, /Never start a second task/); assert.match(text, /goal reached: <what was done>/)
+    assert.match(text, /one BATCH of tasks/); assert.match(text, /up to about 4 that are independent/); assert.match(text, /Orbit starts the next run itself/); assert.match(text, /marked working first/); assert.match(text, /Never start a second batch/); assert.match(text, /goal reached: <what was done>/)
+    assert.match(text, /spawn_agent \{kind:'code', isolation:'worktree'/)
+    // Speed rules (from the audit of real loop runs): helpers at once, no idle waiting, and, where restart_orbit runs the
+    // full checks itself, only targeted tests (no full suite, no mutation runs) before it.
+    assert.match(text, /Within the first minutes, spawn one isolated helper per task, all in one turn/); assert.match(text, /While helpers or a reviewer run, continue independent work instead of waiting/)
+    assert.equal(/targeted tests for its new logic only/.test(text), applies); assert.equal(/run no full suite and no mutation checks yourself first/.test(text), applies)
+    assert.equal(/the checks its change needs/.test(text), !applies, 'without restart_orbit nobody else runs the full checks')
     assert.equal(/restart_orbit as the last step/.test(text), applies)
+    assert.equal(/Apply the batch ONCE/.test(text), applies)
+    // Another project's chat: only a change to Orbit's own code is applied, and its helpers may work on Orbit's copy.
+    assert.equal(/isolation:'orbit'/.test(text), elsewhere); assert.equal(/when you changed Orbit's own code, call restart_orbit/.test(text), elsewhere)
   }
 })
 

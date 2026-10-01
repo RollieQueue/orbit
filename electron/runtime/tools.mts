@@ -5,13 +5,44 @@ import { randomUUID } from 'node:crypto'
 import { executeWorkspaceTool, WORKSPACE_TOOLS } from '../runtime-tools.mts'
 import { projectPacket, saveNote } from '../shared-context.mts'
 import * as chatMemory from '../chat-memory.mts'
-import { ceiling, bounded, clip, abortable } from './util.mts'
+import { AGENT_TERMINAL, ceiling, bounded, clip, abortable, agentWorkspace, logicalWorkspace } from './util.mts'
 import { noteIndex } from './prompts.mts'
 import { ranOnFields } from './agents.mts'
+import { stopHelper } from './pause.mts'
 import * as knowledge from './knowledge.mts'
 import * as restart from './restart.mts'
 import * as improvement from './improvement.mts'
 import type { AgentRecord, ApprovalRequest, Communication, Observation, OrbitRuntimeLike, RunRecord, ToolArgs, WorkspaceContext } from '../types.mts'
+
+// wait_agent returns at least this often while helpers work: ORBIT_WAIT_CHECK_MS, else 5 minutes.
+function checkEvery(): number {
+  const value = Number(process.env.ORBIT_WAIT_CHECK_MS)
+  return Number.isFinite(value) && value >= 10 ? value : 5 * 60 * 1000
+}
+// Trace kinds that show what a helper did, and the bare "Bash status=started" lines among them that say nothing.
+const STEP_KINDS = new Set(['tool', 'output', 'message', 'steer', 'pause', 'watchdog', 'handover'])
+const BARE_STATUS = /^[\w.:-]+ status=\w+$/
+const minutes = (ms: number): string => `${Math.max(0, Math.round(ms / 60000))} min`
+// A helper still at work as its parent's wait_agent shows it: how long it has worked, how long since it or a helper of
+// its own last did anything, and its last steps.
+function progressOf(run: RunRecord, child: AgentRecord, now: number): { workingFor: string; quietFor: string; lastSteps: string[] } {
+  const team = new Set([child.id])
+  for (let grew = true; grew;) {
+    grew = false
+    for (const node of run.agentNodes.values()) if (node.parentId && team.has(node.parentId) && !team.has(node.id)) { team.add(node.id); grew = true }
+  }
+  const started = Date.parse(child.startedAt || '') || now
+  let last = 0
+  const steps: string[] = []
+  for (let index = run.traces.length - 1; index >= 0 && steps.length < 4; index--) {
+    const trace = run.traces[index]
+    if (!team.has(trace.agentId)) continue
+    last ||= Date.parse(trace.time) || 0
+    const text = trace.text.replace(/\s+/g, ' ').trim()
+    if (trace.agentId === child.id && STEP_KINDS.has(trace.kind) && text && !BARE_STATUS.test(text)) steps.unshift(clip(text, 160))
+  }
+  return { workingFor: minutes(now - started), quietFor: minutes(now - Math.max(last, started)), lastSteps: steps }
+}
 
 async function approve(runtime: OrbitRuntimeLike, run: RunRecord, agent: AgentRecord, request: ApprovalRequest, signal: AbortSignal = runtime.agentSignal(run, agent)): Promise<boolean> {
   if (signal.aborted || !runtime.requestApproval) return false
@@ -50,21 +81,24 @@ async function executeTool(runtime: OrbitRuntimeLike, run: RunRecord, agent: Age
     if (!await runtime.approve(run, agent, { tool: name, arguments: args }, signal)) throw new Error('User declined this operation')
   }
   if (WORKSPACE_TOOLS.has(name)) {
-    const context: WorkspaceContext = { workspace: run.workspace, accessMode: run.accessMode, signal, maxOutputChars: run.limits.maxOutputChars, onFileChange: change => runtime.reportWrite(run, agent, name, change), env: restart.agentEnv(runtime, run, agent) }
+    const context: WorkspaceContext = { workspace: agentWorkspace(run, agent), accessMode: run.accessMode, signal, maxOutputChars: run.limits.maxOutputChars, onFileChange: change => runtime.reportWrite(run, agent, name, change), env: restart.agentEnv(runtime, run, agent) }
     const result = name === 'run_command' ? await runtime.runTrackedCommand(run, agent, args, context) : await executeWorkspaceTool(name, args, context)
     return runtime.trackWorkspaceTool(run, agent, name, args, result)
   }
   if (name === 'index_search' || name === 'index_outline') {
     if (!runtime.projectIndex) throw new Error('The project index is unavailable')
-    await runtime.awaitIndex(run, { refresh: true })
+    // The tree the agent's files belong to: the run's workspace, whatever isolated copy the agent works in (the copy itself
+    // is never indexed), or Orbit's repository for a helper in an 'orbit' copy.
+    const tree = logicalWorkspace(run, agent)
+    await runtime.awaitIndex(run, { refresh: true, workspace: tree })
     const touchedBy = (file: string) => run.fileActivity.peers(file, '').slice(0, 4).map(item => ({ agent: run.agentNodes.get(item.agentId)?.name || item.agentId, how: item.how }))
     if (name === 'index_search') {
       if (!String(args.query || '').trim()) throw new Error('A search query is required')
       // A nonempty query, checked just above.
-      const found = runtime.projectIndex.search(run.workspace, args.query as string, { limit: Number(args.limit) || 10 })
+      const found = runtime.projectIndex.search(tree, args.query as string, { limit: Number(args.limit) || 10 })
       return { ...found, results: found.results.map(hit => { const touched = touchedBy(hit.path); return touched.length ? { ...hit, touchedBy: touched } : hit }) }
     }
-    const outline = runtime.projectIndex.outline(run.workspace, args.path)
+    const outline = runtime.projectIndex.outline(tree, args.path)
     if (!outline) throw new Error('That file is not in the index (missing, ignored by Git, generated or outside the project); list_files shows what exists')
     const touched = touchedBy(outline.path)
     return touched.length ? { ...outline, touchedBy: touched } : outline
@@ -100,18 +134,27 @@ async function executeTool(runtime: OrbitRuntimeLike, run: RunRecord, agent: Age
   if (name === 'read_messages') return runtime.readAgentMessages(run, agent, args)
   if (name === 'wait_message') return runtime.waitAgentMessage(run, agent, args, signal, ready)
   if (name === 'followup_agent') return runtime.followupAgent(run, agent, args)
+  if (name === 'stop_agent') return stopHelper(runtime, run, agent, args)
   if (name === 'wait_agent') {
     const target = args.agentId ? runtime.resolveAgent(run, args.agentId) : null
     const children = [...run.agentNodes.values()].filter((child) => child.parentId === agent.id && (!target || child.id === target.id))
     if (args.agentId && !children.length) throw new Error('Only direct children may be waited on; ancestor waits would deadlock')
     const timeout = args.timeout_ms === undefined ? 0 : Math.max(10, Math.min(Number(args.timeout_ms) || 30000, ceiling(run.limits, 'runTimeoutMs')))
     runtime.updateAgent(run, agent, { status: 'waiting', detail: 'Waiting for delegated results' })
-    await runtime.waitForTeam(run, agent, children, timeout, signal)
+    // The wait ends with the first helper to finish (at once when a finished one's result is new to the caller), and at
+    // the latest after checkEvery() with the progress of those still at work: a parent never sits blind on a slow or
+    // stuck helper while a finished one's result waits (2026-10-01: the root sat 20 minutes in one wait, the results of
+    // two helpers ready 8 and 19 minutes before it took them, and never looked at the third one's work).
+    const running = children.filter(child => !AGENT_TERMINAL.has(child.status))
+    const fresh = children.some(child => AGENT_TERMINAL.has(child.status) && !agent.seenChildren.has(runtime.resultKey(child)))
+    if (running.length && !fresh) await runtime.waitForTeam(run, agent, running, timeout ? Math.min(timeout, checkEvery()) : checkEvery(), signal, true)
     await ready?.()
+    const now = Date.now()
     return children.map((child) => {
-      if (['done', 'error', 'cancelled'].includes(child.status)) agent.seenChildren.add(runtime.resultKey(child))
+      const ended = AGENT_TERMINAL.has(child.status)
+      if (ended) agent.seenChildren.add(runtime.resultKey(child))
       // The model fields come before the result: a long result is cut at its end.
-      return { agentId: child.id, generation: child.generation, status: child.status, providerId: child.providerId, model: child.model, ...ranOnFields(child), result: child.result, error: child.error }
+      return { agentId: child.id, generation: child.generation, status: child.status, providerId: child.providerId, model: child.model, ...ranOnFields(child), ...(child.isolation ? { isolation: child.isolation } : {}), ...(ended ? {} : progressOf(run, child, now)), result: child.result, error: child.error }
     })
   }
   throw new Error(`Unknown tool: ${name}`)

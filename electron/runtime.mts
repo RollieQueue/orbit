@@ -13,6 +13,7 @@
 //   changes    file activity, change capture, attributed commands, index readiness
 //   turn       one provider turn and its event stream (buffers, streaming, usage, timings)
 //   handover   subscription failover as applied to an agent (preflight, handover, recovery), a new helper's model by kind
+//   isolation  helpers in their own git worktree copies: making the copy, merging it back, taking it away
 //   loops      executeAgent, the envelope loop (loop guard, poll budget) and the session loop (post-answer checks)
 //   session    transport choice, the MCP server, tokens, tools/list, approve and tools/call handlers
 //   tools      executeTool: approval gate, shared notes, improvement plan, workspace, index and team tools
@@ -31,18 +32,20 @@ import * as prompts from './runtime/prompts.mts'
 import * as ledger from './runtime/ledger.mts'
 import * as turn from './runtime/turn.mts'
 import * as handovers from './runtime/handover.mts'
+import * as isolation from './runtime/isolation.mts'
 import * as loops from './runtime/loops.mts'
 import * as session from './runtime/session.mts'
 import * as tools from './runtime/tools.mts'
 import * as knowledge from './runtime/knowledge.mts'
 import * as restart from './runtime/restart.mts'
 import type { RestartHost } from './resume.mts'
+import type { MergedFile } from './agent-worktree.mts'
 import type {
   AgentRecord, AgentRef, AgentResult, ApprovalHandler, Attachment, ApprovalRequest, CapabilityStoreLike, CatalogLike, ChangeDescription, ChangeInput,
   CloseSession, Communication, CommunicationDelivery, CommunicationStatus, ContextStoreLike, FileAction, FileWrite, HandoverRequest,
   McpApproveRequest, McpServerLike, MemoryEntry, MemoryStoreLike, OrbitRuntimeLike, OrbitRuntimeOptions, ProjectIndexLike, PromptBase,
   ProviderEvent, QuotaMonitorLike, RestartMark, RunProvider, RunRecord, RunStoreLike, RuntimeEventData, RuntimeListener, SessionInfo, SessionRef,
-  StartPayload, StreamState, ToolArgs, ToolRegistryLike, TraceImage, TranscriptEntry, TransportFor, UsageFigures, WorkspaceContext,
+  StartPayload, StreamState, ToolArgs, ToolRegistryLike, TraceImage, TranscriptEntry, TransportFor, WorkspaceContext,
 } from './types.mts'
 const { DEFAULT_LIMITS, normalizeLimits } = lifecycle
 // Captured at load; session.mts compares an instance's runProvider against the same value. main.cjs passes the providers
@@ -73,6 +76,7 @@ class OrbitRuntime implements OrbitRuntimeLike {
   declare toolRegistry: ToolRegistryLike | null | undefined
   declare sessions: Map<string, SessionRef>
   declare restartHost: RestartHost | null
+  declare worktreeRoot: string | null
   declare runs: Map<string, RunRecord>
   declare listeners: Set<RuntimeListener>
   // `clock` is injectable so tests can exercise time-dependent rules without real sleeping.
@@ -81,9 +85,10 @@ class OrbitRuntime implements OrbitRuntimeLike {
   // registry) are injectable for tests; by default they come from electron/mcp-server.mts, providers.mts and
   // electron/tool-registry.mts (the server is created on the first session); without a server every agent uses the envelope loop.
   // `restartHost` (resume.mts createRestartHost, or a test's fake) runs the self-upgrade script for restart_orbit.
-  constructor({ runProvider = defaultRunProvider, memoryStore = null, capabilityStore = null, runStore = null, requestApproval = null, clock = Date.now, projectIndex = new ProjectIndex({ clock }), quota = null, catalog = null, mcp = null, transportFor = null, closeSession = null, registry = undefined, restartHost = null }: OrbitRuntimeOptions = {}) {
+  // `worktreeRoot` is the folder isolated helpers' git copies are made under (<userData>/worktrees from the runtime host).
+  constructor({ runProvider = defaultRunProvider, memoryStore = null, capabilityStore = null, runStore = null, requestApproval = null, clock = Date.now, projectIndex = new ProjectIndex({ clock }), quota = null, catalog = null, mcp = null, transportFor = null, closeSession = null, registry = undefined, restartHost = null, worktreeRoot = null }: OrbitRuntimeOptions = {}) {
     Object.assign(this, { runProvider, memoryStore, capabilityStore, runStore, requestApproval, clock, projectIndex, quota, catalog, contextStore: null, sharing: new Map(), lastShare: -Infinity })
-    Object.assign(this, { mcp, mcpStarted: null, mcpError: null, transportFor, closeSession, toolRegistry: registry, sessions: new Map(), restartHost })
+    Object.assign(this, { mcp, mcpStarted: null, mcpError: null, transportFor, closeSession, toolRegistry: registry, sessions: new Map(), restartHost, worktreeRoot })
     this.runs = new Map(); this.listeners = new Set()
   }
   setQuota(monitor: QuotaMonitorLike | null) { this.quota = monitor }
@@ -125,7 +130,7 @@ class OrbitRuntime implements OrbitRuntimeLike {
   // ---- restart: restart_orbit's host ----
   setRestartHost(host: RestartHost | null) { return restart.setRestartHost(this, host) }
   // ---- agents: the tree, scheduling, slots, completion ----
-  createAgent(run: RunRecord, parent: AgentRecord | null, spec: ToolArgs) { return agents.createAgent(this, run, parent, spec) }
+  createAgent(run: RunRecord, parent: AgentRecord | null, spec: ToolArgs, extra?: Partial<AgentRecord>) { return agents.createAgent(this, run, parent, spec, extra) }
   scheduleAgent(run: RunRecord, agent: AgentRecord) { return agents.scheduleAgent(this, run, agent) }
   spawnSubAgent(runId: string, parentId: string, spec?: ToolArgs) { return agents.spawnSubAgent(this, runId, parentId, spec) }
   resolveAgent(run: RunRecord, reference: unknown) { return agents.resolveAgent(this, run, reference) }
@@ -147,7 +152,7 @@ class OrbitRuntime implements OrbitRuntimeLike {
   sendAgentMessage(run: RunRecord, sender: AgentRecord, args: ToolArgs) { return mailbox.sendAgentMessage(this, run, sender, args) }
   recordCommunication(run: RunRecord, sender: AgentRef, target: AgentRef, text: string, extra?: Partial<Communication>) { return mailbox.recordCommunication(this, run, sender, target, text, extra) }
   readAgentMessages(run: RunRecord, agent: AgentRecord, args?: ToolArgs) { return mailbox.readAgentMessages(this, run, agent, args) }
-  waitForTeam(run: RunRecord, agent: AgentRecord, participants: { id: string }[], timeout?: number, signal?: AbortSignal) { return mailbox.waitForTeam(this, run, agent, participants, timeout, signal) }
+  waitForTeam(run: RunRecord, agent: AgentRecord, participants: { id: string }[], timeout?: number, signal?: AbortSignal, any?: boolean) { return mailbox.waitForTeam(this, run, agent, participants, timeout, signal, any) }
   waitAgentMessage(run: RunRecord, agent: AgentRecord, args: ToolArgs, signal?: AbortSignal, ready?: () => Promise<void>) { return mailbox.waitAgentMessage(this, run, agent, args, signal, ready) }
   mailboxContext(run: RunRecord, agent: AgentRecord, held?: ReadonlySet<string>) { return mailbox.mailboxContext(this, run, agent, held) }
   askTeam(run: RunRecord, sender: AgentRecord, args: ToolArgs) { return mailbox.askTeam(this, run, sender, args) }
@@ -161,7 +166,7 @@ class OrbitRuntime implements OrbitRuntimeLike {
   resumePrompt(run: RunRecord, agent: AgentRecord, instruction: string, entries: TranscriptEntry[], mailboxText: string, lastWorkerTurn: boolean | undefined) { return prompts.resumePrompt(this, run, agent, instruction, entries, mailboxText, lastWorkerTurn) }
   toolGuide(run: RunRecord, agent: AgentRecord) { return prompts.toolGuide(this, run, agent) }
   // ---- changes: file activity, change capture, index readiness ----
-  awaitIndex(run: RunRecord, options?: { refresh?: boolean }) { return changes.awaitIndex(this, run, options) }
+  awaitIndex(run: RunRecord, options?: { refresh?: boolean; workspace?: string }) { return changes.awaitIndex(this, run, options) }
   publishFiles(run: RunRecord, agent: AgentRecord) { return changes.publishFiles(this, run, agent) }
   touchFile(run: RunRecord, agent: AgentRecord, target: string, action: FileAction) { return changes.touchFile(this, run, agent, target, action) }
   trackNativeFiles(run: RunRecord, agent: AgentRecord, event: ProviderEvent) { return changes.trackNativeFiles(this, run, agent, event) }
@@ -169,6 +174,7 @@ class OrbitRuntime implements OrbitRuntimeLike {
   drainChanges(run: RunRecord, ms?: number) { return changes.drainChanges(this, run, ms) }
   recordChange(run: RunRecord, agent: AgentRecord, input: ChangeInput) { return changes.recordChange(this, run, agent, input) }
   reportWrite(run: RunRecord, agent: AgentRecord, tool: string, change: FileWrite) { return changes.reportWrite(this, run, agent, tool, change) }
+  reportMerge(run: RunRecord, agent: AgentRecord, file: MergedFile) { return changes.reportMerge(this, run, agent, file) }
   trackWorkspaceTool(run: RunRecord, agent: AgentRecord, name: string, args: ToolArgs, result: unknown) { return changes.trackWorkspaceTool(this, run, agent, name, args, result) }
   runTrackedCommand(run: RunRecord, agent: AgentRecord, args: ToolArgs, context: WorkspaceContext) { return changes.runTrackedCommand(this, run, agent, args, context) }
   // ---- tools and knowledge: Orbit tool execution ----
@@ -188,7 +194,7 @@ class OrbitRuntime implements OrbitRuntimeLike {
   noteTurnEvent(agent: AgentRecord, event: ProviderEvent) { return turn.noteTurnEvent(this, agent, event) }
   streamOutput(run: RunRecord, agent: AgentRecord, event: ProviderEvent) { return turn.streamOutput(this, run, agent, event) }
   flushStream(run: RunRecord, agent: AgentRecord, stream: StreamState) { return turn.flushStream(this, run, agent, stream) }
-  recordUsage(run: RunRecord, usage: UsageFigures) { return turn.recordUsage(this, run, usage) }
+  recordUsage(run: RunRecord, agent: AgentRecord, usage: unknown) { return turn.recordUsage(this, run, agent, usage) }
   trackOperation<T>(run: RunRecord, operation: T | PromiseLike<T>, agent: { id: string }): Promise<Awaited<T>> { return turn.trackOperation(this, run, operation, agent) }
   providerTurn(run: RunRecord, agent: AgentRecord, prompt: string | (() => string), sessionOptions?: SessionInfo | null) { return turn.providerTurn(this, run, agent, prompt, sessionOptions) }
   // ---- handover: subscription failover, model routing ----
@@ -198,6 +204,12 @@ class OrbitRuntime implements OrbitRuntimeLike {
   handover(run: RunRecord, agent: AgentRecord, request: HandoverRequest) { return handovers.handover(this, run, agent, request) }
   recoverProvider(run: RunRecord, agent: AgentRecord, error: unknown) { return handovers.recoverProvider(this, run, agent, error) }
   routeSpawn(run: RunRecord, parent: AgentRecord, spec: ToolArgs) { return handovers.routeSpawn(this, run, parent, spec) }
+  // ---- isolation: helpers in their own git worktree copies ----
+  prepareIsolation(run: RunRecord, parent: AgentRecord, kind: string) { return isolation.prepareIsolation(this, run, parent, kind) }
+  discardIsolation(run: RunRecord, agentId: string) { return isolation.discardIsolation(this, run, agentId) }
+  mergeIsolated(run: RunRecord, agent: AgentRecord) { return isolation.mergeIsolated(this, run, agent) }
+  cleanupIsolation(run: RunRecord) { return isolation.cleanupIsolation(this, run) }
+  sweepIsolation() { return isolation.sweepIsolation(this) }
   // ---- loops: running an agent to its result ----
   executeAgent(run: RunRecord, agent: AgentRecord) { return loops.executeAgent(this, run, agent) }
   envelopeLoop(run: RunRecord, agent: AgentRecord, signal: AbortSignal) { return loops.envelopeLoop(this, run, agent, signal) }

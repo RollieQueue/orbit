@@ -188,7 +188,9 @@ time: Cursor 50 s, Codex and Antigravity 59 min, 0 (no limit) for the others;
 `runtime/session.mts` (`dispatchMcp`):
 
 - cuts `wait_agent` and `wait_message` that would wait longer (`wait_agent` without
-  `timeout_ms` waits indefinitely, `wait_message` 30 s) at the limit and answers
+  `timeout_ms` waits until the first helper finishes, at most `ORBIT_WAIT_CHECK_MS`,
+  5 min by default, and then shows the progress of the others; `wait_message` waits
+  30 s) at the limit and answers
   "still running / still waiting, call again". The model slot the wait gave away is taken
   back within what is left of the limit (at least a tenth of it, 5 s at most: about 55 s in
   all for Cursor); if it is not free by then, the answer goes out and the slot comes back
@@ -341,8 +343,8 @@ Every CLI process a provider turn starts, on both transports (Claude, Codex exec
 Server, Cursor, Antigravity), gets `ProviderRunOptions.extraEnv` in its environment. The
 runtime fills it with the restart variables (`ORBIT_RUN_ID`, `ORBIT_CHAT_ID`,
 `ORBIT_PROJECT_ID`, `ORBIT_AGENT_ID`, `ORBIT_RESUME_FILE`, `ORBIT_USER_DATA`) exactly where
-`restart_orbit` is offered: for the root agent of a writable run on Orbit's own repository,
-with a usable restart host, not under `ORBIT_DEV` (`runtime/restart.mts` `agentEnv`); a
+`restart_orbit` is offered: for the root agent of a writable run on any project (Orbit improves
+itself from every chat), with a usable restart host, not under `ORBIT_DEV` (`runtime/restart.mts` `agentEnv`); a
 self-upgrade run from the CLI's own shell then names the run to continue and signals this
 Orbit's profile. For every other agent it is empty. Orbit's transport variables (the MCP
 token, `NO_PROXY`, proxy settings) win over it.

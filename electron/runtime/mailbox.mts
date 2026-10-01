@@ -173,8 +173,9 @@ function readAgentMessages(runtime: OrbitRuntimeLike, run: RunRecord, agent: Age
   runtime.markCommunications(run, selected.map((message) => message.id), 'read', 'mailbox')
   return { messages: structuredClone(selected), remainingUnread: runtime.communicationsFor(run, agent, true).length }
 }
-// `signal`: what ends the wait early; a session turn's wait ends with its turn (session.dispatchMcp).
-async function waitForTeam(runtime: OrbitRuntimeLike, run: RunRecord, agent: AgentRecord, participants: { id: string }[], timeout = 0, signal = runtime.agentSignal(run, agent)): Promise<string> {
+// `signal`: what ends the wait early; a session turn's wait ends with its turn (session.dispatchMcp). `any`: the wait
+// ends with the first participant to finish (wait_agent), not with the last (a turn that ends waits for them all).
+async function waitForTeam(runtime: OrbitRuntimeLike, run: RunRecord, agent: AgentRecord, participants: { id: string }[], timeout = 0, signal = runtime.agentSignal(run, agent), any = false): Promise<string> {
   if (runtime.pendingMail(run, agent).length) return 'message'
   // Assigned by the Promise executor, which runs synchronously.
   let wake!: () => void
@@ -183,7 +184,8 @@ async function waitForTeam(runtime: OrbitRuntimeLike, run: RunRecord, agent: Age
   // Created on the line above when missing.
   run.messageWaiters.get(agent.id)!.add(wake)
   try {
-    return await abortable(Promise.race([incoming, Promise.all(participants.map(member => run.tasks.get(member.id))).then(() => 'results')]), signal, timeout, 'wait_timeout')
+    const tasks = participants.map(member => run.tasks.get(member.id))
+    return await abortable(Promise.race([incoming, (any ? Promise.race(tasks) : Promise.all(tasks)).then(() => 'results')]), signal, timeout, 'wait_timeout')
   } catch (error) {
     // abortable rejects with Errors (a timeout, an abort, or a failed task).
     if ((error as Error).message === 'wait_timeout') return 'timeout'

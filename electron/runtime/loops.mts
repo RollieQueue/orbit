@@ -8,7 +8,7 @@ import { ToolProtocolError, hasToolCalls, parseResponse } from './envelope.mts'
 import { sessionGuide, evaluationReminder, skillReminder } from './prompts.mts'
 import * as improvement from './improvement.mts'
 import { describeCall } from './ledger.mts'
-import { PauseInterrupt, pauseGate, interruptedSession, STOPPED_BY_USER } from './pause.mts'
+import { PauseInterrupt, pauseGate, interruptedSession, STOPPED_BY_USER, wasStopped, endStopped, markEnded, afterCompletion } from './pause.mts'
 import { keptAnswer, answerAsKept } from './mailbox.mts'
 import type { AgentRecord, AgentResult, MailboxContext, McpServerLike, OrbitRuntimeLike, PromptBase, ProviderResult, RunRecord, SessionInfo, TranscriptEntry } from '../types.mts'
 // Consecutive turns made only of identical repeats: warn, then stop the agent honestly.
@@ -63,22 +63,15 @@ async function executeAgent(runtime: OrbitRuntimeLike, run: RunRecord, agent: Ag
       runtime.trace(run, agent.id, 'transport', `Continuing with the ${agent.transport} transport on ${targetLabel({ providerId: agent.providerId, model: agent.model })}`)
     }
   } catch (error) {
-    if (agent.stoppedByUser) {
-      runtime.updateAgent(run, agent, { status: 'cancelled', error: STOPPED_BY_USER, detail: 'Остановлен вами' })
-      return { agentId: agent.id, generation: agent.generation, status: 'cancelled', error: STOPPED_BY_USER, result: agent.result }
-    }
-    if (error instanceof TurnBudgetError && !signal.aborted) return runtime.budgetHandoff(run, agent)
+    if (wasStopped(agent)) return endStopped(runtime, run, agent)
+    if (error instanceof TurnBudgetError && !signal.aborted) return afterCompletion(runtime, run, agent, signal, runtime.budgetHandoff(run, agent))
     // Whatever was thrown, only its `message` is read (undefined for a non-Error).
     if (agent.draftAnswer && !signal.aborted && !TERMINAL.has(run.status)) {
       // Only an optional extra turn (a reminder, or a session resume after the answer) failed; the answer was complete.
       runtime.trace(run, agent.id, 'budget', `The turn after the answer failed (${(error as Error).message}); the drafted answer is delivered`)
-      return runtime.completeAgent(run, agent, answerAsKept(runtime, run, agent, agent.draftAnswer, (error as Error).message))
+      return afterCompletion(runtime, run, agent, signal, runtime.completeAgent(run, agent, answerAsKept(runtime, run, agent, agent.draftAnswer, (error as Error).message)))
     }
-    // An agent already cancelled with a reason (its supervisor was stopped, the whole run was) keeps that reason.
-    const marked = signal.aborted && agent.status === 'cancelled'
-    runtime.updateAgent(run, agent, { status: signal.aborted ? 'cancelled' : 'error', error: (error as Error).message, detail: marked && agent.detail ? agent.detail : (error as Error).message, finishedAt: marked && agent.finishedAt ? agent.finishedAt : new Date().toISOString() })
-    // A failed parent must never leave its descendants executing unowned work.
-    run.agentControllers.get(agent.id)?.controller.abort()
+    markEnded(runtime, run, agent, signal.aborted, error as Error)
     throw error
   } finally {
     const own = run.agentControllers.get(agent.id)
@@ -167,7 +160,7 @@ async function envelopeLoop(runtime: OrbitRuntimeLike, run: RunRecord, agent: Ag
             continue
           }
         }
-        // Improvement mode: the run's one task is closed and, in Orbit's own repository, applied (improvement.mts).
+        // Improvement mode: the run's batch of tasks is closed and Orbit's own code, when it changed, applied (improvement.mts).
         const improvementReminder = agent.id === 'root' ? improvement.reminderFor(runtime, run) : null
         if (improvementReminder) {
           if (guard.improvementReminders++ < REMINDER_LIMIT) {

@@ -2,6 +2,7 @@ import { spawn } from 'node:child_process'
 import { isOrbitToolEnvelope } from './tool-schema.mts'
 import { codexUpdateLimit } from './quota.mts'
 import type { CodexRateLimitBucket, QuotaTaggedError } from './quota.mts'
+import { serverUsage } from './codex-usage.mts'
 // providers.mts imports this file as well; both sides use the other only inside functions, so the ESM cycle is harmless.
 import { codexMcpArgs, loopbackNoProxy, wellFormed } from './providers.mts'
 import type { ApprovalHandler, CliHelpers, NormalizedSession, ParserEvent, ProviderEventListener, ProviderResult, ProviderRunOptions } from './providers.mts'
@@ -17,7 +18,9 @@ interface CodexServerError { message?: string; codexErrorInfo?: unknown }
 // An item of the thread as the server reports it in item/started and item/completed.
 interface CodexServerItem { id?: string; type?: string; text?: string; phase?: string; command?: string; changes?: unknown; status?: string; server?: string; tool?: string; arguments?: unknown }
 // The union of every notification's and request's params the client reads; each method uses its own subset.
-interface CodexServerParams { threadId?: string; itemId?: string; delta?: string; summaryIndex?: number; rateLimits?: CodexRateLimitBucket; item?: CodexServerItem; turn?: { status?: string; error?: CodexServerError; usage?: unknown }; willRetry?: boolean; error?: CodexServerError; permissions?: unknown; [key: string]: unknown }
+// `turn.usage` is not in the v2 protocol (the figures come in `thread/tokenUsage/updated`: `turnId` and `tokenUsage`), so
+// nothing reads it; `turn.id` names a turn in turn/started.
+interface CodexServerParams { threadId?: string; turnId?: string; tokenUsage?: unknown; itemId?: string; delta?: string; summaryIndex?: number; rateLimits?: CodexRateLimitBucket; item?: CodexServerItem; turn?: { id?: string; status?: string; error?: CodexServerError }; willRetry?: boolean; error?: CodexServerError; permissions?: unknown; [key: string]: unknown }
 // Result of thread/start and thread/resume.
 interface CodexThreadResult { thread: { id: string; model?: string }; model?: string }
 interface PendingRequest { resolve(value: unknown): void; reject(error: Error): void }
@@ -44,6 +47,19 @@ const cancelledError = (): Error => { const error = new Error('Codex request can
 // One JSON-RPC line. Codex drops a line whose JSON has an escaped lone surrogate and never answers it, so every string
 // goes out well-formed (a chat message or an agent's name bounded inside an emoji).
 const rpcLine = (message: CodexClientMessage): string => JSON.stringify(message, (_key, value: unknown) => typeof value === 'string' ? wellFormed(value) : value) + '\n'
+
+// One App Server process's token accounting. A turn's figures come in `thread/tokenUsage/updated`; a notification of a turn
+// this process did not start is the replay of the thread's history after `thread/resume`, which only sets the start
+// (codex-usage.mts). Called with every notification once its thread is known to be ours.
+function usageMeter(emit: (event: ParserEvent) => void): (method: string, params: CodexServerParams) => void {
+  const started = new Set<string>()
+  return (method, params) => {
+    if (method === 'turn/started' && params.turn?.id) started.add(params.turn.id)
+    if (method !== 'thread/tokenUsage/updated' || !params.threadId) return
+    const usage = serverUsage(params.threadId, params.tokenUsage, !!params.turnId && started.has(params.turnId))
+    if (usage) emit({ kind: 'usage', usage })
+  }
+}
 
 // Codex exec cannot answer native approval requests; Ask uses the stdio App Server.
 async function runCodexServer(options: CodexServerOptions, helpers: CliHelpers): Promise<ProviderResult> {
@@ -73,6 +89,7 @@ async function runCodexServer(options: CodexServerOptions, helpers: CliHelpers):
     send({ id, method, params })
   })
   const emit = (event: ParserEvent) => options.onEvent?.({ providerId: 'codex', ...event })
+  const meter = usageMeter(emit)
   const handle = async (message: CodexServerMessage) => {
     if (closed) return
     if (message.method && message.id !== undefined) {
@@ -102,6 +119,7 @@ async function runCodexServer(options: CodexServerOptions, helpers: CliHelpers):
     if (message.method === 'account/rateLimits/updated' && params.rateLimits) emit({ kind: 'quota', quota: codexUpdateLimit(params.rateLimits) })
     if (handedOff) return
     if (threadId && params.threadId && params.threadId !== threadId) return
+    if (message.method) meter(message.method, params)
     if (message.method === 'item/agentMessage/delta') emit({ kind: 'output', text: params.delta || '', messageId: params.itemId, partial: true })
     if (message.method === 'item/reasoning/summaryTextDelta') emit({ kind: 'reasoning', text: params.delta || '', messageId: `${params.itemId}:${params.summaryIndex || 0}`, partial: true })
     if (message.method === 'item/started' || message.method === 'item/completed') {
@@ -178,6 +196,7 @@ async function openCodexSession(options: CodexServerOptions, session: Normalized
   let turn: TurnState | null = null, idleTimer: NodeJS.Timeout | null = null, failure: Error | null = null
   let onEvent = options.onEvent, onApproval = options.onApproval
   const emit = (event: ParserEvent) => { try { onEvent?.({ providerId: 'codex', ...event }) } catch { /* UI observers do not control the provider. */ } }
+  const meter = usageMeter(emit)
   const send = (message: CodexClientMessage) => { if (!closed && !child.stdin.destroyed) child.stdin.write(rpcLine(message)) }
   // A request after the connection closed fails with what closed it (the cancellation, the process's end).
   const request = <T = unknown,>(method: string, params?: unknown) => new Promise<T>((resolve, reject) => {
@@ -242,6 +261,7 @@ async function openCodexSession(options: CodexServerOptions, session: Normalized
     const params: CodexServerParams = message.params || {}
     if (message.method === 'account/rateLimits/updated' && params.rateLimits) emit({ kind: 'quota', quota: codexUpdateLimit(params.rateLimits) })
     if (threadId && params.threadId && params.threadId !== threadId) return
+    if (message.method) meter(message.method, params)
     if (message.method === 'item/agentMessage/delta') emit({ kind: 'output', text: params.delta || '', messageId: params.itemId, partial: true })
     if (message.method === 'item/reasoning/summaryTextDelta') emit({ kind: 'reasoning', text: params.delta || '', messageId: `${params.itemId}:${params.summaryIndex || 0}`, partial: true })
     if (message.method === 'item/started' || message.method === 'item/completed') {
@@ -256,7 +276,7 @@ async function openCodexSession(options: CodexServerOptions, session: Normalized
     if (message.method === 'turn/completed' && turn) {
       if (params.turn?.status !== 'completed') settleTurn(refusal(params.turn?.error?.codexErrorInfo, new Error(params.turn?.error?.message || `Codex turn ${params.turn?.status || 'incomplete'}`)))
       else if (!turn.text.trim()) settleTurn(new Error('Codex completed without a final response'))
-      else { emit({ kind: 'observation', text: 'Codex turn completed', status: 'completed', usage: params.turn?.usage }); settleTurn(null, { text: turn.text, model: actualModel, threadId }) }
+      else { emit({ kind: 'observation', text: 'Codex turn completed', status: 'completed' }); settleTurn(null, { text: turn.text, model: actualModel, threadId }) }
     }
     if (message.method === 'error' && !params.willRetry) settleTurn(refusal(params.error?.codexErrorInfo, new Error(params.error?.message || 'Codex server error')))
   }

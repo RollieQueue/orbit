@@ -1,16 +1,20 @@
 import type { ReactNode } from 'react'
-import type { Agent, InspectorTab, QuotaSnapshot, RunSnapshot } from './types'
+import type { Agent, AgentIsolation, InspectorTab, QuotaSnapshot, RunSnapshot } from './types'
 import { RunHistoryList } from './AgentHistory'
 import { AgentInspector, type AgentControls, type MessageAgent } from './AgentInspector'
 import { Icon } from './Icon'
 import { handoverLabel } from './QuotaPanel'
 import { plural, statusText } from './format'
 import { providerName, providers } from './providers'
-import { isActiveStatus, resumeLinks, shortRunId, shownStatus } from './run-events'
+import { agentTokens, isActiveStatus, resumeLinks, shortRunId, shownStatus, tokenCount, usageTitle } from './run-events'
+import './agent-tokens.css'
 
 type TreeOptions = { run: RunSnapshot; selectedId?: string; onSelect: (id: string) => void }
 const handoverTitle = (agent: Agent) =>
   (agent.handovers || []).map(item => `${handoverLabel(providers, item.from)} → ${handoverLabel(providers, item.to)}`).join('\n')
+// The copy an agent works in: where it is and, if a merge back left any, how many files conflict.
+const isolationTitle = ({ kind, path, base, conflicts }: AgentIsolation) =>
+  [`${kind === 'worktree' ? 'Git worktree' : 'Копия Orbit'}: ${path}`, base && `Основа: ${base}`, conflicts?.length ? `Конфликтов при слиянии: ${conflicts.length}` : ''].filter(Boolean).join('\n')
 
 // The agents of a run as rows, each parent followed by its children. An agent whose parent is missing is shown at the top.
 function agentTree(items: Agent[], options: TreeOptions, parentId: string | null = null, depth = 0, seen = new Set<string>()): ReactNode {
@@ -21,6 +25,7 @@ function agentTree(items: Agent[], options: TreeOptions, parentId: string | null
     const providerId = agent.providerId || options.run.providerId
     const modelLabel = `${providerName(providerId) || providerId || 'Провайдер не указан'} · ${agent.model || 'Модель: авто (ещё не определена)'}`
     const files = agent.files
+    const tokens = agentTokens(agent)
     return <div key={agent.id}>
       <button className={`agent-row ${options.selectedId === agent.id ? 'selected' : ''}`} style={{ paddingLeft: 14 + Math.min(depth, 8) * 16 }}
         onClick={() => options.onSelect(agent.id)}>
@@ -31,6 +36,10 @@ function agentTree(items: Agent[], options: TreeOptions, parentId: string | null
           {agent.role && <small>{agent.role}</small>}
           {!!files && files.wrote.length + files.read.length > 0 && <small>Файлы: изменил {files.wrote.length}, читал {files.read.length}</small>}
           {!!agent.handovers?.length && <small className="handover-badge" title={handoverTitle(agent)}>⇄ Сменил подписку: {agent.handovers.length}</small>}
+          {(tokens !== undefined || !!agent.isolation) && <small className="agent-row-meta">
+            {tokens !== undefined && <span className="agent-tokens" title={usageTitle(agent.usage)}>Токены: {tokenCount(tokens)}</span>}
+            {agent.isolation && <span className={`isolation-badge ${agent.isolation.conflicts?.length ? 'conflict' : ''}`} title={isolationTitle(agent.isolation)}>Изолированная копия</span>}
+          </small>}
         </span>
         <span className="agent-state">{statusText(shownStatus(agent))}</span>
       </button>

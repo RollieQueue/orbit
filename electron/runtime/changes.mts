@@ -2,8 +2,9 @@
 // change records with their diffs made in the background, and the project index's readiness for a prompt.
 import { executeWorkspaceTool } from '../runtime-tools.mts'
 import { normalizeRel } from '../file-activity.mts'
-import { nativeChange, commandChange } from '../change-log.mts'
-import { TERMINAL, overlappingWorkspaces, diagnostics } from './util.mts'
+import { nativeChange, commandChange, REASONS } from '../change-log.mts'
+import type { MergedFile } from '../agent-worktree.mts'
+import { TERMINAL, overlappingWorkspaces, sameFolder, logicalWorkspace, diagnostics } from './util.mts'
 import type { AgentRecord, ChangeDescription, ChangeInput, FileAction, FileTouch, FileWrite, OrbitRuntimeLike, ProviderEvent, RunRecord, ToolArgs, WorkspaceContext } from '../types.mts'
 // A command can change many files at once (a formatter, a generator); past this it is not attributed to anyone.
 const COMMAND_ATTRIBUTION_LIMIT = 40
@@ -12,14 +13,21 @@ const CHANGE_DRAIN_MS = 1500
 // How long the first turn waits for the project index before it goes on without it.
 const INDEX_WAIT_MS = 2500
 
-// The index scan starts with the run; a prompt waits for it only briefly and the run never depends on it.
-async function awaitIndex(runtime: OrbitRuntimeLike, run: RunRecord, { refresh = false }: { refresh?: boolean } = {}): Promise<void> {
-  if (!runtime.projectIndex || (run.indexSettled && !refresh)) return
-  const pending = refresh && run.indexSettled ? runtime.projectIndex.refresh(run.workspace) : run.indexReady
+// An agent that works in an isolated copy does not change the run's workspace until its changes are merged: its writes are
+// neither file activity nor change records (reportMerge records them then), and a command's changes cannot be read from the
+// workspace's index. Its reads count while the copy mirrors the run's own workspace; for a copy of another tree (an 'orbit'
+// copy) they would name files the run's workspace does not have.
+const readsCount = (run: RunRecord, agent: AgentRecord): boolean => !agent.workspace || sameFolder(logicalWorkspace(run, agent), run.workspace)
+// The index scan starts with the run; a prompt waits for it only briefly and the run never depends on it. `workspace`: the
+// tree of an agent in an 'orbit' copy (util.logicalWorkspace), which is scanned on demand instead.
+async function awaitIndex(runtime: OrbitRuntimeLike, run: RunRecord, { refresh = false, workspace = run.workspace }: { refresh?: boolean; workspace?: string } = {}): Promise<void> {
+  const own = workspace === run.workspace
+  if (!runtime.projectIndex || (own && run.indexSettled && !refresh)) return
+  const pending = !own || (refresh && run.indexSettled) ? runtime.projectIndex.refresh(workspace) : run.indexReady
   let timer: ReturnType<typeof setTimeout> | undefined
   await Promise.race([pending, new Promise(resolve => { timer = setTimeout(resolve, INDEX_WAIT_MS); timer.unref?.() })]).catch(error => diagnostics(runtime, run, 'awaitIndex', error))
   clearTimeout(timer)
-  run.indexSettled = true
+  if (own) run.indexSettled = true
 }
 function publishFiles(runtime: OrbitRuntimeLike, run: RunRecord, agent: AgentRecord): void { runtime.updateAgent(run, agent, { files: run.fileActivity.forAgent(agent.id) }, false) }
 // Records that `agent` read or changed a file. A change also tells the other agents who used that file.
@@ -31,6 +39,7 @@ function touchFile(runtime: OrbitRuntimeLike, run: RunRecord, agent: AgentRecord
 }
 // Files touched by a vendor's own tools (Codex file changes, Claude Read/Edit/Write) arrive as provider events.
 function trackNativeFiles(runtime: OrbitRuntimeLike, run: RunRecord, agent: AgentRecord, event: ProviderEvent): void {
+  if (agent.workspace) return
   const call = run.changes.remember(agent.id, event)
   const changed = new Set<string>() // one tool call names a file once, however often its event lists it
   for (const touch of run.fileActivity.nativeEvent(agent.id, event)) {
@@ -66,6 +75,7 @@ function recordChange(runtime: OrbitRuntimeLike, run: RunRecord, agent: AgentRec
 }
 // Orbit's own file tools report the exact text before and after a write.
 function reportWrite(runtime: OrbitRuntimeLike, run: RunRecord, agent: AgentRecord, tool: string, { path: target, before, after }: FileWrite): void {
+  if (agent.workspace) return
   const rel = normalizeRel(run.workspace, target)
   if (!rel) return
   run.changes.claim(rel)
@@ -75,8 +85,9 @@ function reportWrite(runtime: OrbitRuntimeLike, run: RunRecord, agent: AgentReco
 // Runs only after executeWorkspaceTool succeeded: a file tool that read or wrote a file had a string `path` (without one it
 // resolves the workspace folder itself, which is not a file), and write_file/edit_file return an object.
 async function trackWorkspaceTool(runtime: OrbitRuntimeLike, run: RunRecord, agent: AgentRecord, name: string, args: ToolArgs, result: unknown): Promise<unknown> {
-  if (name === 'read_file') runtime.touchFile(run, agent, args.path as string, 'read')
+  if (name === 'read_file') { if (readsCount(run, agent)) runtime.touchFile(run, agent, args.path as string, 'read') }
   else if (name === 'write_file' || name === 'edit_file') {
+    if (agent.workspace) return result
     const { shared } = runtime.touchFile(run, agent, args.path as string, 'write')
     try { await runtime.projectIndex?.touch(run.workspace, [args.path as string]) } catch (error) { diagnostics(runtime, run, 'projectIndex.touch', error, agent.id) /* The index catches up on its next scan. */ }
     if (shared.length) return { ...(result as object), sharedWith: shared }
@@ -86,7 +97,7 @@ async function trackWorkspaceTool(runtime: OrbitRuntimeLike, run: RunRecord, age
 // A command's file changes are attributed to its agent only when nothing else could have made them:
 // no other command overlapped it, no other agent had a provider turn (native tools) running and no other chat works in the folder.
 async function runTrackedCommand(runtime: OrbitRuntimeLike, run: RunRecord, agent: AgentRecord, args: ToolArgs, context: WorkspaceContext): Promise<unknown> {
-  if (!runtime.projectIndex) return executeWorkspaceTool('run_command', args, context)
+  if (!runtime.projectIndex || agent.workspace) return executeWorkspaceTool('run_command', args, context)
   const commands = run.commands, serial = ++commands.serial
   try { await runtime.projectIndex.refresh(run.workspace) } catch (error) { diagnostics(runtime, run, 'runTrackedCommand refresh', error, agent.id) /* Attribution is best effort. */ }
   const writes = commands.writes
@@ -109,4 +120,14 @@ async function runTrackedCommand(runtime: OrbitRuntimeLike, run: RunRecord, agen
   return result
 }
 
-export { awaitIndex, publishFiles, touchFile, trackNativeFiles, captureChange, drainChanges, recordChange, reportWrite, trackWorkspaceTool, runTrackedCommand }
+// A file the merge of an isolated helper's copy wrote into its target, as the helper's own change (until then its writes
+// were not the workspace's). `file.path` is the path below the run's workspace (runtime/isolation.mts maps it).
+function reportMerge(runtime: OrbitRuntimeLike, run: RunRecord, agent: AgentRecord, { path: rel, kind, before, after }: MergedFile): void {
+  run.changes.claim(rel)
+  run.commands.writes++ // a command that overlapped this write cannot claim the file
+  runtime.recordChange(run, agent, { path: rel, tool: 'merge', source: 'exact', kind, ...(before !== undefined && after !== undefined ? { before, after } : { reason: REASONS.UNREADABLE }) })
+  runtime.touchFile(run, agent, rel, 'write'); agent.workDone++
+  runtime.projectIndex?.touch(run.workspace, [rel]).catch(error => diagnostics(runtime, run, 'projectIndex.touch', error, agent.id))
+}
+
+export { awaitIndex, publishFiles, touchFile, trackNativeFiles, captureChange, drainChanges, recordChange, reportWrite, reportMerge, trackWorkspaceTool, runTrackedCommand }

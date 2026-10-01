@@ -5,13 +5,13 @@ const path = require('node:path')
 
 // Same loader as tests/diff-parse.test.cjs: vite's oxc transform, then an ES module from a data URL.
 // run-events.ts only has type imports, which the transform erases.
-let applyRunEvent, restoreRuns, snapshotBase, runNotices, openTurn, durationMs, formatDuration, activeRunIds, interruptLost, isActiveStatus, LOST_RUN_ERROR, historyAnchors, pauseHolder, shownStatus, actionCount, thinkingText
+let applyRunEvent, restoreRuns, snapshotBase, runNotices, openTurn, durationMs, formatDuration, activeRunIds, interruptLost, isActiveStatus, LOST_RUN_ERROR, historyAnchors, pauseHolder, shownStatus, actionCount, thinkingText, agentTokens, tokenCount, usageTitle, usageBreakdown, runUsage
 test.before(async () => {
   const { transformWithOxc } = await import('vite')
   const file = path.join(__dirname, '..', 'src', 'run-events.ts')
   const out = await transformWithOxc(fs.readFileSync(file, 'utf8'), file, { lang: 'ts' })
   const mod = await import(`data:text/javascript;base64,${Buffer.from(out.code).toString('base64')}`)
-  ;({ applyRunEvent, restoreRuns, snapshotBase, runNotices, openTurn, durationMs, formatDuration, activeRunIds, interruptLost, isActiveStatus, LOST_RUN_ERROR, historyAnchors, pauseHolder, shownStatus, actionCount, thinkingText } = mod)
+  ;({ applyRunEvent, restoreRuns, snapshotBase, runNotices, openTurn, durationMs, formatDuration, activeRunIds, interruptLost, isActiveStatus, LOST_RUN_ERROR, historyAnchors, pauseHolder, shownStatus, actionCount, thinkingText, agentTokens, tokenCount, usageTitle, usageBreakdown, runUsage } = mod)
 })
 
 const AT = '2026-09-29T10:00:00.000Z'
@@ -370,6 +370,46 @@ test('thinkingText: «думает» with the rounded estimate of the thinking b
   assert.equal(thinkingText(4240), 'думает · ~4,2 тыс. токенов')
   assert.equal(thinkingText(9960), 'думает · ~10 тыс. токенов')
   assert.equal(thinkingText(18_400), 'думает · ~18 тыс. токенов')
+})
+
+// Tokens as the window writes them: short counts with the Russian decimal comma, exact figures in the tooltip.
+const plainSpaces = text => text.replace(/[  ]/g, ' ')
+test('tokenCount: short counts with a decimal comma, in thousands, millions and billions', () => {
+  assert.deepEqual([0, 7, 850, 999].map(tokenCount), ['0', '7', '850', '999'])
+  assert.deepEqual([1000, 1234, 9949, 9950, 48_000, 999_499].map(tokenCount), ['1 тыс.', '1,2 тыс.', '9,9 тыс.', '10 тыс.', '48 тыс.', '999 тыс.'])
+  assert.deepEqual([999_500, 1_198_000, 1_150_000, 12_345_678, 250_000_000].map(tokenCount), ['1 млн', '1,2 млн', '1,2 млн', '12 млн', '250 млн'])
+  assert.deepEqual([1_200_000_000, 3_456_000_000].map(tokenCount), ['1,2 млрд', '3,5 млрд'])
+  assert.equal(tokenCount(-5), '0')
+})
+
+test('usage views: an agent counts input plus output, the run is the sum of its agents, nothing without figures', () => {
+  const usage = { inputTokens: 1_150_000, outputTokens: 48_000, cachedInputTokens: 1_020_000 }
+  assert.equal(agentTokens({ id: 'a', name: 'A', status: 'done', usage }), 1_198_000)
+  assert.equal(agentTokens({ id: 'a', name: 'A', status: 'done', usage: null }), undefined)
+  assert.equal(agentTokens({ id: 'a', name: 'A', status: 'done', usage: { inputTokens: 0, outputTokens: 0, cachedInputTokens: 0 } }), undefined, 'a zero is not shown')
+  assert.equal(agentTokens({ id: 'a', name: 'A', status: 'done' }), undefined)
+  assert.equal(agentTokens(undefined), undefined)
+  assert.equal(plainSpaces(usageTitle(usage)), 'Вход 1 150 000 (из кэша 1 020 000) · выход 48 000')
+  assert.equal(plainSpaces(usageTitle({ inputTokens: 500, outputTokens: 20, cachedInputTokens: 0 })), 'Вход 500 · выход 20', 'no cached part to name')
+  assert.equal(usageTitle(null), '')
+  assert.equal(usageBreakdown(usage), 'вход 1,2 млн (из кэша 1 млн) · выход 48 тыс.')
+  const agents = [{ id: 'a', name: 'A', status: 'done', usage }, { id: 'b', name: 'B', status: 'working', usage: null }, { id: 'c', name: 'C', status: 'working', usage: { inputTokens: 850_000, outputTokens: 2000, cachedInputTokens: 0 } }]
+  assert.deepEqual(runUsage(agents), { inputTokens: 2_000_000, outputTokens: 50_000, cachedInputTokens: 1_020_000 })
+  assert.equal(runUsage([agents[1]]), null)
+  assert.equal(runUsage([]), null)
+})
+
+test('an agent update carries the tokens onto the run, replacing the earlier count, and a saved run keeps them', () => {
+  const base = { runId: 'r', projectId: 'p', chatId: 'c' }
+  let runs = applyRunEvent({}, { ...base, type: 'agent.created', agent: { id: 'root', name: 'Orbit', status: 'working', usage: null } }, AT)
+  assert.equal(runs.r.agents[0].usage, null)
+  runs = applyRunEvent(runs, { ...base, type: 'agent.updated', agent: { id: 'root', name: 'Orbit', status: 'working', usage: { inputTokens: 100, outputTokens: 10, cachedInputTokens: 50 } } }, AT)
+  runs = applyRunEvent(runs, { ...base, type: 'agent.updated', agent: { id: 'root', name: 'Orbit', status: 'working', usage: { inputTokens: 300, outputTokens: 30, cachedInputTokens: 150 } } }, AT)
+  assert.deepEqual(runs.r.agents[0].usage, { inputTokens: 300, outputTokens: 30, cachedInputTokens: 150 })
+  runs = applyRunEvent(runs, { ...base, type: 'run.info', usage: { providerTurns: 1, workerTurns: 0, inputTokens: 300, outputTokens: 30, cachedInputTokens: 150 } }, AT)
+  assert.equal(runs.r.usage.inputTokens, 300)
+  const restored = restoreRuns({}, [{ ...runs.r, agents: [{ id: 'root', name: 'Orbit', status: 'done', usage: { inputTokens: 900, outputTokens: 90, cachedInputTokens: 450 } }] }])
+  assert.deepEqual(agentTokens(restored.r.agents[0]), 990)
 })
 
 test('run.started and run.info carry the loop task and the plan handoff onto the run', () => {

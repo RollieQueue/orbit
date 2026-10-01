@@ -10,6 +10,7 @@ import { removeTemporaryDirectory } from './storage.mts'
 import { attachmentsFolder } from './attachments.mts'
 import { claudeStreamLimit } from './quota.mts'
 import type { ClaudeRateLimitInfo, QuotaPartial, QuotaTaggedError } from './quota.mts'
+import { execTurnUsage, startedThread } from './codex-usage.mts'
 import { report } from './diagnostics.mts'
 import REASONING_DEFAULTS from './reasoning-defaults.json' with { type: 'json' }
 // codex-server.mts imports loopbackNoProxy from this file; both sides use the other only inside functions, so the ESM cycle is harmless.
@@ -21,7 +22,7 @@ import type { SubscriptionId } from './subscription-providers.mts'
 
 type AccessMode = 'read-only' | 'workspace-write' | 'danger-full-access'
 type Transport = 'session' | 'envelope'
-type ProviderEventKind = 'output' | 'reasoning' | 'thinking' | 'tool' | 'observation' | 'quota' | 'session'
+type ProviderEventKind = 'output' | 'reasoning' | 'thinking' | 'tool' | 'observation' | 'quota' | 'session' | 'usage'
 interface ProviderEventBase { providerId: string; kind: ProviderEventKind }
 // A text delta of the assistant's answer; `replace` rewrites the message instead of appending.
 interface OutputEvent extends ProviderEventBase { kind: 'output'; text: string; messageId?: string; partial?: boolean; replace?: boolean; parentToolId?: string | null }
@@ -39,7 +40,10 @@ interface QuotaEvent extends ProviderEventBase { kind: 'quota'; quota: QuotaPart
 // The CLI named its session as the turn began (a Codex thread, a Cursor chat, an Antigravity conversation): a turn Orbit
 // cuts off before its result can still be resumed in it (runtime turn.mts).
 interface SessionEvent extends ProviderEventBase { kind: 'session'; sessionId: string }
-type ProviderEvent = OutputEvent | ReasoningEvent | ThinkingEvent | ToolEvent | ObservationEvent | QuotaEvent | SessionEvent
+// Tokens the model spent since the last usage event, in the vendor's own spelling: a growth, never a running total (the
+// parsers deal with repeated figures and cumulative totals), which the runtime adds to the agent (runtime/turn.mts).
+interface UsageEvent extends ProviderEventBase { kind: 'usage'; usage: unknown }
+type ProviderEvent = OutputEvent | ReasoningEvent | ThinkingEvent | ToolEvent | ObservationEvent | QuotaEvent | SessionEvent | UsageEvent
 // The same union with `providerId` removed from every member (a plain Omit would collapse the union).
 type WithoutProvider<E> = E extends ProviderEvent ? Omit<E, 'providerId'> : never
 type ParserEvent = WithoutProvider<ProviderEvent>
@@ -132,12 +136,12 @@ type ClaudeContentBlock = ClaudeTextBlock | ClaudeToolUseBlock | ClaudeToolResul
 const isTextBlock = (block: ClaudeContentBlock): block is ClaudeTextBlock => block.type === 'text'
 const isToolUseBlock = (block: ClaudeContentBlock): block is ClaudeToolUseBlock => block.type === 'tool_use'
 const isToolResultBlock = (block: ClaudeContentBlock): block is ClaudeToolResultBlock => block.type === 'tool_result'
-interface ClaudeMessage { id?: string; model?: string; content?: ClaudeContentBlock[] }
+interface ClaudeMessage { id?: string; model?: string; content?: ClaudeContentBlock[]; usage?: unknown }
 interface ClaudeTextDelta { type: 'text_delta'; text: string }
 interface ClaudeThinkingDelta { type: 'thinking_delta'; thinking: string }
 interface ClaudeOtherDelta { type: 'input_json_delta' | 'signature_delta' }
 // One Anthropic streaming event as `stream_event.event`.
-interface ClaudeStreamPart { type?: string; index?: number; message?: { id?: string }; delta?: ClaudeTextDelta | ClaudeThinkingDelta | ClaudeOtherDelta; content_block?: { type?: string; id: string; name: string } }
+interface ClaudeStreamPart { type?: string; index?: number; message?: { id?: string; usage?: unknown }; usage?: unknown; delta?: ClaudeTextDelta | ClaudeThinkingDelta | ClaudeOtherDelta; content_block?: { type?: string; id: string; name: string } }
 interface ClaudeEventBase { model?: string; session_id?: string; parent_tool_use_id?: string | null; message?: ClaudeMessage; content?: ClaudeContentBlock[] }
 interface ClaudeRateLimitEvent extends ClaudeEventBase { type: 'rate_limit_event'; rate_limit_info?: ClaudeRateLimitInfo }
 interface ClaudeErrorEvent extends ClaudeEventBase { type: 'error'; error?: unknown }
@@ -491,7 +495,8 @@ function toolFlags(orbitTool: string | undefined): { native: false; mcp: true; s
   return orbitTool ? { native: false, mcp: true, server: 'orbit', orbitTool } : { native: true }
 }
 
-function createCodexParser(onEvent: ProviderEventListener | null | undefined, requestedModel = '', responseSchema?: unknown): StreamParser {
+// `resumed`: the turn resumes a thread (`exec resume`); a turn's usage is what the thread's total grew by (codex-usage.mts).
+function createCodexParser(onEvent: ProviderEventListener | null | undefined, requestedModel = '', responseSchema?: unknown, { resumed = false }: { resumed?: boolean } = {}): StreamParser {
   let model = requestedModel
   let finalText = ''
   let finalPhaseText: string | undefined
@@ -511,10 +516,19 @@ function createCodexParser(onEvent: ProviderEventListener | null | undefined, re
       try { event = JSON.parse(line) } catch { dispatch({ kind: 'observation', text: line, source: 'diagnostic' }); return }
       if (!isCodexEvent(event)) return
       model = event.model || event.thread?.model || event.metadata?.model || model
-      if (event.type === 'thread.started' && typeof event.thread_id === 'string' && SESSION_ID.test(event.thread_id)) { sessionId = event.thread_id; dispatch({ kind: 'session', sessionId }) }
+      if (event.type === 'thread.started' && typeof event.thread_id === 'string' && SESSION_ID.test(event.thread_id)) {
+        sessionId = event.thread_id
+        if (!resumed) startedThread(sessionId)
+        dispatch({ kind: 'session', sessionId })
+      }
       if (event.type === 'turn.failed') failure = errorText(event.error)
       if (event.type === 'error') { lastError = errorText(event.message || event.error); dispatch({ kind: 'observation', text: lastError, status: 'error' }) }
-      if (event.type === 'turn.completed') { completed = true; dispatch({ kind: 'observation', text: 'Codex turn completed', usage: event.usage, status: 'completed' }) }
+      if (event.type === 'turn.completed') {
+        completed = true
+        const usage = execTurnUsage(sessionId, event.usage, resumed)
+        if (usage) dispatch({ kind: 'usage', usage })
+        dispatch({ kind: 'observation', text: 'Codex turn completed', status: 'completed' })
+      }
       const item = event.item
       if (!item) return
       if (item.type === 'agent_message' && typeof item.text === 'string') {
@@ -561,6 +575,17 @@ function createCodexParser(onEvent: ProviderEventListener | null | undefined, re
   }
 }
 
+// Anthropic counts the cache apart from `input_tokens` (the runtime adds them up: runtime/turn.mts normalizeUsage).
+const TOKEN_KEYS = ['input_tokens', 'cache_creation_input_tokens', 'cache_read_input_tokens', 'output_tokens'] as const
+type TokenFigures = Record<(typeof TOKEN_KEYS)[number], number>
+const noTokens = (): TokenFigures => ({ input_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0, output_tokens: 0 })
+function tokenFigures(value: unknown): TokenFigures | null {
+  if (!isRecord(value)) return null
+  const figures = noTokens()
+  for (const key of TOKEN_KEYS) { const number = Number(value[key]); if (Number.isFinite(number) && number > 0) figures[key] = number }
+  return figures
+}
+
 function createClaudeParser(onEvent: ProviderEventListener | null | undefined, requestedModel = '', responseSchema?: unknown): StreamParser {
   let model = requestedModel
   let result: ClaudeResultEvent | undefined
@@ -575,6 +600,30 @@ function createClaudeParser(onEvent: ProviderEventListener | null | undefined, r
   // Tool id → name, so the result of an Orbit MCP call is labelled like the call that made it.
   const toolNames = new Map<string, string>()
   const dispatch = (event: ParserEvent) => emit(onEvent, { providerId: 'claude', ...event })
+  // Tokens by API call. The CLI repeats one call's figures on several events (message_start, an `assistant` event per content
+  // block, message_delta) and its `output_tokens` is final only on message_delta, so each call stays at the most the stream
+  // showed of it and only a growth is reported: the count is live and counts a call once. A `result` states the agent's own
+  // calls of one stretch of the process (not its native subagents' calls, which the stream shows on `assistant` events only),
+  // and may come after the next stretch's calls have streamed; so the stretches are summed and compared with the own calls
+  // seen so far, and only what the stream missed is added (a stream without partial messages ends exact too). Checked against
+  // Claude Code 2.1.285: a turn with two calls, and one with a subagent whose two results followed all three calls.
+  const calls = new Map<string, TokenFigures>()
+  const own = noTokens(), stated = noTokens(), added = noTokens()
+  const noteCall = (id: string, usage: unknown, ownCall: boolean) => {
+    const figures = tokenFigures(usage)
+    if (!figures) return
+    const seen = calls.get(id) || noTokens(), grown = noTokens()
+    let any = false
+    for (const key of TOKEN_KEYS) {
+      const more = figures[key] - seen[key]
+      if (more <= 0) continue
+      grown[key] = more; seen[key] = figures[key]; any = true
+      if (ownCall) own[key] += more
+    }
+    calls.delete(id); calls.set(id, seen)
+    if (calls.size > 512) calls.delete(calls.keys().next().value!)
+    if (any) dispatch({ kind: 'usage', usage: grown })
+  }
   // The index of the agent's own thinking block in progress. The CLI's system/thinking_tokens events estimate it; they
   // name no parent tool, so one outside such a block (a native subagent thinking) is not taken for the agent's own.
   let thinkingBlock: number | null = null
@@ -606,12 +655,25 @@ function createClaudeParser(onEvent: ProviderEventListener | null | undefined, r
         if (parentToolId) return
         result = event
         if (event.is_error || (event.subtype && event.subtype !== 'success')) failure = errorText(event.errors?.join('\n') || event.result || event.subtype)
-        dispatch({ kind: 'observation', text: failure || 'Claude turn completed', status: failure ? 'error' : 'completed', usage: event.usage })
+        const reported = tokenFigures(event.usage)
+        if (reported) {
+          const missing = noTokens()
+          let any = false
+          for (const key of TOKEN_KEYS) {
+            stated[key] += reported[key]
+            const more = stated[key] - own[key] - added[key]
+            if (more > 0) { missing[key] = more; added[key] += more; any = true }
+          }
+          if (any) dispatch({ kind: 'usage', usage: missing })
+        }
+        dispatch({ kind: 'observation', text: failure || 'Claude turn completed', status: failure ? 'error' : 'completed' })
       }
       if (event.type === 'stream_event') {
         const part: ClaudeStreamPart = event.event || {}
         if (part.type === 'message_start') streams.set(streamKey, { id: part.message?.id || streamKey, text: '' })
         const current = streams.get(streamKey) || { id: streamKey, text: '' }
+        if (part.type === 'message_start') noteCall(current.id, part.message?.usage, !parentToolId)
+        if (part.type === 'message_delta') noteCall(current.id, part.usage, !parentToolId)
         if (part.type === 'content_block_delta' && part.delta?.type === 'text_delta') {
           current.text += part.delta.text
           streams.set(streamKey, current)
@@ -634,6 +696,7 @@ function createClaudeParser(onEvent: ProviderEventListener | null | undefined, r
       const content = event.message?.content || event.content
       if (event.type === 'assistant' && Array.isArray(content)) {
         const id = event.message?.id || `${streamKey}:assistant`
+        noteCall(id, event.message?.usage, !parentToolId)
         const text = content.filter(isTextBlock).map((block) => block.text).join('')
         const previous = messages.get(id) || ''
         if (text && text !== previous) dispatch({ kind: 'output', text: text.startsWith(previous) ? text.slice(previous.length) : text, messageId: id, parentToolId, partial: false, replace: !text.startsWith(previous) })
@@ -861,7 +924,7 @@ async function runClaudeSession(options: NativeRunOptions, session: NormalizedSe
 
 async function runCodexSession(options: NativeRunOptions, session: NormalizedSession): Promise<ProviderResult> {
   if (options.approvalPolicy === 'on-request') return codexServer.runCodexSessionTurn(options, session, launchHelpers(options, busyCheck))
-  const parser = createCodexParser(options.onEvent, options.model)
+  const parser = createCodexParser(options.onEvent, options.model, undefined, { resumed: session.resume })
   const command = options.providerOptions?.command || process.env.ORBIT_CODEX_COMMAND || 'codex'
   try {
     await runCli(command, buildCodexSessionArgs(options, session), {

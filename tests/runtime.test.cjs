@@ -991,3 +991,37 @@ test('nullable schema arguments retain optional tool semantics', () => {
   assert.deepEqual(parsed.calls[1].arguments, { message: 'Hello' })
   assert.deepEqual(parsed.calls[2].arguments, {})
 })
+
+test('each agent counts its own tokens, the run is their sum, and the team directory shows them', async (t) => {
+  const prompts = []
+  const runtime = new OrbitRuntime({ runProvider: async ({ prompt, onEvent }) => {
+    const [, name] = identity(prompt)
+    if (name === 'Child') {
+      // Claude's spelling: the cache is apart from input_tokens (10 + 90 + 900 input, 900 of it cached).
+      onEvent({ kind: 'usage', usage: { input_tokens: 10, cache_creation_input_tokens: 90, cache_read_input_tokens: 900, output_tokens: 40 } })
+      return { text: 'CHILD_FINDING' }
+    }
+    if (name === 'Quiet') return { text: 'QUIET_FINDING' }
+    prompts.push(prompt)
+    if (prompts.length === 1) {
+      onEvent({ kind: 'usage', usage: { input_tokens: 2000, cached_input_tokens: 1500, output_tokens: 100 } })
+      return response(tool('spawn_agent', { name: 'Child', task: 'Measured work', reason: 'Independent evidence' }), tool('spawn_agent', { name: 'Quiet', task: 'Work that reports no figures', reason: 'Independent evidence' }), tool('wait_agent'))
+    }
+    // A provider that reports once per turn, as an observation (Ollama, endpoints).
+    onEvent({ kind: 'observation', text: 'done', usage: { input_tokens: 300, output_tokens: 30 } })
+    return { text: 'Integrated' }
+  } })
+  const { snapshot, events, runId } = await finished(runtime, payload(folder(t)))
+  assert.equal(snapshot.status, 'completed')
+  const byName = Object.fromEntries(snapshot.agents.map(agent => [agent.name, agent]))
+  assert.deepEqual(byName.Orbit.usage, { inputTokens: 2300, outputTokens: 130, cachedInputTokens: 1500 })
+  assert.deepEqual(byName.Child.usage, { inputTokens: 1000, outputTokens: 40, cachedInputTokens: 900 })
+  assert.equal(byName.Quiet.usage, null, 'an agent no provider reported for has no count, not a zero')
+  assert.deepEqual({ ...snapshot.usage, providerTurns: undefined, workerTurns: undefined, promptChars: undefined }, { providerTurns: undefined, workerTurns: undefined, promptChars: undefined, inputTokens: 3300, outputTokens: 170, cachedInputTokens: 2400 }, 'the run is the sum of its agents')
+  // The directory (list_agents) and the TEAM DIRECTORY of a prompt carry the count when there is one.
+  const directory = runtime.agentDirectory(runtime.runs.get(runId))
+  assert.deepEqual(directory.map(entry => [entry.name, entry.tokens]), [['Orbit', 2430], ['Child', 1040], ['Quiet', undefined]])
+  const roster = JSON.parse(prompts.at(-1).match(/TEAM DIRECTORY[^\n]*\n(\[.*\])\n/)[1])
+  assert.deepEqual(roster.map(entry => [entry.name, entry.tokens]), [['Orbit', 2100], ['Child', 1040], ['Quiet', undefined]], 'the prompt shows what was counted when it was written')
+  assert.equal(events.find(event => event.type === 'agent.created' && event.agent.name === 'Quiet').agent.usage, null)
+})

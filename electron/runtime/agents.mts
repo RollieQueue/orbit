@@ -5,10 +5,11 @@ import { setMaxListeners } from 'node:events'
 import { saveNote } from '../shared-context.mts'
 import * as chatMemory from '../chat-memory.mts'
 import { ROUTING_KINDS } from '../model-routing.mts'
-import type { AgentDirectoryEntry, AgentRecord, AgentResult, ChildResultEntry, FollowupResult, ModelTarget, OrbitRuntimeLike, PublicAgent, RoutedSpawn, RunRecord, SpawnResult, TeamDigest, ToolArgs, TurnWaiter, WorkedModel } from '../types.mts'
-import { TERMINAL, AGENT_TERMINAL, ceiling, USER, newMailMark, withoutGoogleReasoning, answerLimit, publicAgent, bounded, clip, abortError } from './util.mts'
+import type { AgentDirectoryEntry, AgentRecord, AgentResult, ChildResultEntry, FollowupResult, IsolationPrepared, ModelTarget, OrbitRuntimeLike, PublicAgent, RoutedSpawn, RunRecord, SpawnResult, TeamDigest, ToolArgs, TurnWaiter, WorkedModel } from '../types.mts'
+import { TERMINAL, AGENT_TERMINAL, ceiling, USER, newMailMark, withoutGoogleReasoning, answerLimit, publicAgent, agentTokens, bounded, clip, abortError } from './util.mts'
 
-function createAgent(runtime: OrbitRuntimeLike, run: RunRecord, parent: AgentRecord | null, spec: ToolArgs): AgentRecord {
+// `extra`: fields the record starts with beyond what the spec says (an isolated helper's id, workspace and isolation).
+function createAgent(runtime: OrbitRuntimeLike, run: RunRecord, parent: AgentRecord | null, spec: ToolArgs, extra: Partial<AgentRecord> = {}): AgentRecord {
   const sameProvider = !spec.providerId || spec.providerId === (parent?.providerId || run.providerId)
   const providerId = spec.providerId || parent?.providerId || run.providerId
   const model = spec.model || (sameProvider ? parent?.model || run.model : '')
@@ -29,7 +30,9 @@ function createAgent(runtime: OrbitRuntimeLike, run: RunRecord, parent: AgentRec
     handovers: [], failedCandidates: new Set(), trial: null, partialTurn: null, quotaWarned: '',
     // session: one CLI process resumed turn after turn, Orbit tools over MCP; envelope: the JSON protocol, one process per turn.
     transport: runtime.decideTransport(run, providerId, model), sessionId: null, sessionToken: null, sessionCursor: 0, turnTimings: [], activeTurn: null, stream: null,
-    mailMark: newMailMark(),
+    mailMark: newMailMark(), usage: null,
+    // A helper works where its parent does (inside an isolated copy, when the parent has one); `extra` may give it its own.
+    ...(parent?.workspace ? { workspace: parent.workspace } : {}), ...extra,
   }
   run.agentNodes.set(agent.id, agent)
   run.agentOperations.set(agent.id, new Set())
@@ -52,27 +55,51 @@ function scheduleAgent(runtime: OrbitRuntimeLike, run: RunRecord, agent: AgentRe
   run.tasks.set(agent.id, task)
   return task
 }
+const ISOLATIONS = ['', 'worktree', 'orbit']
 // spawn_agent. With a kind and no model Orbit first picks the model for that work (handover.mts routeSpawn); that waits
 // for the provider list and the quotas, so a call refused for an ended run or parent or a missing task or reason, or one
-// that reuses a helper by its name, skips it (registerSubAgent checks everything again afterwards).
+// that reuses a helper by its name, skips it (registerSubAgent checks everything again afterwards). With isolation the
+// helper's copy is made last, once nothing refuses the call any more, and thrown away again if the registration that
+// follows still does.
 async function spawnSubAgent(runtime: OrbitRuntimeLike, runId: string, parentId: string, spec: ToolArgs = {}): Promise<SpawnResult> {
   const run = runtime.runs.get(runId)
   const parent = run?.agentNodes.get(parentId)
-  if (!run || !parent || !ROUTING_KINDS.includes(String(spec.kind)) || spec.model || TERMINAL.has(run.status) || ['done', 'error', 'cancelled'].includes(parent.status)
-    || !String(spec.task || '').trim() || !String(spec.reason || '').trim() || (spec.name && [...run.agentNodes.values()].some(agent => agent.name === bounded(spec.name, 80)))) return registerSubAgent(runtime, runId, parentId, spec)
+  const isolation = spec.isolation === undefined || spec.isolation === null ? '' : String(spec.isolation)
+  if (!ISOLATIONS.includes(isolation)) return { ok: false, reason: 'invalid_isolation', instruction: "isolation is one of '' (the helper shares your workspace), 'worktree' (its own git copy of your workspace) or 'orbit' (its own git copy of Orbit's repository)" }
   // A session call runs inside its caller's turn. A pause that cut the turn meanwhile lost this call's result for the
   // model, so no helper is made behind its back: the resumed model decides again.
-  const turn = parent.activeTurn
-  const { spec: routedSpec, routed } = await runtime.routeSpawn(run, parent, spec)
-  if (turn && parent.activeTurn !== turn) return { ok: false, reason: 'turn_interrupted', instruction: 'Your turn was cut off (a pause) while the helper\'s model was being chosen, so no helper was created; spawn it again if it is still needed.' }
-  const result = registerSubAgent(runtime, runId, parentId, routedSpec, routed)
-  return result.ok && !result.reused ? { ...result, routed } : result
+  const turn = parent?.activeTurn
+  let routedSpec = spec, routed: RoutedSpawn | null = null
+  if (run && parent && ROUTING_KINDS.includes(String(spec.kind)) && !spec.model && !TERMINAL.has(run.status) && !['done', 'error', 'cancelled'].includes(parent.status)
+    && String(spec.task || '').trim() && String(spec.reason || '').trim() && !(spec.name && [...run.agentNodes.values()].some(agent => agent.name === bounded(spec.name, 80)))) {
+    ({ spec: routedSpec, routed } = await runtime.routeSpawn(run, parent, spec))
+    if (turn && parent.activeTurn !== turn) return { ok: false, reason: 'turn_interrupted', instruction: 'Your turn was cut off (a pause) while the helper\'s model was being chosen, so no helper was created; spawn it again if it is still needed.' }
+  }
+  let prepared: Extract<IsolationPrepared, { ok: true }> | undefined, copyRun: RunRecord | undefined
+  if (isolation) {
+    const vetted = vetSpawn(runtime, runId, parentId, routedSpec)
+    if (!('run' in vetted)) return vetted
+    const made = await runtime.prepareIsolation(vetted.run, vetted.parent, isolation)
+    if (!made.ok) return { ok: false, reason: made.reason, ...(made.instruction ? { instruction: made.instruction } : {}) }
+    prepared = made; copyRun = vetted.run
+    if (turn && vetted.parent.activeTurn !== turn) {
+      await runtime.discardIsolation(copyRun, made.id)
+      return { ok: false, reason: 'turn_interrupted', instruction: 'Your turn was cut off (a pause) while the helper\'s isolated copy was being made, so no helper was created; spawn it again if it is still needed.' }
+    }
+  }
+  const result = registerSubAgent(runtime, runId, parentId, routedSpec, routed, prepared)
+  if (prepared && copyRun && (!result.ok || result.reused)) await runtime.discardIsolation(copyRun, prepared.id)
+  return routed && result.ok && !result.reused ? { ...result, routed } : result
 }
 // "Model for review work: claude/opus (passed over codex/gpt-6-astra: quota 93% used)", for the delegation trace.
 function routedLine({ kind, model, skipped }: RoutedSpawn): string {
   return `Model for ${kind} work: ${model || 'none of the routing table can take it now, so the usual one'}${skipped?.length ? ` (passed over ${skipped.join('; ')})` : ''}`
 }
-function registerSubAgent(runtime: OrbitRuntimeLike, runId: string, parentId: string, spec: ToolArgs, routed: RoutedSpawn | null = null): SpawnResult {
+// What a spawn needs before any agent (or isolated copy) is made: the refusals, in the order they are told, and the reuse of
+// a helper by its name. The call ends here with a result, or goes on with the live run and parent, the spec as completed
+// (the name of the helper it continues, the model of the provider's pool entry) and the earlier agent it continues.
+interface Vetted { run: RunRecord; parent: AgentRecord; spec: ToolArgs; prior: PublicAgent | null }
+function vetSpawn(runtime: OrbitRuntimeLike, runId: string, parentId: string, spec: ToolArgs): SpawnResult | Vetted {
   const run = runtime.runs.get(runId)
   if (!run || TERMINAL.has(run.status)) return { ok: false, reason: 'run_not_active' }
   const parent = run.agentNodes.get(parentId)
@@ -95,9 +122,16 @@ function registerSubAgent(runtime: OrbitRuntimeLike, runId: string, parentId: st
   if (parent.depth >= ceiling(run.limits, 'maxDepth')) return { ok: false, reason: 'depth_limit' }
   if (run.agentNodes.size >= ceiling(run.limits, 'maxAgents')) return { ok: false, reason: 'agent_limit' }
   if (run.usage.workerTurns >= ceiling(run.limits, 'maxTotalTurns')) return { ok: false, reason: 'worker_turn_budget_exhausted', instruction: 'Integrate the existing findings. The root agent has no turn limit.' }
-  const agent = runtime.createAgent(run, parent, spec)
+  return { run, parent, spec, prior }
+}
+// `prepared`: the isolated copy made for this helper (runtime/isolation.mts), whose fields its record starts with.
+function registerSubAgent(runtime: OrbitRuntimeLike, runId: string, parentId: string, spec: ToolArgs, routed: RoutedSpawn | null = null, prepared?: Extract<IsolationPrepared, { ok: true }>): SpawnResult {
+  const vetted = vetSpawn(runtime, runId, parentId, spec)
+  if (!('run' in vetted)) return vetted
+  const { run, parent, prior } = vetted
+  const agent = runtime.createAgent(run, parent, vetted.spec, prepared?.fields)
   if (prior) agent.previousWork.push({ generation: prior.generation ?? 0, task: prior.task, result: prior.result, error: prior.error, files: prior.files })
-  runtime.trace(run, parent.id, 'delegation', `${agent.name}: ${agent.task}\nReason: ${agent.reason}${routed ? `\n${routedLine(routed)}` : ''}`)
+  runtime.trace(run, parent.id, 'delegation', `${agent.name}: ${agent.task}\nReason: ${agent.reason}${routed ? `\n${routedLine(routed)}` : ''}${agent.isolation ? `\nIsolated copy: ${agent.isolation.path}; its changes merge into ${agent.isolation.target} when it finishes` : ''}`)
   runtime.scheduleAgent(run, agent)
   return { ok: true, agentId: agent.id, agent: runtime.snapshot(run).agents.find((item) => item.id === agent.id) }
 }
@@ -195,13 +229,14 @@ function ranOnFields(agent: Pick<AgentRecord, 'providerId' | 'model' | 'handover
 }
 // Compact directory: every participant fits one observation, results are excerpts.
 function directoryRanOn(agent: AgentRecord): { ranOn?: string[] } { const worked = modelsWorked(agent); return worked.length > 1 ? { ranOn: worked.map(item => item.label) } : {} }
+const tokensOf = (agent: AgentRecord): { tokens?: number } => { const tokens = agentTokens(agent); return tokens === undefined ? {} : { tokens } }
 function agentDirectory(runtime: OrbitRuntimeLike, run: RunRecord): AgentDirectoryEntry[] {
   const agents = [...run.agentNodes.values()]
   const share = Math.max(300, Math.floor((run.limits.maxOutputChars - 1000) / Math.max(1, agents.length)) - 280)
   return agents.map(agent => ({
     paused: !!agent.paused,
     id: agent.id, name: agent.name, parentId: agent.parentId, status: agent.status, generation: agent.generation,
-    providerId: agent.providerId, model: agent.model, ...directoryRanOn(agent), task: clip(agent.task, 240),
+    providerId: agent.providerId, model: agent.model, ...directoryRanOn(agent), ...tokensOf(agent), task: clip(agent.task, 240),
     result: bounded(agent.result, share), ...(agent.result.length > share ? { resultTruncated: true, fullResult: 'wait_agent {agentId} returns a direct child result in full' } : {}),
     error: agent.error, budgetLimited: !!agent.budgetLimited,
   }))
@@ -219,7 +254,23 @@ function cancelDescendants(runtime: OrbitRuntimeLike, run: RunRecord, agent: Age
     }
   }
 }
-function completeAgent(runtime: OrbitRuntimeLike, run: RunRecord, agent: AgentRecord, content: string, budgetLimited = false, detail = '', extra: Partial<AgentRecord> = {}): AgentResult {
+// An isolated helper's changes are merged into their target BEFORE it counts as done, so that whoever waits for it (its
+// parent's wait_agent, the next turn's helper results) gets the result after the merge. The merge report leads the
+// result: a long answer is cut at its end, never at its start. Every other agent completes at once.
+function completeAgent(runtime: OrbitRuntimeLike, run: RunRecord, agent: AgentRecord, content: string, budgetLimited = false, detail = '', extra: Partial<AgentRecord> = {}): AgentResult | Promise<AgentResult> {
+  if (!agent.isolation) return finishAgent(runtime, run, agent, content, budgetLimited, detail, extra)
+  return runtime.mergeIsolated(run, agent).then(report => {
+    // Stopped or cancelled meanwhile (the user stopped the helper, its parent failed, the run ended): the merge still
+    // happened, so the cancelled helper's result says what it did (it is traced as well), and the agent ends cancelled the
+    // way executeAgent ends one, never done.
+    if (runtime.agentSignal(run, agent).aborted || agent.status === 'cancelled') {
+      if (report) agent.result = bounded(`The helper was stopped while its changes were being merged; the merge had this outcome:\n${report}${agent.result ? `\n\n${agent.result}` : ''}`, answerLimit(run, agent))
+      throw abortError()
+    }
+    return finishAgent(runtime, run, agent, report ? `${report}\n\n${content}` : content, budgetLimited, detail, extra)
+  })
+}
+function finishAgent(runtime: OrbitRuntimeLike, run: RunRecord, agent: AgentRecord, content: string, budgetLimited: boolean, detail: string, extra: Partial<AgentRecord>): AgentResult {
   agent.result = bounded(content, answerLimit(run, agent))
   try { run.sharedContext = saveNote(runtime.contextStore, run.workspace, run.sharedContext, { key: `agent:${run.chatId}:${agent.name}`, summary: JSON.stringify({ result: agent.result.slice(0, 1800), task: agent.task.slice(0, 200), runId: run.runId, state: budgetLimited ? 'partial' : 'reported complete; verify before reuse' }) }) }
   catch (error) { runtime.persistenceError(run, error as Error) }
@@ -231,7 +282,7 @@ function completeAgent(runtime: OrbitRuntimeLike, run: RunRecord, agent: AgentRe
   runtime.updateAgent(run, agent, { status: 'done', progress: 100, budgetLimited, detail: detail || (budgetLimited ? 'Worker limit reached; findings preserved' : 'Response complete'), finishedAt: new Date().toISOString(), ...extra })
   return { agentId: agent.id, generation: agent.generation, status: 'done', result: agent.result, budgetLimited }
 }
-function budgetHandoff(runtime: OrbitRuntimeLike, run: RunRecord, agent: AgentRecord): AgentResult {
+function budgetHandoff(runtime: OrbitRuntimeLike, run: RunRecord, agent: AgentRecord): AgentResult | Promise<AgentResult> {
   const evidence = agent.transcript.filter(entry => ['tool_result', 'child_result', 'assistant_final'].includes(entry.type)).slice(-5)
   // Mail riding on a result carries the helper's secret mark (util.mailTag), which only its own prompts may show.
   const content = `Достигнут лимит работы помощника ${agent.name}. Задача может быть не завершена.\n${agent.result ? `Последний результат:\n${agent.result}\n` : ''}${evidence.length ? `Сохранённые результаты и наблюдения:\n${bounded(evidence, run.limits.maxOutputChars - 1000).replaceAll(agent.mailMark, 'mark')}` : 'Подтверждённых результатов пока нет.'}`
@@ -239,7 +290,7 @@ function budgetHandoff(runtime: OrbitRuntimeLike, run: RunRecord, agent: AgentRe
   return runtime.completeAgent(run, agent, content, true)
 }
 // Ends an agent that keeps repeating identical calls, reporting what really happened instead of looping.
-function stallHandoff(runtime: OrbitRuntimeLike, run: RunRecord, agent: AgentRecord, turns: number): AgentResult {
+function stallHandoff(runtime: OrbitRuntimeLike, run: RunRecord, agent: AgentRecord, turns: number): AgentResult | Promise<AgentResult> {
   const actions = agent.ledger.slice(-12).map(entry => entry.text).join('\n')
   const results = agent.transcript.filter((entry): entry is ChildResultEntry => entry.type === 'child_result' && !!entry.result).slice(-6)
     .map(entry => `- ${run.agentNodes.get(entry.agentId)?.name || entry.agentId}: ${clip(entry.result, 300)}`).join('\n')

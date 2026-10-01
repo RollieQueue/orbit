@@ -11,7 +11,7 @@ import { Markdown, assistantOutput, errorText, timeOf } from './format'
 import { TraceImages } from './TraceImages'
 import { fileMap } from './file-map'
 import { providerName, providers } from './providers'
-import { actionCount, isActiveStatus, pauseHolder, transportLabel } from './run-events'
+import { actionCount, agentTokens, isActiveStatus, pauseHolder, runUsage, tokenCount, transportLabel, usageBreakdown, usageTitle } from './run-events'
 
 export type MessageAgent = (runId: string, agentId: string, text: string) => Promise<void>
 
@@ -111,6 +111,7 @@ function AgentActivity({ run, agent, quotas }: { run: RunSnapshot; agent: Agent;
   const quotaText = windows.map(window => `${windowName(window)} — осталось ${Math.max(0, 100 - usedNow(window, at))}%`).join(' · ')
   const improvements = run.improvements || []
   const done = improvements.filter(task => task.status === 'done').length
+  const tokens = agentTokens(agent), team = runUsage(run.agents)
   return <>
     <div className="inspector-heading">
       <div className="eyebrow">{agent.parentId ? 'ПОДАГЕНТ' : 'ОСНОВНОЙ АГЕНТ'}</div>
@@ -127,6 +128,8 @@ function AgentActivity({ run, agent, quotas }: { run: RunSnapshot; agent: Agent;
     {agent.reason && <p className="agent-reason">{agent.reason}</p>}
     <p className="agent-budget" title={ACTIONS_HINT}>{budgetText(agent, run)}</p>
     <TurnTimings timings={agent.turnTimings} />
+    {tokens !== undefined && agent.usage && <p className="agent-budget agent-tokens-line" title={usageTitle(agent.usage)}>Токены агента: {tokenCount(tokens)} · {usageBreakdown(agent.usage)}</p>}
+    {team && run.agents.length > 1 && <p className="agent-budget agent-tokens-line" title={usageTitle(team)}>Токены запуска: {tokenCount(team.inputTokens + team.outputTokens)} · {usageBreakdown(team)}</p>}
     {run.usage && <p className="agent-budget">Работают: {working} · Ходы помощников: {helperTurns}</p>}
     {!!windows.length && <p className="agent-budget">Квота {providerName(providerId)}: {quotaText}</p>}
     {!!agent.handovers?.length && <div className="handover-list">

@@ -163,12 +163,15 @@ function previousRuns(runtime: OrbitRuntimeLike, run: RunRecord): ChatRunView[] 
   for (const live of runtime.runs.values()) if (sameChat(live)) found.set(live.runId, live)
   return [...found.values()].sort((a, b) => String(a.startedAt).localeCompare(String(b.startedAt))).slice(-8).map(chatMemory.view)
 }
+// The isolated copies of the run's helpers are taken away once it has ended (unmerged changes are saved first); nothing waits for it.
+const releaseCopies = (runtime: OrbitRuntimeLike, run: RunRecord): void => { void runtime.cleanupIsolation(run).catch(() => undefined) }
 function finishRun(runtime: OrbitRuntimeLike, run: RunRecord, result: AgentResult): void {
   if (TERMINAL.has(run.status)) return
   clearTimeout(run.timer); run.status = 'completed'; run.finishedAt = new Date().toISOString()
   run.summary = { text: result.result, agentCount: run.agentNodes.size, providerTurns: run.usage.providerTurns, limitedAgents: [...run.agentNodes.values()].filter(agent => agent.budgetLimited).map(agent => agent.id) }
   runtime.emit(run, 'run.finished', { status: run.status, summary: run.summary })
   runtime.closeSessions(run)
+  releaseCopies(runtime, run)
   runtime.maintainKnowledge(run)
 }
 // Whether a project lets its knowledge be shared. The UI reports it when it changes, a run reports it when it starts; a project
@@ -195,6 +198,7 @@ function failRun(runtime: OrbitRuntimeLike, run: RunRecord, error: Error): void 
   run.controller.abort(); runtime.cancelAgents(run, run.error)
   runtime.emit(run, 'run.failed', { status: run.status, error: run.error })
   runtime.closeSessions(run)
+  releaseCopies(runtime, run)
 }
 function cancelAgents(runtime: OrbitRuntimeLike, run: RunRecord, detail: string): void {
   for (const agent of run.agentNodes.values()) {
@@ -208,6 +212,7 @@ function stop(runtime: OrbitRuntimeLike, runId: string): boolean {
   run.controller.abort(); runtime.cancelAgents(run, 'Stopped by the user')
   runtime.emit(run, 'run.cancelled', { status: run.status })
   runtime.closeSessions(run)
+  releaseCopies(runtime, run)
   return true
 }
 // Orbit shuts down to restart with new code an agent asked for (restart_orbit, or the self-upgrade script from an
@@ -225,6 +230,7 @@ function markRestarting(runtime: OrbitRuntimeLike, runId: string, mark: RestartM
   run.controller.abort(); runtime.cancelAgents(run, RESTART_DETAIL)
   runtime.emit(run, 'run.finished', { status: run.status, restart: run.restart })
   runtime.closeSessions(run)
+  releaseCopies(runtime, run)
   return true
 }
 

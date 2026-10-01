@@ -62,3 +62,59 @@ test('App Server cancellation interrupts an unanswered approval', async () => {
 test('App Server refuses early process exit', async () => {
   await assert.rejects(runCodexServer({ workspace: process.cwd(), timeoutMs: 3000 }, helpers('process.exit(0)')), /closed before completion/)
 })
+
+// Token usage: the v2 protocol's turn/completed has no usage; `thread/tokenUsage/updated` carries the thread's total and
+// the latest model call (checked against codex-cli 0.155), and the server replays it right after thread/resume.
+const usageFixture = `
+const readline = require('node:readline');
+const send = message => console.log(JSON.stringify(message));
+const tokens = (input, cached, output) => ({ inputTokens: input, cachedInputTokens: cached, outputTokens: output, reasoningOutputTokens: 0, totalTokens: input + output });
+let thread = '', calls = 0, turns = 0, total = { input: 0, cached: 0, output: 0 };
+const update = (turnId, call) => {
+  total = { input: total.input + call[0], cached: total.cached + call[1], output: total.output + call[2] };
+  const message = { method: 'thread/tokenUsage/updated', params: { threadId: thread, turnId, tokenUsage: { total: tokens(total.input, total.cached, total.output), last: tokens(...call) } } };
+  send(message);
+  return message;
+};
+readline.createInterface({ input: process.stdin }).on('line', line => {
+  const m = JSON.parse(line);
+  if (m.method === 'initialize') send({ id: m.id, result: {} });
+  if (m.method === 'thread/start') { thread = 'thread-usage-a'; send({ id: m.id, result: { thread: { id: thread }, model: 'test-model' } }); }
+  if (m.method === 'thread/resume') {
+    thread = m.params.threadId; total = { input: 9000, cached: 900, output: 90 };
+    send({ id: m.id, result: { thread: { id: thread }, model: 'test-model' } });
+    if (thread.includes('replay')) send({ method: 'thread/tokenUsage/updated', params: { threadId: thread, turnId: 'turn-old', tokenUsage: { total: tokens(9000, 900, 90), last: tokens(5000, 500, 50) } } });
+  }
+  if (m.method === 'turn/start') {
+    const turnId = 'turn-' + (++turns), prompt = m.params.input[0].text;
+    send({ id: m.id, result: { turn: { id: turnId } } });
+    send({ method: 'turn/started', params: { threadId: thread, turn: { id: turnId, status: 'inProgress' } } });
+    let last;
+    for (let call = 0; call < (prompt.includes('two calls') ? 2 : 1); call++) { const n = ++calls; last = update(turnId, [1000 * n, 100 * n, 10 * n]); }
+    if (prompt.includes('repeat')) send(last);
+    send({ method: 'item/completed', params: { threadId: thread, item: { type: 'agentMessage', id: 'a' + turns, text: 'answer ' + turns } } });
+    send({ method: 'turn/completed', params: { threadId: thread, turn: { id: turnId, status: 'completed' } } });
+  }
+});
+`
+test('App Server counts each model call once, and the replay after thread/resume only sets the start', async t => {
+  const { runCodexSessionTurn, closeAllSessions } = require('../electron/codex-server.mts')
+  t.after(() => closeAllSessions())
+  const turn = async (session, prompt) => {
+    const events = []
+    await runCodexSessionTurn({ workspace: process.cwd(), accessMode: 'workspace-write', timeoutMs: 5000, prompt, onEvent: event => events.push(event), onApproval: async () => false },
+      { id: null, resume: false, mcpUrl: null, token: null, systemAppend: '', activity: null, ...session }, helpers(usageFixture))
+    return events.filter(event => event.kind === 'usage').map(event => event.usage).reduce((sum, usage) => ({ input_tokens: sum.input_tokens + usage.input_tokens, cached_input_tokens: sum.cached_input_tokens + usage.cached_input_tokens, output_tokens: sum.output_tokens + usage.output_tokens }), { input_tokens: 0, cached_input_tokens: 0, output_tokens: 0 })
+  }
+  const figures = (input, cached, output) => ({ input_tokens: input, cached_input_tokens: cached, output_tokens: output })
+  // A new thread: two model calls in the turn (1000 and 2000 input tokens), the last update sent twice.
+  assert.deepEqual(await turn({}, 'two calls, repeat'), figures(3000, 300, 30))
+  // The next turn in the live process: the third call.
+  assert.deepEqual(await turn({ id: 'thread-usage-a', resume: true }, 'one call'), figures(3000, 300, 30))
+  // A new process resumes a thread of 9000 input tokens and replays that total first: only the new call counts.
+  await closeAllSessions()
+  assert.deepEqual(await turn({ id: 'thread-usage-replay', resume: true }, 'one call'), figures(1000, 100, 10))
+  // A server that does not replay: a thread this process has not seen counts the latest model call, not its total.
+  await closeAllSessions()
+  assert.deepEqual(await turn({ id: 'thread-usage-unseen', resume: true }, 'one call'), figures(1000, 100, 10))
+})

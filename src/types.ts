@@ -37,7 +37,17 @@ export type Agent = {
   pausedAt?: string | null
   // Cancelled by the user's Stop on this helper, not by the run ending.
   stoppedByUser?: boolean
+  // Tokens used so far over the agent's whole life, live during a turn; null (or absent) until a provider reports figures.
+  usage?: AgentUsage | null
+  // Set while the agent works in its own copy of the project (a git worktree or Orbit's own copy) instead of the shared folder.
+  isolation?: AgentIsolation
 }
+// `inputTokens` is everything the model was sent, the cached part (`cachedInputTokens`) included: input + output is the count.
+export type AgentUsage = { inputTokens: number; outputTokens: number; cachedInputTokens: number }
+// What a run reports of tokens: the sum of its agents' (run.info events and the saved run), null until anything was reported.
+export type RunUsage = { providerTurns: number; workerTurns?: number; inputTokens?: number | null; outputTokens?: number | null; cachedInputTokens?: number }
+// `base`: what the copy was made from; `conflicts`: the files whose changes could not be merged back.
+export type AgentIsolation = { kind: 'worktree' | 'orbit'; path: string; base: string; conflicts?: string[] }
 export type AgentFiles = { read: string[]; wrote: string[] }
 export type AgentTransport = 'session' | 'envelope'
 // One provider turn of one agent. `endedAt` is missing while the turn is still running.
@@ -266,7 +276,7 @@ export type RunSnapshot = {
   loopTask?: number
   improvementHandoff?: string
   limits?: RunLimits
-  usage?: { providerTurns: number; workerTurns?: number }
+  usage?: RunUsage
   streaming?: StreamingMessage
   // A continuation Orbit started itself after a restart: the run it continues and how many restarts in a row led here.
   resumedFrom?: string

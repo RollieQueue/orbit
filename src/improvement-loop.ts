@@ -205,7 +205,7 @@ export function loopPrompt(loop: ImprovementLoop, messages: Message[], task: num
   const lines = [`∞ Бесконечное улучшение — задача №${task}.`, `Цель цикла: ${clip(loop.goal, 4000)}`]
   if (later.length) lines.push('', 'Сообщения пользователя в этом чате после запуска цикла (учти их):', ...later)
   if (outcome) lines.push('', `Итог предыдущей попытки: ${outcome}`)
-  lines.push('', 'Возьми следующую задачу из плана (или найди новые задачи для цели цикла) и доведи до конца ОДНУ задачу по правилам цикла. Следующую задачу Orbit запустит сам.')
+  lines.push('', 'Возьми из плана пачку независимых задач (до 4; или найди новые задачи для цели цикла), выполни их параллельно и доведи до конца по правилам цикла. Следующую пачку Orbit запустит сам.')
   return lines.join('\n')
 }
 // The chat entry that stands for a loop task's run (instead of its generated prompt as a user message).

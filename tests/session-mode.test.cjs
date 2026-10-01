@@ -195,7 +195,8 @@ test('completed workers with a known model get one combined model_evaluate remin
     prompts.push(options.prompt)
     if (!options.session.resume) {
       for (const member of ['A', 'B']) await runtime.dispatchMcp(token, 'spawn_agent', { name: member, task: `Task ${member}`, reason: 'Independent' })
-      await runtime.dispatchMcp(token, 'wait_agent', {})
+      // wait_agent returns at the first helper to finish: wait again until both are done.
+      for (let left = 3; left && (await runtime.dispatchMcp(token, 'wait_agent', {})).observation.some(child => !['done', 'error', 'cancelled'].includes(child.status)); left--);
       return { text: 'Answer without evaluation' }
     }
     return { text: 'Still no evaluation' }
