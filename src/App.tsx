@@ -64,7 +64,7 @@ export default function App() {
       {panel === 'quota' && (desktop
         ? <QuotaPanel providers={providers} connected={orbit.connected} quotas={quotas} busy={orbit.quotaBusy} onRefresh={() => void orbit.refreshQuotas(true)}
           failover={state.settings.quotaFailover!} onFailover={patch => updateSettings({ quotaFailover: { ...state.settings.quotaFailover!, ...patch } })}
-          agents={currentRun?.agents || []} currentProviderId={state.settings.providerId} />
+          agents={currentRun?.agents || []} currentProviderId={state.settings.providerId} workspace={project?.workspace.path || ''} />
         : <p className="inline-notice">Квоты подписок доступны в настольном приложении.</p>)}
       {panel === 'add' && <AddProjectPanel desktop={desktop} busy={orbit.projectBusy} remote={remote} onRemote={setRemote} onAdd={orbit.addProject}
         onDone={() => { setPanel(null); setRemote(''); setProjectMenu(false) }} />}

@@ -151,11 +151,15 @@ export type LibraryStats = {
 }
 // Skills are add-ons Orbit builds for itself, of any form (electron/capabilities.mts): instructions for agents, and
 // optionally a package of files (pages, scripts, assets) with parameters the user sets, triggers Orbit runs on its own
-// (task-completed → show one of the package's pages full screen) and commands agents run in the package folder.
+// (task-completed → show one of the package's pages full screen; quota-panel → one of its pages inside the quota window)
+// and commands agents run in the package folder.
 export type SkillParamType = 'text' | 'url' | 'number' | 'seconds' | 'boolean'
 export type SkillParamValue = string | number | boolean
 export type SkillParam = { key: string; label: string; type: SkillParamType; default: SkillParamValue; value: SkillParamValue; hint?: string }
-export type SkillTrigger = { on: 'task-completed'; show: string }
+export type SkillTrigger = { on: 'task-completed' | 'quota-panel'; show: string }
+// What a quota-panel page gets (electron/project-stats.mts): lines of code and run tokens over time, oldest first.
+export type StatPoint = { at: number; value: number }
+export type ProjectStats = { workspace: string; lines: StatPoint[]; linesSource: 'git' | 'files' | 'none'; tokens: StatPoint[]; updatedAt: number }
 export type SkillCommand = { name: string; run: string; description?: string }
 export type SkillFile = { path: string; size: number }
 // `id` is the host of orbit-skill://<id>/<file> (electron/skill-files.mts), `dir` the package folder.

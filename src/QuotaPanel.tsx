@@ -1,6 +1,7 @@
-import { useEffect, useState } from 'react'
-import type { Agent, Handover, QuotaFailover, QuotaSnapshot, QuotaState, QuotaWindow } from './types'
+import { useCallback, useEffect, useRef, useState } from 'react'
+import type { Agent, Handover, ProjectStats, QuotaFailover, QuotaSnapshot, QuotaState, QuotaWindow } from './types'
 import { shownStatus } from './run-events'
+import { panelPages, skillPageUrl, type SkillPage } from './skill-triggers'
 
 type ProviderInfo = { id: string; name: string; description: string }
 
@@ -97,12 +98,63 @@ function Card({ provider, snapshot, connected, agents, at, current }: CardProps)
   </article>
 }
 
-type QuotaPanelProps = {
-  providers: ProviderInfo[]; connected: Record<string, boolean>; quotas: Record<string, QuotaSnapshot>; busy: boolean; onRefresh: () => void
-  failover: QuotaFailover; onFailover: (patch: Partial<QuotaFailover>) => void; agents: Agent[]; currentProviderId: string
+const PANEL_HEIGHT = 300
+const panelKey = (page: SkillPage) => `${page.skill.id}|${page.show}`
+
+// Pages of the enabled skills with a quota-panel trigger, above the subscriptions. Each sits in a sandboxed frame that gets
+// the project's lines of code and run tokens ({ type: 'orbit-skill:data', stats }) when it loads, when it asks for them
+// ({ type: 'orbit-skill:ready' }) and every minute; it may set its own height ({ type: 'orbit-skill:height', height }).
+function SkillPanels({ workspace }: { workspace: string }) {
+  const [pages, setPages] = useState<SkillPage[]>([])
+  const [stats, setStats] = useState<ProjectStats | null>(null)
+  const [heights, setHeights] = useState<Record<string, number>>({})
+  const frames = useRef(new Map<string, HTMLIFrameElement>())
+  useEffect(() => {
+    const api = window.orbit
+    if (!api) return
+    let live = true
+    void api.listCapabilities(workspace).then(skills => { if (live) setPages(panelPages(skills)) }).catch(() => undefined)
+    const load = () => void api.projectStats(workspace).then(next => { if (live) setStats(next) }).catch(() => undefined)
+    load()
+    const timer = window.setInterval(load, 60_000)
+    return () => { live = false; window.clearInterval(timer) }
+  }, [workspace])
+  const send = useCallback((frame?: HTMLIFrameElement | null) => {
+    if (stats && frame?.contentWindow) frame.contentWindow.postMessage({ type: 'orbit-skill:data', stats }, '*')
+  }, [stats])
+  useEffect(() => { for (const frame of frames.current.values()) send(frame) }, [send])
+  useEffect(() => {
+    const onMessage = (event: MessageEvent) => {
+      const data = event.data as { type?: unknown; height?: unknown } | null
+      for (const [key, frame] of frames.current) {
+        if (!event.source || event.source !== frame.contentWindow || !data || typeof data !== 'object') continue
+        if (data.type === 'orbit-skill:ready') send(frame)
+        if (data.type === 'orbit-skill:height' && typeof data.height === 'number' && Number.isFinite(data.height)) {
+          const height = Math.round(Math.min(640, Math.max(80, data.height)))
+          setHeights(current => current[key] === height ? current : { ...current, [key]: height })
+        }
+      }
+    }
+    window.addEventListener('message', onMessage)
+    return () => window.removeEventListener('message', onMessage)
+  }, [send])
+  if (!pages.length) return null
+  return <div className="quota-skill-panels">
+    {pages.map(page => {
+      const key = panelKey(page)
+      return <iframe key={key} className="quota-skill-frame" title={page.skill.name} src={skillPageUrl(page.skill, page.show, { orbit_event: 'quota-panel' })}
+        sandbox="allow-scripts allow-same-origin" style={{ height: heights[key] || PANEL_HEIGHT }} onLoad={event => send(event.currentTarget)}
+        ref={frame => { if (frame) frames.current.set(key, frame); else frames.current.delete(key) }} />
+    })}
+  </div>
 }
 
-export function QuotaPanel({ providers, connected, quotas, busy, onRefresh, failover, onFailover, agents, currentProviderId }: QuotaPanelProps) {
+type QuotaPanelProps = {
+  providers: ProviderInfo[]; connected: Record<string, boolean>; quotas: Record<string, QuotaSnapshot>; busy: boolean; onRefresh: () => void
+  failover: QuotaFailover; onFailover: (patch: Partial<QuotaFailover>) => void; agents: Agent[]; currentProviderId: string; workspace?: string
+}
+
+export function QuotaPanel({ providers, connected, quotas, busy, onRefresh, failover, onFailover, agents, currentProviderId, workspace = '' }: QuotaPanelProps) {
   useTick(30000)
   const at = Date.now()
   return <>
@@ -110,6 +162,7 @@ export function QuotaPanel({ providers, connected, quotas, busy, onRefresh, fail
       Остаток подписок так, как его сообщают сами CLI: Orbit ничего не списывает и не читает токены входа. Если у подписки кончается квота, работающий
       агент переходит на другую с моделью сравнимого уровня.
     </p>
+    <SkillPanels workspace={workspace} />
     <div className="settings-section-heading">
       <h3>Подписки и агенты</h3>
       <button className="text-button" disabled={busy} onClick={onRefresh}>{busy ? 'Обновляем…' : '↻ Обновить'}</button>

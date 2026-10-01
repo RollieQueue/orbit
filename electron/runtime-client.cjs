@@ -48,7 +48,7 @@ const REAP_WAIT_MS = 5000
  */
 const REPEATABLE = new Set([
   'runtime:list', 'runtime:get', 'runtime:changes', 'runtime:image', 'state:load', 'state:save', 'project-index:status',
-  'memory:list', 'memory:stats', 'capabilities:list', 'capabilities:read', 'providers:health', 'quota:get',
+  'memory:list', 'memory:stats', 'capabilities:list', 'capabilities:read', 'providers:health', 'quota:get', 'stats:project',
 ])
 
 /** @typedef {'child' | 'inprocess'} RuntimeMode */

@@ -1,0 +1,9 @@
+<!doctype html><html><body style="margin:0;background:#17181b;padding:12px">
+<iframe id="f" src="../../skills/code-tokens-chart/chart.html?days=30" style="width:580px;height:300px;border:1px solid #2b2d33;border-radius:10px;display:block"></iframe>
+<script src="stats.js"></script>
+<script>
+const f = document.getElementById('f')
+const send = () => f.contentWindow.postMessage({ type: 'orbit-skill:data', stats: window.STATS }, '*')
+f.addEventListener('load', send)
+addEventListener('message', e => { if (e.data?.type === 'orbit-skill:ready') send(); if (e.data?.type === 'orbit-skill:height') f.style.height = e.data.height + 'px' })
+</script></body></html>

@@ -27,15 +27,22 @@ export type SkillPage = { skill: Capability; show: string }
 export const completionPages = (skill: Capability): SkillPage[] =>
   skill.package ? (skill.triggers ?? []).filter(trigger => trigger.on === 'task-completed').map(trigger => ({ skill, show: trigger.show })) : []
 
-// Pages of the enabled skills for a completed task; project skills before global ones, the triggers of one skill keep their order.
-export function triggeredSkills(skills: Capability[]): SkillPage[] {
+// Enabled skills, project skills before global ones.
+const enabledInOrder = (skills: Capability[]): Capability[] => {
   const enabled = skills.filter(skill => skill.enabled !== false)
-  return [...enabled.filter(skill => skill.scope === 'project'), ...enabled.filter(skill => skill.scope !== 'project')].flatMap(completionPages)
+  return [...enabled.filter(skill => skill.scope === 'project'), ...enabled.filter(skill => skill.scope !== 'project')]
 }
+
+// Pages of the enabled skills for a completed task; project skills before global ones, the triggers of one skill keep their order.
+export const triggeredSkills = (skills: Capability[]): SkillPage[] => enabledInOrder(skills).flatMap(completionPages)
+
+// Pages the enabled skills show inside the quota window (QuotaPanel.tsx), in the same order.
+export const panelPages = (skills: Capability[]): SkillPage[] => enabledInOrder(skills).flatMap(skill =>
+  skill.package ? (skill.triggers ?? []).filter(trigger => trigger.on === 'quota-panel').map(trigger => ({ skill, show: trigger.show })) : [])
 
 // The page address: every parameter's current value (booleans as true/false) and what happened. The page reads its settings
 // from the query, so a changed parameter applies at once. `show` is a package-relative path; each segment is encoded.
-export function skillPageUrl(skill: Capability, show: string, extra: { orbit_event: 'task-completed' | 'preview'; orbit_run?: string }): string {
+export function skillPageUrl(skill: Capability, show: string, extra: { orbit_event: 'task-completed' | 'preview' | 'quota-panel'; orbit_run?: string }): string {
   const query = new URLSearchParams()
   for (const param of skill.params ?? []) query.set(param.key, String(param.value))
   query.set('orbit_event', extra.orbit_event)

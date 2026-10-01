@@ -54,6 +54,7 @@
 .communication-item.conflict .communication-kind{color:#e0958c}
 .agent-reason.route-reason{margin:-4px 0 12px;color:#8fb4a0}
 .quota-list{display:flex;flex-direction:column;gap:9px}
+.quota-skill-panels{display:flex;flex-direction:column;gap:9px;margin:0 0 14px}.quota-skill-frame{display:block;width:100%;border:1px solid var(--line);border-radius:10px;background:var(--panel)}
 .quota-card{border:1px solid #363c42;border-radius:9px;padding:14px 15px;background:#22262b}
 .quota-card.current{border-color:#607666;background:#252c28}
 .quota-card.disconnected{opacity:.62}

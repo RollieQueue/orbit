@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:">
+  <title>Строки кода и токены</title>
+  <link rel="stylesheet" href="chart.css">
+</head>
+<body>
+  <main id="app" aria-live="polite">
+    <header class="head">
+      <div class="totals" id="totals"></div>
+      <div class="controls">
+        <div class="seg" role="group" aria-label="Что показывать" id="view">
+          <button type="button" data-value="tokens">Токены</button>
+          <button type="button" data-value="lines">Строки</button>
+          <button type="button" data-value="both">Вместе</button>
+        </div>
+        <div class="seg" role="group" aria-label="Шкала" id="scale">
+          <button type="button" data-value="auto">Авто</button>
+          <button type="button" data-value="linear">Обычная</button>
+          <button type="button" data-value="log">Логарифм.</button>
+          <button type="button" data-value="index">Индекс %</button>
+        </div>
+      </div>
+    </header>
+    <div class="legend" id="legend"></div>
+    <div class="plot" id="plot"><p class="empty">Ждём данные от Orbit…</p></div>
+    <p class="note" id="note"></p>
+    <div class="tip" id="tip" role="tooltip" hidden></div>
+  </main>
+  <script src="chart.js"></script>
+</body>
+</html>

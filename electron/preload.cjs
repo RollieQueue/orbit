@@ -44,6 +44,7 @@ const CALLS = [
   ['restoreCapability', 'capabilities:restore', 3],
   ['checkProviders', 'providers:health', 1],
   ['getQuotas', 'quota:get', 2],
+  ['projectStats', 'stats:project', 1],
   ['applyArtifact', 'artifact:apply', 1],
   ['openExternal', 'shell:open', 1],
   ['openPath', 'shell:open-path', 1],

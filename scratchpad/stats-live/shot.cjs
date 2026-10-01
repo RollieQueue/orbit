@@ -1,0 +1,20 @@
+const { app, BrowserWindow } = require('electron')
+const path = require('node:path'), fs = require('node:fs')
+app.whenReady().then(async () => {
+  const win = new BrowserWindow({ width: 620, height: 420, show: true, x: 40, y: 40, webPreferences: { sandbox: true } })
+  await win.loadFile(path.join(__dirname, 'host.html'))
+  const wait = ms => new Promise(r => setTimeout(r, ms))
+  await wait(1500)
+  const frame = () => win.webContents.mainFrame.frames[0]
+  const shot = async name => { await wait(400); fs.writeFileSync(path.join(__dirname, name), (await win.webContents.capturePage()).toPNG()) }
+  const click = sel => frame().executeJavaScript(`document.querySelector('${sel}').click()`)
+  await click('#view [data-value=both]'); await click('#scale [data-value=auto]'); await shot('both-auto.png')
+  await click('#view [data-value=tokens]'); await shot('tokens.png')
+  await click('#view [data-value=lines]'); await shot('lines.png')
+  await click('#view [data-value=both]'); await click('#scale [data-value=index]'); await shot('both-index.png')
+  await click('#scale [data-value=linear]'); await shot('both-linear.png')
+  const note = await frame().executeJavaScript(`document.getElementById('note').textContent + ' | ' + document.getElementById('totals').innerText.replace(/\n/g,' ')`)
+  console.log(note)
+  await click('#scale [data-value=auto]')
+  app.quit()
+})

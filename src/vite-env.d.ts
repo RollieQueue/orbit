@@ -43,6 +43,7 @@ interface OrbitBridge {
   restoreCapability: (id: string, version: number, workspace: string) => Promise<import('./types').Capability>
   checkProviders: (options?: Record<string, import('./types').ProviderOption>) => Promise<ProviderHealth[]>
   getQuotas: (options?: Record<string, import('./types').ProviderOption>, force?: boolean) => Promise<Record<string, import('./types').QuotaSnapshot>>
+  projectStats: (workspace: string) => Promise<import('./types').ProjectStats>
   applyArtifact: (payload: ApplyArtifactPayload) => Promise<ApplyArtifactResult>
   openExternal: (target: string) => Promise<void>
   openPath: (target: string) => Promise<string>

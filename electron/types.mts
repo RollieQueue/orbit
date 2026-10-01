@@ -354,7 +354,9 @@ export type SkillParamType = 'text' | 'url' | 'number' | 'seconds' | 'boolean'
 export type SkillParamValue = string | number | boolean
 export interface SkillParam { key: string; label: string; type: SkillParamType; default: SkillParamValue; value: SkillParamValue; hint?: string }
 // task-completed: a run of the skill's project completed (after a restart_orbit restart, the continuation's completion).
-export interface SkillTrigger { on: 'task-completed'; show: string }
+// quota-panel: the page is shown inside the quota window, above the subscriptions, and gets the project's lines of code
+// and tokens (electron/project-stats.mts) as a message.
+export interface SkillTrigger { on: 'task-completed' | 'quota-panel'; show: string }
 export interface SkillCommand { name: string; run: string; description?: string }
 export interface SkillFile { path: string; size: number }
 export interface SkillPackage { id: string; dir: string }

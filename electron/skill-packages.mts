@@ -91,14 +91,16 @@ function checkValues(params: readonly SkillParam[], values: unknown): SkillParam
 }
 
 // A trigger shows one html page of the package; `has` says whether the package has the file.
+const TRIGGER_EVENTS: readonly SkillTrigger['on'][] = ['task-completed', 'quota-panel']
 function checkTriggers(input: unknown, has: (file: string) => boolean): SkillTrigger[] {
   const found = new Map<string, SkillTrigger>()
   entries(input, 'triggers', MAX_TRIGGERS).forEach((raw, index) => {
-    if (!isRecord(raw) || raw.on !== 'task-completed') return fail(`triggers[${index}].on must be "task-completed"`)
+    const on = isRecord(raw) ? TRIGGER_EVENTS.find(event => event === raw.on) : undefined
+    if (!isRecord(raw) || !on) return fail(`triggers[${index}].on must be "task-completed" or "quota-panel"`)
     const show = packagePath(raw.show)
     if (!show || !/\.html?$/i.test(show)) return fail(`triggers[${index}].show must be an .html page of the package (letters, digits, . _ - and / only)`)
     if (!has(show)) return fail(`Trigger page "${show}" is not a file of this package`)
-    found.set(`${raw.on}|${show}`, { on: 'task-completed', show })
+    found.set(`${on}|${show}`, { on, show })
   })
   return [...found.values()]
 }

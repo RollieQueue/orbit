@@ -12,6 +12,7 @@ import { runGit } from './git.mts'
 import { workspaceKey } from './storage.mts'
 import { MAX_RUN_FILES, discardAttachments, readAttachmentImage, saveAttachments, trustedAttachments } from './attachments.mts'
 import { RUNTIME_CHANNELS } from './runtime-protocol.mts'
+import { projectStats } from './project-stats.mts'
 import type { OrbitRuntime } from './runtime.mts'
 import type { QuotaMonitor, QuotaReaderOptions } from './quota.mts'
 import type { OrbitMemoryStore, MemoryInput } from './memory.mts'
@@ -155,6 +156,8 @@ function createRuntimeApi(ctx: RuntimeApiContext): Map<string, RuntimeHandler> {
     options: providerOptions && typeof providerOptions === 'object' ? providerOptions as Record<string, QuotaReaderOptions | undefined> : {},
     force: force === true,
   }))
+  // Lines of code and spent tokens of a project over time, for skill pages in the quota window.
+  handle('stats:project', (workspace) => projectStats(userData, text(workspace) ?? ''))
   // The only path into electron/worktree.mts; unused by the renderer today, kept for the write-lane flow.
   handle('artifact:apply', async (value) => {
     const payload = value as ApplyArtifactPayload

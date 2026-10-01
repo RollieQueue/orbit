@@ -1,0 +1,40 @@
+:root {
+  color-scheme: dark;
+  --surface: #1d1f23;
+  --text: #e6e7e9;
+  --muted: #898b96;
+  --faint: #646772;
+  --grid: #2b2d33;
+  --tokens: #3987e5;
+  --lines: #d95926;
+  font: 12px/1.35 Manrope, Inter, "Segoe UI", sans-serif;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; background: var(--surface); color: var(--text); overflow: hidden; }
+main { padding: 10px 12px 8px; position: relative; }
+.head { display: flex; flex-wrap: wrap; align-items: flex-start; justify-content: space-between; gap: 8px; }
+.totals { display: flex; gap: 16px; flex-wrap: wrap; }
+.total { display: flex; flex-direction: column; gap: 1px; }
+.total b { font-size: 17px; font-weight: 650; letter-spacing: -0.01em; }
+.total span { color: var(--muted); }
+.total small { color: var(--faint); }
+.controls { display: flex; gap: 6px; flex-wrap: wrap; }
+.seg { display: inline-flex; border: 1px solid var(--grid); border-radius: 7px; overflow: hidden; }
+.seg button { font: inherit; color: var(--muted); background: transparent; border: 0; padding: 3px 8px; cursor: pointer; }
+.seg button + button { border-left: 1px solid var(--grid); }
+.seg button:hover { color: var(--text); }
+.seg button[aria-pressed="true"] { background: #2b2d33; color: var(--text); }
+.seg button:disabled { opacity: .4; cursor: default; }
+.seg button:focus-visible { outline: 2px solid var(--tokens); outline-offset: -2px; }
+.legend { display: flex; gap: 14px; margin: 8px 0 2px; color: var(--muted); }
+.legend span { display: inline-flex; align-items: center; gap: 6px; }
+.legend i { width: 10px; height: 10px; border-radius: 3px; display: inline-block; }
+.plot { position: relative; height: 168px; }
+.plot svg { display: block; width: 100%; height: 100%; overflow: visible; }
+.plot text { fill: var(--muted); font-size: 10.5px; }
+.empty { color: var(--muted); margin: 0; padding-top: 60px; text-align: center; }
+.note { color: var(--faint); margin: 4px 0 0; min-height: 1em; }
+.tip { position: absolute; pointer-events: none; background: #26282e; border: 1px solid #383a42; border-radius: 7px; padding: 6px 8px; box-shadow: 0 6px 18px rgba(0,0,0,.35); white-space: nowrap; z-index: 2; }
+.tip b { display: block; margin-bottom: 2px; font-weight: 600; }
+.tip div { display: flex; align-items: center; gap: 6px; color: var(--text); }
+.tip i { width: 8px; height: 8px; border-radius: 2px; display: inline-block; }

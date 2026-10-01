@@ -91,6 +91,8 @@ const CALLS = [
   { method: 'restoreCapability', channel: 'capabilities:restore', args: [id, { name: 'version', type: 'number' }, workspace], returns: T('Capability') },
   { method: 'checkProviders', channel: 'providers:health', args: [providerOptions], returns: 'ProviderHealth[]' },
   { method: 'getQuotas', channel: 'quota:get', args: [providerOptions, { name: 'force', type: 'boolean', optional: true }], returns: `Record<string, ${T('QuotaSnapshot')}>` },
+  // Lines of code (git history or counts) and tokens of the project's runs over time, for skill pages in the quota window.
+  { method: 'projectStats', channel: 'stats:project', args: [workspace], returns: T('ProjectStats') },
   // The only path into electron/worktree.mts; unused by the renderer today, kept for the write-lane flow.
   { method: 'applyArtifact', channel: 'artifact:apply', args: [{ name: 'payload', type: 'ApplyArtifactPayload' }], returns: 'ApplyArtifactResult' },
   { method: 'openExternal', channel: 'shell:open', args: [{ name: 'target', type: 'string' }], returns: 'void' },
