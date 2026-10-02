@@ -5,6 +5,8 @@ import type { CodexRateLimitBucket, QuotaTaggedError } from './quota.mts'
 import { serverUsage } from './codex-usage.mts'
 // providers.mts imports this file as well; both sides use the other only inside functions, so the ESM cycle is harmless.
 import { codexMcpArgs, loopbackNoProxy, wellFormed } from './providers.mts'
+import { toolCallText } from './connectors.mts'
+import { processWatch } from './process-reaper.mts'
 import type { ApprovalHandler, CliHelpers, NormalizedSession, ParserEvent, ProviderEventListener, ProviderResult, ProviderRunOptions } from './providers.mts'
 
 // ---- App Server protocol (JSON-RPC over stdio) ------------------------------------------------------------------
@@ -42,6 +44,9 @@ const APPROVAL_REQUESTS = ['item/commandExecution/requestApproval', 'item/fileCh
 // A session nobody has used for this long ends itself, so a forgotten agent cannot keep a Codex process forever.
 const DEFAULT_SESSION_IDLE_MS = 30 * 60 * 1000
 const DEFAULT_INACTIVITY_MS = 15 * 60 * 1000
+// Live web search with full access, as `codex exec --sandbox danger-full-access` has it: the App Server thread runs in the
+// workspace-write sandbox (Orbit answers its approval requests), where codex-cli 0.155 gives the model only cached results.
+const webSearchArgs = (access: string | undefined): string[] => access === 'danger-full-access' ? ['-c', 'web_search="live"'] : []
 const cancelledError = (): Error => { const error = new Error('Codex request cancelled'); error.name = 'AbortError'; return error }
 
 // One JSON-RPC line. Codex drops a line whose JSON has an escaped lone surrogate and never answers it, so every string
@@ -65,8 +70,11 @@ function usageMeter(emit: (event: ParserEvent) => void): (method: string, params
 async function runCodexServer(options: CodexServerOptions, helpers: CliHelpers): Promise<ProviderResult> {
   const { resolveLaunch, terminateProcess, createLineReader } = helpers
   if (options.signal?.aborted) throw new Error('Codex request cancelled')
-  const launch = resolveLaunch(options.providerOptions?.command || process.env.ORBIT_CODEX_COMMAND || 'codex', ['app-server', '-c', 'features.multi_agent=false'])
+  const launch = resolveLaunch(options.providerOptions?.command || process.env.ORBIT_CODEX_COMMAND || 'codex', ['app-server', '-c', 'features.multi_agent=false', ...webSearchArgs(options.accessMode)])
+  const startedAt = Date.now()
   const child = spawn(launch.executable, launch.args, { cwd: options.workspace, env: launch.env, windowsHide: true, shell: false, detached: process.platform !== 'win32', stdio: ['pipe', 'pipe', 'pipe'] })
+  // The agent's CLI: what it leaves running when it ends is stopped (process-reaper.mts).
+  if (options.processScope) processWatch.track(child, { startedAt, scope: options.processScope })
   const requests = new Map<number | string, PendingRequest>(), items = new Map<string | undefined, CodexServerItem>()
   let sequence = 0, closed = false, stderr = '', bytes = 0, threadId: string | undefined, text = '', actualModel = options.model || ''
   let handedOff = false
@@ -171,8 +179,11 @@ async function runCodexServer(options: CodexServerOptions, helpers: CliHelpers):
     closed = true
     clearTimeout(timer ?? undefined)
     options.signal?.removeEventListener('abort', abort)
-    await terminateProcess(child)
-    if (options.signal?.aborted) throw new Error('Codex request cancelled')
+    const terminated = terminateProcess(child)
+    const cleaned = processWatch.end(child, { settleMs: 0, after: terminated })
+    await terminated
+    // A cancelled turn waits for the cleanup: its folder may be removed next. A finished one does not.
+    if (options.signal?.aborted) { await cleaned; throw new Error('Codex request cancelled') }
   }
 }
 
@@ -182,15 +193,18 @@ async function runCodexServer(options: CodexServerOptions, helpers: CliHelpers):
 const sessions = new Map<string, CodexSessionApi>()
 
 // The same overrides as `codex exec` gets (providers.codexMcpArgs), per-call tool timeout included.
-function mcpOverrides(session: Pick<NormalizedSession, 'mcpUrl' | 'token'> | null | undefined): string[] {
+function mcpOverrides(session: Pick<NormalizedSession, 'mcpUrl' | 'token' | 'connectors'> | null | undefined): string[] {
   return codexMcpArgs(session)
 }
 
 async function openCodexSession(options: CodexServerOptions, session: NormalizedSession, helpers: CliHelpers): Promise<CodexSessionApi> {
   const { resolveLaunch, terminateProcess, createLineReader } = helpers
   if (options.signal?.aborted) throw cancelledError()
-  const launch = resolveLaunch(options.providerOptions?.command || process.env.ORBIT_CODEX_COMMAND || 'codex', ['app-server', '-c', 'features.multi_agent=false', ...mcpOverrides(session)])
+  const launch = resolveLaunch(options.providerOptions?.command || process.env.ORBIT_CODEX_COMMAND || 'codex', ['app-server', '-c', 'features.multi_agent=false', ...webSearchArgs(options.accessMode), ...mcpOverrides(session)])
+  const startedAt = Date.now()
   const child = spawn(launch.executable, launch.args, { cwd: options.workspace, env: { ...launch.env, ...(session?.token ? { ORBIT_MCP_TOKEN: session.token, ...loopbackNoProxy() } : {}) }, windowsHide: true, shell: false, detached: process.platform !== 'win32', stdio: ['pipe', 'pipe', 'pipe'] })
+  // The process lives as long as the agent's session, so what its commands leave running is stopped when the session closes.
+  if (options.processScope) processWatch.track(child, { startedAt, scope: options.processScope, passive: true })
   const requests = new Map<number | string, PendingRequest>(), items = new Map<string | undefined, CodexServerItem>()
   let sequence = 0, closed = false, stderr = '', bytes = 0, threadId: string | null = null, actualModel = options.model || ''
   let turn: TurnState | null = null, idleTimer: NodeJS.Timeout | null = null, failure: Error | null = null
@@ -209,6 +223,7 @@ async function openCodexSession(options: CodexServerOptions, session: Normalized
     const current = turn
     if (!current) return
     turn = null
+    processWatch.busy(child, false)
     clearTimeout(current.deadline ?? undefined); clearTimeout(current.idle ?? undefined)
     current.signal?.removeEventListener('abort', current.abort)
     if (error) current.reject(error); else current.resolve(result as TurnResult)
@@ -225,7 +240,8 @@ async function openCodexSession(options: CodexServerOptions, session: Normalized
     for (const pending of requests.values()) pending.reject(error)
     requests.clear()
     if (threadId) sessions.delete(threadId)
-    termination = terminateProcess(child).catch(() => {}).then(() => settleTurn(error))
+    const terminated = terminateProcess(child).catch(() => {})
+    termination = Promise.all([terminated, processWatch.end(child, { settleMs: 0, after: terminated })]).then(() => settleTurn(error))
     return termination
   }
   const close = () => fail(new Error('Codex session closed'))
@@ -270,7 +286,7 @@ async function openCodexSession(options: CodexServerOptions, session: Normalized
       if (turn && item.type === 'agentMessage' && message.method === 'item/completed' && item.phase !== 'commentary') turn.text = item.text || turn.text
       if (['commandExecution', 'fileChange', 'mcpToolCall'].includes(item.type as string)) {
         const orbitTool = item.type === 'mcpToolCall' && item.server === 'orbit' && typeof item.tool === 'string' ? item.tool : undefined
-        emit({ kind: 'tool', tool: item.type, toolId: item.id, changes: item.changes, text: item.command || (orbitTool ? `${orbitTool} ${JSON.stringify(item.arguments || {}).slice(0, 200)}` : JSON.stringify(item.changes || item)), status: message.method === 'item/started' ? 'started' : item.status || 'completed', ...(orbitTool ? { native: false, mcp: true, server: 'orbit', orbitTool } : { native: true }) })
+        emit({ kind: 'tool', tool: item.type, toolId: item.id, changes: item.changes, text: item.command || (orbitTool ? toolCallText(orbitTool, item.arguments || {}) : JSON.stringify(item.changes || item)), status: message.method === 'item/started' ? 'started' : item.status || 'completed', ...(orbitTool ? { native: false, mcp: true, server: 'orbit', orbitTool } : { native: true }) })
       }
     }
     if (message.method === 'turn/completed' && turn) {
@@ -326,6 +342,7 @@ async function openCodexSession(options: CodexServerOptions, session: Normalized
           }, idleMs)
         }
         turn = current
+        processWatch.busy(child, true)
         turnOptions.signal?.addEventListener('abort', current.abort, { once: true })
         current.armIdle()
         request('turn/start', { threadId, input: [{ type: 'text', text: prompt }], ...(turnOptions.reasoningEffort ? { effort: turnOptions.reasoningEffort } : {}) }).catch(error => settleTurn(error))

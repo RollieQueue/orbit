@@ -122,7 +122,6 @@ test('improvement_plan clips, archives old done tasks, keeps open ones and write
   const emitted = []
   const run = { improvementMode: true, improvements: [task('p', 'pending'), task('k', 'blocked')], improvementStatus: 'implementing', prompt: 'P'.repeat(400), chatId: 'c', workspace: os.tmpdir(), sharedContext: {} }
   const runtime = { contextStore: null, emit: (_run, type, data) => emitted.push({ type, ...data }) }
-  assert.throws(() => improvement.updatePlan(runtime, run, { status: 'implementing', tasks: [] }), /cannot be silently removed/)
   assert.throws(() => improvement.updatePlan(runtime, run, { status: 'implementing', tasks: [task('p', 'pending')], handoff: 'h'.repeat(2001) }), /longer than 2000/)
   const many = Array.from({ length: 33 }, (_, i) => ({ ...task(`d${i}`, 'done'), title: 'T'.repeat(400), evidence: 'E'.repeat(2000) }))
   // The blocked task k may be dropped; the pending one may not.
@@ -145,6 +144,72 @@ test('improvement_plan clips, archives old done tasks, keeps open ones and write
   assert.ok(block.indexOf('[working] p') < block.indexOf('[done] d32'))
   assert.equal((block.match(/\[done\]/g) || []).length, 8)
   assert.match(block, /HANDOFF FROM THE PREVIOUS TASK: next: check X$/)
+})
+
+test('improvement_plan merges by id: an unlisted unfinished task is kept and reported, a listed one is updated, a closed one left out is dropped', () => {
+  const plan = [task('d', 'done'), task('k', 'blocked'), { ...task('p', 'pending'), evidence: 'BRIEF p' }, { ...task('w', 'working'), evidence: 'BRIEF w' }]
+  const { run, runtime } = planFixture(plan)
+  const result = improvement.updatePlan(runtime, run, { status: 'implementing', tasks: [{ id: 'w', title: 'Task w', status: 'done', evidence: 'verified w' }, task('n', 'pending')] })
+  assert.deepEqual(run.improvements.map(item => item.id), ['w', 'n', 'p'], 'listed tasks in the order sent, then the kept ones; the unlisted closed d and k are dropped as before')
+  assert.deepEqual(run.improvements.find(item => item.id === 'p'), plan[2], 'the unlisted pending task is kept unchanged, brief included')
+  assert.equal(run.improvements.find(item => item.id === 'w').status, 'done', 'a listed task updates the stored one')
+  assert.deepEqual(result.keptOpen, ['p']); assert.match(result.note, /Unfinished task\(s\) p were not in the list and were kept unchanged/)
+  assert.deepEqual(result.tasks, run.improvements, 'the result shows the merged plan')
+  // Nothing kept: no key, no note.
+  const clean = improvement.updatePlan(runtime, run, { status: 'implementing', tasks: run.improvements })
+  assert.equal('keptOpen' in clean, false); assert.equal('note' in clean, false)
+  // An empty list changes nothing but the status, and keeps every unfinished task.
+  const empty = improvement.updatePlan(runtime, run, { status: 'planning', tasks: [] })
+  assert.deepEqual(empty.keptOpen, ['n', 'p']); assert.equal(run.improvementStatus, 'planning'); assert.deepEqual(run.improvements.map(item => item.id), ['n', 'p'])
+  // An open task re-sent with a clipped copy of its evidence gets the stored text back.
+  const long = { ...task('c', 'pending'), evidence: 'LONG BRIEF '.repeat(40) }
+  const held = planFixture([], [long])
+  improvement.updatePlan(held.runtime, held.run, { status: 'implementing', tasks: [{ ...long, evidence: `${long.evidence.slice(0, 120)}…` }] })
+  assert.equal(held.run.improvements[0].evidence, long.evidence)
+})
+
+test("'completed' is refused while a kept unfinished task is not done, and passes once every task is", () => {
+  const { run, runtime } = planFixture([task('a', 'done'), { ...task('p', 'pending'), evidence: 'brief' }])
+  assert.throws(() => improvement.updatePlan(runtime, run, { status: 'completed', tasks: [task('a', 'done')] }), /kept and block it: p/)
+  assert.throws(() => improvement.updatePlan(runtime, run, { status: 'completed', tasks: [] }), /kept and block it: p/)
+  assert.equal(run.improvementStatus, 'implementing', 'a refused update changes nothing')
+  assert.deepEqual(run.improvements.map(item => item.id), ['a', 'p'])
+  const closed = improvement.updatePlan(runtime, run, { status: 'completed', tasks: [task('p', 'done')] })
+  assert.equal(closed.status, 'completed'); assert.equal('keptOpen' in closed, false)
+  // Without kept tasks the old message stays.
+  const bare = planFixture([task('a', 'done')])
+  assert.throws(() => improvement.updatePlan(bare.runtime, bare.run, { status: 'completed', tasks: [] }), /record a verified audit task/)
+})
+
+test('the progress block carries a 1500-character open brief whole and stays bounded with many tasks', () => {
+  const brief = id => `BRIEF-${id}-${'x'.repeat(1480)}-END`
+  const open = id => ({ ...task(id, 'pending'), evidence: brief(id).slice(0, 1500) })
+  const block = (tasks, extra = {}) => improvement.progressBlock({ ...planFixture([], tasks).run, ...extra }, false)
+  const one = block([open('a')])
+  assert.ok(one.includes(open('a').evidence), 'one open brief reaches the prompt whole')
+  assert.equal((one.match(/…/g) || []).length, 0)
+  // Four briefs and a 1500-character handoff still fit whole.
+  const four = block(['a', 'b', 'c', 'd'].map(open), { improvementHandoff: 'h'.repeat(1500) })
+  for (const id of ['a', 'b', 'c', 'd']) assert.ok(four.includes(open(id).evidence), `brief ${id} whole`)
+  assert.ok(four.length <= 9000, `${four.length}`)
+  // Many tasks: the block stays bounded, every open task keeps its id, title and status, the done lines go first.
+  const many = [...Array.from({ length: 12 }, (_, i) => open(`o${i}`)), ...Array.from({ length: 10 }, (_, i) => ({ ...task(`d${i}`, 'done'), evidence: 'e'.repeat(300) })), { ...task('k', 'blocked'), evidence: 'blocker' }]
+  const crowded = block(many, { improvementHandoff: 'h'.repeat(2000) })
+  assert.ok(crowded.length <= 9000, `${crowded.length}`)
+  for (let i = 0; i < 12; i++) assert.match(crowded, new RegExp(`- \\[pending\\] o${i}: Task o${i}`))
+  assert.doesNotMatch(crowded, /\[done\] d/, 'the done lines are trimmed before the open evidence')
+  assert.match(crowded, /HANDOFF FROM THE PREVIOUS TASK: h{2000}$/)
+  const lengths = [...crowded.matchAll(/^- \[pending\] o\d+: Task o\d+ — (.*)$/gm)].map(m => m[1].length)
+  assert.equal(lengths.length, 12); assert.ok(Math.max(...lengths) - Math.min(...lengths) <= 1, 'the shortened briefs are even')
+  assert.ok(lengths[0] > 100, 'and still carry text')
+  // A short brief stays whole while a long one gives up the room.
+  const mixed = block([...Array.from({ length: 8 }, (_, i) => open(`l${i}`)), { ...task('s', 'pending'), evidence: 'short brief' }], { improvementHandoff: 'h'.repeat(2000) })
+  assert.match(mixed, /\[pending\] s: Task s — short brief\n?/)
+  // Dozens of open tasks: the lines stay, the titles shorten, the total is still bounded.
+  const dozens = Array.from({ length: 80 }, (_, i) => ({ ...task(`t${i}`, 'working'), title: 'T'.repeat(250), evidence: 'e'.repeat(1500) }))
+  const huge = block(dozens, { improvementHandoff: 'h'.repeat(2000) })
+  assert.ok(huge.length <= 9000, `${huge.length}`)
+  for (let i = 0; i < 80; i++) assert.match(huge, new RegExp(`- \\[working\\] t${i}: `))
 })
 
 test('a task left working is reminded, then the answer is accepted with a note naming it', async t => {

@@ -29,3 +29,10 @@
 .skill-list{margin:8px 0 0;padding-left:18px;font-size:11px;line-height:1.7;color:#a9bbb0}
 .skill-list code{font-size:11px;color:#d3e4d9}
 .skill-list small{color:#73807a;margin-left:6px}
+.skill-order{display:flex;align-items:center;gap:10px;margin:0 0 14px;font-size:11px;color:#8fa497}
+.skill-order select{width:auto;margin:0;padding:5px 24px 5px 8px;font-size:11px}
+.skill-group{margin-top:22px}
+.skill-group .section-label{padding:0;margin-bottom:10px}
+.connector-where code{font-size:10px;color:#a9bbb0;overflow-wrap:anywhere}
+.connector-ok{color:#9fd3b0}
+.connector-fail{color:#e0a3a0;overflow-wrap:anywhere}

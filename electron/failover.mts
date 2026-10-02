@@ -14,7 +14,8 @@ interface FailoverConfig { enabled: boolean; switchAtPercent: number; allowWeake
 interface CatalogEntry { id: string; available?: boolean; models?: string[]; reasoningLevels?: Record<string, string[] | undefined> }
 // One member of the user's provider pool.
 interface PoolMember { providerId: string; model?: string; reasoningEffort?: string | null }
-interface FailoverAgent { providerId: string; model?: string | null; requestedModel?: string | null; reasoningEffort?: string | null; failedCandidates?: Set<string> }
+// `failover: 'none'` pins the agent to its provider and `avoidProviders` are never offered to it (spawn_agent options).
+interface FailoverAgent { providerId: string; model?: string | null; requestedModel?: string | null; reasoningEffort?: string | null; failedCandidates?: Set<string>; failover?: 'none'; avoidProviders?: string[] }
 // Only the cached reading is consulted here; the runtime refreshes the monitor before asking.
 interface QuotaPeeker { peek(id: string): QuotaAssessable | null }
 interface ReplacementsInput { agent: FailoverAgent; catalog?: CatalogEntry[]; pool?: PoolMember[]; models?: Record<string, string | undefined>; quota?: QuotaPeeker | null; config: FailoverConfig; now?: number; relaxed?: boolean; skip?: Set<string> }
@@ -64,6 +65,11 @@ function tierOf(model: unknown): number {
 const excluded = (model: unknown): boolean => { const name = String(model || '').toLowerCase(); return !!name && EXCLUDED.some(pattern => pattern.test(name)) }
 // The tier the agent being replaced is judged by.
 const baselineTier = (providerId: string, model: unknown): number => tierOf(model) || tiers.baseline[providerId] || 2
+// spawn_agent's failover option: 'none' pins the helper to its subscription, 'auto' allows the usual replacement. Left out, a
+// helper the caller sent to another subscription than its own for a review is pinned (a judge of another vendor that quietly
+// moved to the producer's would judge nothing).
+const isPinned = (spec: { failover?: string | null; kind?: string | null; providerId?: string | null }, parentProviderId: string): boolean =>
+  spec.failover === 'none' || (spec.failover !== 'auto' && spec.kind === 'review' && !!spec.providerId && spec.providerId !== parentProviderId)
 const targetKey = (providerId: string, model: unknown): string => `${providerId}:${String(model || '').toLowerCase()}`
 const targetLabel = (target: Target): string => `${target.providerId}${target.model ? ` / ${target.model}` : ''}`
 
@@ -80,6 +86,9 @@ function effortFor(providerId: string, model: string, wanted: string | null | un
 // `relaxed` also admits providers that are close to the limit but not out of it (after a refusal, anything beats stopping).
 // `skip` names providers that just failed to answer at all (region, sign-in, network): none of their models is tried.
 function replacements({ agent, catalog = [], pool = [], models = {}, quota, config, now = Date.now(), relaxed = false, skip = new Set<string>() }: ReplacementsInput): Replacement[] {
+  // A pinned agent never changes provider, and one that avoids providers is never offered those.
+  if (agent.failover === 'none') return []
+  const avoided = new Set(agent.avoidProviders || [])
   const baseline = baselineTier(agent.providerId, agent.model || agent.requestedModel)
   const floor = baseline - (config.allowWeaker ? 1 : 0)
   const entries = new Map(catalog.map(entry => [entry.id, entry]))
@@ -88,7 +97,7 @@ function replacements({ agent, catalog = [], pool = [], models = {}, quota, conf
   const own = new Set([targetKey(agent.providerId, agent.requestedModel), targetKey(agent.providerId, agent.model)])
   const found: Replacement[] = []
   for (const providerId of [...new Set(providerIds)]) {
-    if (skip.has(providerId)) continue
+    if (skip.has(providerId) || avoided.has(providerId)) continue
     const members = pool.filter(member => member.providerId === providerId)
     if (LOCAL.has(providerId) && !members.length) continue
     const entry = entries.get(providerId)
@@ -154,4 +163,4 @@ function handoverNote({ agent, from, to, reason, level, error, interrupted, team
 }
 
 export type { ModelTiers, FailoverConfig, CatalogEntry, PoolMember, FailoverAgent, QuotaPeeker, ReplacementsInput, Replacement, Target, HandoverReason, HandoverLevel, HandoverNoteInput, InterruptedTurn }
-export { normalizeFailover, tierOf, baselineTier, excluded, replacements, effortFor, handoverNote, reasonText, unreachable, targetKey, targetLabel, DEFAULTS, LOCAL }
+export { normalizeFailover, isPinned, tierOf, baselineTier, excluded, replacements, effortFor, handoverNote, reasonText, unreachable, targetKey, targetLabel, DEFAULTS, LOCAL }

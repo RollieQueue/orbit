@@ -274,15 +274,30 @@ async function linkRoots(dir: string, paths: string[]): Promise<Set<string>> {
 // What the helper changed in the copy against the commit merges are measured against. `changes` are the files within its
 // workspace; `outside` are the changes beyond it (the workspace is a folder below the repository's top) and `linked` the
 // links of the copy whose files git staged (see linkRoots): none of those is merged.
-interface Collected { changes: RawChange[]; outside: string[]; linked: string[] }
-async function collect(copy: AgentCopy): Promise<({ ok: true } & Collected) | { ok: false; error: string }> {
-  const read = await staged(copy, env => git(copy.dir, ['diff', '--cached', '--raw', '-z', '--no-renames', '--no-abbrev', '--no-ext-diff', copy.base], { env, encoding: 'buffer', maxBuffer: BIG_BUFFER }))
+// `lines` (asked for with `withLines`): the added and removed lines of each changed file, null for a binary one.
+interface LineCount { added: number; removed: number }
+interface Collected { changes: RawChange[]; outside: string[]; linked: string[]; lines?: Map<string, LineCount | null> }
+// `git diff --numstat -z`: "added<TAB>removed<TAB>path" for every file, "-" for both of a binary file's.
+function parseNumstat(output: Buffer): Map<string, LineCount | null> {
+  const lines = new Map<string, LineCount | null>()
+  for (const entry of output.toString('utf8').split('\0')) {
+    const match = /^(\d+|-)\t(\d+|-)\t([\s\S]+)$/.exec(entry)
+    if (match) lines.set(match[3], match[1] === '-' ? null : { added: Number(match[1]), removed: Number(match[2]) })
+  }
+  return lines
+}
+async function collect(copy: AgentCopy, withLines = false): Promise<({ ok: true } & Collected) | { ok: false; error: string }> {
+  const read = await staged(copy, async env => {
+    const raw = await git(copy.dir, ['diff', '--cached', '--raw', '-z', '--no-renames', '--no-abbrev', '--no-ext-diff', copy.base], { env, encoding: 'buffer', maxBuffer: BIG_BUFFER })
+    const counted = withLines && raw.ok ? await git(copy.dir, ['diff', '--cached', '--numstat', '-z', '--no-renames', '--no-ext-diff', copy.base], { env, encoding: 'buffer', maxBuffer: BIG_BUFFER }) : null
+    return { raw, counted }
+  })
   if (!read.ok) return { ok: false, error: `git could not read the copy: ${read.error}` }
-  if (!read.value.ok) return { ok: false, error: `git could not compare the copy with its snapshot: ${read.value.error}` }
-  const all = parseRaw(read.value.stdout)
+  if (!read.value.raw.ok) return { ok: false, error: `git could not compare the copy with its snapshot: ${read.value.raw.error}` }
+  const all = parseRaw(read.value.raw.stdout)
   const roots = await linkRoots(copy.dir, all.map(change => change.path))
   const prefix = copy.relPrefix ? `${copy.relPrefix}/` : ''
-  const collected: Collected = { changes: [], outside: [], linked: [] }
+  const collected: Collected = { changes: [], outside: [], linked: [], ...(read.value.counted?.ok ? { lines: parseNumstat(read.value.counted.stdout) } : {}) }
   for (const root of roots) (!prefix || `${root}/`.startsWith(prefix) ? collected.linked : collected.outside).push(root)
   for (const change of all) {
     if ([...roots].some(root => change.path.startsWith(`${root}/`))) continue
@@ -550,6 +565,35 @@ function describeMerge(copy: AgentCopy, result: MergeResult): string {
   return lines.join('\n')
 }
 
+// A merge held back (spawn_agent {merge: 'hold'}), as the helper's parent reads it ahead of the helper's own answer: nothing
+// is merged, and the report counts what the copy holds the way a merge counts it (collect: new files included, a link's files
+// and the files beyond the helper's workspace apart), says where it is, how to see it and how to decide. It reads the copy
+// on the merge queue, so that a merge into the same target is never half done under it. Never throws.
+async function describeHeld(copy: AgentCopy): Promise<string> {
+  const head = `HELD MERGE: the helper's changes are HELD and not merged into ${copy.target}.`
+  const collected = await serialized(keyOf(copy.sourceTop), () => collect(copy, true)).catch((error): { ok: false; error: string } => ({ ok: false, error: message(error) }))
+  if (!collected.ok) return `${head} They could not be counted (${collected.error}); the copy is at ${copy.dir}.`
+  const { changes, outside, linked, lines } = collected
+  const kindOf = (change: RawChange): 'added' | 'deleted' | 'modified' => ZERO.test(change.oldMode) ? 'added' : ZERO.test(change.newMode) ? 'deleted' : 'modified'
+  const byKind = (['added', 'deleted', 'modified'] as const).map(kind => ({ kind, paths: changes.filter(change => kindOf(change) === kind).map(change => change.path) }))
+  let plus = 0, minus = 0, binary = 0
+  for (const change of changes) {
+    const count = lines?.get(change.path)
+    if (count) { plus += count.added; minus += count.removed } else if (count === null) binary++
+  }
+  const kinds = byKind.map(item => `${item.paths.length} ${item.kind}`).join(', ')
+  const counted = lines ? `, +${plus} -${minus} lines${binary ? `, ${binary} binary` : ''}` : ''
+  const out = [head, changes.length ? `Changes: ${changes.length} file(s) (${kinds})${counted}.` : 'Changes: none (the helper changed no files).']
+  const listed = byKind.filter(item => item.paths.length).map(item => `${item.kind}: ${item.paths.slice(0, 8).join(', ')}${item.paths.length > 8 ? `, and ${item.paths.length - 8} more` : ''}`)
+  if (listed.length) out.push(`${listed.join('; ')}.`)
+  if (outside.length) out.push(`NOT MERGEABLE: ${outside.length} file(s) changed outside the helper's workspace ${copy.workspace} (${outside.slice(0, 6).join(', ')}${outside.length > 6 ? `, and ${outside.length - 6} more`: ''}) stay in the copy and are saved as a patch when it is removed.`)
+  if (linked.length) out.push(`NOT MERGEABLE: a link made in the copy leads to files outside it (${linked.slice(0, 4).join(', ')}): they are neither merged nor saved.`)
+  out.push(`Copy (a git worktree): ${copy.dir}${copy.workspace !== copy.dir ? `; the helper's workspace in it: ${copy.workspace}` : ''}; base commit ${short(copy.base)}.`)
+  out.push(`See it: git -C ${quoted(copy.dir)} status --short (every changed and new file) and git -C ${quoted(copy.dir)} diff ${short(copy.base)} (changes to files the base has).`)
+  out.push(`Decide with merge_agent {agentId: "${copy.agentId}", action: "merge"} (merged exactly as an automatic merge is, conflicts reported) or action "discard" (the copy goes, its changes are kept as a patch); only the helper's parent or the root may. followup_agent continues the helper in its copy and keeps it held; undecided at the end of the run, its changes are saved as a patch.`)
+  return out.join('\n')
+}
+
 // ---- Removing a copy -------------------------------------------------------------------------------------------------
 // A link made inside a copy is unlinked, never followed: removing the folder it points to would delete the source's
 // node_modules. Only a real link is touched.
@@ -670,5 +714,5 @@ async function sweepLeftovers(root: string): Promise<SweepResult> {
   return result
 }
 
-export { createCopy, mergeCopy, describeMerge, removeCopy, sweepLeftovers, inside, realFolder, RUN_FOLDER, PATCHES }
+export { createCopy, mergeCopy, describeMerge, describeHeld, removeCopy, sweepLeftovers, inside, realFolder, RUN_FOLDER, PATCHES }
 export type { AgentCopy, CopyKind, CopyOptions, CopyRefusal, MergedFile, MergeConflict, MergeResult, MergeHooks, RemoveResult, SweepResult }

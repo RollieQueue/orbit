@@ -31,7 +31,7 @@ const T = (name) => `import('./types').${name}`
 
 // Named helper types emitted before the bridge interface, in this order.
 const TYPES = {
-  StartTaskPayload: `{ projectId: string; chatId: string; prompt: string; history: { role: 'user' | 'assistant'; content: string }[]; workspace: string; memoryEnabled: boolean; globalMemoryEnabled?: boolean; reasoningEffort?: string; providerId: string; model?: string; models?: Record<string, string>; quotaFailover?: ${T('QuotaFailover')}; providerPool?: ${T('PoolMember')}[]; providerOptions?: Record<string, ${T('ProviderOption')}>; agentInstructions: string; accessMode: ${T('AccessMode')}; approvalPolicy: ${T('ApprovalPolicy')}; limits: ${T('RunLimits')}; improvementMode?: boolean; skillLearning?: boolean; loopTask?: number; attachments?: ${T('Attachment')}[] }`,
+  StartTaskPayload: `{ projectId: string; chatId: string; prompt: string; history: { role: 'user' | 'assistant'; content: string }[]; workspace: string; memoryEnabled: boolean; globalMemoryEnabled?: boolean; reasoningEffort?: string; providerId: string; model?: string; models?: Record<string, string>; quotaFailover?: ${T('QuotaFailover')}; providerPool?: ${T('PoolMember')}[]; providerOptions?: Record<string, ${T('ProviderOption')}>; agentInstructions: string; accessMode: ${T('AccessMode')}; approvalPolicy: ${T('ApprovalPolicy')}; limits: ${T('RunLimits')}; improvementMode?: boolean; skillLearning?: boolean; loopTask?: number; wakeups?: ${T('Wakeup')}[]; attachments?: ${T('Attachment')}[] }`,
   ApplyArtifactPayload: '{ workspace: string; patchPath: string; worktreePath?: string }',
   ApplyArtifactResult: '{ ok: boolean; reason?: string; detail?: string }',
   QuotaUpdate: `{ providerId: string; snapshot: ${T('QuotaSnapshot')} | null }`,
@@ -89,6 +89,12 @@ const CALLS = [
   { method: 'installCapability', channel: 'capabilities:install', args: [{ name: 'entry', type: `Partial<${T('Capability')}>` }], returns: T('Capability') },
   { method: 'removeCapability', channel: 'capabilities:remove', args: [id, workspace], returns: 'unknown' },
   { method: 'restoreCapability', channel: 'capabilities:restore', args: [id, { name: 'version', type: 'number' }, workspace], returns: T('Capability') },
+  // Connectors (external MCP servers agents add with connector_add): every one of the project and the global ones, secrets
+  // masked. Enable, remove and test address one by name and scope; a test starts the server and lists its tools.
+  { method: 'listConnectors', channel: 'connectors:list', args: [workspace], returns: `${T('ConnectorView')}[]` },
+  { method: 'setConnectorEnabled', channel: 'connectors:enable', args: [{ name: 'name', type: 'string' }, { name: 'enabled', type: 'boolean' }, { name: 'scope', type: `${T('ConnectorView')}['scope']` }, workspace], returns: T('ConnectorView') },
+  { method: 'removeConnector', channel: 'connectors:remove', args: [{ name: 'name', type: 'string' }, { name: 'scope', type: `${T('ConnectorView')}['scope']` }, workspace], returns: 'unknown' },
+  { method: 'testConnector', channel: 'connectors:test', args: [{ name: 'name', type: 'string' }, { name: 'scope', type: `${T('ConnectorView')}['scope']` }, workspace], returns: T('ConnectorTestResult') },
   { method: 'checkProviders', channel: 'providers:health', args: [providerOptions], returns: 'ProviderHealth[]' },
   { method: 'getQuotas', channel: 'quota:get', args: [providerOptions, { name: 'force', type: 'boolean', optional: true }], returns: `Record<string, ${T('QuotaSnapshot')}>` },
   // Lines of code (git history or counts) and tokens of the project's runs over time, for skill pages in the quota window.

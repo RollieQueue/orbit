@@ -1,5 +1,5 @@
 import { useEffect, useRef } from 'react'
-import type { ChatThread, HandoverTarget, InspectorTab, Message, Project, RestartNoticeKind, RunSnapshot } from './types'
+import type { ChatThread, HandoverTarget, InspectorTab, Message, Project, RestartNoticeKind, RunSnapshot, Wakeup } from './types'
 import { RunHistory, runChangedFiles } from './AgentHistory'
 import { MessageAttachments } from './AttachmentChips'
 import { WorkingStatus } from './ChatNotices'
@@ -11,6 +11,7 @@ import { loopPhaseText, type LoopView } from './improvement-loop'
 import { providers } from './providers'
 import { historyAnchors, isActiveStatus, resumeLinks, shortRunId, shownStatus, type RunMap } from './run-events'
 import { RESTART_WAIT_TEXT, restartCardDetail, settlingRestart } from './state-store'
+import { wakeupChip } from './wakeups'
 
 type OpenTeam = (runId: string, tab?: InspectorTab, agentId?: string) => void
 const suggestions = ['Помоги разобраться в проекте', 'Давай обсудим новую функцию', 'Найди, что можно улучшить']
@@ -29,6 +30,8 @@ type ChatPaneProps = {
   composer: ComposerProps
   // The chat's endless-improvement loop while it is active: the banner with its state and actions.
   loop?: LoopView; onStopLoop: () => void; onRunLoopNow: () => void
+  // The chat's pending scheduled wake-ups: a chip each, which can be made due now or cancelled.
+  wakeups: Wakeup[]; onRunWakeupNow: (id: string) => void; onCancelWakeup: (id: string) => void
   onOpenSidebar: () => void; onToggleAgents: () => void; onOpenAgents: () => void; onOpenTeam: OpenTeam
   onSuggest: (text: string) => void; onAddProject: () => void
 }
@@ -36,7 +39,7 @@ type ChatPaneProps = {
 // Header, notices, the conversation (messages, the answer being written, the team's status) and the composer.
 export function ChatPane({
   project, chat, chatKey, runs, ready, desktop, running, restartWait, starting, workingRun, currentRun, agentsOpen, storageError, composer,
-  loop, onStopLoop, onRunLoopNow, onOpenSidebar, onToggleAgents, onOpenAgents, onOpenTeam, onSuggest, onAddProject,
+  loop, onStopLoop, onRunLoopNow, wakeups, onRunWakeupNow, onCancelWakeup, onOpenSidebar, onToggleAgents, onOpenAgents, onOpenTeam, onSuggest, onAddProject,
 }: ChatPaneProps) {
   const bottom = useRef<HTMLDivElement>(null)
   const nearBottom = useRef(true)
@@ -79,6 +82,7 @@ export function ChatPane({
     </div>}
     {storageError && <div className="error-banner" role="alert">{storageError}</div>}
     {loop && <LoopBanner loop={loop} onStop={onStopLoop} onRunNow={onRunLoopNow} />}
+    {!!wakeups.length && <WakeupList wakeups={wakeups} loopActive={!!loop} onRunNow={onRunWakeupNow} onCancel={onCancelWakeup} />}
     {!!otherActiveChats && <div className="parallel-chat-notice" role="status">
       Других активных чатов в проекте: {otherActiveChats}. Файлы общие — поручайте изменения разных участков.
     </div>}
@@ -118,6 +122,22 @@ function LoopBanner({ loop, onStop, onRunNow }: { loop: LoopView; onStop: () => 
   </div>
 }
 
+// «⏰ 14:30 — задача» per pending wake-up of the chat. «Сейчас» makes it due (it starts as soon as the chat is idle, and in a chat
+// with an active loop releases the loop's next task); the loop's next task does not start before its wake-ups are due.
+function WakeupList({ wakeups, loopActive, onRunNow, onCancel }: { wakeups: Wakeup[]; loopActive: boolean; onRunNow: (id: string) => void; onCancel: (id: string) => void }) {
+  const now = Date.now()
+  return <div className="wakeup-list" role="status">
+    {wakeups.map(w => {
+      const chip = wakeupChip(w, now, loopActive && !w.manual && w.dueAt > now)
+      return <div key={w.id} className={`wakeup-chip${chip.overdue ? ' overdue' : ''}`} title={`${w.reason}\n\n${w.task}`}>
+        <span className="wakeup-text">⏰ <strong>{chip.clock}</strong> — {chip.text}{chip.held && <em> · цикл ждёт этого пробуждения</em>}</span>
+        <button type="button" onClick={() => onRunNow(w.id)} title="Запустить сразу, как только чат освободится">Сейчас</button>
+        <button type="button" onClick={() => onCancel(w.id)}>Отменить</button>
+      </div>
+    })}
+  </div>
+}
+
 type WelcomeProps = { project?: Project; desktop: boolean; onSuggest: (text: string) => void; onAddProject: () => void }
 
 function Welcome({ project, desktop, onSuggest, onAddProject }: WelcomeProps) {
@@ -142,9 +162,10 @@ function Welcome({ project, desktop, onSuggest, onAddProject }: WelcomeProps) {
 function ChatMessage({ message, run, anchored, loaded, streaming, onOpen }: {
   message: Message; run?: RunSnapshot; anchored: boolean; loaded: boolean; streaming?: boolean; onOpen: OpenTeam
 }) {
-  const author = message.author === 'user' ? 'Вы' : message.author === 'system' ? 'Система' : 'Orbit'
+  const scheduled = message.kind === 'wakeup'
+  const author = scheduled ? 'Расписание' : message.author === 'user' ? 'Вы' : message.author === 'system' ? 'Система' : 'Orbit'
   return <article className={`message ${message.author}${streaming ? ' streaming' : ''}`} aria-busy={streaming || undefined}>
-    <div className="message-avatar">{message.author === 'user' ? 'В' : message.author === 'system' ? '!' : <span className="tiny-orbit" />}</div>
+    <div className="message-avatar">{scheduled ? '⏰' : message.author === 'user' ? 'В' : message.author === 'system' ? '!' : <span className="tiny-orbit" />}</div>
     <div className="message-content">
       <div className="message-meta">
         <strong>{author}</strong>

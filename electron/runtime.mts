@@ -39,6 +39,7 @@ import * as tools from './runtime/tools.mts'
 import * as knowledge from './runtime/knowledge.mts'
 import * as restart from './runtime/restart.mts'
 import type { RestartHost } from './resume.mts'
+import type { ConnectorStore } from './connectors.mts'
 import type { MergedFile } from './agent-worktree.mts'
 import type {
   AgentRecord, AgentRef, AgentResult, ApprovalHandler, Attachment, ApprovalRequest, CapabilityStoreLike, CatalogLike, ChangeDescription, ChangeInput,
@@ -59,6 +60,7 @@ class OrbitRuntime implements OrbitRuntimeLike {
   declare runProvider: RunProvider
   declare memoryStore: MemoryStoreLike | null
   declare capabilityStore: CapabilityStoreLike | null
+  declare connectorStore: ConnectorStore | null
   declare runStore: RunStoreLike | null
   declare requestApproval: ApprovalHandler | null
   declare clock: () => number
@@ -86,8 +88,8 @@ class OrbitRuntime implements OrbitRuntimeLike {
   // electron/tool-registry.mts (the server is created on the first session); without a server every agent uses the envelope loop.
   // `restartHost` (resume.mts createRestartHost, or a test's fake) runs the self-upgrade script for restart_orbit.
   // `worktreeRoot` is the folder isolated helpers' git copies are made under (<userData>/worktrees from the runtime host).
-  constructor({ runProvider = defaultRunProvider, memoryStore = null, capabilityStore = null, runStore = null, requestApproval = null, clock = Date.now, projectIndex = new ProjectIndex({ clock }), quota = null, catalog = null, mcp = null, transportFor = null, closeSession = null, registry = undefined, restartHost = null, worktreeRoot = null }: OrbitRuntimeOptions = {}) {
-    Object.assign(this, { runProvider, memoryStore, capabilityStore, runStore, requestApproval, clock, projectIndex, quota, catalog, contextStore: null, sharing: new Map(), lastShare: -Infinity })
+  constructor({ runProvider = defaultRunProvider, memoryStore = null, capabilityStore = null, connectorStore = null, runStore = null, requestApproval = null, clock = Date.now, projectIndex = new ProjectIndex({ clock }), quota = null, catalog = null, mcp = null, transportFor = null, closeSession = null, registry = undefined, restartHost = null, worktreeRoot = null }: OrbitRuntimeOptions = {}) {
+    Object.assign(this, { runProvider, memoryStore, capabilityStore, connectorStore, runStore, requestApproval, clock, projectIndex, quota, catalog, contextStore: null, sharing: new Map(), lastShare: -Infinity })
     Object.assign(this, { mcp, mcpStarted: null, mcpError: null, transportFor, closeSession, toolRegistry: registry, sessions: new Map(), restartHost, worktreeRoot })
     this.runs = new Map(); this.listeners = new Set()
   }
@@ -97,6 +99,7 @@ class OrbitRuntime implements OrbitRuntimeLike {
   setProjectIndex(index: ProjectIndexLike | null) { this.projectIndex = index }
   setMemoryStore(store: MemoryStoreLike | null) { this.memoryStore = store }
   setCapabilityStore(store: CapabilityStoreLike | null) { this.capabilityStore = store }
+  setConnectorStore(store: ConnectorStore | null) { this.connectorStore = store }
   setRunStore(store: RunStoreLike | null) { this.runStore = store }
   setContextStore(store: ContextStoreLike | null) { this.contextStore = store }
   // Compatibility for old IPC callers; every message now enters the same agent loop.

@@ -1,4 +1,4 @@
-import { clip, ellipsis } from './text.mts'
+import { clip, ellipsis, pageText, PAGE_CEILING } from './text.mts'
 import { profileSummary } from './runtime/run-profile.mts'
 import type { ProfileSource } from './runtime/run-profile.mts'
 
@@ -10,7 +10,7 @@ import type { ProfileSource } from './runtime/run-profile.mts'
 // The files an agent touched, as the runtime publishes them on the agent.
 interface AgentFileList { wrote?: string[]; read?: string[] }
 // An agent as a saved snapshot or the live run holds it; only these fields are read here.
-interface AgentLike { id: string; name?: string; status?: string; task?: string; result?: string; error?: string | null; providerId?: string; model?: string; files?: AgentFileList | null }
+interface AgentLike { id: string; name?: string; status?: string; task?: string; result?: string; report?: string; error?: string | null; providerId?: string; model?: string; files?: AgentFileList | null }
 interface MessageLike { agentId?: string; text?: string }
 interface CommunicationLike { kind?: string; fromAgentName?: string; toAgentName?: string; text?: string }
 // A run held in memory (`agentNodes`, a Map) or a saved snapshot (`agents`, an array); the profile reads the rest of ProfileSource.
@@ -20,8 +20,9 @@ interface RunLike extends ProfileSource { prompt?: string; resumedFrom?: string;
 // `restartApplied`/`restartDeferred`, whether its change of Orbit's code was applied or left for a later restart.
 interface RunView { runId: string; prompt: string; status?: string; startedAt?: string; resumedFrom?: string; restartApplied?: boolean; restartDeferred?: boolean; profile?: string | null; answer: string; agents: AgentLike[]; communications: CommunicationLike[] }
 // The arguments of `team_history`, as the model sends them.
-interface HistoryArgs { runId?: unknown; agent?: unknown; limit?: unknown }
-interface HistoryAgent { name?: string; status?: string; provider?: string; model?: string; task: string; result: string; files: { wrote: string[]; read: string[] } }
+interface HistoryArgs { runId?: unknown; agent?: unknown; limit?: unknown; offset?: unknown; maxChars?: unknown }
+// `result` is a preview of the report; with an agent named it is the page that starts at `offset`, and `nextOffset` continues it (null at the end).
+interface HistoryAgent { name?: string; status?: string; provider?: string; model?: string; task: string; result: string; totalChars: number; offset?: number; nextOffset?: number | null; files: { wrote: string[]; read: string[] } }
 interface HistoryRecord {
   runId: string; startedAt?: string; status?: string; prompt: string; answer: string; agents: HistoryAgent[]
   omittedAgents?: number; note?: string; correspondence: Array<{ from?: string; to?: string; text: string }>
@@ -77,7 +78,8 @@ function digest(runs: RunView[], maxChars = 6000): string {
 }
 
 // Full records on demand, bounded to what one observation can carry. Text is cut proportionally first;
-// when even that is not enough, the tail of a very large team is left out and said to be.
+// when even that is not enough, the tail of a very large team is left out and said to be. With an agent named, its report is
+// paged as it is (offset, maxChars: 6000 by default, 20000 at most); otherwise it is a one-line preview.
 function history(runs: RunView[], args: HistoryArgs = {}, budget = 12000): HistoryRecord[] {
   const wantedRun = args.runId ? String(args.runId) : ''
   const wantedAgent = args.agent ? String(args.agent).toLowerCase() : ''
@@ -87,13 +89,19 @@ function history(runs: RunView[], args: HistoryArgs = {}, budget = 12000): Histo
     const matching = run.agents.filter(agent => !wantedAgent || String(agent.name).toLowerCase().includes(wantedAgent))
     const agents = matching.slice(0, Math.max(1, Math.ceil(matching.length * keep)))
     const size = (full: number, floor = 40): number => Math.max(floor, Math.floor(full * scale))
-    const resultChars = size(wantedAgent ? 6000 : Math.floor(Math.max(600, (budget / Math.max(1, chosen.length) - 900) / Math.max(1, agents.length))))
+    const resultChars = size(wantedAgent ? Math.min(Number(args.maxChars) || 6000, PAGE_CEILING) : Math.floor(Math.max(600, (budget / Math.max(1, chosen.length) - 900) / Math.max(1, agents.length))))
     return {
       runId: run.runId, startedAt: run.startedAt, status: run.status, prompt: clip(run.prompt, size(400)), answer: clip(run.answer, size(wantedAgent ? 400 : 900)),
-      agents: agents.map(agent => ({
-        name: agent.name, status: agent.status, provider: agent.providerId, model: agent.model, task: clip(agent.task, size(400)),
-        result: clip(agent.result || agent.error, resultChars), files: { wrote: (agent.files?.wrote || []).slice(0, size(30, 3)), read: (agent.files?.read || []).slice(0, size(20, 2)) },
-      })),
+      agents: agents.map(agent => {
+        const report = agent.report || agent.result || agent.error || ''
+        // When the budget shrinks a page, nextOffset still says where it ended.
+        const shown = wantedAgent ? pageText(report, args.offset, resultChars, 6000) : null
+        return {
+          name: agent.name, status: agent.status, provider: agent.providerId, model: agent.model, task: clip(agent.task, size(400)),
+          result: shown ? shown.text : clip(report, resultChars), totalChars: report.length, ...(shown ? { offset: shown.offset, nextOffset: shown.nextOffset } : {}),
+          files: { wrote: (agent.files?.wrote || []).slice(0, size(30, 3)), read: (agent.files?.read || []).slice(0, size(20, 2)) },
+        }
+      }),
       ...(agents.length < matching.length ? { omittedAgents: matching.length - agents.length, note: 'Ask with agent to read the others' } : {}),
       correspondence: run.communications.filter(message => message.kind === 'message').slice(-8).map(message => ({ from: message.fromAgentName, to: message.toAgentName, text: clip(message.text, size(300)) })),
     }
@@ -117,5 +125,19 @@ function findAgent(runs: RunView[], reference: unknown): AgentLike | null {
   return null
 }
 
-export { view, digest, history, findAgent }
+// The whole report behind an `agent:<chat>:<name>` note. The note keeps only the first 1800 characters (it is loaded into prompts);
+// the run record, live (`current`) or saved (`runs`), keeps the report (`report`, or `result` when that was not cut; records from
+// before `report` have only `result`). null when the note is not such a note, belongs
+// to another chat, or its run is gone: the note's own text is all there is.
+function fullReport(key: string, summary: string, chatId: string, current: { runId: string; agents: Iterable<AgentLike> }, runs: RunView[]): string | null {
+  const match = /^agent:([^:]+):(.+)$/.exec(key)
+  if (!match || match[1] !== chatId) return null
+  let runId = ''
+  try { runId = String((JSON.parse(summary) as { runId?: unknown }).runId || '') } catch { return null }
+  const candidates = runId === current.runId ? [...current.agents] : runs.find(run => run.runId === runId)?.agents || []
+  const agent = candidates.find(item => item.name === match[2])
+  return agent?.report || agent?.result || null
+}
+
+export { view, digest, history, findAgent, fullReport }
 export type { RunLike, RunView, AgentLike, HistoryArgs, HistoryRecord }

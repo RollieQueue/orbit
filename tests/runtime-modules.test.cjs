@@ -15,7 +15,7 @@ const { diagnostics } = require('../electron/runtime/util.mts')
 const ROOT = path.join(__dirname, '..', 'electron')
 const RUNTIME_DIR = path.join(ROOT, 'runtime')
 const modules = fs.readdirSync(RUNTIME_DIR).filter(name => name.endsWith('.mts'))
-const OWN = ['constructor', 'setQuota', 'setCatalog', 'onEvent', 'setProjectIndex', 'setMemoryStore', 'setCapabilityStore', 'setRunStore', 'setContextStore', 'routeMessage']
+const OWN = ['constructor', 'setQuota', 'setCatalog', 'onEvent', 'setProjectIndex', 'setMemoryStore', 'setCapabilityStore', 'setConnectorStore', 'setRunStore', 'setContextStore', 'routeMessage']
 
 test('the envelope tool guide the runtime keeps inline matches the registry', () => {
   assert.equal(TOOL_GUIDE, registry.describeForPrompt({ id: 'root' }, {}))

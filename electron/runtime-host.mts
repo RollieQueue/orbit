@@ -11,6 +11,7 @@ import { OrbitRuntime } from './runtime.mts'
 import { OrbitMemoryStore } from './memory.mts'
 import { ProjectContextStore } from './project-context.mts'
 import { CapabilityStore } from './capabilities.mts'
+import { ConnectorStore } from './connectors.mts'
 import { ProjectIndex } from './project-index.mts'
 import { RunStore, StateStore } from './run-store.mts'
 import * as providers from './providers.mts'
@@ -18,6 +19,7 @@ import { QuotaMonitor, readers as quotaReaders } from './quota.mts'
 import { createRuntimeApi } from './runtime-api.mts'
 import { configureAttachments, sweepDiscarded } from './attachments.mts'
 import { createRestartHost, markRestartingRuns, resumePending } from './resume.mts'
+import { processWatch } from './process-reaper.mts'
 import { codedError, ERROR_CODES } from './runtime-protocol.mts'
 import type { ApprovalWire, LogLevel, RendererHealthyInfo, ShutdownMode, SpawnedProcess } from './runtime-protocol.mts'
 import type { RuntimeHandler, RuntimeStores } from './runtime-api.mts'
@@ -67,6 +69,8 @@ const ACTIVE = new Set<string>(['running', 'working', 'waiting', 'queued'])
 // How long a shutdown waits for the MCP server to close and for the stopped runs' processes (CLI trees, commands)
 // to be killed and settle. The runtime child exits right after, and on Windows only its direct children die with it.
 const SETTLE_MS = 2000
+// How long it waits for what the stopped CLIs left running to be stopped (process-reaper.mts): two table reads and the kills.
+const CLEANUP_MS = 4000
 
 // The provider-facing functions a smoke must replace (ORBIT_SMOKE=1): turns, CLI inspection and quota readers.
 const SMOKE_FIXTURES = ['runProvider', 'inspectProviders', 'patchQuotaReaders'] as const
@@ -190,8 +194,10 @@ function createRuntimeService(options: RuntimeServiceOptions): RuntimeService {
   const stateStore = new StateStore(userData)
   runtime.setMemoryStore(memoryStore)
   runtime.setCapabilityStore(capabilityStore)
+  const connectorStore = new ConnectorStore(userData)
+  runtime.setConnectorStore(connectorStore)
   runtime.setRunStore(runStore)
-  const stores: RuntimeStores = { memoryStore, projectContextStore, capabilityStore, projectIndex, runStore, stateStore }
+  const stores: RuntimeStores = { memoryStore, projectContextStore, capabilityStore, connectorStore, projectIndex, runStore, stateStore }
   // Housekeeping on start (expiry, duplicates, caps). Nothing is shared between projects here: which projects allow it is known only once they run.
   try { memoryStore.maintain({ crossProject: true, projects: [] }); capabilityStore.maintain({ crossProject: true, projects: [] }) } catch (error) { log('error', `Memory housekeeping failed: ${messageOf(error)}`) }
 
@@ -235,9 +241,10 @@ function createRuntimeService(options: RuntimeServiceOptions): RuntimeService {
       // Every other active run stops as when Orbit quits; its CLI trees and commands are killed.
       for (const run of runtime.runs.values()) if (ACTIVE.has(run.status)) runtime.stop(run.runId)
       // The Orbit MCP server (session transport) listens on a loopback port and goes down with the runtime; meanwhile the
-      // stopped runs' provider turns and commands finish unwinding.
+      // stopped runs' provider turns and commands finish unwinding, and what their CLIs left running is stopped
+      // (process-reaper.mts): once the runtime is gone nobody else knows which process belonged to which CLI.
       const operations = [...runtime.runs.values()].flatMap(run => [...run.operations])
-      await Promise.all([settle(runtime.shutdown(), SETTLE_MS), settle(Promise.allSettled(operations), SETTLE_MS)])
+      await Promise.all([settle(runtime.shutdown(), SETTLE_MS), settle(Promise.allSettled(operations), SETTLE_MS), settle(processWatch.idle(), CLEANUP_MS)])
       for (const withdraw of [...approvals.values()]) withdraw()
       // A run file still waiting for its coalesced write (agents that reported their cancellation) is written now.
       for (const run of runtime.runs.values()) if (run.persistTimer) runtime.persist(run)

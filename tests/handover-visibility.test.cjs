@@ -36,7 +36,8 @@ test('records without a turn number list the models without ranges', () => {
 test('a model that was switched away from before it did anything is not credited', () => {
   const agent = agentOn(SONNET, [move(CURSOR, SONNET, { fresh: true, turn: 0, reason: 'replacement-failed' })])
   assert.deepEqual(modelsWorked(agent).map(item => [item.label, item.turns]), [['claude/sonnet', 'turns 1–']])
-  assert.deepEqual(ranOnFields(agent), {}, 'nothing to disambiguate')
+  assert.equal(ranOnFields(agent).ranOn, undefined, 'nothing to disambiguate')
+  assert.equal(ranOnFields(agent).failedOver.to, 'claude/sonnet', 'but the move itself is reported')
   const chain = agentOn(GEMINI, [move(CURSOR, ASTRA, { fresh: true, turn: 0 }), move(ASTRA, GEMINI, { turn: 2 })])
   assert.deepEqual(modelsWorked(chain).map(item => [item.label, item.turns]), [['codex/gpt-6-astra', 'turns 1–2'], ['antigravity/gemini-3.1-pro-high', 'turns 3–']])
 })
@@ -124,7 +125,7 @@ test('after a real switch wait_agent and model_evaluate say which model did what
   assert.deepEqual(modelsWorked(helper).map(item => item.label), ['codex/gpt-6-sol', 'claude/opus'])
   // wait_agent: the models come before the result
   const waited = unescape(rootPrompts[1])
-  assert.ok(waited.includes('"providerId":"claude","model":"opus","ranOn":["codex/gpt-6-sol (turn 1)","claude/opus (turns 2–)"],"switched":"codex/gpt-6-sol → claude/opus after turn 1 (approaching)","result"'), waited.slice(waited.indexOf('"generation"'), waited.indexOf('"generation"') + 400))
+  assert.ok(waited.includes('"providerId":"claude","model":"opus","ranOn":["codex/gpt-6-sol (turn 1)","claude/opus (turns 2–)"],"switched":"codex/gpt-6-sol → claude/opus after turn 1 (approaching)","failedOver":{"from":"codex/gpt-6-sol","to":"claude/opus","switches":1,"why":"quota nearly used up","steps":"codex/gpt-6-sol → claude/opus after turn 1 (approaching)"},"result"'), waited.slice(waited.indexOf('"generation"'), waited.indexOf('"generation"') + 600))
   // model_evaluate: no model, a model that did no work, then the right one
   assert.match(rootPrompts[2], /ran on several models: codex\/gpt-6-sol \(turn 1\), claude\/opus \(turns 2–\)\. Pass model: "<provider>\/<model>"/)
   assert.match(rootPrompts[3], /did not run on model "antigravity\/gemini"/)
@@ -154,7 +155,7 @@ test('a worker that switched before doing anything is credited to the model that
   const helper = run.agents.find(agent => agent.name === 'Helper')
   assert.deepEqual([helper.handovers.length, helper.handovers[0].fresh], [1, true])
   assert.ok(!unescape(rootPrompts[1]).includes('"ranOn"'), 'nothing ambiguous to report')
-  assert.ok(unescape(rootPrompts[1]).includes('"providerId":"claude","model":"opus","result":"helper done"'))
+  assert.ok(unescape(rootPrompts[1]).includes('"providerId":"claude","model":"opus","failedOver":{"from":"codex/gpt-6-sol","to":"claude/opus","switches":1,"why":"quota nearly used up","steps":"codex/gpt-6-sol → claude/opus before any turn (approaching)"},"result":"helper done"'))
   const [record] = assessments(memory, workspace)
   assert.equal(record.title, 'Model: claude/opus — code')
   assert.ok(!('ranOn' in JSON.parse(record.content.split('\n')[0])))

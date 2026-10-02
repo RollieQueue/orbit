@@ -146,3 +146,94 @@ test('a history request stays within one observation however many agents ran', (
   const one = chatMemory.history(runs, { runId: 'r1', agent: 'helper 7' }, 12000)
   assert.deepEqual([one.length, one[0].agents.length, one[0].agents[0].name], [1, 1, 'Helper 7'])
 })
+
+// A long report: numbered lines with blank lines, so that a page which collapsed or trimmed whitespace would not rejoin to the original.
+const LONG_REPORT = Array.from({ length: 700 }, (_, index) => `ITEM_${index + 1}: ${'detail '.repeat(3)}ok`).join('\n\n')
+const pagesOf = async read => {
+  const pages = []
+  let offset = 0
+  for (let guard = 0; guard < 50 && offset !== null; guard++) { const page = await read(offset); pages.push(page); offset = page.nextOffset }
+  return pages
+}
+
+test('team_history pages a long report: the default stays compact, the pages rejoin to the exact text', async t => {
+  assert.ok(LONG_REPORT.length > 20000)
+  const workspace = folder(t), store = folder(t)
+  const first = new OrbitRuntime({ runStore: new RunStore(store), runProvider: scripted({ ...firstTurn(), Backend: [() => ({ text: LONG_REPORT })] }) })
+  await finish(first, { workspace, prompt: 'Write the report' })
+  const runtime = new OrbitRuntime({ runStore: new RunStore(store), runProvider: scripted({}) })
+  const { run, runId } = await finish(runtime, { workspace, prompt: 'Read it back' })
+  const live = runtime.runs.get(runId), root = live.agentNodes.get('root')
+  const read = args => runtime.executeTool(live, root, 'team_history', { agent: 'backend', ...args }).then(records => records[0].agents[0])
+  assert.equal(run.status, 'completed')
+
+  const preview = await runtime.executeTool(live, root, 'team_history', {})
+  assert.ok(JSON.stringify(preview).length < 12000, 'without an agent the output stays a bounded preview')
+  assert.equal(preview[0].agents[0].totalChars, LONG_REPORT.length, 'the preview says how long the report really is')
+
+  const initial = await read({})
+  assert.ok(initial.result.length <= 6000, 'the default page is as small as before')
+  assert.equal(initial.totalChars, LONG_REPORT.length)
+  assert.equal(initial.offset, 0)
+  assert.equal(initial.nextOffset, initial.result.length)
+
+  const pages = await pagesOf(offset => read({ offset, maxChars: 5000 }))
+  assert.ok(pages.length > 3 && pages.every(page => page.result.length <= 5000))
+  assert.equal(pages.map(page => page.result).join(''), LONG_REPORT, 'concatenated pages equal the full report')
+  assert.equal(pages.at(-1).nextOffset, null)
+
+  assert.ok((await read({ maxChars: 500000 })).result.length <= 20000, 'a page is never larger than 20000 characters')
+  const past = await read({ offset: LONG_REPORT.length + 100 })
+  assert.deepEqual([past.result, past.nextOffset, past.totalChars], ['', null, LONG_REPORT.length])
+  const exact = await read({ offset: LONG_REPORT.length })
+  assert.deepEqual([exact.result, exact.nextOffset], ['', null])
+})
+
+test('context_read pages the whole report behind a helper note, and a plain or old note still reads as before', async t => {
+  const workspace = folder(t), root = folder(t)
+  const { ProjectContextStore } = require('../electron/project-context.mts')
+  const { saveNote } = require('../electron/shared-context.mts')
+  const contextStore = new ProjectContextStore(root)
+  const first = new OrbitRuntime({ runStore: new RunStore(root), runProvider: scripted({ ...firstTurn(), Backend: [() => ({ text: LONG_REPORT })] }) })
+  first.setContextStore(contextStore)
+  await finish(first, { workspace, prompt: 'Write the report' })
+  const old = JSON.stringify({ result: 'OLD_NOTE_RESULT', task: 'x', runId: 'a-run-that-is-gone', state: 'reported complete; verify before reuse' })
+  saveNote(contextStore, workspace, {}, { key: 'agent:chat:Gone', summary: old })
+  saveNote(contextStore, workspace, {}, { key: 'plain', summary: 'PLAIN_NOTE '.repeat(300) })
+
+  const runtime = new OrbitRuntime({ runStore: new RunStore(root), runProvider: scripted({}) })
+  runtime.setContextStore(contextStore)
+  const { runId } = await finish(runtime, { workspace, prompt: 'Read it back' })
+  const live = runtime.runs.get(runId), orbit = live.agentNodes.get('root')
+  const read = args => runtime.executeTool(live, orbit, 'context_read', { key: 'agent:chat:Backend', ...args })
+
+  const compact = await read({})
+  assert.ok(compact.summary.length < 2200, 'the default is the compact note, as before')
+  assert.equal(compact.fullReportChars, LONG_REPORT.length, 'it says that a longer report exists')
+  assert.equal(compact.nextOffset, null)
+
+  const pages = await pagesOf(offset => read({ offset }))
+  assert.ok(pages.length > 3 && pages.every(page => page.summary.length <= 6000 && page.source === 'full report' && page.totalChars === LONG_REPORT.length))
+  assert.equal(pages.map(page => page.summary).join(''), LONG_REPORT, 'concatenated pages equal the full report')
+  const past = await read({ offset: LONG_REPORT.length + 5 })
+  assert.deepEqual([past.summary, past.nextOffset], ['', null])
+
+  const gone = await runtime.executeTool(live, orbit, 'context_read', { key: 'agent:chat:Gone', offset: 0 })
+  assert.equal(gone.summary, old, 'a note whose run is gone pages its own text')
+  assert.equal(gone.nextOffset, null)
+  const plain = await runtime.executeTool(live, orbit, 'context_read', { key: 'plain', offset: 1000, maxChars: 1500 })
+  assert.equal(plain.summary, ('PLAIN_NOTE '.repeat(300)).slice(1000, 2500))
+  assert.equal(plain.nextOffset, 2500)
+  assert.equal((await runtime.executeTool(live, orbit, 'context_read', { key: 'plain' })).summary, 'PLAIN_NOTE '.repeat(300), 'a plain note is returned whole by default')
+})
+
+test('team_history pages the result of an old record that has no report field', () => {
+  const text = 'old result '.repeat(900)
+  const runs = [{ runId: 'r1', prompt: 'p', status: 'completed', startedAt: '2026-01-01T00:00:00Z', answer: 'a', communications: [], agents: [{ id: 'a1', name: 'Writer', status: 'done', task: 't', result: text }] }]
+  const first = chatMemory.history(runs, { agent: 'writer', maxChars: 4000 })[0].agents[0]
+  const second = chatMemory.history(runs, { agent: 'writer', offset: first.nextOffset, maxChars: 4000 })[0].agents[0]
+  const third = chatMemory.history(runs, { agent: 'writer', offset: second.nextOffset, maxChars: 4000 })[0].agents[0]
+  assert.equal(first.result + second.result + third.result, text)
+  assert.deepEqual([first.totalChars, third.nextOffset], [text.length, null])
+  assert.equal(chatMemory.history(runs, {})[0].agents[0].totalChars, text.length, 'no paging fields without an agent')
+})

@@ -4,6 +4,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { randomBytes } from 'node:crypto'
 import { clip } from '../text.mts'
+import type { ConnectorLaunch } from '../connectors.mts'
 import type { AgentRecord, InternalAgentField, OrbitRuntimeLike, PublicAgent, RunLimits, RunRecord } from '../types.mts'
 
 const TERMINAL = new Set(['completed', 'failed', 'cancelled', 'restarting'])
@@ -12,7 +13,7 @@ const ceiling = (limits: RunLimits, key: keyof RunLimits): number => limits[key]
 const MESSAGE_TOOLS = new Set(['send_message', 'broadcast_message', 'ask_team'])
 // What counts as doing something rather than talking: it reopens a discussion the router closed.
 const WORK_TOOLS = new Set(['write_file', 'edit_file', 'spawn_agent', 'followup_agent'])
-const MUTATING_TOOLS = new Set(['write_file', 'edit_file', 'spawn_agent', 'followup_agent', 'memory_save', 'memory_forget', 'context_save', 'capability_install', 'capability_feedback', 'improvement_plan', 'model_evaluate', ...MESSAGE_TOOLS])
+const MUTATING_TOOLS = new Set(['write_file', 'edit_file', 'spawn_agent', 'followup_agent', 'memory_save', 'memory_forget', 'context_save', 'capability_install', 'capability_feedback', 'connector_add', 'connector_remove', 'improvement_plan', 'model_evaluate', 'merge_agent', 'schedule_wakeup', 'cancel_wakeup', ...MESSAGE_TOOLS])
 // A skill an agent loads on purpose is read whole (an agent's skill is at most 12 000 characters, the user's 24 000).
 const SKILL_READ_CHARS = 28000
 const MCP_TOOL_PREFIX = 'mcp__orbit__'
@@ -25,15 +26,25 @@ const USER = Object.freeze({ id: 'user', name: 'Вы' })
 const newMailMark = (): string => randomBytes(5).toString('hex')
 const isMailMark = (value: unknown): value is string => typeof value === 'string' && /^[0-9a-f]{10}$/.test(value)
 const mailTag = (agent: Pick<AgentRecord, 'mailMark'>): string => `[orbit:${agent.mailMark}]`
-const INTERNAL_AGENT_FIELDS: readonly InternalAgentField[] = ['inbox', 'seenChildren', 'requestedModel', 'transcript', 'previousWork', 'ledger', 'ledgerDropped', 'workDone', 'failedCandidates', 'trial', 'partialTurn', 'quotaWarned', 'draftAnswer', 'activeTurn', 'stream', 'sessionToken', 'sessionCursor', 'transcriptChars', 'pausedSession', 'mailMark', 'effortNote']
+const INTERNAL_AGENT_FIELDS: readonly InternalAgentField[] = ['inbox', 'seenChildren', 'requestedModel', 'transcript', 'previousWork', 'ledger', 'ledgerDropped', 'workDone', 'failedCandidates', 'trial', 'partialTurn', 'quotaWarned', 'draftAnswer', 'activeTurn', 'stream', 'sessionToken', 'sessionCursor', 'transcriptChars', 'pausedSession', 'mailMark', 'effortNote', 'report']
 // Google models (Antigravity) have reasoning built in: Orbit never sends an effort for them,
 // whatever was persisted in settings, the provider pool or a spawn request.
 const withoutGoogleReasoning = (providerId: string, effort: string): string => providerId === 'antigravity' ? '' : effort
 // The observation limit protects the model's context. The root's final answer is for the user, so it gets
 // a far larger allowance instead of being silently cut at the size of a tool observation.
+// The longest report of a helper that the run record keeps (AgentRecord.report): `result` is cut to one observation, this is what team_history and context_read page.
+const REPORT_CHARS = 64000
 const answerLimit = (run: RunRecord, agent: AgentRecord): number => agent.id === 'root' ? Math.max(run.limits.maxOutputChars, 60000) : run.limits.maxOutputChars
 // Every field but the internal ones stays on the copy, which is what PublicAgent says.
 const publicAgent = (agent: AgentRecord): PublicAgent => { const copy: Partial<AgentRecord> = { ...agent }; for (const key of INTERNAL_AGENT_FIELDS) delete copy[key]; return copy as PublicAgent }
+// The connectors (connectors.mts) this agent's provider process is launched with, read afresh each time, so one removed or
+// switched off meanwhile just goes. Only a run with full access has any: the root gets every enabled one, a helper only
+// those its spawn named (AgentRecord.connectors), so it never reaches further than its parent could pass on.
+const agentConnectors = (runtime: Pick<OrbitRuntimeLike, 'connectorStore'>, run: Pick<RunRecord, 'accessMode' | 'workspace'>, agent: Pick<AgentRecord, 'parentId' | 'connectors'>): ConnectorLaunch[] => {
+  if (run.accessMode !== 'danger-full-access') return []
+  const enabled = runtime.connectorStore?.resolve(run.workspace) ?? []
+  return agent.parentId ? enabled.filter(item => agent.connectors?.includes(item.name)) : enabled
+}
 // The tokens an agent has used (input + output), or undefined while no provider has reported any: what the directory shows.
 const agentTokens = (agent: Pick<AgentRecord, 'usage'>): number | undefined => agent.usage ? agent.usage.inputTokens + agent.usage.outputTokens : undefined
 // A plain JSON object: what a tool argument bag, an envelope or a parsed event must be before its fields are read.
@@ -98,4 +109,4 @@ function diagnostics(runtime: Pick<OrbitRuntimeLike, 'trace'>, run: RunRecord, w
   try { runtime.trace(run, agentId, 'diagnostic', `${where}: ${(error as Error | null | undefined)?.message || String(error)}`) } catch { /* Reporting a failure must not add one. */ }
 }
 
-export { TERMINAL, AGENT_TERMINAL, ceiling, WORK_TOOLS, MUTATING_TOOLS, SKILL_READ_CHARS, MCP_TOOL_PREFIX, USER, newMailMark, isMailMark, mailTag, withoutGoogleReasoning, answerLimit, publicAgent, agentTokens, isRecord, oneOf, bounded, clip, TurnBudgetError, abortError, overlappingWorkspaces, agentWorkspace, sameFolder, logicalWorkspace, abortable, diagnostics, markProviderFailure, fromProvider }
+export { TERMINAL, AGENT_TERMINAL, ceiling, WORK_TOOLS, MUTATING_TOOLS, SKILL_READ_CHARS, MCP_TOOL_PREFIX, USER, newMailMark, isMailMark, mailTag, withoutGoogleReasoning, answerLimit, REPORT_CHARS, publicAgent, agentConnectors, agentTokens, isRecord, oneOf, bounded, clip, TurnBudgetError, abortError, overlappingWorkspaces, agentWorkspace, sameFolder, logicalWorkspace, abortable, diagnostics, markProviderFailure, fromProvider }

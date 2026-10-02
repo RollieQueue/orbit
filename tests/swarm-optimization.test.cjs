@@ -94,7 +94,7 @@ test('improvement mode requires implemented verified tasks and rejects premature
       case 1: return { text: 'Here is a list of improvements' }
       case 2: assert.match(prompt, /has not closed a task yet/); return calls(['improvement_plan', { status: 'implementing', tasks: [{ id: 'a', title: 'Fix output', status: 'pending', evidence: '' }] }])
       case 3: return calls(['improvement_plan', { status: 'completed', tasks: [] }])
-      case 4: assert.match(prompt, /cannot be silently removed/); return calls(['write_file', { path: 'fixed.txt', content: 'fixed' }])
+      case 4: assert.match(prompt, /kept and block it: a/); return calls(['write_file', { path: 'fixed.txt', content: 'fixed' }])
       case 5: return calls(['read_file', { path: 'fixed.txt' }])
       case 6: return calls(['improvement_plan', { status: 'completed', tasks: [{ id: 'a', title: 'Fix output', status: 'done', evidence: 'read_file fixed.txt returned fixed' }] }])
       default: return { text: 'Implemented and verified' }

@@ -3,9 +3,10 @@
 // post-answer checks; executeAgent chooses between them and handles budgets, draft answers, errors and cancellation.
 import { randomUUID, createHash } from 'node:crypto'
 import { targetLabel } from '../failover.mts'
-import { TERMINAL, AGENT_TERMINAL, ceiling, USER, WORK_TOOLS, MUTATING_TOOLS, SKILL_READ_CHARS, bounded, TurnBudgetError, abortError } from './util.mts'
+import { TERMINAL, AGENT_TERMINAL, ceiling, USER, WORK_TOOLS, MUTATING_TOOLS, SKILL_READ_CHARS, bounded, agentConnectors, TurnBudgetError, abortError } from './util.mts'
 import { ToolProtocolError, hasToolCalls, parseResponse } from './envelope.mts'
 import { sessionGuide, evaluationReminder, skillReminder } from './prompts.mts'
+import { maskToolArguments } from '../connectors.mts'
 import * as improvement from './improvement.mts'
 import { describeCall } from './ledger.mts'
 import { PauseInterrupt, pauseGate, interruptedSession, STOPPED_BY_USER, wasStopped, endStopped, markEnded, afterCompletion } from './pause.mts'
@@ -184,7 +185,7 @@ async function envelopeLoop(runtime: OrbitRuntimeLike, run: RunRecord, agent: Ag
         }
         return runtime.completeAgent(run, agent, response.content)
       }
-      runtime.remember(agent, { type: 'assistant', content: response.content, tool_calls: response.calls.map(call => ({ ...call, arguments: ['write_file', 'edit_file', 'memory_save', 'context_save', 'capability_install'].includes(call.name) ? { path: call.arguments.path, key: call.arguments.key, summary: 'Payload omitted after execution; use result and shared context.' } : call.arguments })) })
+      runtime.remember(agent, { type: 'assistant', content: response.content, tool_calls: response.calls.map(call => ({ ...call, arguments: ['write_file', 'edit_file', 'memory_save', 'context_save', 'capability_install'].includes(call.name) ? { path: call.arguments.path, key: call.arguments.key, summary: 'Payload omitted after execution; use result and shared context.' } : maskToolArguments(call.name, call.arguments) as typeof call.arguments })) })
       // A response carrying tool calls is a protocol turn, not an answer to
       // the user. Keep its optional progress note in the agent trace so the
       // next tool result/turn remains the only thing published to chat.
@@ -196,7 +197,7 @@ async function envelopeLoop(runtime: OrbitRuntimeLike, run: RunRecord, agent: Ag
       for (const call of orderedCalls) {
         await pauseGate(runtime, run, agent)
         if (signal.aborted) throw abortError()
-        runtime.trace(run, agent.id, 'tool', `${call.name} ${bounded(call.arguments, 1200)}`)
+        runtime.trace(run, agent.id, 'tool', `${call.name} ${bounded(maskToolArguments(call.name, call.arguments), 1200)}`)
         const startedAt = runtime.clock()
         let observation: unknown, failure: string | null = null
         try {
@@ -272,7 +273,9 @@ async function sessionLoop(runtime: OrbitRuntimeLike, run: RunRecord, agent: Age
       // `activity` lets the provider's inactivity guard see that a silent CLI is waiting on an Orbit tool call, not stuck.
       // (`runtime.mcp` is false once the server failed to start; `false?.activity` is undefined like `null?.activity`.)
       const token = agent.sessionToken
-      session = { id: agent.sessionId || randomUUID(), token, mcpUrl: runtime.mcpUrl(), systemAppend: bounded(sessionGuide(run, agent), SYSTEM_APPEND_LIMIT), resume, activity: () => { try { return (runtime.mcp as McpServerLike | null)?.activity?.(token) || null } catch { return null } } }
+      // Connectors (external MCP servers) go only to a run with full access: all of them to the root, to a helper only those its spawn named. The stable block names exactly these.
+      const connectors = agentConnectors(runtime, run, agent)
+      session = { id: agent.sessionId || randomUUID(), token, mcpUrl: runtime.mcpUrl(), systemAppend: bounded(sessionGuide(run, agent, connectors), SYSTEM_APPEND_LIMIT), resume, connectors, activity: () => { try { return (runtime.mcp as McpServerLike | null)?.activity?.(token) || null } catch { return null } } }
       const base = resume ? null : await runtime.context(run, agent)
       const cursorBeforeTurn = agent.sessionCursor
       try {

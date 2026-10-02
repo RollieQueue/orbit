@@ -23,8 +23,10 @@ const effortTitle = (agent: Agent) => {
 const handoverTitle = (agent: Agent) =>
   (agent.handovers || []).map(item => `${handoverLabel(providers, item.from)} → ${handoverLabel(providers, item.to)}`).join('\n')
 // The copy an agent works in: where it is and, if a merge back left any, how many files conflict.
-const isolationTitle = ({ kind, path, base, conflicts }: AgentIsolation) =>
-  [`${kind === 'worktree' ? 'Git worktree' : 'Копия Orbit'}: ${path}`, base && `Основа: ${base}`, conflicts?.length ? `Конфликтов при слиянии: ${conflicts.length}` : ''].filter(Boolean).join('\n')
+const isolationTitle = ({ kind, path, base, conflicts, held, decided }: AgentIsolation) =>
+  [`${kind === 'worktree' ? 'Git worktree' : 'Копия Orbit'}: ${path}`, base && `Основа: ${base}`, conflicts?.length ? `Конфликтов при слиянии: ${conflicts.length}` : '', held && (decided ? `Слияние было удержано; решение: ${decided === 'merge' ? 'слить' : 'отбросить'}` : 'Слияние удержано: решает родитель помощника или корень (merge_agent)')].filter(Boolean).join('\n')
+// Beside the copy's badge: a held merge waits for the parent's decision, then says what was decided.
+const heldLabel = ({ held, decided }: AgentIsolation) => decided === 'discard' ? ' (отброшена)' : decided === 'merge' ? ' (слита по решению)' : held ? ' (слияние удержано)' : ''
 
 // The agents of a run as rows, each parent followed by its children. An agent whose parent is missing is shown at the top.
 function agentTree(items: Agent[], options: TreeOptions, parentId: string | null = null, depth = 0, seen = new Set<string>()): ReactNode {
@@ -50,7 +52,7 @@ function agentTree(items: Agent[], options: TreeOptions, parentId: string | null
           {!!agent.handovers?.length && <small className="handover-badge" title={handoverTitle(agent)}>⇄ Сменил подписку: {agent.handovers.length}</small>}
           {(tokens !== undefined || !!agent.isolation) && <small className="agent-row-meta">
             {tokens !== undefined && <span className="agent-tokens" title={usageTitle(agent.usage)}>Токены: {tokenCount(tokens)}</span>}
-            {agent.isolation && <span className={`isolation-badge ${agent.isolation.conflicts?.length ? 'conflict' : ''}`} title={isolationTitle(agent.isolation)}>Изолированная копия</span>}
+            {agent.isolation && <span className={`isolation-badge ${agent.isolation.conflicts?.length ? 'conflict' : ''}`} title={isolationTitle(agent.isolation)}>Изолированная копия{heldLabel(agent.isolation)}</span>}
           </small>}
         </span>
         <span className="agent-state">{activityLabel(agent)}</span>

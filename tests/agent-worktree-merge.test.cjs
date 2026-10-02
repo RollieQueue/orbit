@@ -3,7 +3,7 @@
 // copies work, and removing a copy never follows its links. Everything runs against real temporary git repositories.
 // The tests are spread over agent-worktree*.test.cjs, which run side by side (the fixtures are in helpers-worktree.cjs).
 // This part merges a finished helper's changes back: added, modified and deleted files, line by line, a follow-up merge, a
-// CRLF working tree, and the merge report.
+// CRLF working tree, the merge report and the report of a merge held back.
 const test = require('node:test')
 const assert = require('node:assert/strict')
 const fs = require('node:fs')
@@ -91,4 +91,26 @@ test('the merge report stays short however many files conflict, and says so when
   assert.match(worktree.describeMerge(copy, { ok: true, merged: [], conflicts: [], identical: 0 }), /nothing to merge/)
   const many = Array.from({ length: 20 }, (_, index) => ({ path: `m${index}.txt`, kind: 'modify' }))
   assert.match(worktree.describeMerge(copy, { ok: true, merged: many, conflicts: [], identical: 3 }), /20 file\(s\) \(modified: m0\.txt, .*m7\.txt, and 12 more\)/)
+})
+
+test('the held report counts what a merge would: new and binary files too, lines added and removed, files beyond the workspace apart', async t => {
+  const dir = repo(t, { 'pkg/a.txt': 'one\ntwo\n', 'pkg/old.txt': 'x\ny\nz\n', 'top.txt': 't\n' })
+  const { copy } = await copyOf(t, path.join(dir, 'pkg'))
+  put(copy.workspace, { 'a.txt': 'one\nTWO\nthree\n', 'new.txt': 'n\n' })
+  fs.writeFileSync(path.join(copy.workspace, 'blob.bin'), Buffer.from([0, 1, 2, 0]))
+  fs.rmSync(path.join(copy.workspace, 'old.txt'))
+  put(copy.dir, { 'top.txt': 'changed outside the workspace\n' })
+  const head = git(dir, 'rev-parse', 'HEAD'), before = fs.readFileSync(path.join(dir, 'pkg', 'a.txt'), 'utf8')
+  const report = await worktree.describeHeld(copy)
+  assert.match(report, /^HELD MERGE: the helper's changes are HELD and not merged into /)
+  assert.match(report, /\nChanges: 4 file\(s\) \(2 added, 1 deleted, 1 modified\), \+3 -4 lines, 1 binary\.\n/)
+  assert.match(report, /\nadded: pkg\/blob\.bin, pkg\/new\.txt; deleted: pkg\/old\.txt; modified: pkg\/a\.txt\.\n/)
+  assert.match(report, /NOT MERGEABLE: 1 file\(s\) changed outside the helper's workspace .*\(top\.txt\)/)
+  assert.ok(report.includes(`Copy (a git worktree): ${copy.dir}; the helper's workspace in it: ${copy.workspace}; base commit ${copy.base.slice(0, 7)}.`))
+  assert.ok(report.includes(`merge_agent {agentId: "${copy.agentId}", action: "merge"}`))
+  assert.equal(git(dir, 'rev-parse', 'HEAD'), head)
+  assert.equal(fs.readFileSync(path.join(dir, 'pkg', 'a.txt'), 'utf8'), before, 'reading the copy merges nothing')
+  assert.equal(fs.existsSync(path.join(dir, 'pkg', 'new.txt')), false)
+  const clean = await copyOf(t, dir)
+  assert.match(await worktree.describeHeld(clean.copy), /\nChanges: none \(the helper changed no files\)\.\n/)
 })

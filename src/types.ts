@@ -49,7 +49,7 @@ export type AgentUsage = { inputTokens: number; outputTokens: number; cachedInpu
 // What a run reports of tokens: the sum of its agents' (run.info events and the saved run), null until anything was reported.
 export type RunUsage = { providerTurns: number; workerTurns?: number; inputTokens?: number | null; outputTokens?: number | null; cachedInputTokens?: number }
 // `base`: what the copy was made from; `conflicts`: the files whose changes could not be merged back.
-export type AgentIsolation = { kind: 'worktree' | 'orbit'; path: string; base: string; conflicts?: string[] }
+export type AgentIsolation = { kind: 'worktree' | 'orbit'; path: string; base: string; held?: boolean; decided?: 'merge' | 'discard'; conflicts?: string[] }
 export type AgentFiles = { read: string[]; wrote: string[] }
 export type AgentTransport = 'session' | 'envelope'
 // One provider turn of one agent. `endedAt` is missing while the turn is still running.
@@ -204,6 +204,13 @@ export type Capability = {
   editedBy?: string
   revisions?: { version: number; name: string; description: string; instructions: string; updatedAt: string }[]
 }
+// A connector (an external MCP server agents add with connector_add; electron/connectors.mts) as the window sees it: no env or
+// header values, a url without its query values.
+export type ConnectorView = {
+  name: string; description: string; scope: 'global' | 'project'; enabled: boolean; addedAt: string; transport: 'stdio' | 'http'
+  command?: string; args?: string[]; envKeys?: string[]; url?: string; headerNames?: string[]; shadowedBy?: 'global' | 'project'
+}
+export type ConnectorTestResult = { ok: boolean; name: string; transport: 'stdio' | 'http'; tools?: { name: string; description?: string }[]; server?: string; error?: string; elapsedMs: number }
 export type Workspace = GitContext & { name: string; description?: string }
 // The endless improvement loop of one chat (renderer-driven, saved with the chat): while active and the improvement switch
 // is on, each ended run of the chat is followed by the next task as a new run with a fresh context (src/improvement-loop.ts).
@@ -217,7 +224,11 @@ export type ImprovementLoop = {
   startFailures?: number; busyStarts?: number
   lastRunId?: string; startingAt?: number; closedKeys: string[]; stopped?: { reason: LoopStopReason; at: string }
 }
-export type ChatThread = { id: string; title: string; messages: Message[]; updated: string; loop?: ImprovementLoop }
+// A later run of a chat that its root agent scheduled with schedule_wakeup (electron/runtime/wakeups.mts); the renderer keeps
+// and fires it (src/wakeups.ts). dueAt = when it is due (ms); createdAt = when it was scheduled (ISO); runId = the run that
+// scheduled it. manual = the user pressed «Сейчас». retryAt / failures = a start that was refused: not before retryAt (ms).
+export type Wakeup = { id: string; dueAt: number; task: string; reason: string; createdAt: string; runId?: string; manual?: boolean; retryAt?: number; failures?: number }
+export type ChatThread = { id: string; title: string; messages: Message[]; updated: string; loop?: ImprovementLoop; wakeups?: Wakeup[] }
 export type Project = { id: string; workspace: Workspace; chats: ChatThread[]; activeChatId?: string; globalMemoryEnabled?: boolean; deletedChatIds?: string[] }
 // An image a tool result showed the agent (a screenshot it read): the run store's file name, its type and size in bytes.
 export type TraceImage = { id: string; mediaType: string; bytes: number }

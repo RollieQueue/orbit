@@ -36,6 +36,7 @@ const SHELL_FILES = Object.freeze([
   'electron/runtime-client.cjs',
   'electron/fingerprint.cjs',
   'electron/git.mts',
+  'electron/process-table.mts',
   'electron/runtime-protocol.mts',
   'electron/skill-files.mts',
   'electron/window-proxy.cjs',

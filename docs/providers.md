@@ -191,6 +191,15 @@ Approval is for that request only; cancelling the task closes pending dialogs.
 Other modes use `codex exec` with the selected sandbox and no interactive
 escalation. Full access uses `danger-full-access` and `approval_policy="never"`.
 
+Web search: codex-cli 0.155 always offers the model its `web_search` tool, live with the
+`danger-full-access` sandbox and cached-only in `workspace-write` / `read-only`. An Ask-mode thread runs
+in `workspace-write` (approvals escalate single actions), so with full access the App Server is launched
+with `-c web_search="live"` as well; restricted modes keep the cached results.
+
+On Windows the Codex CLI often is not on PATH: Orbit also finds the `codex.exe` that the VS Code
+extension bundles (`%USERPROFILE%\.vscode\extensions\openai.chatgpt-*\bin\windows-x86_64\codex.exe`).
+A helper that wants to run Codex by hand (`codex mcp get --json`, `codex --help`) uses that path.
+
 Both Codex transports override `features.multi_agent=false` for the spawned
 process only. Delegation uses Orbit's tools, so child
 agents, their messages and results are owned by Orbit and shown in its UI.
@@ -300,6 +309,21 @@ as `effortSource`. A level the model does not offer is moved to the nearest one 
 first (`reasoning-levels.mts`; handovers use the same rule), and `spawn_agent` answers with the
 level and why.
 The agent inspector displays the effective effort. Changes apply to new tasks.
+
+A helper stays on the subscription the caller gave it unless Orbit's automatic failover moves it (quota nearly used
+up or refused, a failing or silent model). `spawn_agent` controls that move: `failover: "none"` pins the helper
+(it never changes subscription; out of quota or failing, it stops with an error that names the provider and the reason,
+which `wait_agent` shows), and `avoidProviders: ["claude"]` lists subscriptions it is never moved to or routed onto.
+A `kind: "review"` with a `providerId` other than the caller's is pinned by default (an independent judge of another
+vendor must not quietly become the producer's); `failover: "auto"` allows the move. With a `kind`, a `providerId` and no
+`model`, a pinned helper whose subscription has no usable model now (all out of quota) is not started
+(`provider_unavailable`); a free one starts and `routed.note` says it may be moved. Whatever moved, `wait_agent` and
+`list_agents` report it as `failedOver` (`from`, `to`, `switches`, `why`; `wait_agent` adds `steps`), also when the
+agent moved before its first turn. `avoidProviders` works per provider id: Cursor can serve Claude models, so for a
+strict vendor rule use `failover: "none"`.
+
+`spawn_agent {connectors: [names]}` passes external MCP servers (connectors) to a helper: none by default, only names the caller itself has
+(the root: every enabled connector); see "Connectors" in ARCHITECTURE.md.
 
 Codex uses `model_reasoning_effort` for exec and `effort` for App Server; levels
 come from its local catalog. Claude receives `--effort`. Google models (Antigravity)

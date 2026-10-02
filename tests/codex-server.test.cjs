@@ -118,3 +118,17 @@ test('App Server counts each model call once, and the replay after thread/resume
   await closeAllSessions()
   assert.deepEqual(await turn({ id: 'thread-usage-unseen', resume: true }, 'one call'), figures(1000, 100, 10))
 })
+
+// codex-cli 0.155 gives an App Server thread (workspace-write sandbox) only cached web search; full access gets live search
+// as `codex exec --sandbox danger-full-access` does, other access modes keep the cached results.
+test('App Server: live web search with full access only, for one-shot and session launches', async () => {
+  const { runCodexSessionTurn } = require('../electron/codex-server.mts')
+  for (const [accessMode, live] of [['danger-full-access', true], ['workspace-write', false], ['read-only', false]]) {
+    for (const start of [helpers => runCodexServer({ workspace: process.cwd(), accessMode, approvalPolicy: 'on-request', prompt: 'x' }, helpers), helpers => runCodexSessionTurn({ workspace: process.cwd(), accessMode, approvalPolicy: 'on-request', prompt: 'x' }, { id: null, resume: false }, helpers)]) {
+      let seen = null
+      const capture = { resolveLaunch: (_command, args) => { seen = args; throw new Error('captured') }, terminateProcess, createLineReader: _testing.createLineReader }
+      await assert.rejects(start(capture), /captured/)
+      assert.equal(seen.join(' ').includes('web_search="live"'), live, `${accessMode}: ${seen.join(' ')}`)
+    }
+  }
+})

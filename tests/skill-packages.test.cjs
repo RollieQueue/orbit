@@ -430,3 +430,75 @@ test('the per-scope cap holds for package skills: a new skill that cannot displa
   assert.equal(skills.save(pack(61), agent).evicted, 1, 'a package displaces the last plain skill')
   assert.throws(() => skills.save(pack(62), agent), /Skill limit/, 'and then nothing is left to displace')
 })
+
+test('fromDir parses SKILL.md frontmatter; skill.json wins on conflicts; oversized files yield a precise error', t => {
+  const { root, a, open } = fixture(t), skills = open()
+  const source = path.join(root, 'skill-source')
+  fs.mkdirSync(source)
+  fs.writeFileSync(path.join(source, 'SKILL.md'), '---\nname: MD Name\ndescription: MD Desc. Use when MD.\n---\nMD Instructions')
+  
+  const savedMd = skills.save({ workspace: a, fromDir: source }, agent).entry
+  assert.equal(savedMd.name, 'MD Name')
+  assert.equal(savedMd.description, 'MD Desc. Use when MD.')
+  assert.equal(savedMd.whenToUse, 'Use when MD.')
+  assert.match(savedMd.instructions, /relative paths are relative to the package folder/)
+  assert.match(savedMd.instructions, /MD Instructions/)
+  
+  // both present
+  fs.writeFileSync(path.join(source, 'skill.json'), JSON.stringify({ name: 'JSON Name' }))
+  const savedBoth = skills.save({ workspace: a, fromDir: source }, agent).entry
+  assert.equal(savedBoth.name, 'JSON Name')
+  assert.equal(savedBoth.description, 'MD Desc. Use when MD.')
+  
+  // oversize handling
+  const bigSource = path.join(root, 'skill-source-big')
+  fs.mkdirSync(bigSource)
+  fs.writeFileSync(path.join(bigSource, 'SKILL.md'), '---\nname: Big\n---\nBig')
+  const bigBuffer = Buffer.alloc(1024 * 513) // 513 KB
+  fs.writeFileSync(path.join(bigSource, 'large1.docx'), bigBuffer)
+  fs.writeFileSync(path.join(bigSource, 'large2.pptx'), bigBuffer)
+  
+  assert.throws(() => skills.save({ workspace: a, fromDir: bigSource }, agent), /2 files are larger than 512 KB: "large1.docx" \(513 KB\), "large2.pptx" \(513 KB\)/)
+
+  // SKILL.md with no name -> error
+  const noName = path.join(root, 'skill-no-name')
+  fs.mkdirSync(noName)
+  fs.writeFileSync(path.join(noName, 'SKILL.md'), '---\ndescription: No name here\n---\nBody')
+  assert.throws(() => skills.save({ workspace: a, fromDir: noName }, agent), /name and instructions are required/)
+
+  // block scalar and quoted strings in frontmatter
+  const blockSource = path.join(root, 'skill-block')
+  fs.mkdirSync(blockSource)
+  fs.writeFileSync(path.join(blockSource, 'SKILL.md'), '---\nname: "Block Skill"\ndescription: >\n  A long description\n  that spans lines. Use when block.\n---\nBlock body')
+  const savedBlock = skills.save({ workspace: a, fromDir: blockSource }, agent).entry
+  assert.equal(savedBlock.name, 'Block Skill')
+  assert.match(savedBlock.description, /long description/)
+  assert.equal(savedBlock.whenToUse, 'Use when block.')
+  assert.match(savedBlock.instructions, /Block body/)
+})
+
+// Agent Skills frontmatter as the ecosystem writes it: a block scalar before other keys must not swallow them, nested
+// mappings are skipped, a closing --- may end the file; a package of exactly the file limit installs.
+test('SKILL.md: block scalars end at the next key, nested keys are skipped, the file limit is inclusive', t => {
+  const { root, a, open } = fixture(t), skills = open()
+  const folded = path.join(root, 'skill-folded')
+  fs.mkdirSync(folded)
+  fs.writeFileSync(path.join(folded, 'SKILL.md'), '\uFEFF---\r\ndescription: >\r\n  Builds charts\r\n  from tables.\r\n\r\n  Use when the user asks for a chart, e.g. a bar chart.\r\nmetadata:\r\n  name: nested-not-the-name\r\nname: chart-maker # the id\r\nlicense: MIT\r\n---')
+  const chart = skills.save({ workspace: a, fromDir: folded }, agent).entry
+  assert.equal(chart.name, 'chart-maker')
+  assert.equal(chart.description, 'Builds charts from tables.\nUse when the user asks for a chart, e.g. a bar chart.')
+  assert.equal(chart.whenToUse, 'Use when the user asks for a chart, e.g. a bar chart.')
+  const literal = path.join(root, 'skill-literal')
+  fs.mkdirSync(literal)
+  fs.writeFileSync(path.join(literal, 'SKILL.md'), "---\nname: 'it''s'\ndescription: |\n  line one\n    indented\n---\nBody")
+  const kept = skills.save({ workspace: a, fromDir: literal }, agent).entry
+  assert.equal(kept.name, "it's")
+  assert.equal(kept.description, 'line one\n  indented')
+  const full = path.join(root, 'skill-full')
+  fs.mkdirSync(full)
+  fs.writeFileSync(path.join(full, 'SKILL.md'), '---\nname: full\ndescription: Forty files.\n---\nBody')
+  for (let i = 1; i < 40; i++) fs.writeFileSync(path.join(full, `f${i}.txt`), 'x')
+  assert.equal(skills.save({ workspace: a, fromDir: full }, agent).entry.name, 'full', 'exactly 40 files install')
+  fs.writeFileSync(path.join(full, 'f40.txt'), 'x')
+  assert.throws(() => skills.save({ workspace: a, fromDir: full }, agent), /at most 40 files \(found 41\)/)
+})

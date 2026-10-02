@@ -3,7 +3,7 @@
 // Also the model a new helper gets for its kind of work (routeSpawn), judged on the same provider list and quotas.
 import { randomUUID } from 'node:crypto'
 import { classifyQuotaError, assess } from '../quota.mts'
-import { replacements, handoverNote, targetLabel, unreachable } from '../failover.mts'
+import { replacements, handoverNote, targetLabel, unreachable, isPinned } from '../failover.mts'
 import { candidates, route } from '../model-routing.mts'
 import type { AgentRecord, CatalogEntry, HandoverReason, HandoverRecord, HandoverRequest, InterruptedTurn, ModelTarget, OrbitRuntimeLike, RoutedSpawn, RunRecord, ToolArgs } from '../types.mts'
 import { withoutGoogleReasoning, publicAgent, bounded, clip, TurnBudgetError, diagnostics, fromProvider } from './util.mts'
@@ -81,6 +81,12 @@ async function preflightQuota(runtime: OrbitRuntimeLike, run: RunRecord, agent: 
 // Moves the agent to the best comparable subscription and tells the newcomer what it takes over. False: nobody suitable.
 async function handover(runtime: OrbitRuntimeLike, run: RunRecord, agent: AgentRecord, { reason, level = null, error = null, interrupted = null }: HandoverRequest): Promise<boolean> {
   if (agent.handovers.length >= MAX_HANDOVERS) return false
+  // A helper pinned to its subscription (spawn_agent failover 'none') never moves: replacements() would find nobody anyway,
+  // so the lookups are skipped, and the trace says why it stays.
+  if (agent.failover === 'none') {
+    if (reason !== 'stalled' && reason !== 'failed' && agent.quotaWarned !== agent.providerId) { agent.quotaWarned = agent.providerId; runtime.trace(run, agent.id, 'quota', `${agent.providerId}: ${reason === 'approaching' ? 'квота на исходе' : 'квота исчерпана'}; помощник привязан к подписке (failover none), замена не ищется`) }
+    return false
+  }
   const catalog = await runtime.providerCatalog(run)
   const ids = new Set([agent.providerId, ...catalog.filter(entry => entry.available !== false).map(entry => entry.id), ...run.providerPool.map(member => member.providerId)])
   // Candidates are judged on fresh figures; one slow probe does not hold the agent for long.
@@ -145,7 +151,8 @@ async function recoverProvider(runtime: OrbitRuntimeLike, run: RunRecord, agent:
     runtime.quota!.markExhausted?.(agent.providerId, { resetsAt: refusal.resetsAt, reason: refusal.message })
     if (await runtime.handover(run, agent, { reason: 'exhausted', level: { usedPercent: 100, window: null, resetsAt: refusal.resetsAt }, error, interrupted })) return true
     const until = refusal.resetsAt ? ` (лимит снимется ${new Date(refusal.resetsAt).toLocaleString('ru-RU', { dateStyle: 'short', timeStyle: 'short' })})` : ''
-    throw new Error(`Квота подписки «${agent.providerId}» исчерпана${until}, а подходящей замены среди подключённых подписок нет. Подключите другую подписку, разрешите более слабую модель в разделе «Квоты» или дождитесь сброса. Ход и журнал действий сохранены. Ответ провайдера: ${clip((error as Error).message, 240)}`, { cause: error })
+    const pinned = agent.failover === 'none' ? ` Помощник привязан к этой подписке (failover 'none'): Orbit не переносит его на другую.` : ''
+    throw new Error(`Квота подписки «${agent.providerId}» исчерпана${until}, а подходящей замены среди подключённых подписок нет.${pinned} Подключите другую подписку, разрешите более слабую модель в разделе «Квоты» или дождитесь сброса. Ход и журнал действий сохранены. Ответ провайдера: ${clip((error as Error).message, 240)}`, { cause: error })
   }
   if (!agent.trial) {
     // A provider that failed the turn moves the agent on too: an agent in error is replaced, not lost (the user's rule,
@@ -154,6 +161,7 @@ async function recoverProvider(runtime: OrbitRuntimeLike, run: RunRecord, agent:
     // agent of this run for a while; without a replacement the provider's own error stops the agent, as before.
     if (!fromProvider(error)) return false
     if (unreachable(error)) run.brokenProviders.set(agent.providerId, runtime.clock() + BROKEN_PROVIDER_MS)
+    if (agent.failover === 'none') throw new Error(`Подписка «${agent.providerId}» не смогла выполнить ход, а помощник привязан к ней (failover 'none'), поэтому на другую он не переносится: ${clip((error as Error).message, 240)}`, { cause: error })
     return runtime.handover(run, agent, { reason: 'failed', level: null, error, interrupted })
   }
   // The replacement itself failed before completing a turn: try the next one, never the same twice. A subscription that
@@ -182,7 +190,7 @@ async function recoverStall(runtime: OrbitRuntimeLike, run: RunRecord, agent: Ag
   }
   clearSilentTurns(agent)
   if (runtime.failoverActive(run) && await runtime.handover(run, agent, { reason: 'stalled', error, interrupted })) return true
-  const why = runtime.failoverActive(run) ? 'подходящей замены среди подключённых подписок нет' : 'автозамена подписок выключена'
+  const why = agent.failover === 'none' ? "помощник привязан к подписке (failover 'none')" : runtime.failoverActive(run) ? 'подходящей замены среди подключённых подписок нет' : 'автозамена подписок выключена'
   throw new Error(`Модель ${label} не присылала событий ${silent} мин два хода подряд, поэтому сторож Orbit остановил агента: ${why}. Журнал действий сохранён.`, { cause: error })
 }
 
@@ -208,9 +216,14 @@ async function routeSpawn(runtime: OrbitRuntimeLike, run: RunRecord, parent: Age
     known: new Set([parent.providerId, run.providerId, ...run.providerPool.map(member => member.providerId)]),
     pool: run.providerPool, runProviderId: run.providerId, quota: runtime.quota, threshold: run.failover.switchAtPercent, now,
     skip: new Set([...run.brokenProviders].filter(([, until]) => until > now).map(([id]) => id)),
+    ...(spec.avoidProviders?.length ? { avoid: new Set(spec.avoidProviders) } : {}),
   })
   const passed = skipped.length ? { skipped } : {}
-  if (!choice) return { spec, routed: { kind, model: null, ...passed, note: 'No model of the routing table can take this work now; the helper got the model it gets without a kind.' } }
+  if (!choice) {
+    // The caller named the subscription and none of its models can take the work: say so, and that failover may move the helper.
+    const named = spec.providerId ? ` All ${kind} models of ${spec.providerId} are unusable now (${skipped.join('; ')}); the helper starts on ${spec.providerId} with its default model${isPinned(spec, parent.providerId) ? ' and does not change subscription' : ' and Orbit may move it to another subscription (wait_agent then shows failedOver; pass failover "none" to forbid it)'}.` : ''
+    return { spec, routed: { kind, model: null, ...passed, note: `No model of the routing table can take this work now; the helper got the model it gets without a kind.${named}` } }
+  }
   // The level the audit measured for this model goes along as `routed.reasoningEffort`; createAgent ranks it under the
   // caller's and the user's pool level and above the parent's and the provider settings' (agents.decideEffort).
   return { spec: { ...spec, providerId: choice.providerId, model: choice.model }, routed: { kind, model: `${choice.providerId}/${choice.model}`, ...passed, ...(choice.reasoningEffort ? { reasoningEffort: choice.reasoningEffort } : {}) } }

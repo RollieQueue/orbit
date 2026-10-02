@@ -69,6 +69,9 @@ function sendAgentMessage(runtime: OrbitRuntimeLike, run: RunRecord, sender: Age
   const target = runtime.resolveAgent(run, args.agentId)
   if (target.id === sender.id) throw new Error('Send messages to another agent, not yourself')
   if (['error', 'cancelled'].includes(target.status)) throw new Error('Agent is unavailable; failed agents can be retried with followup_agent')
+  const deciding = run.deciding?.get(target.id)
+  if (deciding) throw new Error(`A ${deciding} decision for ${target.name} is in progress (merge_agent) and a message would wake it in the copy that decision uses; try again when it finishes`)
+  if (target.isolation?.decided === 'discard') throw new Error(`${target.name} was discarded with merge_agent and its isolated copy is gone, so it cannot be messaged`)
   if (target.id !== 'root' && (target.turns >= ceiling(run.limits, 'maxTurns') || (target.status === 'done' && run.usage.workerTurns >= ceiling(run.limits, 'maxTotalTurns')))) throw new Error('Recipient has no remaining work turns; its existing findings are available in list_agents')
   const text = String(args.message || '').trim()
   if (!text) throw new Error('A message is required')
@@ -111,6 +114,9 @@ function postUserMessage(runtime: OrbitRuntimeLike, runId: string, agentId: stri
   const text = bounded(String(value ?? '').trim(), USER_MESSAGE_CHARS) || (attachments.length ? FILES_ONLY : '')
   if (!text) throw new Error('Сообщение пустое.')
   if (target.status === 'error' || target.status === 'cancelled') throw new Error(`${target.name} остановлен и сообщений больше не получает.`)
+  const deciding = run.deciding?.get(target.id)
+  if (deciding) throw new Error(`Решение merge_agent (${deciding === 'merge' ? 'слить' : 'отбросить'}) для ${target.name} ещё выполняется, и сообщение подняло бы его в копии, которую это решение использует: напишите снова, когда оно закончится.`)
+  if (target.isolation?.decided === 'discard') throw new Error(`${target.name} отброшен (merge_agent): его изолированная копия удалена, сообщений он больше не получает.`)
   // A root that has answered ends the run in a moment: nothing may start again in between.
   if (run.agentNodes.get('root')?.status === 'done') throw new Error('Агент уже закончил ответ: напишите новое сообщение в чат, когда он появится.')
   // A helper in (or past) its last allowed turn would never read the message: its last turn's prompt is already built.

@@ -1,18 +1,22 @@
 // Orbit tool execution, one entry point for both transports: the user approval gate, shared project notes and the
-// improvement plan, workspace and index tools, and the team tools (run_profile among them: run-profile.mts does the
+// improvement plan and wake-ups, workspace and index tools, and the team tools (run_profile among them: run-profile.mts does the
 // measuring); memory, skills and model assessments are in knowledge.mts. The registry (tool-registry.mts) validates MCP
 // arguments before a call gets here.
 import { createHash, randomUUID } from 'node:crypto'
 import { executeWorkspaceTool, WORKSPACE_TOOLS } from '../runtime-tools.mts'
 import { projectPacket, saveNote } from '../shared-context.mts'
 import * as chatMemory from '../chat-memory.mts'
+import { pageText } from '../text.mts'
 import { AGENT_TERMINAL, ceiling, bounded, clip, abortable, agentWorkspace, logicalWorkspace } from './util.mts'
 import { noteIndex } from './prompts.mts'
 import { ranOnFields } from './agents.mts'
 import { stopHelper } from './pause.mts'
+import { decideHeld } from './isolation.mts'
 import * as knowledge from './knowledge.mts'
+import { executeConnectorTool } from './connector-tools.mts'
 import * as restart from './restart.mts'
 import * as improvement from './improvement.mts'
+import * as wakeups from './wakeups.mts'
 import { profileRun, formatProfile, span } from './run-profile.mts'
 import type { ProfileSource } from './run-profile.mts'
 import type { AgentRecord, ApprovalRequest, Communication, Observation, OrbitRuntimeLike, RunRecord, ToolArgs, WorkspaceContext } from '../types.mts'
@@ -177,7 +181,15 @@ async function executeTool(runtime: OrbitRuntimeLike, run: RunRecord, agent: Age
     }
     const note = (packet.notes || []).find(item => item.key === String(args.key))
     if (!note) throw new Error(`No shared note has the key "${clip(args.key, 80)}"; call context_read without a key to list the keys`)
-    return { key: note.key, summary: note.summary, stale: note.stale, files: Object.keys(note.files || {}), updatedAt: note.updatedAt }
+    // A helper's note keeps only the start of its report; offset or maxChars read the whole report from its run record, page by page.
+    const report = chatMemory.fullReport(note.key, note.summary, run.chatId, { runId: run.runId, agents: run.agentNodes.values() }, run.priorRuns)
+    const paged = args.offset !== undefined || args.maxChars !== undefined
+    const shown = pageText(paged && report ? report : note.summary, args.offset, args.maxChars, 6000)
+    const { text, ...position } = shown
+    return {
+      key: note.key, summary: text, ...position, ...(paged && report ? { source: 'full report' } : report ? { fullReportChars: report.length, hint: 'summary is the start of the report; repeat with offset 0 to read it whole, page by page' } : {}),
+      stale: note.stale, files: Object.keys(note.files || {}), updatedAt: note.updatedAt,
+    }
   }
   if (name === 'context_save') {
     run.sharedContext = saveNote(runtime.contextStore, run.workspace, run.sharedContext, args)
@@ -188,7 +200,10 @@ async function executeTool(runtime: OrbitRuntimeLike, run: RunRecord, agent: Age
     if (!run.improvementMode) throw new Error('Improvement mode is disabled')
     return improvement.updatePlan(runtime, run, args)
   }
+  if (name === 'schedule_wakeup') return wakeups.schedule(runtime, run, agent, args)
+  if (name === 'cancel_wakeup') return wakeups.cancel(runtime, run, agent, args)
   if (name === 'model_evaluate' || name === 'memory_search' || name === 'memory_save' || name === 'memory_forget' || name.startsWith('capability_')) return knowledge.executeKnowledgeTool(runtime, run, agent, name, args)
+  if (name.startsWith('connector_')) return executeConnectorTool(runtime, run, agent, name, args, signal)
   if (name === 'restart_orbit') return restart.executeRestart(runtime, run, agent, args)
   if (run.approvalPolicy === 'on-request' && ['write_file', 'edit_file', 'run_command'].includes(name) && run.accessMode !== 'read-only') {
     if (!await runtime.approve(run, agent, { tool: name, arguments: args }, signal)) throw new Error('User declined this operation')
@@ -219,6 +234,7 @@ async function executeTool(runtime: OrbitRuntimeLike, run: RunRecord, agent: Age
   if (name === 'team_history') return chatMemory.history(run.priorRuns, args, Math.max(4000, run.limits.maxOutputChars - 1000))
   if (name === 'run_profile') return profileOf(runtime, run, args)
   if (name === 'spawn_agent') return runtime.spawnSubAgent(run.runId, agent.id, args)
+  if (name === 'merge_agent') return decideHeld(runtime, run, agent, args)
   if (name === 'list_agents') return runtime.agentDirectory(run)
   if (name === 'ask_team') return runtime.askTeam(run, agent, args)
   if (name === 'send_message') return runtime.sendAgentMessage(run, agent, args)

@@ -22,6 +22,8 @@
 const childProcess = require('node:child_process')
 const path = require('node:path')
 const { parseFromChild, deserializeError, codedError, PROTOCOL_VERSION, ERROR_CODES } = require('./runtime-protocol.mts')
+// The process table is read here and by the runtime's process-reaper.mts alike; both files belong to the shell.
+const { listProcessTable, parseProcessTable } = require('./process-table.mts')
 
 /** @typedef {import('./runtime-protocol.mts').LogLevel} LogLevel */
 /** @typedef {import('./runtime-protocol.mts').ShutdownMode} ShutdownMode */
@@ -76,13 +78,7 @@ const REPEATABLE = new Set([
  * @property {RuntimeErrorInfo} [lastError] set while the current runtime process runs after an uncaught error (at most
  *   one update a second); a new process starts without it
  */
-/**
- * One process of the system's process table, as the orphan check reads it.
- * @typedef {object} ProcessRow
- * @property {number} pid
- * @property {number} ppid the pid of the process that created it (Windows keeps it after that process has exited)
- * @property {number | null} created when the OS created it (ms since the epoch); null when unknown
- */
+/** @typedef {import('./process-table.mts').ProcessRow} ProcessRow */
 /**
  * The runtime process as the client drives it. adaptUtilityProcess (Electron) and adaptChildProcess (Node) make one
  * from a real process; tests pass fakes.
@@ -231,62 +227,6 @@ function killProcessTree(pid) {
     }
     try { process.kill(pid, 'SIGKILL') } catch { /* Already gone. */ }
     resolve()
-  })
-}
-
-/**
- * Prints the process table as JSON, `[{ p, pp, c }]`: pid, parent pid, creation time in ms since the epoch. Win32_Process
- * keeps the pid of a parent that has exited, which is how the orphans of a crashed runtime are found; run through
- * -EncodedCommand, so nothing in it needs quoting.
- */
-const PROCESS_TABLE_SCRIPT = [
-  "$ProgressPreference = 'SilentlyContinue'",
-  "$rows = Get-CimInstance -Query 'SELECT ProcessId, ParentProcessId, CreationDate FROM Win32_Process' | ForEach-Object {",
-  '  $created = $null',
-  '  if ($_.CreationDate) { $created = ([DateTimeOffset]$_.CreationDate).ToUnixTimeMilliseconds() }',
-  '  [pscustomobject]@{ p = [long]$_.ProcessId; pp = [long]$_.ParentProcessId; c = $created }',
-  '}',
-  'ConvertTo-Json -InputObject @($rows) -Compress',
-].join('\n')
-/** How long the process table may take to read (PowerShell starts in ~0.5 s). */
-const PROCESS_TABLE_TIMEOUT_MS = 15000
-
-/**
- * PROCESS_TABLE_SCRIPT's output as rows; null when it is not that.
- * @param {string} text
- * @returns {ProcessRow[] | null}
- */
-function parseProcessTable(text) {
-  /** @type {unknown} */
-  let parsed
-  try { parsed = JSON.parse(text.trim()) } catch { return null }
-  const list = Array.isArray(parsed) ? parsed : (parsed !== null && typeof parsed === 'object' ? [parsed] : null)
-  if (!list) return null
-  /** @type {ProcessRow[]} */
-  const rows = []
-  for (const item of list) {
-    const fields = /** @type {{ p?: unknown, pp?: unknown, c?: unknown } | null} */ (item !== null && typeof item === 'object' ? item : null)
-    if (!fields || !Number.isSafeInteger(fields.p) || !Number.isSafeInteger(fields.pp)) continue
-    rows.push({ pid: Number(fields.p), ppid: Number(fields.pp), created: typeof fields.c === 'number' && Number.isFinite(fields.c) ? fields.c : null })
-  }
-  return rows
-}
-
-/**
- * The system's process table, read once: on Windows Win32_Process through PowerShell. Null elsewhere, or when it cannot
- * be read in time; the orphan check then leaves every process alone.
- * @param {number} [timeoutMs]
- * @returns {Promise<ProcessRow[] | null>}
- */
-function listProcessTable(timeoutMs = PROCESS_TABLE_TIMEOUT_MS) {
-  if (process.platform !== 'win32') return Promise.resolve(null)
-  const systemRoot = process.env.SystemRoot
-  const powershell = systemRoot ? path.join(systemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe') : 'powershell.exe'
-  const encoded = Buffer.from(PROCESS_TABLE_SCRIPT, 'utf16le').toString('base64')
-  return new Promise((resolve) => {
-    childProcess.execFile(powershell, ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', encoded], {
-      windowsHide: true, timeout: timeoutMs, maxBuffer: 16 * 1024 * 1024,
-    }, (error, stdout) => resolve(error ? null : parseProcessTable(String(stdout))))
   })
 }
 

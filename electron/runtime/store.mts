@@ -17,7 +17,8 @@ function snapshot(runtime: OrbitRuntimeLike, run: RunRecord): RunSnapshot {
     workspace: run.workspace, status: run.status, providerId: run.providerId, model: run.model,
     accessMode: run.accessMode, approvalPolicy: run.approvalPolicy, reasoningEffort: run.reasoningEffort, memoryEnabled: run.memoryEnabled, improvementMode: run.improvementMode, improvements: run.improvements, improvementStatus: run.improvementStatus,
     startedAt: run.startedAt, finishedAt: run.finishedAt, limits: run.limits, usage: run.usage,
-    agents: [...run.agentNodes.values()].map(publicAgent),
+    // Events leave the long report out (publicAgent); the saved record keeps it.
+    agents: [...run.agentNodes.values()].map(agent => ({ ...publicAgent(agent), ...(agent.report ? { report: agent.report } : {}) })),
     traces: run.traces, messages: run.messages, communications: run.communications, summary: run.summary, error: run.error,
     files: run.fileActivity.snapshot(), changes: run.changes.snapshot(), router: { ...run.router.stats },
     // Restarts: what a continuation starts again from (with the files the user attached in the run), the link to the run a
@@ -29,6 +30,8 @@ function snapshot(runtime: OrbitRuntimeLike, run: RunRecord): RunSnapshot {
     // code was applied or left for a later restart (the next run of the chat checks all of the code then).
     ...(run.loopTask ? { loopTask: run.loopTask } : {}), ...(run.improvementHandoff ? { improvementHandoff: run.improvementHandoff } : {}),
     ...(run.restartApplied ? { restartApplied: true } : {}), ...(run.restartDeferred ? { restartDeferred: true } : {}),
+    // The chat's pending scheduled wake-ups as this run ended with them (a continuation after a restart starts from them).
+    ...(run.wakeups.length ? { wakeups: run.wakeups } : {}),
   })
 }
 // A run's file changes with their diff text: the live run first, then the saved one.

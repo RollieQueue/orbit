@@ -5,13 +5,20 @@ import os from 'node:os'
 import path from 'node:path'
 import { randomUUID } from 'node:crypto'
 import * as worktree from '../agent-worktree.mts'
-import type { AgentCopy, SweepResult } from '../agent-worktree.mts'
-import type { AgentRecord, IsolationPrepared, OrbitRuntimeLike, RunRecord, Trace } from '../types.mts'
-import { TERMINAL, bounded, clip, agentWorkspace, logicalWorkspace, sameFolder, diagnostics } from './util.mts'
+import { processWatch } from '../process-reaper.mts'
+import type { AgentCopy, RemoveResult, SweepResult } from '../agent-worktree.mts'
+import type { AgentRecord, IsolationPrepared, OrbitRuntimeLike, RunRecord, ToolArgs, Trace } from '../types.mts'
+import { TERMINAL, AGENT_TERMINAL, bounded, clip, agentWorkspace, logicalWorkspace, sameFolder, diagnostics } from './util.mts'
 
 // How long a run that ended waits for its provider processes to unwind before it takes the copies away: a process keeps its
 // working folder locked on Windows. The removal retries on its own after that.
 const SETTLE_MS = 8000
+// Waits for operations to finish, but not for long: a stuck one must not hold the caller.
+async function settle(operations: Iterable<Promise<unknown>>): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  await Promise.race([Promise.allSettled([...operations]), new Promise(resolve => { timer = setTimeout(resolve, SETTLE_MS) })])
+  clearTimeout(timer)
+}
 // Where copies are made without a configured folder (tests, embedders); Orbit's runtime host passes <userData>/worktrees.
 const rootOf = (runtime: OrbitRuntimeLike): string => runtime.worktreeRoot || path.join(os.tmpdir(), 'orbit-worktrees')
 const refusal = (instruction: string): IsolationPrepared => ({ ok: false, reason: 'isolation_unavailable', instruction: `${instruction} Spawn the helper without isolation and give each helper its own files instead.` })
@@ -39,11 +46,11 @@ async function prepareIsolation(runtime: OrbitRuntimeLike, run: RunRecord, paren
   return { ok: true, id, fields: { id, workspace: copy.workspace, isolation: { kind, path: copy.workspace, base: copy.startBase, target: copy.target } } }
 }
 // A copy whose helper was not made after all (a refused name, a limit, a run that ended meanwhile).
-async function discardIsolation(runtime: OrbitRuntimeLike, run: RunRecord, agentId: string): Promise<void> {
+async function discardIsolation(runtime: OrbitRuntimeLike, run: RunRecord, agentId: string): Promise<RemoveResult | undefined> {
   const copy = run.copies?.get(agentId)
-  if (!copy) return
+  if (!copy) return undefined
   run.copies?.delete(agentId)
-  await worktree.removeCopy(copy, rootOf(runtime), run.runId).catch(() => undefined)
+  return await worktree.removeCopy(copy, rootOf(runtime), run.runId).catch((error) => ({ removed: false, patch: null, error: String(error) }))
 }
 
 // A merged file's path as the run's workspace names it. The target is that workspace, or a copy of it, so the path below
@@ -58,6 +65,19 @@ function runPath(run: RunRecord, agent: AgentRecord, copy: AgentCopy, file: stri
 async function mergeIsolated(runtime: OrbitRuntimeLike, run: RunRecord, agent: AgentRecord): Promise<string> {
   const copy = run.copies?.get(agent.id)
   if (!copy || !agent.isolation) return ''
+  // A helper spawned with merge 'hold' keeps its changes in the copy until its parent decides (decideHeld): its result says
+  // what is held. After that decision it merges like any other, and so does its next result.
+  if (agent.isolation.held && agent.isolation.decided === undefined) {
+    runtime.updateAgent(run, agent, { detail: `Holding changes for ${clip(copy.target, 80)}` }, false)
+    const report = await runtime.trackOperation(run, worktree.describeHeld(copy), agent)
+    note(runtime, run, agent.id, report)
+    return report
+  }
+  return (await mergeInto(runtime, run, agent, copy)).report
+}
+// `ok` is false when the merge failed outright (the copy or the target was gone, git could not read the copy): nothing landed.
+async function mergeInto(runtime: OrbitRuntimeLike, run: RunRecord, agent: AgentRecord, copy: AgentCopy): Promise<{ report: string; ok: boolean }> {
+  if (!agent.isolation) return { report: '', ok: false }
   runtime.updateAgent(run, agent, { detail: `Merging changes into ${clip(copy.target, 80)}` }, false)
   // A run operation: the end of the run waits for a merge under way (cleanupIsolation), and the copy is not taken away
   // under it (agent-worktree.mts runs both on one queue).
@@ -72,7 +92,69 @@ async function mergeIsolated(runtime: OrbitRuntimeLike, run: RunRecord, agent: A
   runtime.updateAgent(run, agent, { isolation: { ...agent.isolation, merged: (agent.isolation.merged ?? 0) + result.merged.length, conflicts: result.conflicts.map(item => item.path) } }, false)
   const report = worktree.describeMerge(copy, result)
   note(runtime, run, agent.id, report)
-  return report
+  return { report, ok: result.ok }
+}
+
+// merge_agent: the fate of a held helper, decided by its parent or the root. Every refusal throws before anything is touched.
+// The decision is recorded in the same step as the last check (nothing is awaited between them), so two calls cannot both
+// take it, and the end of the run cannot slip in between; a merge that fails outright, or a discard that cannot save what the
+// copy holds, gives it back and leaves the helper as it was.
+interface HeldDecision { ok: true; agentId: string; action: 'merge' | 'discard'; report: string }
+async function decideHeld(runtime: OrbitRuntimeLike, run: RunRecord, caller: AgentRecord, args: ToolArgs): Promise<HeldDecision> {
+  const action = args.action
+  if (action !== 'merge' && action !== 'discard') throw new Error("merge_agent action is 'merge' or 'discard'")
+  const target = runtime.resolveAgent(run, args.agentId)
+  const label = target.name || target.id
+  // What would refuse the decision right now; the copy and the helper's isolation when nothing does.
+  const vet = (): { copy: AgentCopy; isolation: NonNullable<AgentRecord['isolation']> } => {
+    if (TERMINAL.has(run.status)) throw new Error('The run has ended: its isolated copies are already taken away (changes that were never merged are saved as patches)')
+    if (caller.id !== 'root' && target.parentId !== caller.id) throw new Error(`merge_agent decides only for your own direct helpers; ${label} is not one (the root decides for any helper)`)
+    const { isolation } = target
+    if (!isolation) throw new Error(`${label} is not isolated: only a helper spawned with isolation and merge 'hold' has a merge to decide`)
+    if (!isolation.held) throw new Error(`${label}'s merge was not held (spawned without merge 'hold'): Orbit merges its changes by itself when it finishes`)
+    if (isolation.decided) throw new Error(`${label}'s merge was already decided (${isolation.decided})`)
+    if (!AGENT_TERMINAL.has(target.status)) throw new Error(`${label} is still working: decide when it has finished (wait_agent)`)
+    const copy = run.copies?.get(target.id)
+    if (!copy) throw new Error(`${label}'s isolated copy is gone`)
+    return { copy, isolation }
+  }
+  vet()
+  // A helper that has just finished may still have a process unwinding in its copy: the copy is not touched under it.
+  const unwinding = run.agentOperations.get(target.id)
+  if (unwinding?.size) await settle(unwinding)
+  const { copy, isolation } = vet()
+  if (run.agentOperations.get(target.id)?.size) throw new Error(`${label} is still shutting down its processes: call merge_agent again in a moment`)
+  // Only the call that takes the decision marks it under way, and it alone clears the mark, however the decision ends: while it
+  // is under way followup_agent and messages are refused (agents.mts, mailbox.mts), so nothing starts the helper in the copy
+  // that is being read or removed. After the decision a followup works again, unless the copy was discarded.
+  ;(run.deciding ??= new Map()).set(target.id, action)
+  try { return await carryOut(runtime, run, target, label, action, copy, isolation) } finally { run.deciding?.delete(target.id) }
+}
+async function carryOut(runtime: OrbitRuntimeLike, run: RunRecord, target: AgentRecord, label: string, action: 'merge' | 'discard', copy: AgentCopy, isolation: NonNullable<AgentRecord['isolation']>): Promise<HeldDecision> {
+  runtime.updateAgent(run, target, { isolation: { ...isolation, decided: action } })
+  const reopen = (): void => {
+    const { decided: _taken, ...open } = target.isolation ?? isolation
+    runtime.updateAgent(run, target, { isolation: open })
+  }
+  if (action === 'merge') {
+    const merged = await mergeInto(runtime, run, target, copy)
+    if (!merged.ok) {
+      reopen()
+      throw new Error(`${merged.report}\nThe merge is NOT decided: ${label} is still held; fix the cause and call merge_agent again, or discard it.`)
+    }
+    return { ok: true, agentId: target.id, action, report: merged.report }
+  }
+  const outcome = await runtime.trackOperation(run, runtime.discardIsolation(run, target.id), target)
+  if (outcome?.kept) {
+    if (!TERMINAL.has(run.status)) run.copies?.set(target.id, copy)
+    reopen()
+    throw new Error(`${label}'s changes were NOT discarded: ${outcome.error}. Its copy stays at ${copy.dir} and it is still held: call merge_agent again, or merge it.`)
+  }
+  const report = [`DISCARDED: the changes of ${label} were dropped and not merged into ${copy.target}.`,
+    outcome?.removed === false ? `Its copy at ${copy.dir} could not be removed (${outcome.error}); Orbit removes it when it starts next.` : 'Its isolated copy was removed.',
+    outcome?.patch ? `What the copy held is kept as a patch: ${outcome.patch} (apply it with: git -C "${copy.origin}" apply --3way "${outcome.patch}").` : 'The copy held no changes to keep.'].join('\n')
+  note(runtime, run, target.id, report)
+  return { ok: true, agentId: target.id, action, report }
 }
 
 // The run is over by the time its copies are taken away, and trace() ignores a finished run; where unmerged work went must
@@ -93,10 +175,9 @@ async function cleanupIsolation(runtime: OrbitRuntimeLike, run: RunRecord): Prom
   const copies = [...(run.copies?.values() ?? [])]
   if (!copies.length) return
   run.copies = new Map()
-  // Provider processes still unwinding keep their working folder locked: they finish first, but not for long.
-  let timer: ReturnType<typeof setTimeout> | undefined
-  await Promise.race([Promise.allSettled([...run.operations]), new Promise(resolve => { timer = setTimeout(resolve, SETTLE_MS) })])
-  clearTimeout(timer)
+  // Provider processes still unwinding keep their working folder locked: they finish first, but not for long. That includes
+  // what a CLI left running (a test runner started in the copy), which process-reaper.mts stops a moment after the turn.
+  await settle([...run.operations, processWatch.idle()])
   // Newest first: a copy made from another goes before the copy it was made from.
   for (const copy of copies.reverse()) {
     const name = run.agentNodes.get(copy.agentId)?.name || copy.agentId
@@ -114,4 +195,4 @@ async function sweepIsolation(runtime: OrbitRuntimeLike): Promise<SweepResult> {
   try { return await worktree.sweepLeftovers(rootOf(runtime)) } catch { return { removed: 0, patches: [], kept: [] } }
 }
 
-export { prepareIsolation, discardIsolation, mergeIsolated, cleanupIsolation, sweepIsolation }
+export { prepareIsolation, discardIsolation, mergeIsolated, decideHeld, cleanupIsolation, sweepIsolation }

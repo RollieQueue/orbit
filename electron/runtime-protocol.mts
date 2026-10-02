@@ -27,6 +27,7 @@ const RUNTIME_CHANNELS: readonly string[] = [
   'state:load', 'state:save', 'project-index:status',
   'memory:list', 'memory:save', 'memory:remove', 'memory:pin', 'memory:sharing', 'memory:forget-chat', 'memory:stats',
   'capabilities:list', 'capabilities:pin', 'capabilities:enable', 'capabilities:params', 'capabilities:read', 'capabilities:install', 'capabilities:remove', 'capabilities:restore',
+  'connectors:list', 'connectors:enable', 'connectors:remove', 'connectors:test',
   'attachments:save', 'attachments:image', 'attachments:discard',
   'providers:health', 'quota:get', 'stats:project', 'artifact:apply',
 ]

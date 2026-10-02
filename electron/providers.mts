@@ -7,11 +7,15 @@ import { randomUUID } from 'node:crypto'
 import { StringDecoder } from 'node:string_decoder'
 import { isOrbitToolEnvelope, TOOL_HANDOFF } from './tool-schema.mts'
 import { removeTemporaryDirectory } from './storage.mts'
+import { claudeServers, codexConnectorArgs, toolCallText } from './connectors.mts'
+import type { ConnectorLaunch } from './connectors.mts'
 import { attachmentsFolder } from './attachments.mts'
 import { claudeStreamLimit } from './quota.mts'
 import type { ClaudeRateLimitInfo, QuotaPartial, QuotaTaggedError } from './quota.mts'
 import { execTurnUsage, startedThread } from './codex-usage.mts'
 import { report } from './diagnostics.mts'
+import { processWatch } from './process-reaper.mts'
+import type { ProcessScope } from './process-reaper.mts'
 import REASONING_DEFAULTS from './reasoning-defaults.json' with { type: 'json' }
 // codex-server.mts imports loopbackNoProxy from this file; both sides use the other only inside functions, so the ESM cycle is harmless.
 import * as codexServer from './codex-server.mts'
@@ -59,8 +63,9 @@ interface ProviderOptions { command?: string; transport?: string; proxyMode?: st
 interface SessionActivity { pending?: number }
 type SessionActivityCheck = () => SessionActivity | null | undefined
 // The session the runtime asks for: Orbit's id and MCP access; `resume` continues an earlier turn's conversation.
-interface SessionOptions { id?: string | null; resume?: boolean; token?: string | null; mcpUrl?: string | null; systemAppend?: string; activity?: SessionActivityCheck | null }
-interface NormalizedSession { id: string | null; resume: boolean; mcpUrl: string | null; token: string | null; systemAppend: string; activity: SessionActivityCheck | null }
+interface SessionOptions { id?: string | null; resume?: boolean; token?: string | null; mcpUrl?: string | null; systemAppend?: string; activity?: SessionActivityCheck | null; connectors?: ConnectorLaunch[] | null }
+// `connectors`: external MCP servers (connectors.mts) the process is launched with next to Orbit's own; empty below full access.
+interface NormalizedSession { id: string | null; resume: boolean; mcpUrl: string | null; token: string | null; systemAppend: string; activity: SessionActivityCheck | null; connectors: ConnectorLaunch[] }
 // The options the CLI argument builders read.
 interface LaunchOptions { mode?: string; accessMode?: string; approvalPolicy?: string; workspace?: string; model?: string; reasoningEffort?: string; outputSchemaPath?: string }
 interface ProviderRunOptions extends LaunchOptions {
@@ -79,6 +84,8 @@ interface ProviderRunOptions extends LaunchOptions {
   // Added to the environment of every CLI process the turn starts (the runtime's restart variables); Orbit's own
   // transport variables (MCP token, NO_PROXY, proxy settings) win over it.
   extraEnv?: Record<string, string> | null
+  // The agent's turn the CLI belongs to: what the CLI leaves running when it ends is stopped (process-reaper.mts) and reported here.
+  processScope?: ProcessScope | null
 }
 // A native run always has a workspace (runProvider fills in the process cwd).
 interface NativeRunOptions extends ProviderRunOptions { workspace: string }
@@ -99,6 +106,8 @@ interface RunCliOptions {
   onDiagnostic?: (line: string) => void
   env?: NodeJS.ProcessEnv
   maxOutputBytes?: number
+  // Set for the CLI of an agent's turn: it is followed, and what it leaves running is stopped when it ends.
+  scope?: ProcessScope | null
 }
 // What a stream parser hands back once the CLI is done.
 interface ParsedTurn { text: string; model: string; sessionId?: string; usage?: unknown }
@@ -361,17 +370,20 @@ function createLineReader(onLine: (line: string) => void): LineReader {
 // `timeoutMs` is a total deadline (undefined: 30 min, null/0: none). `inactivityMs` kills a process that emits nothing
 // for that long (undefined: ORBIT_PROVIDER_INACTIVITY_MS or 15 min, null/0: none) unless `isBusy()` says it is
 // legitimately silent, as a session CLI is while an Orbit tool call runs in this process.
-function runCli(file: string, args: string[], { cwd, input = '', timeoutMs, inactivityMs, isBusy, signal, onLine, onDiagnostic, env, maxOutputBytes = MAX_OUTPUT_BYTES }: RunCliOptions = {}): Promise<CliResult> {
+function runCli(file: string, args: string[], { cwd, input = '', timeoutMs, inactivityMs, isBusy, signal, onLine, onDiagnostic, env, maxOutputBytes = MAX_OUTPUT_BYTES, scope }: RunCliOptions = {}): Promise<CliResult> {
   return new Promise((resolve, reject) => {
     if (signal?.aborted) return reject(cancelledError(file))
     let launch: CliLaunch
     let deadline: number
     let idle: number
     try { launch = resolveLaunch(file, args); deadline = timeoutValue(timeoutMs); idle = inactivityValue(inactivityMs) } catch (error) { return reject(error) }
+    const startedAt = Date.now()
     const child = spawn(launch.executable, launch.args, {
       cwd, env: { ...launch.env, ...env }, windowsHide: true, shell: false,
       detached: process.platform !== 'win32', stdio: ['pipe', 'pipe', 'pipe'],
     })
+    // An agent's CLI is followed: whatever it leaves running when it ends (background runners, browsers) is stopped.
+    const followed = !!scope && processWatch.track(child, { startedAt, scope })
     let stdout = ''
     let stderr = ''
     let bytes = 0
@@ -385,6 +397,8 @@ function runCli(file: string, args: string[], { cwd, input = '', timeoutMs, inac
       settled = true
       clearTimeout(timer); clearTimeout(idleTimer)
       signal?.removeEventListener('abort', abort)
+      // A CLI that ended by itself is looked at a moment later, without holding the turn's result.
+      if (followed) void processWatch.end(child)
       if (error) reject(error)
       else resolve({ stdout, stderr })
     }
@@ -392,8 +406,11 @@ function runCli(file: string, args: string[], { cwd, input = '', timeoutMs, inac
       if (settled || stopping) return
       stopping = true
       clearTimeout(timer); clearTimeout(idleTimer)
-      // Settle cancellation after terminating the entire process tree.
-      terminateProcess(child).then(() => finish(error), () => finish(error))
+      // Settle cancellation after terminating the entire process tree and, once that is done, stopping what the CLI left
+      // outside it (process-reaper.mts). The Orbit tool call that ends an envelope turn (no error) does not wait for the second.
+      const terminated = terminateProcess(child)
+      const cleaned = followed ? processWatch.end(child, { settleMs: 0, after: terminated }) : null
+      Promise.allSettled(error === undefined || !cleaned ? [terminated] : [terminated, cleaned]).then(() => finish(error))
     }
     const abort = () => stop(cancelledError(file))
     const armIdle = () => {
@@ -711,7 +728,7 @@ function createClaudeParser(onEvent: ProviderEventListener | null | undefined, r
         }
         for (const tool of content.filter(isToolUseBlock)) {
           const orbitTool = orbitToolName(tool.name)
-          const text = tool.input?.command || tool.input?.description || (orbitTool ? `${orbitTool} ${JSON.stringify(tool.input || {}).slice(0, 200)}` : tool.name)
+          const text = tool.input?.command || tool.input?.description || (orbitTool ? toolCallText(orbitTool, tool.input || {}) : tool.name)
           dispatch({ kind: 'tool', text, tool: tool.name, toolId: tool.id, parentToolId, input: tool.input, status: toolIds.has(tool.id) ? 'running' : 'started', ...toolFlags(orbitTool) })
           toolIds.add(tool.id); toolNames.set(tool.id, tool.name)
         }
@@ -803,14 +820,16 @@ function loopbackNoProxy(env: NodeJS.ProcessEnv = process.env): { NO_PROXY: stri
   return { NO_PROXY: value, no_proxy: value }
 }
 
-// The Orbit MCP server as Claude Code's --mcp-config sees it: inline JSON, bearer token in the header.
-function claudeMcpConfig(session: Pick<NormalizedSession, 'mcpUrl' | 'token'>) {
-  return { mcpServers: { orbit: { type: 'http', url: session.mcpUrl, headers: { Authorization: `Bearer ${session.token}` } } } }
+// The Orbit MCP server as Claude Code's --mcp-config sees it: inline JSON, bearer token in the header; the connectors
+// (external MCP servers of a run with full access) follow it, and --strict-mcp-config keeps out every other server.
+type ConnectorSession = Partial<Pick<NormalizedSession, 'connectors'>>
+function claudeMcpConfig(session: Pick<NormalizedSession, 'mcpUrl' | 'token'> & ConnectorSession) {
+  return { mcpServers: { orbit: { type: 'http', url: session.mcpUrl, headers: { Authorization: `Bearer ${session.token}` } }, ...claudeServers(session.connectors) } }
 }
 
 // Session transport: Orbit chooses the session id, follow-ups resume it, Orbit tools come from the in-process MCP
 // server, the stable Orbit block travels in a temp file, and the session file is kept (no --no-session-persistence).
-function buildClaudeSessionArgs(options: LaunchOptions, session: Pick<NormalizedSession, 'id' | 'resume' | 'mcpUrl' | 'token'>, { appendFile }: { appendFile?: string } = {}): string[] {
+function buildClaudeSessionArgs(options: LaunchOptions, session: Pick<NormalizedSession, 'id' | 'resume' | 'mcpUrl' | 'token'> & ConnectorSession, { appendFile }: { appendFile?: string } = {}): string[] {
   const access = selectedAccess(options)
   const restricted = access !== 'danger-full-access' || options.approvalPolicy === 'on-request'
   const args = ['--print', '--output-format', 'stream-json', '--verbose', '--include-partial-messages']
@@ -828,9 +847,10 @@ function buildClaudeSessionArgs(options: LaunchOptions, session: Pick<Normalized
 
 // Orbit's MCP server as config overrides of one Codex process (exec and App Server alike); the token stays in the
 // environment. `tool_timeout_sec` checked against codex-cli 0.155 (`codex mcp get orbit --json` shows 3600.0).
-function codexMcpArgs(session: Pick<NormalizedSession, 'mcpUrl' | 'token'> | null | undefined): string[] {
+// The connectors follow as `mcp_servers.<name>.*` overrides (command/args/env or url/http_headers, same check).
+function codexMcpArgs(session: (Pick<NormalizedSession, 'mcpUrl' | 'token'> & ConnectorSession) | null | undefined): string[] {
   if (!session?.mcpUrl || !session.token) return []
-  return ['-c', `mcp_servers.orbit.url=${JSON.stringify(session.mcpUrl)}`, '-c', 'mcp_servers.orbit.bearer_token_env_var="ORBIT_MCP_TOKEN"', '-c', `mcp_servers.orbit.tool_timeout_sec=${CODEX_MCP_TOOL_TIMEOUT_SEC}`]
+  return ['-c', `mcp_servers.orbit.url=${JSON.stringify(session.mcpUrl)}`, '-c', 'mcp_servers.orbit.bearer_token_env_var="ORBIT_MCP_TOKEN"', '-c', `mcp_servers.orbit.tool_timeout_sec=${CODEX_MCP_TOOL_TIMEOUT_SEC}`, ...codexConnectorArgs(session.connectors, tomlString)]
 }
 
 // A lone surrogate (a string bounded inside an emoji, such as an agent's name) as U+FFFD: JSON.stringify writes it as an
@@ -850,7 +870,7 @@ function tomlString(text: string): string {
 // The stable Orbit block is the thread's developer instructions (Codex has no system-prompt file option). A resumed
 // thread keeps the block it started with (exec and App Server, checked against 0.155); a resume passes it all the same,
 // so no Codex process of a session runs without it.
-function buildCodexSessionArgs(options: LaunchOptions & { workspace: string }, session: Pick<NormalizedSession, 'id' | 'resume' | 'mcpUrl' | 'token' | 'systemAppend'>): string[] {
+function buildCodexSessionArgs(options: LaunchOptions & { workspace: string }, session: Pick<NormalizedSession, 'id' | 'resume' | 'mcpUrl' | 'token' | 'systemAppend'> & ConnectorSession): string[] {
   const access = selectedAccess(options)
   const args = session.resume
     ? ['exec', 'resume', '--json', '--skip-git-repo-check', '-c', `sandbox_mode=${JSON.stringify(access)}`]
@@ -883,6 +903,7 @@ function normalizeSession(providerId: string, session: SessionOptions | null | u
     id: id || (providerId === 'claude' ? randomUUID() : null), resume, mcpUrl, token,
     systemAppend: typeof session.systemAppend === 'string' ? session.systemAppend : '',
     activity: typeof session.activity === 'function' ? session.activity : null,
+    connectors: Array.isArray(session.connectors) ? session.connectors.filter(item => item && typeof item.name === 'string' && (item.stdio || item.http)) : [],
   }
 }
 // The inactivity guard asks whether an Orbit tool call is running for this agent (the MCP server's activity(token)).
@@ -913,7 +934,7 @@ async function runClaudeSession(options: NativeRunOptions, session: NormalizedSe
     const env = { ...extraEnvOf(options), CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT: process.env.CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT || String(CLAUDE_MCP_IDLE_MS), ...(session.mcpUrl ? loopbackNoProxy() : {}) }
     try {
       await runCli(command, args, {
-        cwd: options.workspace, input: options.prompt, signal: options.signal, env,
+        cwd: options.workspace, input: options.prompt, signal: options.signal, env, scope: options.processScope,
         timeoutMs: options.timeoutMs ?? null, inactivityMs: options.inactivityMs, isBusy: busyCheck(session),
         onLine: parser.line,
         onDiagnostic: (text) => emit(options.onEvent, { providerId: 'claude', kind: 'observation', text, source: 'stderr' }),
@@ -932,7 +953,7 @@ async function runCodexSession(options: NativeRunOptions, session: NormalizedSes
   const command = options.providerOptions?.command || process.env.ORBIT_CODEX_COMMAND || 'codex'
   try {
     await runCli(command, buildCodexSessionArgs(options, session), {
-      cwd: options.workspace, input: options.prompt, signal: options.signal, env: { ...extraEnvOf(options), ...(session.token ? { ORBIT_MCP_TOKEN: session.token, ...loopbackNoProxy() } : {}) },
+      cwd: options.workspace, input: options.prompt, signal: options.signal, env: { ...extraEnvOf(options), ...(session.token ? { ORBIT_MCP_TOKEN: session.token, ...loopbackNoProxy() } : {}) }, scope: options.processScope,
       timeoutMs: options.timeoutMs ?? null, inactivityMs: options.inactivityMs, isBusy: busyCheck(session),
       onLine: parser.line,
       onDiagnostic: (text) => emit(options.onEvent, { providerId: 'codex', kind: 'observation', text, source: 'stderr' }),
@@ -992,7 +1013,7 @@ async function runNative(providerId: 'codex' | 'claude', options: NativeRunOptio
     const args = providerId === 'codex' ? buildCodexArgs(options) : buildClaudeArgs(options)
     try {
       await runCli(command, args, {
-        cwd: options.workspace, input: options.prompt, signal: options.signal, timeoutMs: options.timeoutMs, env: extraEnvOf(options),
+        cwd: options.workspace, input: options.prompt, signal: options.signal, timeoutMs: options.timeoutMs, env: extraEnvOf(options), scope: options.processScope,
         onLine: parser.line,
         onDiagnostic: (text) => emit(options.onEvent, { providerId, kind: 'observation', text, source: 'stderr' }),
       })

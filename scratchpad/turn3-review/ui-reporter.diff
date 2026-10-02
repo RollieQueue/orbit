@@ -1,0 +1,710 @@
+diff --git a/README.md b/README.md
+index 49266d9..1c7711c 100644
+--- a/README.md
++++ b/README.md
+@@ -144,7 +144,7 @@ npm install
+ npm run build          # tsc --noEmit + vite build → dist/ + запись сборки dist/orbit-build.json
+ npm start              # Orbit из репозитория (то же, что Orbit.cmd)
+ npm run dev            # Vite с HMR + Electron (ORBIT_DEV=1)
+-npm test
++npm test              # одна итоговая строка, провалы целиком; полный вывод: $env:ORBIT_TEST_REPORTER='spec'; npm test
+ npm run smoke
+ npm run smoke:desktop
+ npm run verify
+diff --git a/package.json b/package.json
+index 19ab370..99171d7 100644
+--- a/package.json
++++ b/package.json
+@@ -12,7 +12,7 @@
+     "start": "node scripts/run-electron.cjs",
+     "typecheck": "tsc --noEmit && npm run typecheck:main",
+     "typecheck:main": "tsc -p tsconfig.main.json",
+-    "test": "node --experimental-strip-types --disable-warning=ExperimentalWarning --test tests/*.test.cjs",
++    "test": "node --experimental-strip-types --disable-warning=ExperimentalWarning --test-reporter=./scripts/test-reporter.mjs --test tests/*.test.cjs",
+     "smoke": "node --experimental-strip-types --disable-warning=ExperimentalWarning scripts/smoke-runtime.cjs",
+     "smoke:desktop": "node scripts/run-electron.cjs scripts/smoke-desktop.cjs",
+     "package:win": "npm run build && node --experimental-strip-types --disable-warning=ExperimentalWarning scripts/package-win.cjs",
+diff --git a/scripts/test-reporter.mjs b/scripts/test-reporter.mjs
+new file mode 100644
+index 0000000..4353e8f
+--- /dev/null
++++ b/scripts/test-reporter.mjs
+@@ -0,0 +1,145 @@
++/**
++ * Compact node:test reporter for `npm test` (node 22). A passing run prints ONE summary line instead of a TAP line and a
++ * YAML block per test (~800 tests, tens of thousands of lines): every character of a command's output stays in an agent's
++ * context and is re-read on every later step. Nothing a reader needs is dropped: every failing test is printed in full
++ * (file:line, name path, failure type, error message with the assertion diff and the stack without node:internal frames),
++ * so are file-level failures (a file that does not load, crashes, exits non-zero, a test that times out or is cancelled)
++ * together with what the failing file wrote to stderr. The exit code is node's own and is not touched here.
++ *
++ * The full output of a person's choice: ORBIT_TEST_REPORTER=spec npm test (also tap, dot, junit: reporters of
++ * node:test/reporters). In PowerShell: $env:ORBIT_TEST_REPORTER = 'spec'; npm test.
++ *
++ * scripts/self-upgrade.cjs does not use this file: it runs node --test itself and parses the TAP `not ok` entries.
++ */
++import * as builtin from 'node:test/reporters'
++import nodePath from 'node:path'
++import { Readable } from 'node:stream'
++
++const STDERR_LIMIT = 6000
++const NO_TEST_FILE = '(no file)'
++
++/** Stack frames inside node itself say nothing about the test: dropped. */
++function withoutInternalFrames(text) {
++  return text.split('\n').filter((line) => !/^\s+at .*node:internal\//.test(line)).join('\n').replace(/\s+$/, '')
++}
++
++/** An error as text: the original error behind node's wrapper, its stack without node:internal frames. */
++function errorText(error) {
++  if (error == null) return ''
++  const original = error.cause ?? error
++  let text = ''
++  if (typeof original === 'string') text = original
++  else if (original && typeof original.stack === 'string' && original.stack) text = original.stack
++  else if (original && typeof original.message === 'string') text = original.message
++  else {
++    try { text = JSON.stringify(original) } catch { text = String(original) }
++  }
++  if (original !== error && typeof error.message === 'string' && error.message && !text.includes(error.message) &&
++    error.message !== 'test failed') text = `${error.message}\n${text}`
++  return withoutInternalFrames(text)
++}
++
++function indent(text, pad) {
++  return text.split('\n').map((line) => (line ? pad + line : line)).join('\n')
++}
++
++/** What a failing file wrote to stderr: all of it up to the limit, else its start and its end. */
++function stderrText(chunks) {
++  const text = withoutInternalFrames(chunks.join(''))
++  if (text.length <= STDERR_LIMIT) return text
++  const half = STDERR_LIMIT / 2
++  return `${text.slice(0, half)}\n[... ${text.length - STDERR_LIMIT} characters of stderr omitted ...]\n${text.slice(-half)}`
++}
++
++/** Node names a file relative to the cwd on some events and absolutely on others: one key for both. */
++function fileKey(file) {
++  return file ? nodePath.resolve(String(file)) : NO_TEST_FILE
++}
++
++function relativeFile(file) {
++  return file ? nodePath.relative(process.cwd(), fileKey(file)).split(nodePath.sep).join('/') : NO_TEST_FILE
++}
++
++async function* compact(source) {
++  const started = Date.now()
++  const names = new Map() // file -> names of the tests that are running, by nesting
++  const stderr = new Map() // file -> what it wrote to stderr
++  const files = new Set()
++  const failures = [] // { file, block }
++  const failedFiles = new Set()
++  let total = null
++
++  for await (const event of source) {
++    const data = event.data
++    const key = fileKey(data.file)
++    if (data.file) files.add(key)
++    switch (event.type) {
++      case 'test:start': {
++        const trail = names.get(key) ?? []
++        trail.length = data.nesting
++        trail[data.nesting] = data.name
++        names.set(key, trail)
++        break
++      }
++      case 'test:stderr': {
++        const list = stderr.get(key) ?? []
++        list.push(data.message)
++        stderr.set(key, list)
++        break
++      }
++      case 'test:fail': {
++        const error = data.details?.error
++        // A parent whose subtests failed is already explained by those subtests.
++        if (error?.failureType === 'subtestsFailed') break
++        const file = relativeFile(data.file)
++        const trail = (names.get(key) ?? []).slice(0, data.nesting)
++        trail.push(data.name)
++        const fileLevel = data.nesting === 0 && fileKey(data.name) === key
++        const where = data.line ? `${file}:${data.line}${data.column ? `:${data.column}` : ''}` : file
++        const kind = error?.failureType && error.failureType !== 'testCodeFailure' ? ` [${error.failureType}]` : ''
++        const title = fileLevel ? `FAIL ${where} (the file as a whole)${kind}` : `FAIL ${where}${kind}\n  ${trail.join(' > ')}`
++        const message = errorText(error)
++        failures.push({ block: `${title}${message ? `\n${indent(message, '    ')}` : ''}` })
++        failedFiles.add(key)
++        break
++      }
++      case 'test:summary':
++        if (!data.file) total = data
++        break
++      default:
++    }
++  }
++
++  const lines = []
++  for (const { block } of failures) lines.push(block, '')
++  for (const file of failedFiles) {
++    const text = stderrText(stderr.get(file) ?? [])
++    if (text) lines.push(`stderr of ${relativeFile(file)}:`, indent(text, '    '), '')
++  }
++  const counts = total?.counts
++  const seconds = ((total?.duration_ms ?? Date.now() - started) / 1000).toFixed(1)
++  if (counts) {
++    lines.push(`tests ${counts.tests} | pass ${counts.passed} | fail ${counts.failed} | cancelled ${counts.cancelled} | ` +
++      `skipped ${counts.skipped} | todo ${counts.todo} | files ${files.size} | ${seconds}s`)
++  } else {
++    lines.push(`no test summary received (${failures.length} failure(s) above) | files ${files.size} | ${seconds}s`)
++  }
++  if (total && !total.success && failures.length === 0) {
++    lines.push('The run failed but no failing test was reported: rerun with ORBIT_TEST_REPORTER=spec npm test for the full output.')
++  }
++  yield `${lines.join('\n')}\n`
++}
++
++export default async function* testReporter(source) {
++  const wanted = process.env.ORBIT_TEST_REPORTER
++  if (wanted && wanted !== 'compact') {
++    const reporter = ['spec', 'tap', 'dot', 'junit'].includes(wanted) ? builtin[wanted] : null
++    if (typeof reporter !== 'function') {
++      throw new Error(`ORBIT_TEST_REPORTER=${wanted}: expected compact, spec, tap, dot or junit`)
++    }
++    // spec is a stream (made with new), tap, dot and junit are generator functions.
++    yield* wanted === 'spec' ? Readable.from(source).pipe(new reporter()) : reporter(source)
++    return
++  }
++  yield* compact(source)
++}
+diff --git a/src/AgentFilter.tsx b/src/AgentFilter.tsx
+new file mode 100644
+index 0000000..500a6c7
+--- /dev/null
++++ b/src/AgentFilter.tsx
+@@ -0,0 +1,33 @@
++import { useState } from 'react'
++import { AGENT_FILTERS, filterNames, isAgentFilter, type ActivityCounts, type AgentFilter } from './agent-activity'
++import './agent-filter.css'
++
++// The chosen filter is remembered between openings of the panel (one key, checked on read).
++const FILTER_KEY = 'orbit.agents-filter'
++export function useAgentFilter(): [AgentFilter, (filter: AgentFilter) => void] {
++  const [filter, setFilter] = useState<AgentFilter>(() => { try { const saved = localStorage.getItem(FILTER_KEY); return isAgentFilter(saved) ? saved : 'all' } catch { return 'all' } })
++  const pick = (next: AgentFilter) => {
++    setFilter(next)
++    try { localStorage.setItem(FILTER_KEY, next) } catch { /* private mode: only this session remembers */ }
++  }
++  return [filter, pick]
++}
++
++const waitingTitle = ({ waitingBy }: ActivityCounts) => [
++  waitingBy.helpers && `Ждут помощников: ${waitingBy.helpers}`, waitingBy.message && `Ждут сообщения: ${waitingBy.message}`, waitingBy.approval && `Ждут разрешения: ${waitingBy.approval}`,
++].filter(Boolean).join('\n')
++
++// «Все» and «Активные» always; then one chip per activity that has agents (the chosen one stays even at zero, so it can be switched off).
++export function AgentFilterBar({ filter, counts, onChange }: { filter: AgentFilter; counts: ActivityCounts; onChange: (filter: AgentFilter) => void }) {
++  return <div className="agent-filter" role="group" aria-label="Фильтр агентов по активности">
++    {AGENT_FILTERS.filter(id => id === 'all' || id === 'active' || counts[id] > 0 || id === filter).map(id =>
++      <button type="button" key={id} className={`agent-filter-chip${filter === id ? ' active' : ''}`} aria-pressed={filter === id} onClick={() => onChange(id)}
++        title={id === 'waiting' ? waitingTitle(counts) : id === 'active' ? 'Работают, в очереди, ждут и на паузе' : undefined}>
++        {filterNames[id]} <b>{counts[id]}</b>
++      </button>)}
++  </div>
++}
++
++export function AgentFilterEmpty({ filter, onReset }: { filter: AgentFilter; onReset: () => void }) {
++  return <p className="agent-filter-empty">Нет агентов в состоянии «{filterNames[filter]}». <button type="button" onClick={onReset}>Все</button></p>
++}
+diff --git a/src/AgentsPanel.tsx b/src/AgentsPanel.tsx
+index f277767..60ad1a7 100644
+--- a/src/AgentsPanel.tsx
++++ b/src/AgentsPanel.tsx
+@@ -4,13 +4,22 @@ import { RunHistoryList } from './AgentHistory'
+ import { AgentInspector, type AgentControls, type MessageAgent } from './AgentInspector'
+ import { Icon } from './Icon'
+ import { handoverLabel } from './QuotaPanel'
++import { AgentFilterBar, AgentFilterEmpty, useAgentFilter } from './AgentFilter'
+ import { AgentsViewSwitch, RunTimeline, useAgentsView } from './RunTimeline'
++import { effortLabels } from './ReasoningPicker'
+ import { plural, statusText } from './format'
+ import { providerName, providers } from './providers'
++import { activityLabel, countActivities, effortSourceNames, visibleAgents } from './agent-activity'
+ import { agentTokens, isActiveStatus, resumeLinks, shortRunId, shownStatus, tokenCount, usageTitle } from './run-events'
+ import './agent-tokens.css'
+ 
+-type TreeOptions = { run: RunSnapshot; selectedId?: string; onSelect: (id: string) => void }
++type TreeOptions = { run: RunSnapshot; selectedId?: string; onSelect: (id: string) => void; visible: Map<string, 'match' | 'context'> }
++// The model line of a row: provider · model · reasoning level (when the agent has one).
++const effortName = (agent: Agent) => agent.reasoningEffort ? effortLabels[agent.reasoningEffort] || agent.reasoningEffort : ''
++const effortTitle = (agent: Agent) => {
++  const source = effortSourceNames[agent.effortSource || '']
++  return agent.reasoningEffort ? `Уровень мышления: ${effortName(agent)}${source ? ` (${source})` : ''}` : ''
++}
+ const handoverTitle = (agent: Agent) =>
+   (agent.handovers || []).map(item => `${handoverLabel(providers, item.from)} → ${handoverLabel(providers, item.to)}`).join('\n')
+ // The copy an agent works in: where it is and, if a merge back left any, how many files conflict.
+@@ -20,20 +29,22 @@ const isolationTitle = ({ kind, path, base, conflicts }: AgentIsolation) =>
+ // The agents of a run as rows, each parent followed by its children. An agent whose parent is missing is shown at the top.
+ function agentTree(items: Agent[], options: TreeOptions, parentId: string | null = null, depth = 0, seen = new Set<string>()): ReactNode {
+   const orphan = (a: Agent) => parentId === null && !!a.parentId && !items.some(p => p.id === a.parentId)
+-  const children = items.filter(a => (a.parentId || null) === parentId || orphan(a)).filter(a => !seen.has(a.id))
++  const children = items.filter(a => (a.parentId || null) === parentId || orphan(a)).filter(a => !seen.has(a.id) && options.visible.has(a.id))
+   return children.map(agent => {
+     const nextSeen = new Set(seen).add(agent.id)
+     const providerId = agent.providerId || options.run.providerId
+     const modelLabel = `${providerName(providerId) || providerId || 'Провайдер не указан'} · ${agent.model || 'Модель: авто (ещё не определена)'}`
++    const rowTitle = [modelLabel, effortTitle(agent)].filter(Boolean).join('\n')
+     const files = agent.files
+     const tokens = agentTokens(agent)
+     return <div key={agent.id}>
+-      <button className={`agent-row ${options.selectedId === agent.id ? 'selected' : ''}`} style={{ paddingLeft: 14 + Math.min(depth, 8) * 16 }}
++      <button className={`agent-row ${options.selectedId === agent.id ? 'selected' : ''}${options.visible.get(agent.id) === 'context' ? ' context' : ''}`}
++        style={{ paddingLeft: 14 + Math.min(depth, 8) * 16 }} title={rowTitle}
+         onClick={() => options.onSelect(agent.id)}>
+         <span className={`status-dot ${shownStatus(agent)}`} />
+         <span className="agent-row-label">
+           <strong>{agent.name || agent.id}</strong>
+-          <small title={modelLabel}>{modelLabel}</small>
++          <small className="agent-model" title={rowTitle}><span>{modelLabel}</span>{agent.reasoningEffort && <span className="agent-effort">{effortName(agent)}</span>}</small>
+           {agent.role && <small>{agent.role}</small>}
+           {!!files && files.wrote.length + files.read.length > 0 && <small>Файлы: изменил {files.wrote.length}, читал {files.read.length}</small>}
+           {!!agent.handovers?.length && <small className="handover-badge" title={handoverTitle(agent)}>⇄ Сменил подписку: {agent.handovers.length}</small>}
+@@ -42,7 +53,7 @@ function agentTree(items: Agent[], options: TreeOptions, parentId: string | null
+             {agent.isolation && <span className={`isolation-badge ${agent.isolation.conflicts?.length ? 'conflict' : ''}`} title={isolationTitle(agent.isolation)}>Изолированная копия</span>}
+           </small>}
+         </span>
+-        <span className="agent-state">{statusText(shownStatus(agent))}</span>
++        <span className="agent-state">{activityLabel(agent)}</span>
+       </button>
+       {agentTree(items, options, agent.id, depth + 1, nextSeen)}
+     </div>
+@@ -67,6 +78,10 @@ export function AgentsPanel({ chatRuns, currentRun, selectedAgent, inspectorRequ
+   // Runs around an Orbit restart: the run this one continues, and the run that continued this one.
+   const resume = resumeLinks(chatRuns, currentRun)
+   const [view, setView] = useAgentsView()
++  const [filter, setFilter] = useAgentFilter()
++  const agents = currentRun?.agents || []
++  const counts = countActivities(agents)
++  const visible = visibleAgents(agents, filter)
+   return <aside className="agents-panel">
+     <header>
+       <div><Icon name="agents" /><strong>Агенты</strong></div>
+@@ -96,10 +111,12 @@ export function AgentsPanel({ chatRuns, currentRun, selectedAgent, inspectorRequ
+           Продолжен в {shortRunId(resume.next.runId)}
+         </button>}
+       </div>}
++      <AgentFilterBar filter={filter} counts={counts} onChange={setFilter} />
+       <AgentsViewSwitch view={view} onChange={setView} />
+-      {view === 'timeline' ? <RunTimeline run={currentRun} selectedId={selected?.id} onSelect={onSelectAgent} /> : <div className="agent-tree">
+-        {agentTree(currentRun.agents, { run: currentRun, selectedId: selected?.id, onSelect: onSelectAgent })}
+-        {routerRow && <button className={`agent-row router-row ${selected?.id === 'router' ? 'selected' : ''}`} onClick={() => onSelectAgent('router')}>
++      {filter !== 'all' && !counts[filter] ? <AgentFilterEmpty filter={filter} onReset={() => setFilter('all')} />
++        : view === 'timeline' ? <RunTimeline run={currentRun} selectedId={selected?.id} onSelect={onSelectAgent} visible={visible} /> : <div className="agent-tree">
++        {agentTree(currentRun.agents, { run: currentRun, selectedId: selected?.id, onSelect: onSelectAgent, visible })}
++        {routerRow && filter === 'all' && <button className={`agent-row router-row ${selected?.id === 'router' ? 'selected' : ''}`} onClick={() => onSelectAgent('router')}>
+           <span className={`status-dot ${routerAgent.status}`} />
+           <span className="agent-row-label"><strong>{routerAgent.name}</strong><small>Адресует сообщения и следит за общими файлами</small></span>
+           <span className="agent-state">{(currentRun.router?.routed ?? 0) + (currentRun.router?.notices ?? 0)}</span>
+diff --git a/src/RunTimeline.tsx b/src/RunTimeline.tsx
+index 7a9c38d..994e886 100644
+--- a/src/RunTimeline.tsx
++++ b/src/RunTimeline.tsx
+@@ -1,5 +1,6 @@
+ import { useEffect, useLayoutEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react'
+ import type { RunSnapshot } from './types'
++import { activityLabel, activityOf } from './agent-activity'
+ import { handoverLabel, handoverReason } from './QuotaPanel'
+ import { formatDuration, isActiveStatus } from './run-events'
+ import { buildRunTimeline, tickOffsets, type BarState, type RunTimeline as Timeline, type TimelineBar, type TimelineMarker, type TimelineRow } from './run-timeline'
+@@ -129,11 +130,12 @@ function segmentTip(helpers: number, start: number, end: number): TipContent {
+   }
+ }
+ 
+-type RunTimelineProps = { run: RunSnapshot; selectedId?: string; onSelect: (agentId: string) => void }
++// `visible` is the activity filter's choice of rows (see visibleAgents): only the rows shown change, the chart's figures stay those of the whole team.
++type RunTimelineProps = { run: RunSnapshot; selectedId?: string; onSelect: (agentId: string) => void; visible?: Map<string, 'match' | 'context'> }
+ 
+ // Who worked when: a bar per provider turn for every agent (helpers under their parent), the parallelism strip on top, and
+ // the numbers about waiting. Open turns grow with the clock while the run works; a row selects the agent for the inspector.
+-export function RunTimeline({ run, selectedId, onSelect }: RunTimelineProps) {
++export function RunTimeline({ run, selectedId, onSelect, visible }: RunTimelineProps) {
+   const now = useClock(isActiveStatus(run.status))
+   const timeline: Timeline = useMemo(() => buildRunTimeline(run, now), [run, now])
+   const { ref, width } = useWidth()
+@@ -220,11 +222,14 @@ export function RunTimeline({ run, selectedId, onSelect }: RunTimelineProps) {
+               style={{ left: left(part.start), width: wide(part.start, part.end) }} {...tipHandlers(() => segmentTip(part.helpers, part.start, part.end))} />)}
+           </span>
+         </div>}
+-        {rows.map(row => {
++        {rows.filter(row => !visible || visible.has(row.agentId)).map(row => {
+           const selected = row.agentId === selectedId
+-          const worked = row.bars.length ? `${row.bars.every(bar => bar.estimated) ? '≈ ' : ''}${neat(row.workMs)}` : row.status === 'waiting' ? 'в очереди' : ''
+-          return <button type="button" key={row.agentId} className={`run-timeline-row${selected ? ' selected' : ''}`} aria-pressed={selected}
+-            aria-label={`${row.name}: ${statusText(row.status)}${row.bars.length ? `, работал ${neat(row.workMs)}` : ''}`} onClick={() => onSelect(row.agentId)}>
++          // A waiting agent is «в очереди» only when it really is queued: waiting for its helpers or a message reads as that.
++          const source = row.status === 'waiting' ? run.agents.find(agent => agent.id === row.agentId) : undefined
++          const queued = row.status === 'waiting' && (!source || activityOf(source) === 'queued')
++          const worked = row.bars.length ? `${row.bars.every(bar => bar.estimated) ? '≈ ' : ''}${neat(row.workMs)}` : queued ? 'в очереди' : ''
++          return <button type="button" key={row.agentId} className={`run-timeline-row${selected ? ' selected' : ''}${visible?.get(row.agentId) === 'context' ? ' context' : ''}`} aria-pressed={selected}
++            aria-label={`${row.name}: ${source ? activityLabel(source) : statusText(row.status)}${row.bars.length ? `, работал ${neat(row.workMs)}` : ''}`} onClick={() => onSelect(row.agentId)}>
+             <span className="run-timeline-name" style={{ paddingLeft: Math.min(row.depth, 4) * 10 }}>
+               <span className={`status-dot ${row.status}`} />
+               <strong>{row.name}</strong>
+diff --git a/src/agent-activity.ts b/src/agent-activity.ts
+new file mode 100644
+index 0000000..c24e1d1
+--- /dev/null
++++ b/src/agent-activity.ts
+@@ -0,0 +1,90 @@
++import type { Agent } from './types'
++import { shownStatus } from './run-events'
++
++// What an agent is doing right now, for the agents panel's filter and state labels. The runtime keeps one status for «not working yet»
++// (status 'waiting') and tells the reasons apart only in agent.detail, so the detail is read here.
++export type Activity = 'working' | 'queued' | 'waiting' | 'paused' | 'done' | 'error' | 'cancelled'
++export type WaitingReason = 'helpers' | 'message' | 'approval'
++
++// The detail strings electron/runtime/*.mts sets while an agent waits (saved runs of older versions carry the same ones).
++// tests/agent-activity.test.cjs checks that the runtime still sets them: a renamed detail must not turn into «В очереди» unnoticed.
++export const WAITING_DETAILS: Record<WaitingReason, string> = {
++  helpers: 'Waiting for delegated results',
++  message: 'Waiting for a message',
++  approval: 'Waiting for your permission',
++}
++
++export function waitingReasonOf(agent: Agent): WaitingReason | undefined {
++  if (agent.status !== 'waiting') return undefined
++  return (Object.keys(WAITING_DETAILS) as WaitingReason[]).find(reason => WAITING_DETAILS[reason] === agent.detail)
++}
++
++// 'Queued', 'Queued follow-up', 'Waiting for a provider slot', 'Continuing conversation' and anything unknown are all the queue.
++export function activityOf(agent: Agent): Activity {
++  const shown = shownStatus(agent)
++  switch (shown) {
++    case 'paused': return 'paused'
++    case 'working': return 'working'
++    case 'done': return 'done'
++    case 'error': return 'error'
++    case 'cancelled': case 'interrupted': case 'restarting': return 'cancelled'
++    default: return waitingReasonOf(agent) ? 'waiting' : 'queued'
++  }
++}
++
++export const activityNames: Record<Activity, string> = {
++  working: 'Работает', queued: 'В очереди', waiting: 'Ждёт', paused: 'Пауза', done: 'Завершён', error: 'Ошибка', cancelled: 'Остановлен',
++}
++const waitingNames: Record<WaitingReason, string> = { helpers: 'Ждёт помощников', message: 'Ждёт сообщения', approval: 'Ждёт разрешения' }
++
++// The state label of an agent's row. An agent that ended by an interruption or an Orbit restart keeps its own, more exact wording.
++export function activityLabel(agent: Agent): string {
++  if (agent.status === 'interrupted') return 'Прерван'
++  if (agent.status === 'restarting') return 'Перезапуск Orbit'
++  const reason = waitingReasonOf(agent)
++  return reason && activityOf(agent) === 'waiting' ? waitingNames[reason] : activityNames[activityOf(agent)]
++}
++
++// Who picked the agent's reasoning level (Agent.effortSource), for a tooltip.
++export const effortSourceNames: Record<string, string> = {
++  caller: 'выбрал Orbit', routing: 'по таблице маршрутизации', pool: 'из пула провайдеров', parent: 'как у родителя', settings: 'из настроек провайдера',
++}
++
++// The filter: everything, the agents that are still going, or one activity.
++export type AgentFilter = 'all' | 'active' | Activity
++export const AGENT_FILTERS: AgentFilter[] = ['all', 'active', 'working', 'queued', 'waiting', 'paused', 'done', 'error', 'cancelled']
++export const isAgentFilter = (value: unknown): value is AgentFilter => AGENT_FILTERS.includes(value as AgentFilter)
++export const filterNames: Record<AgentFilter, string> = {
++  all: 'Все', active: 'Активные', working: 'Работают', queued: 'В очереди', waiting: 'Ждут', paused: 'На паузе', done: 'Завершены', error: 'С ошибкой', cancelled: 'Остановлены',
++}
++const ACTIVE: Activity[] = ['working', 'queued', 'waiting', 'paused']
++export const matchesFilter = (filter: AgentFilter, activity: Activity) => filter === 'all' || (filter === 'active' ? ACTIVE.includes(activity) : filter === activity)
++
++export type ActivityCounts = Record<AgentFilter, number> & { waitingBy: Record<WaitingReason, number> }
++export function countActivities(agents: Agent[]): ActivityCounts {
++  const counts: ActivityCounts = { all: agents.length, active: 0, working: 0, queued: 0, waiting: 0, paused: 0, done: 0, error: 0, cancelled: 0, waitingBy: { helpers: 0, message: 0, approval: 0 } }
++  for (const agent of agents) {
++    const activity = activityOf(agent)
++    counts[activity]++
++    if (ACTIVE.includes(activity)) counts.active++
++    if (activity === 'waiting') counts.waitingBy[waitingReasonOf(agent)!]++
++  }
++  return counts
++}
++
++// The agents a filter shows: the matching ones, and their ancestors as context (the tree stays readable). Absent = hidden.
++// `all` shows everyone as a match.
++export function visibleAgents(agents: Agent[], filter: AgentFilter): Map<string, 'match' | 'context'> {
++  const shown = new Map<string, 'match' | 'context'>()
++  const byId = new Map(agents.map(agent => [agent.id, agent]))
++  for (const agent of agents) if (matchesFilter(filter, activityOf(agent))) shown.set(agent.id, 'match')
++  for (const agent of agents) {
++    if (shown.get(agent.id) !== 'match') continue
++    const seen = new Set([agent.id])
++    for (let parent = byId.get(agent.parentId || ''); parent && !seen.has(parent.id); parent = byId.get(parent.parentId || '')) {
++      seen.add(parent.id)
++      if (!shown.has(parent.id)) shown.set(parent.id, 'context')
++    }
++  }
++  return shown
++}
+diff --git a/src/agent-filter.css b/src/agent-filter.css
+new file mode 100644
+index 0000000..16e49b5
+--- /dev/null
++++ b/src/agent-filter.css
+@@ -0,0 +1,16 @@
++/* The activity filter of the agents panel (AgentFilter.tsx): a wrapping row of chips under the run summary, and the dimmed context rows. */
++.agent-filter{display:flex;flex-wrap:wrap;gap:5px;flex-shrink:0;margin:0 14px 8px}
++.agent-filter-chip{padding:4px 8px;border:1px solid #30393a;border-radius:11px;font-size:10px;line-height:14px;color:#899b92;background:#1c2122;white-space:nowrap}
++.agent-filter-chip b{margin-left:2px;font-weight:600;font-variant-numeric:tabular-nums;color:#b3c3b9}
++.agent-filter-chip:hover:not(:disabled){background:#252c2d}
++.agent-filter-chip.active{background:#344137;border-color:#4a5d4f;color:#d8e8de}
++.agent-filter-chip.active b{color:#fff}
++.agent-filter-empty{margin:0 14px 8px;padding:10px 12px;border:1px dashed #30393a;border-radius:8px;font-size:11px;line-height:1.6;color:var(--muted)}
++.agent-filter-empty button{margin-left:4px;color:#a7c5b0;text-decoration:underline;text-underline-offset:3px;font-size:11px}
++.agent-row.context,.run-timeline-row.context{opacity:.5}
++.agent-row.context:hover,.run-timeline-row.context:hover{opacity:.85}
++/* The model line of a row: provider and model shorten with an ellipsis, the reasoning level after them stays whole. */
++.agent-row small.agent-model{display:flex;gap:4px}
++.agent-row small.agent-model>span:first-child{min-width:0;overflow:hidden;text-overflow:ellipsis}
++.agent-row small.agent-model>.agent-effort{flex-shrink:0}
++.agent-row small.agent-model>.agent-effort:before{content:"· "}
+diff --git a/src/types.ts b/src/types.ts
+index bf88cb3..165dae9 100644
+--- a/src/types.ts
++++ b/src/types.ts
+@@ -13,6 +13,8 @@ export type Agent = {
+   detail?: string
+   model?: string
+   reasoningEffort?: string
++  // Who picked the reasoning level: 'caller' (the parent's spawn call: Orbit), 'routing', 'pool', 'parent', 'settings', or '' (unknown).
++  effortSource?: string
+   parentId?: string | null
+   depth?: number
+   providerId?: string | null
+diff --git a/tests/agent-activity.test.cjs b/tests/agent-activity.test.cjs
+new file mode 100644
+index 0000000..62ecb11
+--- /dev/null
++++ b/tests/agent-activity.test.cjs
+@@ -0,0 +1,131 @@
++const test = require('node:test')
++const assert = require('node:assert/strict')
++const fs = require('node:fs')
++const path = require('node:path')
++
++// Same loader as tests/run-events.test.cjs (vite's oxc transform, then an ES module from a data URL). agent-activity.ts imports
++// shownStatus from ./run-events, which a data URL cannot resolve: that module is loaded the same way and its specifier replaced.
++let activityOf, waitingReasonOf, activityLabel, countActivities, visibleAgents, matchesFilter, isAgentFilter, WAITING_DETAILS, AGENT_FILTERS, filterNames, effortSourceNames
++const dataUrl = code => `data:text/javascript;base64,${Buffer.from(code).toString('base64')}`
++test.before(async () => {
++  const { transformWithOxc } = await import('vite')
++  const load = async name => {
++    const file = path.join(__dirname, '..', 'src', `${name}.ts`)
++    return (await transformWithOxc(fs.readFileSync(file, 'utf8'), file, { lang: 'ts' })).code
++  }
++  const events = dataUrl(await load('run-events'))
++  const code = (await load('agent-activity')).replace(/(from\s+)(['"])\.\/run-events\2/, `$1"${events}"`)
++  assert.ok(code.includes(events), 'the run-events import was replaced')
++  ;({ activityOf, waitingReasonOf, activityLabel, countActivities, visibleAgents, matchesFilter, isAgentFilter, WAITING_DETAILS, AGENT_FILTERS, filterNames, effortSourceNames } = await import(dataUrl(code)))
++})
++
++const agent = (id, status, extra = {}) => ({ id, name: id, status, parentId: id === 'root' ? null : 'root', ...extra })
++
++test('status maps to one activity; the user\'s pause wins over working and waiting', () => {
++  assert.equal(activityOf(agent('a', 'working')), 'working')
++  assert.equal(activityOf(agent('a', 'done')), 'done')
++  assert.equal(activityOf(agent('a', 'error')), 'error')
++  assert.equal(activityOf(agent('a', 'cancelled')), 'cancelled')
++  assert.equal(activityOf(agent('a', 'interrupted')), 'cancelled')
++  assert.equal(activityOf(agent('a', 'restarting')), 'cancelled')
++  assert.equal(activityOf(agent('a', 'paused')), 'paused')
++  assert.equal(activityOf(agent('a', 'working', { paused: true })), 'paused')
++  assert.equal(activityOf(agent('a', 'waiting', { paused: true, detail: 'Queued' })), 'paused')
++  // a finished agent that still carries the flag is not shown as paused
++  assert.equal(activityOf(agent('a', 'done', { paused: true })), 'done')
++})
++
++test('waiting is split by the detail the runtime sets; every other detail is the queue', () => {
++  assert.equal(activityOf(agent('a', 'waiting', { detail: 'Waiting for delegated results' })), 'waiting')
++  assert.equal(waitingReasonOf(agent('a', 'waiting', { detail: 'Waiting for delegated results' })), 'helpers')
++  assert.equal(waitingReasonOf(agent('a', 'waiting', { detail: 'Waiting for a message' })), 'message')
++  assert.equal(waitingReasonOf(agent('a', 'waiting', { detail: 'Waiting for your permission' })), 'approval')
++  for (const detail of ['Queued', 'Queued follow-up', 'Waiting for a provider slot', 'Continuing conversation', 'Something new', '', undefined]) {
++    const queued = agent('a', 'waiting', { detail })
++    assert.equal(activityOf(queued), 'queued', String(detail))
++    assert.equal(waitingReasonOf(queued), undefined)
++  }
++  // the detail of a working agent (its progress text) never makes it waiting
++  assert.equal(activityOf(agent('a', 'working', { detail: 'Waiting for a message' })), 'working')
++  assert.equal(waitingReasonOf(agent('a', 'working', { detail: 'Waiting for a message' })), undefined)
++})
++
++test('Russian labels', () => {
++  const label = (status, extra) => activityLabel(agent('a', status, extra))
++  assert.equal(label('working'), 'Работает')
++  assert.equal(label('waiting', { detail: 'Queued' }), 'В очереди')
++  assert.equal(label('waiting'), 'В очереди')
++  assert.equal(label('waiting', { detail: 'Waiting for delegated results' }), 'Ждёт помощников')
++  assert.equal(label('waiting', { detail: 'Waiting for a message' }), 'Ждёт сообщения')
++  assert.equal(label('waiting', { detail: 'Waiting for your permission' }), 'Ждёт разрешения')
++  assert.equal(label('working', { paused: true }), 'Пауза')
++  assert.equal(label('done'), 'Завершён')
++  assert.equal(label('error'), 'Ошибка')
++  assert.equal(label('cancelled'), 'Остановлен')
++  assert.equal(label('interrupted'), 'Прерван')
++  assert.equal(label('restarting'), 'Перезапуск Orbit')
++  assert.deepEqual(Object.values(filterNames), ['Все', 'Активные', 'Работают', 'В очереди', 'Ждут', 'На паузе', 'Завершены', 'С ошибкой', 'Остановлены'])
++})
++
++const team = [
++  agent('root', 'waiting', { detail: 'Waiting for delegated results' }),
++  agent('lead', 'waiting', { detail: 'Waiting for delegated results', parentId: 'root' }),
++  agent('w1', 'working', { parentId: 'lead' }),
++  agent('w2', 'working', { parentId: 'lead' }),
++  agent('q', 'waiting', { detail: 'Queued' }),
++  agent('m', 'waiting', { detail: 'Waiting for a message' }),
++  agent('ok', 'done'),
++  agent('bad', 'error', { parentId: 'ok' }),
++  agent('stop', 'cancelled'),
++  agent('hold', 'working', { paused: true }),
++]
++
++test('counts: groups, the active total and the waiting reasons', () => {
++  const counts = countActivities(team)
++  assert.deepEqual({ ...counts, waitingBy: undefined }, { all: 10, active: 7, working: 2, queued: 1, waiting: 3, paused: 1, done: 1, error: 1, cancelled: 1, waitingBy: undefined })
++  assert.deepEqual(counts.waitingBy, { helpers: 2, message: 1, approval: 0 })
++  assert.equal(countActivities([]).all, 0)
++})
++
++test('filter: matches, dimmed ancestors, hidden branches', () => {
++  const ids = filter => [...visibleAgents(team, filter)].map(([id, kind]) => `${id}:${kind}`).sort()
++  assert.deepEqual(ids('working'), ['lead:context', 'root:context', 'w1:match', 'w2:match'])
++  assert.deepEqual(ids('error'), ['bad:match', 'ok:context', 'root:context'])
++  assert.deepEqual(ids('done'), ['ok:match', 'root:context'])
++  assert.deepEqual(ids('queued'), ['q:match', 'root:context'])
++  // a parent that matches too is a match, not context
++  assert.deepEqual(ids('waiting'), ['lead:match', 'm:match', 'root:match'])
++  assert.deepEqual(ids('active').length, 7)
++  assert.equal(visibleAgents(team, 'all').size, 10)
++  assert.ok([...visibleAgents(team, 'all').values()].every(kind => kind === 'match'))
++  assert.equal(visibleAgents(team, 'cancelled').size, 2)
++  assert.equal(visibleAgents([], 'working').size, 0)
++})
++
++test('filter: a missing parent ends the chain and a parent cycle does not hang', () => {
++  const orphan = [agent('a', 'working', { parentId: 'gone' })]
++  assert.deepEqual([...visibleAgents(orphan, 'working')], [['a', 'match']])
++  const loop = [agent('x', 'working', { parentId: 'y' }), agent('y', 'done', { parentId: 'x' })]
++  assert.deepEqual([...visibleAgents(loop, 'working')].sort(), [['x', 'match'], ['y', 'context']])
++})
++
++test('filter ids are validated', () => {
++  assert.ok(AGENT_FILTERS.every(isAgentFilter))
++  assert.equal(isAgentFilter('nonsense'), false)
++  assert.equal(isAgentFilter(null), false)
++  assert.equal(matchesFilter('active', 'done'), false)
++  assert.equal(matchesFilter('active', 'paused'), true)
++  assert.equal(matchesFilter('all', 'error'), true)
++  assert.equal(matchesFilter('error', 'error'), true)
++})
++
++test('effort source names cover the runtime values', () => {
++  assert.deepEqual(Object.keys(effortSourceNames), ['caller', 'routing', 'pool', 'parent', 'settings'])
++})
++
++// Drift guard: the strings above are the ones the runtime sets. A renamed detail must fail here, not silently read «В очереди».
++test('the runtime still sets the waiting details the filter relies on', () => {
++  const dir = path.join(__dirname, '..', 'electron', 'runtime')
++  const source = fs.readdirSync(dir).filter(name => name.endsWith('.mts')).map(name => fs.readFileSync(path.join(dir, name), 'utf8')).join('\n')
++  for (const [reason, detail] of Object.entries(WAITING_DETAILS)) assert.ok(source.includes(`'${detail}'`), `${reason}: electron/runtime/*.mts no longer sets detail '${detail}'`)
++})
+diff --git a/tests/test-reporter.test.cjs b/tests/test-reporter.test.cjs
+new file mode 100644
+index 0000000..a8ee12c
+--- /dev/null
++++ b/tests/test-reporter.test.cjs
+@@ -0,0 +1,85 @@
++const test = require('node:test')
++const assert = require('node:assert/strict')
++const childProcess = require('node:child_process')
++const fs = require('node:fs')
++const os = require('node:os')
++const path = require('node:path')
++
++// scripts/test-reporter.mjs is what `npm test` prints with: one line for a passing run, every failure in full. These
++// tests run it for real (node --test over small sample files in a temp folder) and read what comes out.
++const repo = path.resolve(__dirname, '..')
++const REPORTER = require('node:url').pathToFileURL(path.join(repo, 'scripts', 'test-reporter.mjs')).href
++
++function sampleFolder(t, files) {
++  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'orbit-test-reporter-'))
++  t.after(() => fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 }))
++  for (const [name, text] of Object.entries(files)) fs.writeFileSync(path.join(dir, name), text)
++  return dir
++}
++
++function run(dir, env = {}, reporter = REPORTER) {
++  // Under node --test this process carries NODE_TEST_CONTEXT, which would make the inner run a child that speaks TAP.
++  const clean = { ...process.env }
++  delete clean.NODE_TEST_CONTEXT
++  const result = childProcess.spawnSync(process.execPath, [`--test-reporter=${reporter}`, '--test',
++    ...fs.readdirSync(dir).filter((name) => name.endsWith('.test.cjs')).map((name) => path.join(dir, name))], {
++    cwd: dir, encoding: 'utf8', env: { ...clean, ORBIT_TEST_REPORTER: '', ...env }, timeout: 60000,
++  })
++  return { status: result.status, out: result.stdout + result.stderr }
++}
++
++const PASSING = `const test = require('node:test')
++test('passes', () => { console.error('noise that a passing file must not echo') })
++test('also passes', () => {})
++test.skip('skipped', () => {})
++`
++
++test('a passing run is one summary line and exits 0', (t) => {
++  const dir = sampleFolder(t, { 'a.test.cjs': PASSING, 'b.test.cjs': PASSING })
++  const { status, out } = run(dir)
++  assert.equal(status, 0)
++  assert.equal(out.trim().split('\n').length, 1, out)
++  assert.match(out, /^tests 6 \| pass 4 \| fail 0 \| cancelled 0 \| skipped 2 \| todo 0 \| files 2 \| [\d.]+s$/m)
++})
++
++test('every failure is printed in full: assertion diff, nested name path, timeout, file that does not load, syntax error', (t) => {
++  const dir = sampleFolder(t, {
++    'pass.test.cjs': PASSING,
++    'fail.test.cjs': `const { test, describe, it } = require('node:test')
++const assert = require('node:assert')
++describe('suite', () => {
++  it('compares objects', () => { assert.deepStrictEqual({ a: 1, b: [1, 2] }, { a: 1, b: [1, 3] }) })
++  it('fine', () => {})
++})
++test('slow one', { timeout: 100 }, async () => { await new Promise((resolve) => setTimeout(resolve, 3000)) })
++`,
++    'load.test.cjs': `require('./does-not-exist.cjs')\n`,
++    'syntax.test.cjs': `const x = (\n`,
++  })
++  const { status, out } = run(dir)
++  assert.notEqual(status, 0)
++  assert.match(out, /FAIL fail\.test\.cjs:4:3\n {2}suite > compares objects\n/)
++  assert.match(out, /Expected values to be strictly deep-equal/)
++  assert.match(out, /^ {4}\+ {5}2$/m)
++  assert.match(out, /^ {4}- {5}3$/m)
++  assert.match(out, /FAIL fail\.test\.cjs:7:1 \[testTimeoutFailure\]\n {2}slow one\n {4}test timed out after 100ms/)
++  assert.match(out, /FAIL load\.test\.cjs:\d+:\d+ \(the file as a whole\)/)
++  assert.match(out, /stderr of load\.test\.cjs:[\s\S]*Cannot find module '\.\/does-not-exist\.cjs'/)
++  assert.match(out, /FAIL syntax\.test\.cjs:\d+:\d+ \(the file as a whole\)/)
++  assert.match(out, /stderr of syntax\.test\.cjs:[\s\S]*SyntaxError: Unexpected end of input/)
++  assert.doesNotMatch(out, /noise that a passing file must not echo/)
++  assert.doesNotMatch(out, /^\s+at .*node:internal\//m, 'node-internal stack frames are cut')
++  assert.match(out, /^tests \d+ \| pass \d+ \| fail [1-9]\d* \|.* files 4 \| [\d.]+s\n$/m)
++})
++
++test('ORBIT_TEST_REPORTER=spec gives the full per-test output, an unknown name is an error', (t) => {
++  const dir = sampleFolder(t, { 'a.test.cjs': PASSING })
++  const spec = run(dir, { ORBIT_TEST_REPORTER: 'spec' })
++  assert.equal(spec.status, 0)
++  assert.match(spec.out, /passes/)
++  assert.match(spec.out, /also passes/)
++  assert.ok(spec.out.trim().split('\n').length > 3, spec.out)
++  const unknown = run(dir, { ORBIT_TEST_REPORTER: 'nope' })
++  assert.notEqual(unknown.status, 0)
++  assert.match(unknown.out, /ORBIT_TEST_REPORTER=nope: expected compact, spec, tap, dot or junit/)
++})

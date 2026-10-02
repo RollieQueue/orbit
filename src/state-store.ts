@@ -1,6 +1,7 @@
-import type { AccessMode, AppState, ChatThread, ImprovementLoop, LoopStopReason, Message, Project, RestartNotice, RestartNoticeKind, RunSnapshot, Settings, Workspace } from './types'
+import type { AccessMode, AppState, ChatThread, ImprovementLoop, LoopStopReason, Message, Project, RestartNotice, RestartNoticeKind, RunSnapshot, Settings, Wakeup, Workspace } from './types'
 import { mergeMessage, type RunMap } from './run-events'
 import { loopNote, loopNoteId, stopNote, stoppedLoop } from './improvement-loop'
+import { sanitizeWakeups } from './wakeups'
 import { providers } from './providers'
 import { attachmentNote } from './attachments'
 
@@ -16,6 +17,8 @@ import { attachmentNote } from './attachments'
 export const STATE_KEY = 'orbit:state:v3'
 export const NEW_CHAT_TITLE = 'Новый чат'
 export type RestoredMessage = { projectId: string; chatId: string; message: Message }
+// A wake-up the runtime scheduled (added) or cancelled (removed) while the start-up load was in flight.
+export type RestoredWakeup = { projectId: string; chatId: string; added?: Wakeup; removed?: string }
 
 export const defaults: Settings = {
   providerId: 'codex', models: {}, limitVersion: 2, improvementMode: false, skillLearning: true, providerPool: [], providerOptions: {},
@@ -44,7 +47,7 @@ export function normalize(value: Partial<AppState>): AppState {
   const savedProjects = Array.isArray(value.projects) ? value.projects : []
   const messagesOf = (c: ChatThread) => (Array.isArray(c.messages) ? c.messages : []).filter(m => m.id !== 'welcome')
   const projects = savedProjects.filter(p => p?.id && p.workspace?.path).map(p => ({
-    ...p, chats: (Array.isArray(p.chats) ? p.chats : []).map(c => withLoop({ ...c, messages: messagesOf(c) })),
+    ...p, chats: (Array.isArray(p.chats) ? p.chats : []).map(c => withWakeups(withLoop({ ...c, messages: messagesOf(c) }))),
   }))
   const settings = { ...defaults, ...value.settings, models: { ...value.settings?.models }, limits: { ...defaults.limits, ...value.settings?.limits } }
   if (!value.settings?.limitVersion) {
@@ -86,6 +89,14 @@ function withLoop(chat: ChatThread): ChatThread {
       ...(Number.isFinite(startFailures) ? { startFailures } : {}), ...(Number.isFinite(busyStarts) ? { busyStarts } : {}),
     },
   }
+}
+
+// The saved wake-ups made valid (sanitizeWakeups); the key is dropped when none is left.
+function withWakeups(chat: ChatThread): ChatThread {
+  if (chat.wakeups === undefined) return chat
+  const { wakeups, ...rest } = chat
+  const kept = sanitizeWakeups(wakeups)
+  return kept.length ? { ...rest, wakeups: kept } : rest
 }
 
 // The state for the first render: the mirror of the last save, or the separate keys versions before v3 used.
@@ -151,14 +162,15 @@ export function reconcileRuns(state: AppState, snapshots: RunSnapshot[]): AppSta
 }
 
 // What the start-up load does to the state, in one step: pick the newer copy, fold in the saved runs, then re-apply
-// the root messages and the restart notices that arrived as live events while the load was in flight.
+// the root messages, the restart notices and the wake-up changes that arrived as live events while the load was in flight.
 export function restoreState(
-  local: AppState, saved: AppState | null, snapshots: RunSnapshot[], restoredDuringLoad: RestoredMessage[], noticesDuringLoad: RestartNotice[] = [],
+  local: AppState, saved: AppState | null, snapshots: RunSnapshot[], restoredDuringLoad: RestoredMessage[], noticesDuringLoad: RestartNotice[] = [], wakeupsDuringLoad: RestoredWakeup[] = [],
 ): AppState {
   const durable = saved ? normalize(saved) : null
   const merged = reconcileRuns(reconcileSaved(local, durable), snapshots)
   const restored = restoredDuringLoad.reduce((result, item) => addChatMessage(result, item.projectId, item.chatId, item.message), merged)
-  return noticesDuringLoad.reduce(addRestartNote, restored)
+  const noted = noticesDuringLoad.reduce(addRestartNote, restored)
+  return wakeupsDuringLoad.reduce((result, item) => item.added ? addWakeup(result, item.projectId, item.chatId, item.added) : removeWakeups(result, item.projectId, item.chatId, [item.removed!]), noted)
 }
 
 // ---- Restart notices: a system note in the chat whose run restarted Orbit, saved with the chat ----
@@ -315,6 +327,35 @@ export function activateLoop(state: AppState, projectId: string, chatId: string,
   delete loop.startFailures
   delete loop.busyStarts
   return setChatLoop(next, projectId, chatId, loop)
+}
+
+// ---- Scheduled wake-ups of a chat (src/wakeups.ts decides, these transitions save) ----
+
+const chatOf = (state: AppState, projectId: string, chatId: string) => state.projects.find(p => p.id === projectId)?.chats.find(c => c.id === chatId)
+const withWakeupList = (chat: ChatThread, list: Wakeup[]): ChatThread => {
+  const { wakeups: _old, ...rest } = chat
+  return list.length ? { ...rest, wakeups: list } : rest
+}
+// A wake-up the runtime scheduled: one with the same id is replaced; the list stays sorted by due time and bounded.
+export function addWakeup(state: AppState, projectId: string, chatId: string, wakeup: Wakeup): AppState {
+  const chat = chatOf(state, projectId, chatId)
+  if (!chat) return state
+  return updateChat(state, projectId, chatId, c => withWakeupList(c, sanitizeWakeups([...(c.wakeups || []).filter(w => w.id !== wakeup.id), wakeup])))
+}
+export function removeWakeups(state: AppState, projectId: string, chatId: string, ids: string[]): AppState {
+  const chat = chatOf(state, projectId, chatId)
+  if (!chat?.wakeups?.some(w => ids.includes(w.id))) return state
+  return updateChat(state, projectId, chatId, c => withWakeupList(c, (c.wakeups || []).filter(w => !ids.includes(w.id))))
+}
+// Changes fields of one wake-up (a patched field set to undefined is removed); an unknown id changes nothing.
+export function patchWakeup(state: AppState, projectId: string, chatId: string, id: string, patch: Partial<Wakeup>): AppState {
+  if (!chatOf(state, projectId, chatId)?.wakeups?.some(w => w.id === id)) return state
+  const patched = (w: Wakeup): Wakeup => {
+    const next: Record<string, unknown> = { ...w, ...patch, id: w.id }
+    for (const key of Object.keys(next)) if (next[key] === undefined) delete next[key]
+    return next as Wakeup
+  }
+  return updateChat(state, projectId, chatId, c => withWakeupList(c, sanitizeWakeups((c.wakeups || []).map(w => w.id === id ? patched(w) : w))))
 }
 
 export const dropMessage = (state: AppState, projectId: string, chatId: string, messageId: string) =>

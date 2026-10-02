@@ -50,6 +50,7 @@ export default function App() {
       onOpenSidebar={() => setSidebarOpen(true)} onToggleAgents={() => setAgentsOpen(!agentsOpen)} onOpenAgents={() => setAgentsOpen(true)}
       onOpenTeam={inspector.openTeam} onSuggest={orbit.setDraft} onAddProject={() => setPanel('add')}
       loop={orbit.loop} onStopLoop={orbit.stopLoop} onRunLoopNow={orbit.runLoopNow}
+      wakeups={orbit.wakeups} onRunWakeupNow={orbit.runWakeupNow} onCancelWakeup={orbit.cancelWakeup}
       composer={{
         settings: state.settings, project, chat, currentHealth: orbit.currentHealth, modelChoices: orbit.modelChoices, selectedEffort: orbit.selectedEffort,
         quotas, draft: orbit.draft, files: orbit.files, onAttach: orbit.attachFiles, onDetach: orbit.detachFile, running, loopTask: orbit.loop?.task, canSteer: orbit.canSteer, restartWait, workingRun, ready, desktop, onDraft: orbit.setDraft, onSend: () => orbit.send(inspector.followNewRun),

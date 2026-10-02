@@ -49,6 +49,10 @@ function describeCall(call: ToolCall, observation: Loose, failure: string | null
   else if (call.name === 'capability_read') { subject = ` ${clip(observation.name, 60)}`; outcome = `loaded v${observation.version}` }
   else if (call.name === 'capability_install') { subject = ` ${clip(observation.name, 60)}`; outcome = `${observation.merged ? 'improved' : 'saved'} as ${observation.scope} v${observation.version}${observation.demoted ? ' (kept in the project)' : ''}` }
   else if (call.name === 'capability_feedback') { subject = ` ${clip(observation.name, 60)}`; outcome = `${args.outcome}, now ${Math.round((observation.reliability ?? 0) * 100)}% reliable` }
+  else if (call.name === 'connector_add') { subject = ` ${clip(args.name, 40)}`; outcome = `${observation.replaced ? 'replaced' : 'registered'} (${observation.scope} ${observation.transport})` }
+  else if (call.name === 'connector_remove') outcome = `removed ${clip(observation.removed, 40)} (${observation.scope})`
+  else if (call.name === 'connector_test') { subject = ` ${clip(args.name, 40)}`; outcome = observation.ok ? `${observation.tools?.length ?? 0} tools: ${clip((observation.tools || []).map((tool: Loose) => tool.name).join(', '), 100)}` : `failed: ${clip(observation.error, 120)}` }
+  else if (call.name === 'connector_list') outcome = `${observation.connectors?.length ?? 0} connectors`
   if (outcome === undefined) outcome = observation?.ok === false ? `not ok: ${clip(observation.error || observation.reason, 100)}` : 'ok'
   return `${call.name}${subject} → ${outcome}`
 }

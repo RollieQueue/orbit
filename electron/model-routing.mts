@@ -26,6 +26,8 @@ interface RouteInput {
   now: number
   // Providers that could not answer at all a moment ago (region, sign-in, missing CLI).
   skip: Set<string>
+  // Providers the caller ruled out (spawn_agent avoidProviders).
+  avoid?: Set<string>
 }
 interface RouteChoice { providerId: string; model: string; reasoningEffort: string }
 // `skipped`: the better candidates passed over, as "codex/gpt-6-astra: quota 95% used".
@@ -55,7 +57,7 @@ function route(input: RouteInput): Route {
   const skipped: string[] = []
   for (const candidate of candidates(input.kind)) {
     if (input.providerId && candidate.providerId !== input.providerId) continue
-    const why = unusable(candidate, input)
+    const why = input.avoid?.has(candidate.providerId) ? 'ruled out by avoidProviders' : unusable(candidate, input)
     if (why) { skipped.push(`${candidate.providerId}/${candidate.model}: ${why}`); continue }
     const entry = input.catalog?.find(item => item.id === candidate.providerId)
     // The measured level where the target offers it (Antigravity takes none).

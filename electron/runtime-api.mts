@@ -18,6 +18,8 @@ import type { QuotaMonitor, QuotaReaderOptions } from './quota.mts'
 import type { OrbitMemoryStore, MemoryInput } from './memory.mts'
 import type { ProjectContextStore } from './project-context.mts'
 import type { CapabilityStore, SkillInput } from './capabilities.mts'
+import { testConnector } from './connectors.mts'
+import type { ConnectorScope, ConnectorStore } from './connectors.mts'
 import type { ProjectIndex } from './project-index.mts'
 import type { RunStore, StateStore } from './run-store.mts'
 import type { InspectOptions, ProviderHealth } from './providers.mts'
@@ -25,7 +27,7 @@ import type { FileChange, StartPayload, StoredRun } from './types.mts'
 
 // Every store of the runtime, created by createRuntimeService before any call can arrive.
 interface RuntimeStores {
-  memoryStore: OrbitMemoryStore; projectContextStore: ProjectContextStore; capabilityStore: CapabilityStore
+  memoryStore: OrbitMemoryStore; projectContextStore: ProjectContextStore; capabilityStore: CapabilityStore; connectorStore: ConnectorStore
   projectIndex: ProjectIndex; runStore: RunStore; stateStore: StateStore
 }
 // What the handlers need: the runtime, the quota monitor, the stores, the profile folder (run artifacts live in
@@ -150,6 +152,21 @@ function createRuntimeApi(ctx: RuntimeApiContext): Map<string, RuntimeHandler> {
   handle('capabilities:install', (entry) => stores.capabilityStore.install(entry as SkillInput))
   handle('capabilities:remove', (id, workspace) => stores.capabilityStore.remove(id, text(workspace)))
   handle('capabilities:restore', (id, version, workspace) => stores.capabilityStore.restore(id, version, text(workspace)))
+  // Connectors, for the Skills panel: the project's and the global ones, secrets masked (the store's views). A name and a scope
+  // address one; a missing one is an error the panel shows.
+  const connectorScope = (value: unknown): ConnectorScope => {
+    if (value !== 'global' && value !== 'project') throw new Error('scope must be "project" or "global"')
+    return value
+  }
+  const missing = (name: unknown) => new Error(`No connector named "${String(name).slice(0, 60)}"`)
+  handle('connectors:list', (workspace) => stores.connectorStore.list(text(workspace) ?? ''))
+  handle('connectors:enable', (name, enabled, scope, workspace) => stores.connectorStore.setEnabled(String(name), enabled === true, { scope: connectorScope(scope), workspace: text(workspace) ?? '' }) ?? (() => { throw missing(name) })())
+  handle('connectors:remove', (name, scope, workspace) => stores.connectorStore.remove(String(name), { scope: connectorScope(scope), workspace: text(workspace) ?? '' }) ?? (() => { throw missing(name) })())
+  handle('connectors:test', async (name, scope, workspace) => {
+    const found = stores.connectorStore.find(String(name), text(workspace) ?? '', connectorScope(scope))
+    if (!found) throw missing(name)
+    return testConnector(found, { cwd: text(workspace) || undefined })
+  })
   // The inspection in use: a fixture installed before start-up (smoke:desktop) answers instead of the CLIs.
   handle('providers:health', (options) => inspectProviders(options as InspectOptions | undefined))
   handle('quota:get', (providerOptions, force) => quota.all(PROVIDER_IDS, {

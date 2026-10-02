@@ -3,6 +3,8 @@ import os from 'node:os'
 import path from 'node:path'
 import { proxyEnvironment } from './provider-network.mts'
 import { removeTemporaryDirectory } from './storage.mts'
+import { antigravityServers, cursorServers, toolCallText } from './connectors.mts'
+import type { ConnectorLaunch } from './connectors.mts'
 import { isOrbitResponseEnvelope, TOOL_HANDOFF } from './tool-schema.mts'
 import type { QuotaTaggedError } from './quota.mts'
 import type { CliResult, NormalizedSession, ProviderEvent, ProviderEventListener, ProviderHealth, ProviderOptions, ProviderResult, ProviderRunOptions, RunCli, SessionHelpers, ToolEvent } from './providers.mts'
@@ -106,12 +108,14 @@ function buildAntigravitySessionArgs(options: LaunchArgOptions, session: Pick<No
 }
 // Cursor loads Orbit's server from a plugin folder (its id becomes `plugin-orbit-orbit`). The header names the token by
 // variable, which Cursor expands from its environment, so the token never touches the disk.
-function writeCursorPlugin(mcpUrl: string): string {
+// The connectors (external MCP servers of a run with full access) sit next to it; their env and header values are the
+// connector's own, so the file is private to the user and goes with the folder after the turn.
+function writeCursorPlugin(mcpUrl: string, connectors?: ConnectorLaunch[]): string {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), `${CURSOR_PLUGIN_PREFIX}${process.pid}-`))
   try {
     fs.mkdirSync(path.join(directory, '.cursor-plugin'))
     fs.writeFileSync(path.join(directory, '.cursor-plugin', 'plugin.json'), JSON.stringify({ name: 'orbit', version: '1.0.0', description: 'Orbit tools' }))
-    fs.writeFileSync(path.join(directory, 'mcp.json'), JSON.stringify({ mcpServers: { orbit: { url: mcpUrl, headers: { Authorization: 'Bearer ${env:ORBIT_MCP_TOKEN}' } } } }))
+    fs.writeFileSync(path.join(directory, 'mcp.json'), JSON.stringify({ mcpServers: { orbit: { url: mcpUrl, headers: { Authorization: 'Bearer ${env:ORBIT_MCP_TOKEN}' } }, ...cursorServers(connectors) } }), { mode: 0o600 })
     return directory
   } catch (error) { removeTemporaryDirectory(directory, CURSOR_PLUGIN_PREFIX); throw error }
 }
@@ -119,14 +123,16 @@ function writeCursorPlugin(mcpUrl: string): string {
 // with the server (namespaced `orbit_orbit`; this CLI takes no token variable, so the short-lived token is in the file)
 // and, as the plugin's always-on rule, the stable Orbit block the other CLIs get as a system prompt. Rewritten before
 // every turn, since the port and the token may change.
-function writeAntigravityPlugin(directory: string, session: Pick<NormalizedSession, 'mcpUrl' | 'token' | 'systemAppend'>, workspace: string): void {
+function writeAntigravityPlugin(directory: string, session: Pick<NormalizedSession, 'mcpUrl' | 'token' | 'systemAppend'> & Partial<Pick<NormalizedSession, 'connectors'>>, workspace: string): void {
   const plugin = path.join(directory, '.agents', 'plugins', 'orbit')
   fs.mkdirSync(path.join(plugin, 'rules'), { recursive: true })
   fs.writeFileSync(path.join(plugin, 'plugin.json'), JSON.stringify({ name: 'orbit' }))
-  const servers = session.mcpUrl && session.token ? { orbit: { serverUrl: session.mcpUrl, headers: { Authorization: `Bearer ${session.token}` }, timeoutSeconds: AGY_MCP_TIMEOUT_SECONDS } } : {}
-  fs.writeFileSync(path.join(plugin, 'mcp_config.json'), JSON.stringify({ mcpServers: servers }), { mode: 0o600 })
+  const orbit = session.mcpUrl && session.token ? { orbit: { serverUrl: session.mcpUrl, headers: { Authorization: `Bearer ${session.token}` }, timeoutSeconds: AGY_MCP_TIMEOUT_SECONDS } } : {}
+  // Connectors only alongside Orbit's server (a session always has it); the plugin namespaces them `orbit_<name>` like `orbit_orbit`.
+  const connectors = session.mcpUrl && session.token ? session.connectors || [] : []
+  fs.writeFileSync(path.join(plugin, 'mcp_config.json'), JSON.stringify({ mcpServers: { ...orbit, ...antigravityServers(connectors) } }), { mode: 0o600 })
   const where = `WORKSPACE: the project is ${workspace}. This process starts in a scratch folder that only holds Orbit's plugin: work in the project, with absolute paths under it, and run commands with the project as their working directory.`
-  const tools = 'Orbit tools are called with call_mcp_tool, ServerName "orbit_orbit" and ToolName the Orbit tool\'s name.'
+  const tools = `Orbit tools are called with call_mcp_tool, ServerName "orbit_orbit" and ToolName the Orbit tool's name.${connectors.length ? ` The connectors' tools (${connectors.map(item => item.name).join(', ')}) are called the same way, ServerName "orbit_<connector name>".` : ''}`
   fs.writeFileSync(path.join(plugin, 'rules', 'AGENTS.md'), `${session.systemAppend ? `${session.systemAppend}\n\n` : ''}${where}\n${tools}\n`)
 }
 function modelVariant(model: string | undefined): ModelVariant {
@@ -248,7 +254,7 @@ function cursorToolEvent(event: SubscriptionEvent, orbitServer = true): ToolEven
   const toolId = ids.find((value): value is string => typeof value === 'string' && value !== '')
   const named = typeof args.toolName === 'string' ? args.toolName : typeof args.name === 'string' ? args.name : ''
   const orbitTool = orbitServer && kind === 'mcpToolCall' && ORBIT_SERVER.test(String(args.providerIdentifier || args.serverIdentifier || '')) ? named.replace(/^(?:mcp_+)?(?:plugin-orbit-)?orbit(?:__|[-_:.])/, '') : ''
-  if (orbitTool) return { providerId: 'cursor', kind: 'tool', tool: `mcp__orbit__${orbitTool}`, toolId, status, input: args.args, output, text: `${orbitTool} ${JSON.stringify(args.args ?? {}).slice(0, 200)}`, native: false, mcp: true, server: 'orbit', orbitTool }
+  if (orbitTool) return { providerId: 'cursor', kind: 'tool', tool: `mcp__orbit__${orbitTool}`, toolId, status, input: args.args, output, text: toolCallText(orbitTool, args.args ?? {}), native: false, mcp: true, server: 'orbit', orbitTool }
   const target = typeof args.path === 'string' ? args.path : undefined
   // A search names what it looks for (grep and glob also carry the folder they search in).
   const text = [args.command, args.pattern, args.globPattern, args.query, args.path, named].find((value): value is string => typeof value === 'string' && value !== '')
@@ -267,7 +273,7 @@ function antigravityToolEvent(step: AntigravityStep): ToolEvent {
   const failure = isRecord(info.error) && typeof info.error.message === 'string' ? info.error.message : undefined
   const output = typeof info.output === 'string' ? info.output : failure
   const orbitTool = name === 'call_mcp_tool' && ORBIT_SERVER.test(String(parameters.ServerName || '')) && typeof parameters.ToolName === 'string' ? parameters.ToolName : ''
-  if (orbitTool) return { providerId: 'antigravity', kind: 'tool', tool: `mcp__orbit__${orbitTool}`, toolId, status, input: parameters.Arguments, output, text: `${orbitTool} ${JSON.stringify(parameters.Arguments ?? {}).slice(0, 200)}`, native: false, mcp: true, server: 'orbit', orbitTool }
+  if (orbitTool) return { providerId: 'antigravity', kind: 'tool', tool: `mcp__orbit__${orbitTool}`, toolId, status, input: parameters.Arguments, output, text: toolCallText(orbitTool, parameters.Arguments ?? {}), native: false, mcp: true, server: 'orbit', orbitTool }
   const file = AGY_FILE_TOOLS[name]
   const target = file && typeof parameters[file[1]] === 'string' ? parameters[file[1]] as string : undefined
   const text = target || (typeof parameters.CommandLine === 'string' ? parameters.CommandLine : '') || name
@@ -447,7 +453,7 @@ async function run(id: SubscriptionId, options: SubscriptionRunOptions, { runCli
       cwd: directory || options.workspace,
       input: id === 'antigravity' ? JSON.stringify({ event: 'user', message: { content: options.prompt } }) + '\n' : options.prompt,
       timeoutMs: options.timeoutMs, signal: options.signal, onLine: parser.line,
-      env,
+      env, scope: options.processScope,
       onDiagnostic: text => options.onEvent?.({ providerId: id, kind: 'observation', source: 'stderr', text }),
     })
     const result = parser.finish()
@@ -497,14 +503,14 @@ async function runCursorSession(options: SubscriptionRunOptions & { workspace: s
   const parser = createSessionParser('cursor', resolved.onEvent, resolved.model)
   const stderr: string[] = []
   // One plugin folder per turn: the MCP connection is made again by every process, a resume included.
-  const pluginDir = session.mcpUrl && session.token ? writeCursorPlugin(session.mcpUrl) : undefined
+  const pluginDir = session.mcpUrl && session.token ? writeCursorPlugin(session.mcpUrl, session.connectors) : undefined
   try {
     // Cursor has no system-prompt option: the stable Orbit block opens the conversation's first message.
     const input = !session.resume && session.systemAppend ? `${session.systemAppend}\n\n---\n\n${resolved.prompt}` : resolved.prompt
     try {
       await runCli(command, buildCursorSessionArgs(resolved, session, { pluginDir }), {
         // Cursor keys its chats by the working folder: every turn, the resume included, runs in the workspace.
-        cwd: options.workspace, input, signal: resolved.signal,
+        cwd: options.workspace, input, signal: resolved.signal, scope: resolved.processScope,
         env: { ...extraEnv(resolved), ...(session.token ? { ORBIT_MCP_TOKEN: session.token } : {}), ...loopbackNoProxy() },
         timeoutMs: resolved.timeoutMs ?? null, inactivityMs: resolved.inactivityMs, isBusy: busyCheck(session),
         onLine: parser.line,
@@ -540,7 +546,7 @@ async function runAntigravitySession(options: SubscriptionRunOptions & { workspa
         cwd: folder, input: JSON.stringify({ event: 'user', message: { content: options.prompt } }) + '\n', signal: options.signal,
         // The Google proxy stays for Google; Orbit's loopback server is reached directly.
         env: { ...extraEnv(options), ...proxy, ...loopbackNoProxy({ ...process.env, ...proxy }) },
-        timeoutMs: options.timeoutMs ?? null, inactivityMs: options.inactivityMs, isBusy: busyCheck(session),
+        timeoutMs: options.timeoutMs ?? null, inactivityMs: options.inactivityMs, isBusy: busyCheck(session), scope: options.processScope,
         onLine: parser.line,
         onDiagnostic: text => { keepTail(stderr, text); options.onEvent?.({ providerId: 'antigravity', kind: 'observation', source: 'stderr', text }) },
       })

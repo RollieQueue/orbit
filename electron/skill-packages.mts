@@ -12,6 +12,8 @@ const MAX_PARAMS = 20, MAX_TRIGGERS = 5, MAX_COMMANDS = 20
 const PARAM_KEY = /^[a-z][a-z0-9_]{0,31}$/, COMMAND_NAME = /^[a-z][a-z0-9-]{0,39}$/
 const PARAM_TYPES: readonly string[] = ['text', 'url', 'number', 'seconds', 'boolean']
 const MANIFEST = 'skill.json'
+// The manifest of an Agent Skills folder (the format of github.com/anthropics/skills, Claude Code and Codex).
+const SKILL_MD = 'SKILL.md'
 
 const isRecord = (value: unknown): value is Record<string, unknown> => !!value && typeof value === 'object' && !Array.isArray(value)
 const fail = (message: string): never => { throw new Error(message) }
@@ -142,13 +144,16 @@ function checkSourceDir(dir: string, workspace: unknown, guarded: boolean): stri
 }
 interface Manifest { name?: string; description?: string; whenToUse?: string; instructions?: string; scope?: string; params?: unknown; triggers?: unknown; commands?: unknown }
 interface Source { files: Map<string, Buffer>; manifest: Manifest | null }
-// The files of a folder, recursively; dot files and folders, node_modules and links are skipped.
+// The files of a folder, recursively; dot files and folders, node_modules and links are skipped. Every file is counted
+// and measured, so that one error names all the files over the limit (a skill folder from the ecosystem often carries big
+// samples), but contents are read only while the package stays within the limits.
 function readFolder(dir: string): Source {
   let stat: fs.Stats | null = null
   try { stat = fs.statSync(dir) } catch { /* Reported below. */ }
   if (!stat?.isDirectory()) return fail(`fromDir is not a folder: ${dir}`)
   const files = new Map<string, Buffer>()
-  let total = 0
+  let total = 0, count = 0
+  const largeFiles: { path: string; size: number }[] = []
   const walk = (folder: string): void => {
     for (const item of fs.readdirSync(folder, { withFileTypes: true })) {
       if (item.name.startsWith('.') || item.name === 'node_modules' || item.isSymbolicLink()) continue
@@ -157,25 +162,83 @@ function readFolder(dir: string): Source {
       if (!item.isFile()) continue
       const rel = packagePath(path.relative(dir, file))
       if (!rel) return fail(`Cannot install "${path.relative(dir, file)}": file names may use only letters, digits, . _ - and at most 8 folders deep`)
+      // A folder far beyond the limits (a whole repository) is not walked to its end.
+      if (++count > MAX_FILES * 25) return fail(`Skill package limit: at most ${MAX_FILES} files, and ${dir} holds more than ${MAX_FILES * 25}: is it the skill's own folder?`)
       const size = fs.statSync(file).size
-      if (size > MAX_FILE_BYTES) return fail(`Skill package limit: "${rel}" is larger than ${MAX_FILE_BYTES / 1024} KB`)
       total += size
-      if (files.size >= MAX_FILES) return fail(`Skill package limit: at most ${MAX_FILES} files`)
-      if (total > MAX_PACKAGE_BYTES) return fail(`Skill package limit: at most ${MAX_PACKAGE_BYTES / 1024 / 1024} MB in total`)
-      files.set(rel, fs.readFileSync(file))
+      if (size > MAX_FILE_BYTES) largeFiles.push({ path: rel, size })
+      else if (!largeFiles.length && count <= MAX_FILES && total <= MAX_PACKAGE_BYTES) files.set(rel, fs.readFileSync(file))
     }
   }
   walk(dir)
-  return { files, manifest: files.has(MANIFEST) ? parseManifest(files.get(MANIFEST)!.toString('utf8')) : null }
+  if (largeFiles.length) return fail(`Skill package limit: ${largeFiles.length} files are larger than ${MAX_FILE_BYTES / 1024} KB: ${largeFiles.map(item => `"${item.path}" (${Math.round(item.size / 1024)} KB)`).join(', ')}`)
+  if (count > MAX_FILES) return fail(`Skill package limit: at most ${MAX_FILES} files (found ${count})`)
+  if (total > MAX_PACKAGE_BYTES) return fail(`Skill package limit: at most ${MAX_PACKAGE_BYTES / 1024 / 1024} MB in total (found ${Math.round(total / 1024 / 1024 * 10) / 10} MB)`)
+  const json = files.has(MANIFEST) ? parseManifest(files.get(MANIFEST)!.toString('utf8')) : null
+  const markdown = files.has(SKILL_MD) ? parseMarkdownManifest(files.get(SKILL_MD)!.toString('utf8')) : null
+  return { files, manifest: mergeManifests(json, markdown) }
 }
-// Only the skill.json of a folder (null when it has none), for a caller that has to know the skill's scope before the install.
-function folderManifest(dir: string, workspace: unknown, guarded: boolean): Manifest | null {
-  let text = ''
-  try { text = fs.readFileSync(path.join(checkSourceDir(dir, workspace, guarded), MANIFEST), 'utf8') } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null
+
+// The manifest of an Agent Skills folder (github.com/anthropics/skills, Claude Code, Codex): name and description from
+// the YAML frontmatter of SKILL.md (other keys, nested ones included, are skipped), the trigger sentence of the
+// description as whenToUse, the markdown body as the instructions. Plain, quoted and block (| >) scalars, CRLF, a BOM and
+// a closing --- at the end of the file are understood.
+function parseMarkdownManifest(text: string): Manifest {
+  const manifest: Manifest = {}
+  const match = /^﻿?---[ \t]*\r?\n([\s\S]*?)\r?\n---[ \t]*(?:\r?\n|$)([\s\S]*)$/.exec(text)
+  const lines = match ? match[1].split(/\r?\n/) : []
+  for (let i = 0; i < lines.length; i++) {
+    const entry = /^([A-Za-z0-9_-]+):(?:[ \t]+(.*))?$/.exec(lines[i])
+    if (!entry) continue
+    // Indented and blank lines below a key continue its value: a block, a folded scalar, a nested mapping nobody reads.
+    const more: string[] = []
+    while (i + 1 < lines.length && (/^[ \t]/.test(lines[i + 1]) || !lines[i + 1].trim())) more.push(lines[++i])
+    if (entry[1] === 'name' || entry[1] === 'description') manifest[entry[1]] = yamlScalar((entry[2] ?? '').trim(), more)
+  }
+  if (manifest.description) {
+    const trigger = /(?:^|[.!?]\s+)((?:use|trigger) (?:this skill |it )?(?:when|for|if)\b[\s\S]*)$/i.exec(manifest.description)
+    manifest.whenToUse = trigger ? trigger[1].trim() : manifest.description
+  }
+  manifest.instructions = `Note: relative paths are relative to the package folder (package.dir in capability_read) and scripts run from there.\n\n${(match ? match[2] : text).trim()}`
+  return manifest
+}
+// Lines folded the YAML way: one line per paragraph, a blank line between paragraphs stays a line break.
+const foldLines = (rows: string[]): string => rows.map(row => row.trim()).join('\n').split(/\n{2,}/).map(part => part.replace(/\n/g, ' ')).join('\n').trim()
+// One YAML scalar from the text after its key and the lines continuing it: | keeps the lines, > and plain or quoted
+// scalars fold them.
+function yamlScalar(head: string, more: string[]): string {
+  const block = /^([|>])[+-]?[0-9]?(?:[ \t]+#.*)?$/.exec(head)
+  if (block) {
+    const filled = more.filter(line => line.trim())
+    const indent = filled.length ? Math.min(...filled.map(line => line.length - line.trimStart().length)) : 0
+    const rows = more.map(line => line.slice(indent))
+    return block[1] === '|' ? rows.join('\n').trim() : foldLines(rows)
+  }
+  const value = foldLines([/^["']/.test(head) ? head : head.replace(/[ \t]+#.*$/, ''), ...more])
+  if (/^"[\s\S]*"$/.test(value)) return value.slice(1, -1).replace(/\\n/g, '\n').replace(/\\t/g, '\t').replace(/\\(["\\/])/g, '$1')
+  if (/^'[\s\S]*'$/.test(value)) return value.slice(1, -1).replace(/''/g, "'")
+  return value
+}
+
+// skill.json fields win, SKILL.md fills the ones it leaves out.
+function mergeManifests(json: Manifest | null, markdown: Manifest | null): Manifest | null {
+  if (!json || !markdown) return json || markdown
+  return { ...markdown, ...Object.fromEntries(Object.entries(json).filter(([, value]) => value !== undefined)) }
+}
+
+// A folder's file as text, '' when it has none.
+function readIfThere(file: string): string {
+  try { return fs.readFileSync(file, 'utf8') } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return ''
     throw error
   }
-  return parseManifest(text)
+}
+// Only the manifest of a folder (skill.json and SKILL.md; null when it has neither), for a caller that has to know the
+// skill's scope before the install.
+function folderManifest(dir: string, workspace: unknown, guarded: boolean): Manifest | null {
+  const folder = checkSourceDir(dir, workspace, guarded)
+  const json = readIfThere(path.join(folder, MANIFEST)), markdown = readIfThere(path.join(folder, SKILL_MD))
+  return mergeManifests(json ? parseManifest(json) : null, markdown ? parseMarkdownManifest(markdown) : null)
 }
 function parseManifest(text: string): Manifest {
   let data: unknown

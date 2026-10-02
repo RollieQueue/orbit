@@ -15,6 +15,7 @@ import { ToolProtocolError, parseResponse } from './envelope.mts'
 import { TOOL_GUIDE } from './prompts.mts'
 import { restartNote, prepareContinuation } from './restart.mts'
 import { loadPlan } from './improvement.mts'
+import { loadWakeups } from './wakeups.mts'
 import { MAX_RUN_FILES, attachmentBlock } from '../attachments.mts'
 
 const DEFAULT_LIMITS: Readonly<RunLimits> = Object.freeze({ maxAgents: null, maxDepth: null, maxConcurrent: null, maxTurns: null, maxTotalTurns: null, maxMessages: null, maxToolCalls: null, maxOutputChars: 12000, maxContextChars: 120000, timeoutMs: null, runTimeoutMs: null })
@@ -61,7 +62,8 @@ function conversationHistory(entries: HistoryInput[]): HistoryEntry[] {
 // with, as plain data, without the message and the chat history (the continuation brings its own message, and the chat
 // reaches it through the digest of earlier turns).
 function restartPayload(payload: StartPayload): StartPayload | undefined {
-  const { prompt, history, attachments, resumedFrom, resumeChain, restartNote, resumeSession, resumeAttachments, ...settings } = payload
+  // The wake-ups are the chat's, not a setting: the continuation takes the list its predecessor ended with (wakeups.mts).
+  const { prompt, history, attachments, wakeups, resumedFrom, resumeChain, restartNote, resumeSession, resumeAttachments, ...settings } = payload
   try { return JSON.parse(JSON.stringify(settings)) as StartPayload } catch { return undefined }
 }
 async function start(runtime: OrbitRuntimeLike, payload: StartPayload = {}): Promise<string> {
@@ -96,7 +98,7 @@ async function start(runtime: OrbitRuntimeLike, payload: StartPayload = {}): Pro
     runId: randomUUID(), projectId: payload.projectId || workspace, chatId: payload.chatId || randomUUID(),
     prompt, workspace, providerId: payload.providerId, model: payload.model || '',
     memoryEnabled: payload.memoryEnabled !== false, globalMemoryEnabled: payload.globalMemoryEnabled !== false, memoryContext: (payload.memoryContext || []).filter(entry => payload.globalMemoryEnabled !== false || entry.scope !== 'global'),
-    improvementMode: payload.improvementMode === true, improvements: [], improvementStatus: 'planning',
+    improvementMode: payload.improvementMode === true, improvements: [], improvementStatus: 'planning', wakeups: [],
     providerOptions: payload.providerOptions || {}, providerPool: payload.providerPool || [], sharedContext: {}, evaluations: new Set(),
     failover: normalizeFailover(payload.quotaFailover), models: payload.models && typeof payload.models === 'object' ? payload.models : {}, catalogCache: null, brokenProviders: new Map(),
     history: Array.isArray(payload.history) ? conversationHistory(payload.history) : [],
@@ -119,6 +121,7 @@ async function start(runtime: OrbitRuntimeLike, payload: StartPayload = {}): Pro
   if (typeof payload.resumedFrom === 'string' && /^[\w-]+$/.test(payload.resumedFrom)) run.resumedFrom = payload.resumedFrom
   if (Number.isSafeInteger(payload.resumeChain) && Number(payload.resumeChain) >= 0) run.resumeChain = payload.resumeChain
   if (Number.isSafeInteger(payload.loopTask) && Number(payload.loopTask) >= 1) run.loopTask = payload.loopTask
+  loadWakeups(runtime, run, payload)
   run.router = new TeamRouter(run, {
     record: (sender, target, text, extra) => runtime.recordCommunication(run, sender, target, text, extra),
     announce: (communication, persist) => runtime.emit(run, 'communication.added', { communication }, persist),

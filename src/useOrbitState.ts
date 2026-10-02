@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import type { Attachment, ChatThread, ImprovementLoop, Message, Project, RestartNotice, RuntimeStatus, Settings, Workspace } from './types'
+import type { Attachment, ChatThread, ImprovementLoop, Message, Project, RestartNotice, RuntimeStatus, Settings, Wakeup, Workspace } from './types'
 import { addFiles, discardChatFiles, discardFiles, pendingAttachments, saveFiles } from './attachments'
 import { errorText, remoteErrorText } from './format'
 import { closedKeysOf, loopNote, loopPrompt, loopStartFailed, loopView, newestPlanRun, nextLoopStep } from './improvement-loop'
@@ -9,16 +9,18 @@ import { reasoningLevels } from './ReasoningPicker'
 import { activeRunIds, applyRunEvent, interruptLost, isActiveStatus, linkResumed, restoreRuns, snapshotBase, type RunMap } from './run-events'
 import { initialWatch, watchRuntime } from './runtime-status'
 import {
-  activateLoop, addChatMessage, addRestartNote, addWorkspace, chatHistory, dropMessage, initialState, mirrorState, nameOf, newChat, now, openChat,
-  reconcileRuns, removeChat, restartNote, restartWaits, restoreState, selectChat as selectChatIn, selectProject as selectProjectIn,
+  activateLoop, addChatMessage, addRestartNote, addWakeup, addWorkspace, chatHistory, dropMessage, initialState, mirrorState, nameOf, newChat, now, openChat,
+  patchWakeup, reconcileRuns, removeChat, removeWakeups, restartNote, restartWaits, restoreState, selectChat as selectChatIn, selectProject as selectProjectIn,
   setChatLoop, setGlobalMemory as setGlobalMemoryIn, settlingRestartText, sharingEntries, sharingKey, stampSaved, stopLoop, loopStateNote, titleChat, uid, withSettings,
-  type RestoredMessage,
+  type RestoredMessage, type RestoredWakeup,
 } from './state-store'
 import { useQuotas } from './useQuotas'
+import { holdLoopStep, nextWakeupStep, wakeupFailed, wakeupMessage, wakeupPrompt } from './wakeups'
 
 export type OrbitStore = ReturnType<typeof useOrbitState>
 // The same empty list every render, so that a chat without files does not look changed to the components.
 const noFiles: File[] = []
+const noWakeups: Wakeup[] = []
 
 // Everything the renderer knows: the saved state (projects, chats, settings) with its persistence, the live runs fed by
 // the runtime's events, provider health and quotas, and the actions the components call. Components only render.
@@ -59,8 +61,17 @@ export function useOrbitState() {
     let restoring = true
     const restoredDuringLoad: RestoredMessage[] = []
     const noticesDuringLoad: RestartNotice[] = []
+    const wakeupsDuringLoad: RestoredWakeup[] = []
     const unsubscribe = api.onRuntimeEvent(event => {
       if (!event.projectId || !event.chatId) return
+      // A wake-up the root agent scheduled or cancelled: the chat keeps the list; the run's own state is not touched.
+      if (event.type === 'wakeup.scheduled' || event.type === 'wakeup.cancelled') {
+        const change: RestoredWakeup = { projectId: event.projectId, chatId: event.chatId, ...(event.type === 'wakeup.scheduled' ? { added: event.wakeup } : { removed: event.wakeupId }) }
+        if (!change.added && !change.removed) return
+        if (restoring) wakeupsDuringLoad.push(change)
+        setState(previous => change.added ? addWakeup(previous, change.projectId, change.chatId, change.added) : removeWakeups(previous, change.projectId, change.chatId, [change.removed!]))
+        return
+      }
       if (event.warning) setRuntimeStorageError(event.warning)
       setRuns(previous => applyRunEvent(previous, event))
       if (event.message && (!event.message.agentId || event.message.agentId === 'root')) {
@@ -122,7 +133,7 @@ export function useOrbitState() {
       if (!mounted) return
       const [saved, recovered] = results
       const snapshots = recovered.status === 'fulfilled' ? recovered.value : []
-      setState(previous => restoreState(previous, saved.status === 'fulfilled' ? saved.value : null, snapshots, restoredDuringLoad, noticesDuringLoad))
+      setState(previous => restoreState(previous, saved.status === 'fulfilled' ? saved.value : null, snapshots, restoredDuringLoad, noticesDuringLoad, wakeupsDuringLoad))
       setRuns(previous => restoreRuns(previous, snapshots))
       if (saved.status === 'rejected' || recovered.status === 'rejected') {
         setNotice('Не удалось полностью восстановить данные. Локальная история чатов сохранена в интерфейсе.')
@@ -226,12 +237,14 @@ export function useOrbitState() {
       return true
     } catch (error) { setNotice(errorText(error)); return false } finally { setProjectBusy(false) }
   }
-  // What a new run of `target`'s chat starts with: the current settings, the project's memory switch, effort and model.
+  // What a new run of `target`'s chat starts with: the current settings, the project's memory switch, effort and model, and
+  // the chat's pending wake-ups (the runtime learns them only from here: its prompt lists them, the per-chat limit counts them).
   function taskPayload(target: Project, chatId: string, prompt: string, history: StartTaskPayload['history'], extra: Partial<StartTaskPayload> = {}): StartTaskPayload {
+    const wakeups = target.chats.find(c => c.id === chatId)?.wakeups
     return {
       projectId: target.id, chatId, prompt, history, workspace: target.workspace.path, ...state.settings,
       memoryEnabled: true, globalMemoryEnabled: target.globalMemoryEnabled ?? state.settings.memoryEnabled, reasoningEffort: selectedEffort,
-      model: state.settings.models[providerId]?.trim() || undefined, ...extra,
+      model: state.settings.models[providerId]?.trim() || undefined, ...(wakeups?.length ? { wakeups } : {}), ...extra,
     }
   }
   // Starts a run and holds the chat's pending key until the desktop answers (so `running` shows and nothing starts twice).
@@ -302,9 +315,11 @@ export function useOrbitState() {
     }, attached.length ? async () => { saved = await saveFiles(targetChat, attached); return { attachments: saved } } : undefined)
     return true
   }
-  // ---- The endless improvement loop: every chat whose loop is active, in every project ----
-  // Once the latest run of such a chat has ended, nextLoopStep decides: the next task as a new run with a fresh context
-  // (history: []), a retry after a backoff, or the end of the loop. A timer wakes the driver when a retry or a lost start is due.
+  // ---- The driver: the endless improvement loop and scheduled wake-ups, every chat in every project ----
+  // Once the latest run of a chat with an active loop has ended, nextLoopStep decides: the next task as a new run with a fresh
+  // context (history: []), a retry after a backoff, or the end of the loop. A chat without an active loop fires its due
+  // wake-ups as one run (nextWakeupStep); with an active loop the wake-ups only hold the loop's next task back (holdLoopStep)
+  // and join it once due. A timer wakes the driver when a retry, a lost start or a wake-up is due.
   const [loopTick, setLoopTick] = useState(0)
   const [loopWake, setLoopWake] = useState(0)
   const waitKeys = [...waits.keys()].sort().join('|')
@@ -315,16 +330,22 @@ export function useOrbitState() {
     let wake = 0
     for (const target of state.projects) {
       for (const loopChat of target.chats) {
-        if (!loopChat.loop?.active) continue
+        if (!loopChat.loop?.active && !loopChat.wakeups?.length) continue
         const key = `${target.id}/${loopChat.id}`
         const chatRunList = Object.values(runs).filter(r => r.projectId === target.id && r.chatId === loopChat.id)
         const busy = pendingRef.current.has(key) || waits.has(key) || chatRunList.some(r => isActiveStatus(r.status))
-        const step = nextLoopStep(loopChat, chatRunList, { enabled, busy, now: at, restartNoteText: runId => settlingRestartText(loopChat, runId) })
+        if (!loopChat.loop?.active) {
+          const wakeStep = nextWakeupStep(loopChat, { now: at, busy })
+          if (wakeStep.kind === 'start') startWakeupRun(target, loopChat, wakeStep.wakeups)
+          else if (wakeStep.wakeAt && (!wake || wakeStep.wakeAt < wake)) wake = wakeStep.wakeAt
+          continue
+        }
+        const step = holdLoopStep(nextLoopStep(loopChat, chatRunList, { enabled, busy, now: at, restartNoteText: runId => settlingRestartText(loopChat, runId) }), loopChat, at)
         if (step.kind === 'idle') { if (step.wakeAt && (!wake || step.wakeAt < wake)) wake = step.wakeAt }
         else if (step.kind === 'stop' || step.kind === 'retry') {
           const note = loopStateNote(step.note, atIso, step.kind === 'retry' ? `loop-retry-${step.runId}` : undefined)
           setState(previous => addChatMessage(setChatLoop(previous, target.id, loopChat.id, step.loop), target.id, loopChat.id, note))
-        } else startLoopTask(target, loopChat, step.loop, step.task, step.outcome)
+        } else startLoopTask(target, loopChat, step.loop, step.task, step.outcome, step.wakeups)
       }
     }
     setLoopWake(wake)
@@ -337,14 +358,23 @@ export function useOrbitState() {
   // One loop task: the loop is saved first (task number, lastRunId, startingAt), then the run starts under the chat's
   // pending key; its loop note stands for the generated prompt. A refused start is repeated later (loopStartFailed): in
   // seconds and silently while Orbit is busy, after a backoff and with a warning otherwise.
-  function startLoopTask(target: Project, loopChat: ChatThread, loop: ImprovementLoop, taskNumber: number, outcome?: string) {
+  // `fired`: the due wake-ups this task consumes: their text joins the prompt, they leave the chat once the run started.
+  function startLoopTask(target: Project, loopChat: ChatThread, loop: ImprovementLoop, taskNumber: number, outcome?: string, fired: Wakeup[] = []) {
     const key = `${target.id}/${loopChat.id}`
     if (pendingRef.current.has(key)) return
-    const prompt = loopPrompt(loop, loopChat.messages, taskNumber, outcome)
-    const task = taskPayload(target, loopChat.id, prompt, [], { improvementMode: true, loopTask: taskNumber })
+    const firedIds = fired.map(w => w.id)
+    const prompt = loopPrompt(loop, loopChat.messages, taskNumber, outcome, fired.length ? wakeupPrompt(fired, Date.now()) : undefined)
+    const task = taskPayload(target, loopChat.id, prompt, [], {
+      improvementMode: true, loopTask: taskNumber, ...(fired.length ? { wakeups: (loopChat.wakeups || []).filter(w => !firedIds.includes(w.id)) } : {}),
+    })
     setState(previous => setChatLoop(previous, target.id, loopChat.id, loop))
     launch(task, runId => {
-      setState(previous => addChatMessage(previous, target.id, loopChat.id, loopNote(runId, taskNumber, now(), outcome)))
+      setState(previous => {
+        const next = addChatMessage(removeWakeups(previous, target.id, loopChat.id, firedIds), target.id, loopChat.id, loopNote(runId, taskNumber, now(), outcome))
+        if (!fired.length) return next
+        const text = `⏰ В задачу вошли пробуждения по расписанию: ${fired.map(w => w.reason).join('; ')}`
+        return addChatMessage(next, target.id, loopChat.id, { id: `wakeup-fired-${runId}`, author: 'system', kind: 'loop-state', text, time: now() })
+      })
     }, error => {
       setState(previous => {
         const current = previous.projects.find(p => p.id === target.id)?.chats.find(c => c.id === loopChat.id)?.loop
@@ -356,6 +386,38 @@ export function useOrbitState() {
         return addChatMessage(next, target.id, loopChat.id, warning)
       })
     })
+  }
+  // Fires the due wake-ups of a chat without an active loop as ONE plain run (no improvement loop starts) with the agent's own
+  // task. They leave the chat only once the run started; a refused start keeps them with a retry time (wakeupFailed), so the
+  // driver does not retry in a tight loop, and shows the reason in the chat.
+  function startWakeupRun(target: Project, wakeChat: ChatThread, due: Wakeup[]) {
+    const key = `${target.id}/${wakeChat.id}`
+    if (pendingRef.current.has(key)) return
+    const ids = due.map(w => w.id)
+    const prompt = wakeupPrompt(due, Date.now())
+    const task = taskPayload(target, wakeChat.id, prompt, chatHistory(wakeChat), {
+      improvementMode: false, wakeups: (wakeChat.wakeups || []).filter(w => !ids.includes(w.id)),
+    })
+    launch(task, runId => {
+      setState(previous => addChatMessage(removeWakeups(previous, target.id, wakeChat.id, ids), target.id, wakeChat.id, wakeupMessage(runId, prompt, now())))
+    }, error => {
+      setState(previous => {
+        const kept = previous.projects.find(p => p.id === target.id)?.chats.find(c => c.id === wakeChat.id)?.wakeups || []
+        let next = previous, note: string | undefined
+        for (const w of kept.filter(item => ids.includes(item.id))) {
+          const failed = wakeupFailed(w, errorText(error), Date.now())
+          next = patchWakeup(next, target.id, wakeChat.id, w.id, failed.wakeup)
+          note = note || failed.note
+        }
+        return note ? addChatMessage(next, target.id, wakeChat.id, { id: uid(), author: 'system', kind: 'warning', text: note, time: now() }) : next
+      })
+    })
+  }
+  // The wake-up chips' actions on the current chat: cancel one, or make it due now (the driver fires it as soon as the chat is
+  // idle; with an active loop that releases the loop's hold).
+  function cancelWakeup(id: string) { if (project && chat) setState(previous => removeWakeups(previous, project.id, chat.id, [id])) }
+  function runWakeupNow(id: string) {
+    if (project && chat) setState(previous => patchWakeup(previous, project.id, chat.id, id, { dueAt: Date.now(), retryAt: undefined, manual: true }))
   }
   // The loop banner's actions: stop the current chat's loop (a working run finishes its task), or start a waiting retry now.
   function stopLoopHere() {
@@ -447,6 +509,6 @@ export function useOrbitState() {
     project, globalMemoryEnabled, chat, chatKey, chatRuns, workingRun, running, canSteer, restartWait, restartWaits: waits, draft, setDraft, files, attachFiles, detachFile, loop,
     currentHealth, connected, modelChoices, selectedEffort,
     updateSettings, setGlobalMemory, selectProject, selectChat, createChat, deleteChat, addProject, send, messageAgent, pauseAgent, resumeAgent, stopAgent, togglePause, stop, refreshProviders, restartRuntime,
-    stopLoop: stopLoopHere, runLoopNow,
+    stopLoop: stopLoopHere, runLoopNow, wakeups: chat?.wakeups || noWakeups, cancelWakeup, runWakeupNow,
   }
 }

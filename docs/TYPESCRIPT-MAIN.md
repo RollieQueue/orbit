@@ -22,7 +22,8 @@ stale. This file records the final layout of wave 3; `docs/SESSION-MODE.md` has 
   `electron/main.cjs`. The shell files `require('./x.mts')` the ES modules (Node's `require(esm)`); no `.mts` module
   imports a `.cjs` file, so no CommonJS module sits inside an ESM cycle.
 - **The shell as the restart levels count it** is `SHELL_FILES` of `electron/fingerprint.cjs`: those seven `.cjs`
-  files, the two ES modules main loads (`electron/git.mts`, `electron/runtime-protocol.mts`, which import no other
+  files, the ES modules main loads (`electron/git.mts`, `electron/process-table.mts`, `electron/runtime-protocol.mts`,
+  `electron/skill-files.mts`, which import no other
   `electron/` module at run time) and `package.json`. In child mode main loads nothing else under `electron/`
   (`tests/main-load.test.cjs` enforces it); a change to any of them takes a full relaunch, a change anywhere else in
   `electron/` only a new runtime process. A module main starts to require is added to `SHELL_FILES` in the source.

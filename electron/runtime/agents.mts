@@ -5,9 +5,10 @@ import { setMaxListeners } from 'node:events'
 import { saveNote } from '../shared-context.mts'
 import * as chatMemory from '../chat-memory.mts'
 import { ROUTING_KINDS } from '../model-routing.mts'
+import { isPinned } from '../failover.mts'
 import { RANK, offeredLevels, clampEffort } from '../reasoning-levels.mts'
-import type { AgentDirectoryEntry, AgentRecord, EffortSource, AgentResult, ChildResultEntry, FollowupResult, IsolationPrepared, ModelTarget, OrbitRuntimeLike, PublicAgent, RoutedSpawn, RunRecord, SpawnResult, TeamDigest, ToolArgs, TurnWaiter, WorkedModel } from '../types.mts'
-import { TERMINAL, AGENT_TERMINAL, ceiling, USER, newMailMark, withoutGoogleReasoning, answerLimit, publicAgent, agentTokens, bounded, clip, abortError } from './util.mts'
+import type { AgentDirectoryEntry, AgentRecord, FailedOver, HandoverReason, EffortSource, AgentResult, ChildResultEntry, FollowupResult, IsolationPrepared, ModelTarget, OrbitRuntimeLike, PublicAgent, RoutedSpawn, RunRecord, SpawnResult, TeamDigest, ToolArgs, TurnWaiter, WorkedModel } from '../types.mts'
+import { TERMINAL, AGENT_TERMINAL, ceiling, USER, newMailMark, withoutGoogleReasoning, answerLimit, REPORT_CHARS, publicAgent, agentConnectors, agentTokens, bounded, clip, abortError } from './util.mts'
 
 // The reasoning level of a helper and why. The first rule that names one wins: the level the caller passed to spawn_agent, the
 // user's provider pool entry for the model (its empty level means "auto"), the routing table's level for the kind of work,
@@ -57,6 +58,9 @@ function createAgent(runtime: OrbitRuntimeLike, run: RunRecord, parent: AgentRec
     mailMark: newMailMark(), usage: null,
     // A helper works where its parent does (inside an isolated copy, when the parent has one); `extra` may give it its own.
     ...(parent?.workspace ? { workspace: parent.workspace } : {}), ...extra,
+    ...(parent && isPinned(spec, parent.providerId) ? { failover: 'none' as const } : {}),
+    ...(parent && avoided(spec).length ? { avoidProviders: avoided(spec) } : {}),
+    ...(parent && connectorNames(spec).length ? { connectors: connectorNames(spec) } : {}),
   }
   run.agentNodes.set(agent.id, agent)
   run.agentOperations.set(agent.id, new Set())
@@ -71,6 +75,10 @@ function createAgent(runtime: OrbitRuntimeLike, run: RunRecord, parent: AgentRec
   runtime.recordCommunication(run, parent || USER, agent, agent.task, { kind: 'spawn', reason: agent.reason })
   return agent
 }
+// The providers a caller ruled out for the helper (spawn_agent avoidProviders), trimmed and without repeats.
+const avoided = (spec: ToolArgs): string[] => Array.isArray(spec.avoidProviders) ? [...new Set(spec.avoidProviders.map(id => String(id).trim()).filter(Boolean))] : []
+// The connector names a spawn passes to the helper (spawn_agent connectors, checked by vetSpawn), without repeats, in the order given.
+const connectorNames = (spec: ToolArgs): string[] => Array.isArray(spec.connectors) ? [...new Set(spec.connectors.map(name => String(name).trim()).filter(Boolean))] : []
 function scheduleAgent(runtime: OrbitRuntimeLike, run: RunRecord, agent: AgentRecord): Promise<AgentResult> {
   // Register the task immediately, but start inference after the whole tool batch
   // has registered its participants and initial messages.
@@ -97,6 +105,10 @@ async function spawnSubAgent(runtime: OrbitRuntimeLike, runId: string, parentId:
   if (run && parent && ROUTING_KINDS.includes(String(spec.kind)) && !spec.model && !TERMINAL.has(run.status) && !['done', 'error', 'cancelled'].includes(parent.status)
     && String(spec.task || '').trim() && String(spec.reason || '').trim() && !(spec.name && [...run.agentNodes.values()].some(agent => agent.name === bounded(spec.name, 80)))) {
     ({ spec: routedSpec, routed } = await runtime.routeSpawn(run, parent, spec)); listed = true
+    // Only a subscription the caller named pins a review: one the routing table chose may still move as usual.
+    if (!spec.providerId && routedSpec.providerId && (routedSpec.failover === undefined || routedSpec.failover === null)) routedSpec = { ...routedSpec, failover: 'auto' }
+    // A helper pinned to a subscription that has no usable model now is not started on it to fail or move: the caller decides.
+    if (spec.providerId && !routed.model && routed.skipped?.length && isPinned(spec, parent.providerId)) return { ok: false, reason: 'provider_unavailable', routed, instruction: `Every ${spec.kind} model of ${spec.providerId} is unusable now (${routed.skipped.join('; ')}), and this helper must not change subscription (failover 'none', the default for a review on another subscription than yours), so it was not started. Wait for the reset, name another providerId, or pass failover 'auto' to let Orbit move it.` }
     if (turn && parent.activeTurn !== turn) return { ok: false, reason: 'turn_interrupted', instruction: 'Your turn was cut off (a pause) while the helper\'s model was being chosen, so no helper was created; spawn it again if it is still needed.' }
   }
   // A level the caller names is moved to what the model offers, which the provider list says (routing has waited for it already).
@@ -111,6 +123,7 @@ async function spawnSubAgent(runtime: OrbitRuntimeLike, runId: string, parentId:
     const made = await runtime.prepareIsolation(vetted.run, vetted.parent, isolation)
     if (!made.ok) return { ok: false, reason: made.reason, ...(made.instruction ? { instruction: made.instruction } : {}) }
     prepared = made; copyRun = vetted.run
+    if (spec.merge === 'hold' && prepared.fields.isolation) prepared.fields.isolation.held = true
     if (turn && vetted.parent.activeTurn !== turn) {
       await runtime.discardIsolation(copyRun, made.id)
       return { ok: false, reason: 'turn_interrupted', instruction: 'Your turn was cut off (a pause) while the helper\'s isolated copy was being made, so no helper was created; spawn it again if it is still needed.' }
@@ -138,7 +151,13 @@ function vetSpawn(runtime: OrbitRuntimeLike, runId: string, parentId: string, sp
   if (!parent || ['done', 'error', 'cancelled'].includes(parent.status)) return { ok: false, reason: 'parent_not_active' }
   if (!String(spec.task || '').trim() || !String(spec.reason || '').trim()) return { ok: false, reason: 'task_and_delegation_reason_required' }
   if (spec.reasoningEffort && !['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra', 'enabled'].includes(spec.reasoningEffort)) return { ok: false, reason: 'invalid_reasoning_effort' }
+  if (spec.failover && !['auto', 'none'].includes(String(spec.failover))) return { ok: false, reason: 'invalid_failover', instruction: "failover is 'none' (the helper never changes subscription: when its own is out of quota or fails, it stops with an error you see in wait_agent) or 'auto' (Orbit may move it to another subscription; wait_agent then shows failedOver)" }
+  if (spec.avoidProviders !== undefined && spec.avoidProviders !== null && (!Array.isArray(spec.avoidProviders) || spec.avoidProviders.some(id => typeof id !== 'string'))) return { ok: false, reason: 'invalid_avoid_providers', instruction: 'avoidProviders is a list of provider ids (for example ["claude"]) the helper must never run on or be moved to' }
+  if (spec.providerId && avoided(spec).includes(spec.providerId)) return { ok: false, reason: 'invalid_avoid_providers', instruction: `providerId ${spec.providerId} is also in avoidProviders` }
   if (spec.kind && !ROUTING_KINDS.includes(String(spec.kind))) return { ok: false, reason: 'unknown_kind', instruction: `kind is one of: ${ROUTING_KINDS.join(', ')}` }
+  if (spec.merge && !['auto', 'hold'].includes(String(spec.merge))) return { ok: false, reason: 'invalid_merge', instruction: "merge is 'auto' (Orbit merges the helper's changes when it finishes) or 'hold' (it does not: you decide with merge_agent)" }
+  if (spec.merge === 'hold' && !spec.isolation) return { ok: false, reason: 'invalid_merge', instruction: "merge 'hold' needs isolation ('worktree' or 'orbit'): without a copy of its own there is nothing to hold" }
+  if (spec.connectors !== undefined && spec.connectors !== null && (!Array.isArray(spec.connectors) || spec.connectors.some(name => typeof name !== 'string'))) return { ok: false, reason: 'invalid_connectors', instruction: 'connectors is a list of connector names (for example ["playwright"]) that the helper gets; leave it out for none' }
   let prior: PublicAgent | null = null
   if (spec.continueFrom) {
     // priorRuns are chatMemory.view() results over live AgentRecords and saved snapshots, so a found agent is a
@@ -147,6 +166,19 @@ function vetSpawn(runtime: OrbitRuntimeLike, runId: string, parentId: string, sp
     if (!prior) return { ok: false, reason: 'continue_from_not_found', instruction: 'No agent with that name ran in earlier turns of this chat; team_history lists them.' }
     if (!spec.name) spec = { ...spec, name: prior.name }
   }
+  // Helpers get no connector unless the spawn names it, and never one their parent lacks. A helper that continues an earlier
+  // one keeps the earlier names the parent can still pass on, unless the call names its own (also an empty list).
+  const passable = agentConnectors(runtime, run, parent).map(item => item.name)
+  const asked = connectorNames(spec)
+  if (asked.length) {
+    if (!passable.length) return { ok: false, reason: 'connectors_unavailable', instruction: run.accessMode !== 'danger-full-access' ? `This run has ${run.accessMode} access: connectors reach only runs with full access, so none can be passed to a helper.` : parent.parentId ? 'You have no connector to pass on: a helper gets only the connectors its own parent passed to it. Leave connectors out.' : 'No connector is enabled (connector_list shows them; connector_add registers one). Leave connectors out.' }
+    const unknown = asked.filter(name => !passable.includes(name))
+    if (unknown.length) return { ok: false, reason: 'unknown_connector', instruction: `${unknown.map(name => `"${bounded(name, 60)}"`).join(', ')} ${unknown.length > 1 ? 'are' : 'is'} not a connector you can pass on. Available: ${passable.join(', ')}.` }
+  }
+  if (spec.connectors === undefined || spec.connectors === null) {
+    const inherited = (prior?.connectors ?? []).filter(name => passable.includes(name))
+    if (inherited.length) spec = { ...spec, connectors: inherited }
+  } else spec = { ...spec, connectors: asked }
   if (run.providerPool.length && spec.providerId && spec.providerId !== run.providerId && !run.providerPool.some(item => item.providerId === spec.providerId && (!spec.model || !item.model || item.model === spec.model))) return { ok: false, reason: 'provider_model_not_in_configured_pool' }
   if (spec.providerId && spec.providerId !== parent.providerId && !spec.model) spec = { ...spec, model: run.providerPool.find(item => item.providerId === spec.providerId)?.model || '' }
   const existing = spec.name && [...run.agentNodes.values()].find(agent => agent.name === bounded(spec.name, 80))
@@ -166,7 +198,7 @@ function registerSubAgent(runtime: OrbitRuntimeLike, runId: string, parentId: st
   runtime.trace(run, parent.id, 'delegation', `${agent.name}: ${agent.task}\nReason: ${agent.reason}${routed ? `\n${routedLine(routed)}` : ''}${agent.isolation ? `\nIsolated copy: ${agent.isolation.path}; its changes merge into ${agent.isolation.target} when it finishes` : ''}`)
   runtime.scheduleAgent(run, agent)
   // Compact on purpose: the caller wrote the task itself, and the result and traces come through wait_agent.
-  return { ok: true, agentId: agent.id, name: agent.name, status: agent.status, providerId: agent.providerId, model: agent.model, reasoningEffort: agent.reasoningEffort, effortSource: agent.effortSource ?? '', effort: `${agent.reasoningEffort || 'provider default'} (${agent.effortNote})`, ...(agent.isolation ? { isolation: { ...agent.isolation } } : {}) }
+  return { ok: true, agentId: agent.id, name: agent.name, status: agent.status, providerId: agent.providerId, model: agent.model, reasoningEffort: agent.reasoningEffort, effortSource: agent.effortSource ?? '', effort: `${agent.reasoningEffort || 'provider default'} (${agent.effortNote})`, ...(agent.failover ? { failover: agent.failover } : {}), ...(agent.avoidProviders ? { avoidProviders: agent.avoidProviders } : {}), ...(agent.isolation ? { isolation: { ...agent.isolation } } : {}) }
 }
 function resolveAgent(runtime: OrbitRuntimeLike, run: RunRecord, reference: unknown): AgentRecord {
   const id = String(reference || '')
@@ -181,6 +213,9 @@ function resultKey(runtime: OrbitRuntimeLike, agent: { id: string; generation: n
 function followupAgent(runtime: OrbitRuntimeLike, run: RunRecord, sender: AgentRecord, args: ToolArgs): FollowupResult {
   const target = runtime.resolveAgent(run, args.agentId)
   if (!['done', 'error'].includes(target.status)) throw new Error('Follow-up requires a done/error agent; message active agents with send_message')
+  const deciding = run.deciding?.get(target.id)
+  if (deciding) throw new Error(`A ${deciding} decision for ${target.name} is in progress (merge_agent) and it would work in the copy that decision uses; try again when it finishes`)
+  if (target.isolation?.decided === 'discard') throw new Error(`${target.name} was discarded with merge_agent and its isolated copy is gone, so it cannot continue; spawn a new helper`)
   if (run.agentOperations.get(target.id)?.size) throw new Error('Previous agent operations are still cleaning up; wait before followup_agent')
   if (!String(args.task || '').trim()) throw new Error('A concrete follow-up task is required')
   if (target.turns >= ceiling(run.limits, 'maxTurns') || run.usage.workerTurns >= ceiling(run.limits, 'maxTotalTurns')) throw new Error('Agent or shared worker turn budget exhausted; follow-up cannot reset budgets')
@@ -255,10 +290,18 @@ function modelsWorked(agent: Pick<AgentRecord, 'providerId' | 'model' | 'handove
 function handoverSummary(agent: Pick<AgentRecord, 'handovers'>): string {
   return clip(agent.handovers.map(({ from, to, turn, reason }) => `${modelLabel(from)} → ${modelLabel(to)}${turn === undefined ? '' : turn ? ` after turn ${turn}` : ' before any turn'} (${reason})`).join('; '), 400)
 }
+const WHY: Record<HandoverReason, string> = { approaching: 'quota nearly used up', exhausted: 'quota exhausted', 'replacement-failed': 'the replacement did not start', stalled: 'the model stopped responding', failed: 'provider error' }
+// Every change of subscription, even one before the agent's first turn (which `ranOn` leaves out): a caller who chose a
+// provider on purpose (a judge of another vendor) must never find the helper elsewhere without being told.
+function failedOverFields(agent: Pick<AgentRecord, 'providerId' | 'model' | 'handovers'>, steps = false): { failedOver?: FailedOver } {
+  const first = agent.handovers[0]
+  if (!first) return {}
+  return { failedOver: { from: modelLabel(first.from), to: modelLabel(agent), switches: agent.handovers.length, why: WHY[first.reason], ...(steps ? { steps: handoverSummary(agent) } : {}) } }
+}
 // What a caller needs to see when an agent moved between subscriptions: who worked, and where the switches were.
-function ranOnFields(agent: Pick<AgentRecord, 'providerId' | 'model' | 'handovers'>): { ranOn?: string[]; switched?: string } {
+function ranOnFields(agent: Pick<AgentRecord, 'providerId' | 'model' | 'handovers'>): { ranOn?: string[]; switched?: string; failedOver?: FailedOver } {
   const worked = modelsWorked(agent)
-  return worked.length > 1 ? { ranOn: worked.map(item => item.turns ? `${item.label} (${item.turns})` : item.label), switched: handoverSummary(agent) } : {}
+  return { ...(worked.length > 1 ? { ranOn: worked.map(item => item.turns ? `${item.label} (${item.turns})` : item.label), switched: handoverSummary(agent) } : {}), ...failedOverFields(agent, true) }
 }
 // Compact directory: every participant fits one observation, results are excerpts.
 function directoryRanOn(agent: AgentRecord): { ranOn?: string[] } { const worked = modelsWorked(agent); return worked.length > 1 ? { ranOn: worked.map(item => item.label) } : {} }
@@ -269,7 +312,7 @@ function agentDirectory(runtime: OrbitRuntimeLike, run: RunRecord): AgentDirecto
   return agents.map(agent => ({
     paused: !!agent.paused,
     id: agent.id, name: agent.name, parentId: agent.parentId, status: agent.status, generation: agent.generation,
-    providerId: agent.providerId, model: agent.model, ...directoryRanOn(agent), ...tokensOf(agent), task: clip(agent.task, 240),
+    providerId: agent.providerId, model: agent.model, ...directoryRanOn(agent), ...failedOverFields(agent), ...tokensOf(agent), task: clip(agent.task, 240),
     result: bounded(agent.result, share), ...(agent.result.length > share ? { resultTruncated: true, fullResult: 'wait_agent {agentId} returns a direct child result in full' } : {}),
     error: agent.error, budgetLimited: !!agent.budgetLimited,
   }))
@@ -305,6 +348,9 @@ function completeAgent(runtime: OrbitRuntimeLike, run: RunRecord, agent: AgentRe
 }
 function finishAgent(runtime: OrbitRuntimeLike, run: RunRecord, agent: AgentRecord, content: string, budgetLimited: boolean, detail: string, extra: Partial<AgentRecord>): AgentResult {
   agent.result = bounded(content, answerLimit(run, agent))
+  // What `result` lost is kept for paging (team_history, context_read); a shorter report than before leaves no stale one.
+  if (content.length > answerLimit(run, agent)) agent.report = bounded(content, REPORT_CHARS)
+  else delete agent.report
   try { run.sharedContext = saveNote(runtime.contextStore, run.workspace, run.sharedContext, { key: `agent:${run.chatId}:${agent.name}`, summary: JSON.stringify({ result: agent.result.slice(0, 1800), task: agent.task.slice(0, 200), runId: run.runId, state: budgetLimited ? 'partial' : 'reported complete; verify before reuse' }) }) }
   catch (error) { runtime.persistenceError(run, error as Error) }
   runtime.remember(agent, { type: 'assistant_final', generation: agent.generation, content: agent.result, budgetLimited })
@@ -333,4 +379,4 @@ function stallHandoff(runtime: OrbitRuntimeLike, run: RunRecord, agent: AgentRec
   return runtime.completeAgent(run, agent, content, true, 'Stopped: repeated identical calls', { stalled: true })
 }
 
-export { createAgent, scheduleAgent, spawnSubAgent, resolveAgent, resultKey, followupAgent, acquireTurn, releaseTurn, agentSignal, teamDigest, agentDirectory, modelsWorked, ranOnFields, cancelDescendants, completeAgent, budgetHandoff, stallHandoff }
+export { failedOverFields, createAgent, scheduleAgent, spawnSubAgent, resolveAgent, resultKey, followupAgent, acquireTurn, releaseTurn, agentSignal, teamDigest, agentDirectory, modelsWorked, ranOnFields, cancelDescendants, completeAgent, budgetHandoff, stallHandoff }

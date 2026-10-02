@@ -1,6 +1,6 @@
 /// <reference types="vite/client" />
 // BEGIN generated from electron/ipc-contract.cjs by scripts/gen-ipc-types.cjs; do not edit between the markers.
-type StartTaskPayload = { projectId: string; chatId: string; prompt: string; history: { role: 'user' | 'assistant'; content: string }[]; workspace: string; memoryEnabled: boolean; globalMemoryEnabled?: boolean; reasoningEffort?: string; providerId: string; model?: string; models?: Record<string, string>; quotaFailover?: import('./types').QuotaFailover; providerPool?: import('./types').PoolMember[]; providerOptions?: Record<string, import('./types').ProviderOption>; agentInstructions: string; accessMode: import('./types').AccessMode; approvalPolicy: import('./types').ApprovalPolicy; limits: import('./types').RunLimits; improvementMode?: boolean; skillLearning?: boolean; loopTask?: number; attachments?: import('./types').Attachment[] }
+type StartTaskPayload = { projectId: string; chatId: string; prompt: string; history: { role: 'user' | 'assistant'; content: string }[]; workspace: string; memoryEnabled: boolean; globalMemoryEnabled?: boolean; reasoningEffort?: string; providerId: string; model?: string; models?: Record<string, string>; quotaFailover?: import('./types').QuotaFailover; providerPool?: import('./types').PoolMember[]; providerOptions?: Record<string, import('./types').ProviderOption>; agentInstructions: string; accessMode: import('./types').AccessMode; approvalPolicy: import('./types').ApprovalPolicy; limits: import('./types').RunLimits; improvementMode?: boolean; skillLearning?: boolean; loopTask?: number; wakeups?: import('./types').Wakeup[]; attachments?: import('./types').Attachment[] }
 type ApplyArtifactPayload = { workspace: string; patchPath: string; worktreePath?: string }
 type ApplyArtifactResult = { ok: boolean; reason?: string; detail?: string }
 type QuotaUpdate = { providerId: string; snapshot: import('./types').QuotaSnapshot | null }
@@ -41,6 +41,10 @@ interface OrbitBridge {
   installCapability: (entry: Partial<import('./types').Capability>) => Promise<import('./types').Capability>
   removeCapability: (id: string, workspace: string) => Promise<unknown>
   restoreCapability: (id: string, version: number, workspace: string) => Promise<import('./types').Capability>
+  listConnectors: (workspace: string) => Promise<import('./types').ConnectorView[]>
+  setConnectorEnabled: (name: string, enabled: boolean, scope: import('./types').ConnectorView['scope'], workspace: string) => Promise<import('./types').ConnectorView>
+  removeConnector: (name: string, scope: import('./types').ConnectorView['scope'], workspace: string) => Promise<unknown>
+  testConnector: (name: string, scope: import('./types').ConnectorView['scope'], workspace: string) => Promise<import('./types').ConnectorTestResult>
   checkProviders: (options?: Record<string, import('./types').ProviderOption>) => Promise<ProviderHealth[]>
   getQuotas: (options?: Record<string, import('./types').ProviderOption>, force?: boolean) => Promise<Record<string, import('./types').QuotaSnapshot>>
   projectStats: (workspace: string) => Promise<import('./types').ProjectStats>
@@ -88,7 +92,7 @@ interface ProviderHealth {
   executable?: string
 }
 interface RuntimeEvent {
-  type: 'run.started' | 'run.info' | 'agent.created' | 'agent.updated' | 'agent.handover' | 'trace.added' | 'message.streaming' | 'message.added' | 'communication.added' | 'change.added' | 'run.finished' | 'run.cancelled' | 'run.failed'
+  type: 'run.started' | 'run.info' | 'agent.created' | 'agent.updated' | 'agent.handover' | 'trace.added' | 'message.streaming' | 'message.added' | 'communication.added' | 'change.added' | 'run.finished' | 'run.cancelled' | 'run.failed' | 'wakeup.scheduled' | 'wakeup.cancelled'
   runId: string
   projectId: string
   chatId: string
@@ -122,4 +126,7 @@ interface RuntimeEvent {
   resumedFrom?: string
   resumeChain?: number
   restart?: import('./types').RunRestart
+  // wakeup.scheduled carries the new wake-up, wakeup.cancelled the id of the one the agent cancelled (the chat keeps the list).
+  wakeup?: import('./types').Wakeup
+  wakeupId?: string
 }

@@ -11,6 +11,7 @@ type SessionToken = string | SessionRef | null | undefined
 import * as providers from '../providers.mts'
 // Used only for an identity check against the runtime's runProvider.
 const defaultRunProvider: unknown = providers.runProvider
+import { maskToolArguments } from '../connectors.mts'
 import { TERMINAL, AGENT_TERMINAL, WORK_TOOLS, MUTATING_TOOLS, SKILL_READ_CHARS, abortable, bounded, clip, diagnostics } from './util.mts'
 import { describeCall } from './ledger.mts'
 import { restartOffered } from './restart.mts'
@@ -254,7 +255,7 @@ async function dispatchMcp(runtime: OrbitRuntimeLike, token: SessionToken, name:
   // Without a running turn no model would read a wait's answer.
   if (!turn && TURN_WAITS.has(call.name)) return refuse(TURN_ENDED)
   if (turn) { turn.timing.orbitToolCalls++; publishProgress(runtime, run, agent) }
-  runtime.trace(run, agent.id, 'tool', `${call.name} ${bounded(call.arguments, 1200)}`)
+  runtime.trace(run, agent.id, 'tool', `${call.name} ${bounded(maskToolArguments(call.name, call.arguments), 1200)}`)
   const waits = WAIT_TOOLS.has(call.name)
   const limit = callLimit(agent), calledAt = Date.now()
   if (waits && turn?.slot.held) { turn.slot.held = false; runtime.releaseTurn(run) }
@@ -335,7 +336,7 @@ async function dispatchMcp(runtime: OrbitRuntimeLike, token: SessionToken, name:
   }
   // describeCall reads the observation's fields defensively, whatever the tool returned.
   const logged = parked
-    ? `${call.name} ${clip(call.name === 'run_command' ? [call.arguments.command, ...(Array.isArray(call.arguments.args) ? call.arguments.args : [])].join(' ') : JSON.stringify(call.arguments), 110)} → still running after ${span(parked)} (the same call again collects the result)`
+    ? `${call.name} ${clip(call.name === 'run_command' ? [call.arguments.command, ...(Array.isArray(call.arguments.args) ? call.arguments.args : [])].join(' ') : JSON.stringify(maskToolArguments(call.name, call.arguments)), 110)} → still running after ${span(parked)} (the same call again collects the result)`
     : `${describeCall(call, observation as Record<string, unknown>, failure, id => run.agentNodes.get(id)?.name || id)}${answer !== observation ? ` (cut at ${span(limit)}, still running)` : ''}`
   runtime.recordLedger(agent, call.name, `#${agent.turns} ${logged}`)
   // What the user wrote to the agent during this turn rides on the result, whole (userMail marks it read).

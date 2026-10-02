@@ -1,4 +1,4 @@
-import type { ChatThread, ImprovementLoop, ImprovementTask, LoopStopReason, Message, RunSnapshot } from './types'
+import type { ChatThread, ImprovementLoop, ImprovementTask, LoopStopReason, Message, RunSnapshot, Wakeup } from './types'
 
 // The endless improvement loop, renderer side: pure decisions only. useOrbitState runs nextLoopStep for every chat with an
 // active loop and carries the step out (start the next task as a new run with a fresh context, schedule a retry, stop).
@@ -72,8 +72,9 @@ export type LoopStep =
   // A retry is scheduled: the loop to save and the note for the chat.
   | { kind: 'retry'; loop: ImprovementLoop; note: string; runId: string }
   // Start task `task` now. `loop` is saved before the start (lastRunId, startingAt, iteration = task); outcome = how the
-  // previous attempt ended when that was not a normal completion.
-  | { kind: 'start'; loop: ImprovementLoop; task: number; outcome?: string }
+  // previous attempt ended when that was not a normal completion. `wakeups`: the due scheduled wake-ups this task
+  // consumes (holdLoopStep in src/wakeups.ts adds them).
+  | { kind: 'start'; loop: ImprovementLoop; task: number; outcome?: string; wakeups?: Wakeup[] }
 
 export const NO_PROGRESS_TEXT = 'Предыдущая задача завершилась, но не закрыла ни одной задачи плана.'
 // How the latest run ended, for the next task's prompt; undefined for a completion that moved the plan.
@@ -195,8 +196,9 @@ export function loopStartFailed(started: ImprovementLoop, error: string, now: nu
 // ---- Texts ----
 
 // The prompt of loop task `task`: the goal, what the user wrote in the chat since the loop started, how the previous
-// attempt ended when it did not complete normally, and the one rule of the run.
-export function loopPrompt(loop: ImprovementLoop, messages: Message[], task: number, outcome?: string): string {
+// attempt ended when it did not complete normally, the scheduled wake-ups that fell due (`wakeupsText` = wakeupPrompt of
+// src/wakeups.ts, passed as text so this file stays loadable on its own), and the one rule of the run.
+export function loopPrompt(loop: ImprovementLoop, messages: Message[], task: number, outcome?: string, wakeupsText?: string): string {
   const since = Date.parse(loop.startedAt)
   const later = messages
     .filter(m => m.author === 'user' && m.text.trim() && (Number.isNaN(since) || Date.parse(m.time) > since))
@@ -205,6 +207,7 @@ export function loopPrompt(loop: ImprovementLoop, messages: Message[], task: num
   const lines = [`∞ Бесконечное улучшение — задача №${task}.`, `Цель цикла: ${clip(loop.goal, 4000)}`]
   if (later.length) lines.push('', 'Сообщения пользователя в этом чате после запуска цикла (учти их):', ...later)
   if (outcome) lines.push('', `Итог предыдущей попытки: ${outcome}`)
+  if (wakeupsText) lines.push('', 'Запланированные пробуждения (их срок наступил):', wakeupsText)
   lines.push('', 'Возьми из плана пачку независимых задач (до 4; или найди новые задачи для цели цикла), выполни их параллельно и доведи до конца по правилам цикла. Следующую пачку Orbit запустит сам.')
   return lines.join('\n')
 }

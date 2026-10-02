@@ -21,7 +21,12 @@ const HANDOFF_CHARS = 2000
 const DONE_KEPT = 30
 // How many earlier runs of the chat are searched for the plan.
 const EARLIER_RUNS = 12
-const PROGRESS_CHARS = 6500
+// The progress block (handoff included): the handoff takes up to 2000 of it, and the rest holds four open tasks with a full
+// 1500-character brief each (about 1750 characters a line with the title). More open tasks, or a long done list, make the
+// block shrink (see progressBlock) instead of growing.
+const PROGRESS_CHARS = 9000
+// An open task's brief reaches the next run whole (EVIDENCE_CHARS is the most a task stores) unless the block is over budget.
+const OPEN_EVIDENCE_CHARS = 1600
 
 const isClosed = (task: ImprovementTask): boolean => task.status === 'done' || task.status === 'blocked'
 // Closed in this run: a closed task that is new or whose status changed in this run (a blocked task done now). A task
@@ -93,6 +98,7 @@ function updatePlan(runtime: OrbitRuntimeLike, run: RunRecord, args: ToolArgs): 
   if (!oneOf(PLAN_STATUSES, args.status) || !Array.isArray(args.tasks)) throw new Error('Invalid improvement plan')
   const baseline = run.improvementBaseline || new Map<string, ImprovementTask>()
   const keptTitles: string[] = []
+  const stored = new Map(run.improvements.map(old => [old.id, old]))
   let tasks = args.tasks.map((item): ImprovementTask => {
     if (!item || !item.id || !item.title || !oneOf(TASK_STATUSES, item.status)) throw new Error('Invalid improvement task')
     if (['done', 'blocked'].includes(item.status) && !String(item.evidence || '').trim()) throw new Error('Done/blocked tasks require evidence')
@@ -104,11 +110,21 @@ function updatePlan(runtime: OrbitRuntimeLike, run: RunRecord, args: ToolArgs): 
       if (task.title !== before.title) { keptTitles.push(task.id); task.title = before.title }
       if (task.status === before.status && sameOrClipped(task.evidence, before.evidence)) task.evidence = before.evidence
     }
+    // The same for an open task re-sent from a clipped copy (the progress block shortens the briefs of a long plan).
+    const old = stored.get(task.id)
+    if (old && !isClosed(old) && !isClosed(task) && sameOrClipped(task.evidence, old.evidence)) task.evidence = old.evidence
     return task
   })
   if (new Set(tasks.map(item => item.id)).size !== tasks.length) throw new Error('Task ids must be unique')
-  if (run.improvements.some(old => (old.status === 'pending' || old.status === 'working') && !tasks.some(item => item.id === old.id))) throw new Error('Unfinished tasks cannot be silently removed')
-  if (args.status === 'completed' && (!tasks.length || tasks.some(item => item.status !== 'done'))) throw new Error('Completion requires verified tasks; if none are actionable, record a verified audit task')
+  // The list merges by id: an unfinished task the list leaves out stays as it is, so one status change needs one task, not
+  // the whole backlog re-sent. Closed tasks left out are dropped, as before (the list is what the plan keeps of them).
+  const keptOpen = run.improvements.filter(old => (old.status === 'pending' || old.status === 'working') && !tasks.some(item => item.id === old.id))
+  tasks = [...tasks, ...keptOpen]
+  if (args.status === 'completed' && (!tasks.length || tasks.some(item => item.status !== 'done'))) {
+    throw new Error(keptOpen.length
+      ? `Completion requires verified tasks; unfinished tasks not in the list were kept and block it: ${keptOpen.map(item => item.id).join(', ')}`
+      : 'Completion requires verified tasks; if none are actionable, record a verified audit task')
+  }
   if (args.status === 'blocked') {
     const blocked = tasks.filter(item => item.status === 'blocked')
     if (!blocked.length) throw new Error('Blocked plan requires a documented blocker')
@@ -135,28 +151,55 @@ function updatePlan(runtime: OrbitRuntimeLike, run: RunRecord, args: ToolArgs): 
   const notes = [
     ...(archived ? [`${archived.size} older done task(s) were archived: the plan keeps the ${DONE_KEPT} newest done tasks.`] : []),
     ...(keptTitles.length ? [`Task(s) ${keptTitles.join(', ')} were closed before this run and kept their original titles.`] : []),
+    ...(keptOpen.length ? [`Unfinished task(s) ${keptOpen.map(item => item.id).join(', ')} were not in the list and were kept unchanged.`] : []),
   ]
   return {
     ok: true, status: args.status, tasks, ...(run.improvementHandoff ? { handoff: run.improvementHandoff } : {}),
-    ...(archived ? { archived: archived.size } : {}), ...(keptTitles.length ? { keptTitles } : {}), ...(notes.length ? { note: notes.join(' ') } : {}),
+    ...(archived ? { archived: archived.size } : {}), ...(keptTitles.length ? { keptTitles } : {}), ...(keptOpen.length ? { keptOpen: keptOpen.map(item => item.id) } : {}), ...(notes.length ? { note: notes.join(' ') } : {}),
   }
 }
 
 // CURRENT IMPROVEMENT PROGRESS of an improvement-mode run: counts, open tasks first (with the brief a pending task
-// carries), the last done ones, the handoff and, for the root, the profile of the chat's previous run.
+// carries, whole), the last done ones, the handoff and, for the root, the profile of the chat's previous run. Over budget
+// (PROGRESS_CHARS): the done and blocked lines shrink first (evidence, then the lines themselves), then every open task's
+// evidence shortens evenly, longer briefs losing the most; an open task never loses its id, title or status line.
 function progressBlock(run: RunRecord, withProfile = true): string {
   const count = (status: TaskStatus) => run.improvements.filter(task => task.status === status).length
-  const lines = [`Plan status: ${run.improvementStatus}; tasks: ${count('working')} working, ${count('pending')} pending, ${count('done')} done, ${count('blocked')} blocked.`]
+  const header = `Plan status: ${run.improvementStatus}; tasks: ${count('working')} working, ${count('pending')} pending, ${count('done')} done, ${count('blocked')} blocked.`
   const open = run.improvements.filter(task => task.status === 'working' || task.status === 'pending')
   const blocked = run.improvements.filter(task => task.status === 'blocked')
   const done = run.improvements.filter(task => task.status === 'done').slice(-8)
-  const line = (task: ImprovementTask, evidence: number) => `- [${task.status}] ${task.id}: ${clip(task.title, 200)}${task.evidence.trim() ? ` — ${clip(task.evidence, evidence)}` : ''}`
-  if (open.length) lines.push('Open tasks:', ...open.map(task => line(task, 600)))
-  if (blocked.length) lines.push('Blocked tasks:', ...blocked.map(task => line(task, 200)))
-  if (done.length) lines.push(`Last ${done.length} done:`, ...done.map(task => line(task, 200)))
-  if (!run.improvements.length) lines.push('No tasks recorded yet.')
+  const line = (task: ImprovementTask, title: number, evidence: number) => `- [${task.status}] ${task.id}: ${clip(task.title, title)}${evidence > 0 && task.evidence.trim() ? ` — ${clip(task.evidence, evidence)}` : ''}`
   const handoff = run.improvementHandoff ? `\nHANDOFF FROM THE PREVIOUS TASK: ${ellipsis(run.improvementHandoff, HANDOFF_CHARS)}` : ''
-  return `CURRENT IMPROVEMENT PROGRESS:\n${ellipsis(lines.join('\n'), PROGRESS_CHARS - handoff.length)}${handoff}${withProfile ? previousRunProfile(run.priorRuns) : ''}`
+  // The text for a given shape: the open evidence limit, the closed lines' evidence limit and how many closed lines stay.
+  const compose = (openEvidence: number, closedEvidence: number, closedKept: number, openTitle = 200): string => {
+    const closed = (tasks: ImprovementTask[]) => tasks.slice(-closedKept).map(task => line(task, 200, closedEvidence))
+    const lines = [header]
+    if (open.length) lines.push('Open tasks:', ...open.map(task => line(task, openTitle, openEvidence)))
+    if (blocked.length && closedKept) lines.push('Blocked tasks:', ...closed(blocked))
+    if (done.length && closedKept) lines.push(`Last ${Math.min(done.length, closedKept)} done:`, ...closed(done))
+    if (!run.improvements.length) lines.push('No tasks recorded yet.')
+    return lines.join('\n')
+  }
+  const title = 'CURRENT IMPROVEMENT PROGRESS:\n'
+  const budget = PROGRESS_CHARS - title.length - handoff.length
+  const fits = (text: string) => text.length <= budget
+  let text = compose(OPEN_EVIDENCE_CHARS, 200, 8)
+  if (!fits(text)) {
+    // 1. Closed lines: shorter evidence, then fewer of them, then none; the open briefs stay whole while they fit.
+    const steps: Array<[number, number]> = [[80, 8], [0, 8], [0, 4], [0, 2], [0, 0]]
+    const step = steps.find(([evidence, kept]) => fits(compose(OPEN_EVIDENCE_CHARS, evidence, kept)))
+    if (step) text = compose(OPEN_EVIDENCE_CHARS, step[0], step[1])
+    else {
+      // 2. Open evidence: one limit for all (the largest that fits), so short briefs stay whole and long ones give up the most.
+      let low = 0, high = OPEN_EVIDENCE_CHARS
+      while (low < high) { const mid = (low + high + 1) >> 1; if (fits(compose(mid, 0, 0))) low = mid; else high = mid - 1 }
+      text = compose(low, 0, 0)
+      // 3. Even the titles alone are too long (dozens of open tasks): shorten them, the lines stay.
+      if (!fits(text)) text = compose(0, 0, 0, Math.max(30, Math.floor(budget / open.length) - 40))
+    }
+  }
+  return `${title}${ellipsis(text, budget)}${handoff}${withProfile ? previousRunProfile(run.priorRuns) : ''}`
 }
 
 // What the root's answer still misses, first thing first: a task left working, no task closed in this run, or Orbit's

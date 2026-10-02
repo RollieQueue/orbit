@@ -121,15 +121,21 @@ export type IndexOutline = import('./project-index.mts').Outline
 // here; the envelope path is not, so every callee keeps its coercions. `route` and `discussionId` are added by the
 // broadcast and ask_team paths; `__invalidArguments` marks a call whose arguments were not a JSON object.
 export interface ToolArgs {
-  task?: string; name?: string; reason?: string; kind?: string; providerId?: string; model?: string; reasoningEffort?: string; memoryProfile?: string; continueFrom?: string; id?: string
+  task?: string; name?: string; reason?: string; kind?: string; providerId?: string; model?: string; reasoningEffort?: string; memoryProfile?: string; continueFrom?: string; failover?: string; avoidProviders?: string[]; connectors?: string[]; id?: string
   agentId?: string; agentIds?: string[]; timeout_ms?: number; message?: string; replyTo?: string; discussionId?: string; route?: MessageRoute
   afterId?: string; limit?: number; unread_only?: boolean; topic?: string; files?: string[]; query?: string; path?: string; runId?: string; agent?: string
   start_line?: number; recursive?: boolean; content?: string; old_text?: string; new_text?: string; command?: string; args?: string[]; cwd?: string
   title?: string; scope?: string; type?: string; confidence?: number; outcome?: string; note?: string; description?: string; whenToUse?: string; instructions?: string; source?: string
   key?: string; summary?: string; status?: string; tasks?: ImprovementTaskInput[]; taskType?: string; assessment?: string; evidence?: string
   continueWith?: string; verify?: boolean; handoff?: string
+  // connector_add: a stdio server (command, args, env) or an HTTP one (url, headers); env and headers are lists of "KEY=value" / "Name: value".
+  url?: string; env?: string[]; headers?: string[]; enabled?: boolean
   // spawn_agent: '' (the helper shares its parent's workspace), 'worktree' (an isolated git copy of it) or 'orbit' (of Orbit's own repository).
   isolation?: string
+  // spawn_agent: 'auto' (Orbit merges an isolated helper's changes when it finishes) or 'hold' (its parent decides with merge_agent {agentId, action}).
+  merge?: string; action?: string
+  // schedule_wakeup: the delay in minutes or the time (ISO 8601) of the chat's later run.
+  afterMinutes?: number; at?: string
   __invalidArguments?: boolean
   [extra: string]: unknown
 }
@@ -179,6 +185,10 @@ export interface AgentRecord {
   providerId: string; model: string; memoryProfile: MemoryProfile; reasoningEffort: string; requestedModel: string
   // Which rule gave the helper its level (agents.decideEffort), and the short reason spawn_agent reports (internal).
   effortSource?: EffortSource; effortNote?: string
+  // spawn_agent's failover options: 'none' pins the agent to its subscription; avoidProviders are never moved to (failover.mts).
+  failover?: 'none'; avoidProviders?: string[]
+  // The names of the connectors (external MCP servers) spawn_agent passed to this helper; absent = none. The root gets every enabled one. Names only, never launch data.
+  connectors?: string[]
   status: AgentStatus; progress: number; detail: string; startedAt: string | null; finishedAt: string | null; result: string; error: string | null
   turns: number; generation: number; inbox: unknown[]; seenChildren: Set<string>; transcript: TranscriptEntry[]; transcriptChars: number
   previousWork: PreviousWork[]; ledger: LedgerEntry[]; ledgerDropped: Record<string, number>
@@ -195,16 +205,20 @@ export interface AgentRecord {
   // Where the agent works when that is not the run's workspace (util.agentWorkspace): the isolated copy of its parent's
   // workspace it owns or inherited from its parent. `isolation` is set only on the helper that owns the copy.
   workspace?: string; isolation?: AgentIsolation
+  // The report as the helper wrote it, up to REPORT_CHARS, when `result` (cut to one observation) is shorter. Kept in the run record
+  // only, never in events: team_history and context_read page it (agents.finishAgent).
+  report?: string
 }
 // An isolated helper's copy as snapshots and events show it: `path` is its workspace inside the copy, `target` the folder
 // its changes merge into, `base` the snapshot commit it started from; `merged` counts the files merged so far and
 // `conflicts` lists those that could not be (electron/agent-worktree.mts).
-export interface AgentIsolation { kind: 'worktree' | 'orbit'; path: string; base: string; target: string; merged?: number; conflicts?: string[] }
+// `held`: spawned with merge 'hold', so its changes wait for merge_agent; `decided` is that decision once taken.
+export interface AgentIsolation { kind: 'worktree' | 'orbit'; path: string; base: string; target: string; merged?: number; conflicts?: string[]; held?: boolean; decided?: 'merge' | 'discard' }
 // What spawn_agent {isolation} makes before the helper exists: the copy (kept in run.copies) as the fields the helper's
 // record starts with, or why there is none.
 export type IsolationPrepared = { ok: true; id: string; fields: Partial<AgentRecord> } | { ok: false; reason: string; instruction?: string }
 // The fields that stay inside the runtime; snapshots and events carry the rest (util.INTERNAL_AGENT_FIELDS).
-export type InternalAgentField = 'inbox' | 'seenChildren' | 'requestedModel' | 'transcript' | 'previousWork' | 'ledger' | 'ledgerDropped' | 'workDone' | 'failedCandidates' | 'trial' | 'partialTurn' | 'quotaWarned' | 'draftAnswer' | 'activeTurn' | 'stream' | 'sessionToken' | 'sessionCursor' | 'transcriptChars' | 'pausedSession' | 'mailMark' | 'effortNote'
+export type InternalAgentField = 'inbox' | 'seenChildren' | 'requestedModel' | 'transcript' | 'previousWork' | 'ledger' | 'ledgerDropped' | 'workDone' | 'failedCandidates' | 'trial' | 'partialTurn' | 'quotaWarned' | 'draftAnswer' | 'activeTurn' | 'stream' | 'sessionToken' | 'sessionCursor' | 'transcriptChars' | 'pausedSession' | 'mailMark' | 'effortNote' | 'report'
 export type PublicAgent = Omit<AgentRecord, InternalAgentField>
 // What an agent's execution resolves to (completeAgent), or the error a scheduled agent ended with.
 export interface AgentResult { agentId: string; generation: number; status: AgentStatus; result?: string; error?: string; budgetLimited?: boolean }
@@ -218,15 +232,18 @@ export interface RoutedSpawn { kind: string; model: string | null; skipped?: str
 export interface SpawnResult {
   ok: boolean; reason?: string; instruction?: string; reused?: boolean; agentId?: string; status?: AgentStatus
   name?: string; providerId?: string; model?: string; reasoningEffort?: string; effortSource?: EffortSource; effort?: string
-  isolation?: AgentIsolation; routed?: RoutedSpawn
+  isolation?: AgentIsolation; routed?: RoutedSpawn; failover?: 'none'; avoidProviders?: string[]
 }
+// An agent that changed subscription, as callers see it (wait_agent, list_agents): the model it started on, the one it runs
+// on now, how often it moved, and why the first move happened. `steps` lists every switch (wait_agent only).
+export interface FailedOver { from: string; to: string; switches: number; why: string; steps?: string }
 export interface FollowupResult { ok: true; agentId: string; generation: number; status: AgentStatus }
 export interface TeamDigest { running: string[]; finished: string[] }
 export interface AgentDirectoryEntry {
   paused: boolean
   id: string; name: string; parentId: string | null; status: AgentStatus; generation: number; providerId: string; model: string; task: string
   result: string; resultTruncated?: boolean; fullResult?: string; error: string | null; budgetLimited: boolean
-  ranOn?: string[]
+  ranOn?: string[]; failedOver?: FailedOver
   // Input + output tokens the agent has used (absent until a provider has reported any).
   tokens?: number
 }
@@ -270,11 +287,17 @@ export interface RunRecord {
   // must know, the closed task keys (`id|title`) the run started with, and whether restart_orbit applied this run's change
   // or was refused in a way the next task's restart resolves (cycle limit, other chats working, declined).
   loopTask?: number; improvementHandoff?: string; improvementBaseline?: Map<string, ImprovementTask>; restartApplied?: boolean; restartDeferred?: boolean
+  // The chat's pending scheduled wake-ups as this run knows them (runtime/wakeups.mts): the list the window sent at the start
+  // (or the run this one continues ended with), changed by schedule_wakeup and cancel_wakeup.
+  wakeups: Wakeup[]
   // Orbit's code on disk when an improvement-mode run started (RestartHost.codeOnDisk): a part another chat changed before
   // is not this run's to apply.
   codeAtStart?: import('./resume.mts').CodeHashes | null
   // The isolated copies of this run's helpers by agent id (runtime/isolation.mts): taken away when the run ends.
   copies?: Map<string, import('./agent-worktree.mts').AgentCopy>
+  // The held helpers whose merge_agent decision is being carried out, by agent id (isolation.decideHeld): nothing may wake
+  // such a helper in the copy the decision reads or removes (followup_agent and messages refuse it).
+  deciding?: Map<string, 'merge' | 'discard'>
 }
 // `note`: what the root of the continuation is told about the run the restart ended (work log, files, helpers, cut-off turn);
 // `intentId`: the id of the intent (pending-resume.json) that marked it, the only one that continues it (resume.mts).
@@ -289,7 +312,11 @@ export interface RunSnapshot {
   files: FileActivitySnapshot[]; changes: FileChange[]; router: RouterStats
   startPayload?: StartPayload; resumedFrom?: string; resumeChain?: number; restart?: RestartMark; attachments?: Attachment[]
   loopTask?: number; improvementHandoff?: string; restartApplied?: boolean; restartDeferred?: boolean
+  wakeups?: Wakeup[]
 }
+// A later run of a chat that its root agent scheduled with schedule_wakeup: due (ms) and made (ISO) times, the run that
+// scheduled it. The window keeps the chat's list (src/types.ts Wakeup has its own fields besides these) and starts the run.
+export interface Wakeup { id: string; dueAt: number; task: string; reason: string; createdAt: string; runId?: string }
 // An earlier turn of the chat as chat-memory presents it (a live run or a saved snapshot): chat-memory's own RunView.
 export type ChatRunView = import('./chat-memory.mts').RunView
 // A run as the run store keeps it (run-store.mts): a snapshot saved by any version of Orbit. The store reads only
@@ -304,6 +331,8 @@ export interface StoredRun {
   attachments?: unknown
   // The improvement plan an improvement-mode run left (read back by runtime/improvement.mts loadPlan).
   improvements?: unknown; improvementStatus?: unknown; improvementHandoff?: unknown; loopTask?: number
+  // The chat's pending wake-ups the run ended with (runtime/wakeups.mts loadWakeups: a continuation starts from them).
+  wakeups?: unknown
   // Whether restart_orbit applied the run's change of Orbit's code, or was refused so that a later restart applies it.
   restartApplied?: boolean; restartDeferred?: boolean
 }
@@ -314,6 +343,8 @@ export interface StartPayload {
   history?: HistoryInput[]; agentInstructions?: string; limits?: LimitsInput; skillLearning?: boolean
   // The improvement loop's task number (the renderer starts one run per task); a safe integer ≥ 1, else ignored.
   loopTask?: number
+  // The chat's pending scheduled wake-ups, after the ones this run fires (the window keeps them; runtime/wakeups.mts checks them).
+  wakeups?: unknown
   // Files the user attached to the message that starts the run (saved first with attachments:save).
   attachments?: Attachment[]
   // A continuation after a restart (resume.mts): the run it continues, how many restarts in a row led to it, the note its
@@ -327,7 +358,8 @@ export interface RuntimeEvent { type: string; runId: string; projectId: string; 
 export type RuntimeListener = (event: RuntimeEvent) => void
 
 // ---- Providers ----------------------------------------------------------------------------------------------------
-export interface SessionInfo { id: string; token: string | null; mcpUrl: string | null; systemAppend: string; resume: boolean; activity: () => { pending: number; lastAt: number } | null }
+// `connectors`: the enabled external MCP servers (connectors.mts) to launch this agent's provider process with; only a run with full access has any.
+export interface SessionInfo { id: string; token: string | null; mcpUrl: string | null; systemAppend: string; resume: boolean; activity: () => { pending: number; lastAt: number } | null; connectors?: import('./connectors.mts').ConnectorLaunch[] }
 export interface ApprovalRequest { tool: string; arguments: unknown; toolUseId?: string }
 // What the user is asked, from an envelope tool or a Claude Code permission prompt.
 export interface ApprovalPrompt extends ApprovalRequest { runId: string; agentId: string; agentName: string; workspace: string; signal: AbortSignal }
@@ -340,6 +372,8 @@ export interface ProviderRunOptions {
   onEvent: (event: ProviderEvent) => void
   // Added to the environment of the provider's CLI process: the variables that name the agent's run (resume.mts restartEnv).
   extraEnv?: Record<string, string>
+  // The agent's turn the provider's CLI belongs to: what the CLI leaves running when it ends is stopped and reported here (process-reaper.mts).
+  processScope?: import('./process-reaper.mts').ProcessScope
 }
 // One event of a provider's stream: streamed text and reasoning, native tool activity, observations, quota figures.
 // `kind` is always present (output, reasoning, tool, observation, quota, usage, provider, …); everything else depends on it.
@@ -560,6 +594,7 @@ export interface NoteIndex { overview: unknown; notes: NoteSummary[]; otherNotes
 // ---- The runtime as its modules see it -------------------------------------------------------------------------------
 export interface OrbitRuntimeOptions {
   runProvider?: RunProvider; memoryStore?: MemoryStoreLike | null; capabilityStore?: CapabilityStoreLike | null; runStore?: RunStoreLike | null
+  connectorStore?: import('./connectors.mts').ConnectorStore | null
   requestApproval?: ApprovalHandler | null; clock?: () => number; projectIndex?: ProjectIndexLike | null; quota?: QuotaMonitorLike | null; catalog?: CatalogLike | null
   mcp?: McpServerLike | null | false; transportFor?: TransportFor | null; closeSession?: CloseSession | null; registry?: ToolRegistryLike | null
   restartHost?: import('./resume.mts').RestartHost | null
@@ -572,6 +607,8 @@ export interface OrbitRuntimeOptions {
 // when a handover moved the agent to a provider of the other transport.
 export interface OrbitRuntimeLike {
   runProvider: RunProvider; memoryStore: MemoryStoreLike | null; capabilityStore: CapabilityStoreLike | null; runStore: RunStoreLike | null
+  // External MCP servers registered with connector_add (connectors.mts); null in a runtime without one.
+  connectorStore?: import('./connectors.mts').ConnectorStore | null
   requestApproval: ApprovalHandler | null; clock: () => number; projectIndex: ProjectIndexLike | null; quota: QuotaMonitorLike | null; catalog: CatalogLike | null
   // The provider list a run of this runtime last read: the next runs' root prompts take the reasoning levels from it at once.
   lastCatalog?: { at: number; list: CatalogEntry[] } | null
@@ -588,6 +625,7 @@ export interface OrbitRuntimeLike {
   setProjectIndex(index: ProjectIndexLike | null): void
   setMemoryStore(store: MemoryStoreLike | null): void
   setCapabilityStore(store: CapabilityStoreLike | null): void
+  setConnectorStore(store: import('./connectors.mts').ConnectorStore | null): void
   setRunStore(store: RunStoreLike | null): void
   setContextStore(store: ContextStoreLike | null): void
   routeMessage(): Promise<{ kind: string; reply: string }>
@@ -698,7 +736,7 @@ export interface OrbitRuntimeLike {
   routeSpawn(run: RunRecord, parent: AgentRecord, spec: ToolArgs): Promise<{ spec: ToolArgs; routed: RoutedSpawn }>
   // isolation
   prepareIsolation(run: RunRecord, parent: AgentRecord, kind: string): Promise<IsolationPrepared>
-  discardIsolation(run: RunRecord, agentId: string): Promise<void>
+  discardIsolation(run: RunRecord, agentId: string): Promise<import('./agent-worktree.mts').RemoveResult | undefined>
   mergeIsolated(run: RunRecord, agent: AgentRecord): Promise<string>
   cleanupIsolation(run: RunRecord): Promise<void>
   sweepIsolation(): Promise<import('./agent-worktree.mts').SweepResult>

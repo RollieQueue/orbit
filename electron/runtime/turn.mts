@@ -10,6 +10,8 @@ import type { InterruptReason } from './pause.mts'
 import { watchTurn, clearSilentTurns, isStall } from './watchdog.mts'
 import type { TurnWatch } from './watchdog.mts'
 import { messageNote, stopSteer } from './steer.mts'
+import { describeStopped } from '../process-reaper.mts'
+import type { StoppedProcess } from '../process-reaper.mts'
 import type { AgentRecord, AgentUsage, OrbitRuntimeLike, ProviderEvent, ProviderResult, RunRecord, SessionInfo, StreamState, ToolImage, TraceImage, TurnTiming, UsageFigures } from '../types.mts'
 // The root agent's answer in progress is published at most four times a second.
 const STREAM_INTERVAL_MS = 250
@@ -248,13 +250,15 @@ async function providerTurn(runtime: OrbitRuntimeLike, run: RunRecord, agent: Ag
     const extraEnv = { ...agentEnv(runtime, run, agent), ...quietHelperEnv(agent) }
     // A turn that reports nothing for too long is stopped (watchdog.mts); recoverProvider repeats it or hands it over.
     const turnWatch = watch = agent.activeTurn.watch = watchTurn(agent, session, () => controller.abort())
+    // What the turn's CLI leaves running when it ends (background runners, browsers) is stopped by the provider layer and told here.
+    const processScope = { label: agent.name, onStopped: (stopped: StoppedProcess[]) => { if (!TERMINAL.has(run.status)) runtime.trace(run, agent.id, 'processes', describeStopped(stopped)) } }
     providerTask = runtime.trackOperation(run, Promise.resolve().then(() => runtime.runProvider({
       providerId: agent.providerId, model: agent.requestedModel, prompt: resolvedPrompt, workspace: agentWorkspace(run, agent),
       mode: run.accessMode, accessMode: run.accessMode, approvalPolicy: run.approvalPolicy,
       reasoningEffort: agent.reasoningEffort,
       providerOptions: run.providerOptions[agent.providerId] || {},
       ...(session ? { session } : { responseSchema: ORBIT_RESPONSE_SCHEMA }),
-      ...(Object.keys(extraEnv).length ? { extraEnv } : {}),
+      ...(Object.keys(extraEnv).length ? { extraEnv } : {}), processScope,
       onApproval: request => turnWatch.hold(runtime.approve(run, agent, request, controller.signal)),
       signal: controller.signal, timeoutMs: run.limits.timeoutMs,
       onEvent: (event) => {
