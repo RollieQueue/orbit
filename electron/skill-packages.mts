@@ -8,6 +8,10 @@ import { packagePath } from './skill-files.mts'
 import type { SkillCommand, SkillFile, SkillParam, SkillParamType, SkillParamValue, SkillTrigger } from './types.mts'
 
 const MAX_FILES = 40, MAX_FILE_BYTES = 512 * 1024, MAX_PACKAGE_BYTES = 4 * 1024 * 1024
+// A picture (the gallery of a trained agent, a page's artwork) is allowed twice that: a rendered screenshot is rarely under 512 KB.
+const MAX_IMAGE_BYTES = 1024 * 1024
+const IMAGE_FILE = /\.(?:png|jpe?g|webp)$/i
+const fileLimit = (rel: string): number => IMAGE_FILE.test(rel) ? MAX_IMAGE_BYTES : MAX_FILE_BYTES
 const MAX_PARAMS = 20, MAX_TRIGGERS = 5, MAX_COMMANDS = 20
 const PARAM_KEY = /^[a-z][a-z0-9_]{0,31}$/, COMMAND_NAME = /^[a-z][a-z0-9-]{0,39}$/
 const PARAM_TYPES: readonly string[] = ['text', 'url', 'number', 'seconds', 'boolean']
@@ -142,7 +146,7 @@ function checkSourceDir(dir: string, workspace: unknown, guarded: boolean): stri
   const inside = (root: string): boolean => { const relative = path.relative(root, target); return !relative.startsWith('..') && !path.isAbsolute(relative) }
   return !guarded || roots.some(inside) ? target : fail('fromDir must be inside the project folder or the temp folder')
 }
-interface Manifest { name?: string; description?: string; whenToUse?: string; instructions?: string; scope?: string; params?: unknown; triggers?: unknown; commands?: unknown }
+interface Manifest { name?: string; description?: string; whenToUse?: string; instructions?: string; scope?: string; role?: string; params?: unknown; triggers?: unknown; commands?: unknown }
 interface Source { files: Map<string, Buffer>; manifest: Manifest | null }
 // The files of a folder, recursively; dot files and folders, node_modules and links are skipped. Every file is counted
 // and measured, so that one error names all the files over the limit (a skill folder from the ecosystem often carries big
@@ -166,12 +170,15 @@ function readFolder(dir: string): Source {
       if (++count > MAX_FILES * 25) return fail(`Skill package limit: at most ${MAX_FILES} files, and ${dir} holds more than ${MAX_FILES * 25}: is it the skill's own folder?`)
       const size = fs.statSync(file).size
       total += size
-      if (size > MAX_FILE_BYTES) largeFiles.push({ path: rel, size })
+      if (size > fileLimit(rel)) largeFiles.push({ path: rel, size })
       else if (!largeFiles.length && count <= MAX_FILES && total <= MAX_PACKAGE_BYTES) files.set(rel, fs.readFileSync(file))
     }
   }
   walk(dir)
-  if (largeFiles.length) return fail(`Skill package limit: ${largeFiles.length} files are larger than ${MAX_FILE_BYTES / 1024} KB: ${largeFiles.map(item => `"${item.path}" (${Math.round(item.size / 1024)} KB)`).join(', ')}`)
+  if (largeFiles.length) {
+    const limits = new Set(largeFiles.map(item => fileLimit(item.path) / 1024))
+    return fail(`Skill package limit: ${largeFiles.length} files are larger than ${limits.size === 1 ? `${[...limits][0]} KB` : `their limit (${MAX_FILE_BYTES / 1024} KB, ${MAX_IMAGE_BYTES / 1024} KB for png/jpg/webp pictures)`}: ${largeFiles.map(item => `"${item.path}" (${Math.round(item.size / 1024)} KB)`).join(', ')}`)
+  }
   if (count > MAX_FILES) return fail(`Skill package limit: at most ${MAX_FILES} files (found ${count})`)
   if (total > MAX_PACKAGE_BYTES) return fail(`Skill package limit: at most ${MAX_PACKAGE_BYTES / 1024 / 1024} MB in total (found ${Math.round(total / 1024 / 1024 * 10) / 10} MB)`)
   const json = files.has(MANIFEST) ? parseManifest(files.get(MANIFEST)!.toString('utf8')) : null
@@ -245,7 +252,7 @@ function parseManifest(text: string): Manifest {
   try { data = JSON.parse(text.replace(/^﻿/, '')) } catch { return fail(`${MANIFEST} is not valid JSON`) }
   if (!isRecord(data)) return fail(`${MANIFEST} must be a JSON object`)
   const manifest: Manifest = {}
-  for (const key of ['name', 'description', 'whenToUse', 'instructions', 'scope'] as const) if (typeof data[key] === 'string') manifest[key] = data[key]
+  for (const key of ['name', 'description', 'whenToUse', 'instructions', 'scope', 'role'] as const) if (typeof data[key] === 'string') manifest[key] = data[key]
   for (const key of ['params', 'triggers', 'commands'] as const) if (data[key] !== undefined) manifest[key] = data[key]
   return manifest
 }
@@ -277,7 +284,7 @@ function planPackage(current: readonly SkillFile[], { source, files, removeFiles
   }
   for (const rel of final.keys()) if ([...final.keys()].some(other => other.startsWith(`${rel}/`))) return fail(`Skill package: "${rel}" is both a file and a folder`)
   if (final.size > MAX_FILES) return fail(`Skill package limit: at most ${MAX_FILES} files`)
-  for (const [rel, data] of writes) if (data.length > MAX_FILE_BYTES) return fail(`Skill package limit: "${rel}" is larger than ${MAX_FILE_BYTES / 1024} KB`)
+  for (const [rel, data] of writes) if (data.length > fileLimit(rel)) return fail(`Skill package limit: "${rel}" is larger than ${fileLimit(rel) / 1024} KB`)
   if ([...final.values()].reduce((sum, size) => sum + size, 0) > MAX_PACKAGE_BYTES) return fail(`Skill package limit: at most ${MAX_PACKAGE_BYTES / 1024 / 1024} MB in total`)
   return {
     files: [...final].map(([rel, size]) => ({ path: rel, size })).sort((a, b) => a.path.localeCompare(b.path)),
@@ -315,7 +322,7 @@ function applyPackage(dir: string, plan: PackagePlan): () => void {
 function removePackage(dir: string): void { try { fs.rmSync(dir, { recursive: true, force: true }) } catch { /* Left behind. */ } }
 
 export {
-  MAX_FILES, MAX_FILE_BYTES, MAX_PACKAGE_BYTES, checkParams, checkValues, checkTriggers, checkCommands, reviveParams, reviveFiles, reviveTriggers, reviveCommands,
+  MAX_FILES, MAX_FILE_BYTES, MAX_IMAGE_BYTES, MAX_PACKAGE_BYTES, IMAGE_FILE, checkParams, checkValues, checkTriggers, checkCommands, reviveParams, reviveFiles, reviveTriggers, reviveCommands,
   checkSourceDir, readFolder, folderManifest, parseManifest, planPackage, applyPackage, removePackage,
 }
 export type { Manifest, PackagePlan, Source as PackageSource }

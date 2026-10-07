@@ -1,9 +1,10 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 import type { Agent, Handover, ProjectStats, QuotaFailover, QuotaSnapshot, QuotaState, QuotaWindow } from './types'
 import { shownStatus } from './run-events'
 import { panelPages, skillPageUrl, type SkillPage } from './skill-triggers'
+import { providerName } from './providers'
 
-type ProviderInfo = { id: string; name: string; description: string }
+type ProviderInfo = { id: string; name: string; description: string; base?: string }
 
 const stateLabel: Record<QuotaState, string> = {
   ok: 'В норме', warning: 'Скоро закончится', exhausted: 'Исчерпана', unknown: 'Нет данных', unlimited: 'Без лимитов', unavailable: 'Недоступно',
@@ -42,7 +43,7 @@ function useTick(ms: number) {
 }
 
 export function handoverLabel(providers: ProviderInfo[], target: Handover['from']) {
-  return `${providers.find(provider => provider.id === target.providerId)?.name || target.providerId}${target.model ? ` · ${target.model}` : ''}`
+  return `${providers.find(provider => provider.id === target.providerId)?.name || providerName(target.providerId) || target.providerId}${target.model ? ` · ${target.model}` : ''}`
 }
 export function handoverReason(handover: Handover) {
   if (handover.reason === 'approaching') return `квота почти исчерпана (${handover.usedPercent ?? '?'}%)`
@@ -75,7 +76,7 @@ function Card({ provider, snapshot, connected, agents, at, current }: CardProps)
   const windows = [...(snapshot?.windows || [])].sort((a, b) => order(a) - order(b))
   const blockedUntil = snapshot?.exhaustedUntil && snapshot.exhaustedUntil > at ? snapshot.exhaustedUntil : null
   const stateText = !snapshot ? 'Загружаем…' : !connected && state === 'unavailable' ? 'Не подключён' : stateLabel[state]
-  return <article className={`quota-card ${state} ${current ? 'current' : ''} ${connected ? '' : 'disconnected'}`} aria-label={`Квота ${provider.name}`}>
+  return <article className={`quota-card ${state} ${current ? 'current' : ''} ${connected ? '' : 'disconnected'} ${provider.base ? 'instance' : ''}`} aria-label={`Квота ${provider.name}`}>
     <header>
       <strong>{provider.name}</strong>
       {snapshot?.plan && <span className="quota-plan">{snapshot.plan}</span>}
@@ -152,9 +153,11 @@ function SkillPanels({ workspace }: { workspace: string }) {
 type QuotaPanelProps = {
   providers: ProviderInfo[]; connected: Record<string, boolean>; quotas: Record<string, QuotaSnapshot>; busy: boolean; onRefresh: () => void
   failover: QuotaFailover; onFailover: (patch: Partial<QuotaFailover>) => void; agents: Agent[]; currentProviderId: string; workspace?: string
+  // The «Добавить подписку» button and its form (src/AddSubscription.tsx), shown under the heading of the subscription list.
+  addSubscription?: ReactNode
 }
 
-export function QuotaPanel({ providers, connected, quotas, busy, onRefresh, failover, onFailover, agents, currentProviderId, workspace = '' }: QuotaPanelProps) {
+export function QuotaPanel({ providers, connected, quotas, busy, onRefresh, failover, onFailover, agents, currentProviderId, workspace = '', addSubscription }: QuotaPanelProps) {
   useTick(30000)
   const at = Date.now()
   return <>
@@ -167,6 +170,7 @@ export function QuotaPanel({ providers, connected, quotas, busy, onRefresh, fail
       <h3>Подписки и агенты</h3>
       <button className="text-button" disabled={busy} onClick={onRefresh}>{busy ? 'Обновляем…' : '↻ Обновить'}</button>
     </div>
+    {addSubscription}
     <div className="quota-list">
       {providers.map(provider => <Card key={provider.id} provider={provider} snapshot={quotas[provider.id]} connected={!!connected[provider.id]}
         agents={agents.filter(agent => agent.providerId === provider.id)} at={at} current={provider.id === currentProviderId} />)}

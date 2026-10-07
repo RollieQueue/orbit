@@ -57,6 +57,9 @@ const CALLS = [
   ['setFullScreen', 'app:fullscreen', 1],
   ['restartRuntime', 'runtime:restart', 0],
   ['getRuntimeStatus', 'runtime:status', 0],
+  ['prepareAccount', 'accounts:prepare', 2],
+  ['loginAccount', 'accounts:login', 1],
+  ['removeAccount', 'accounts:remove', 1],
 ]
 /** @type {[method: string, channel: string][]} */
 const EVENTS = [

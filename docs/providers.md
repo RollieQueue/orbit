@@ -280,6 +280,15 @@ items and App Server readable reasoning-summary deltas are forwarded when suppli
 unavailable reasoning is not reconstructed. See the official
 [configuration reference](https://learn.chatgpt.com/docs/config-file/config-reference)
 and [App Server events](https://learn.chatgpt.com/docs/app-server).
+Codex token usage is also live with `exec --json`: stdout reports a total only at
+the end of the Orbit turn, so `codex-rollout-usage.mts` reads the named thread's
+`event_msg/token_count` records from that subscription's `CODEX_HOME/sessions`.
+Older records establish a resume baseline; new cumulative totals share the
+deduplication meter with stdout and App Server reports. Missing or unreadable
+rollouts leave final stdout accounting available. Input tokens already include
+cache hits, and output tokens include reasoning: neither is added twice. Agent
+rows show both the total and the cached input count; the tooltip gives exact
+input, cache and output numbers.
 Claude streams its thinking text empty; inside the agent's own thinking block
 (`content_block_start` of type `thinking` without `parent_tool_use_id`, up to its
 `content_block_stop`) the CLI's `system/thinking_tokens` events (`estimated_tokens`:
@@ -385,6 +394,35 @@ per kind, the candidates in the order of the model audit, each with what was mea
 at. Claude models are named by the CLI aliases the health list shows (`sonnet`, `opus`). A candidate whose provider lists
 models but not this one is passed over, so a renamed model drops out instead of failing a helper. Claude Fable 5.1 is
 left out at the user's request. Edit the file after a new audit.
+
+## Several accounts of one provider
+
+Orbit can use more than one subscription of the same provider: two Claude accounts, two ChatGPT (Codex) accounts. Each extra account is a *subscription instance* `{ id, base, label, dir }`. `id` is what the rest of Orbit calls a provider id (`claude-2`, `codex-2`: the first free number from 2), `base` the provider whose adapter runs it (`claude`), `label` the owner's name for it and `dir` its own configuration folder (`<data folder>/accounts/<id>` for the folders Orbit makes). The default account of each provider keeps today's id (`claude`, `codex`), has no instance entry and no environment change, so a one-account setup behaves exactly as before. The pure rules live in `electron/instances.mts`; the window mirrors them in `src/subscriptions.ts` (`tests/subscription-instances.test.cjs` loads both and fails when they disagree).
+
+Which providers can have a second account was checked against the real CLIs on Windows on 2026-10-03 (Claude Code 2.1.284, codex-cli 0.159, Cursor CLI 2026.09.26, Antigravity CLI `agy` 1.2.16):
+
+| Provider | Second account | Why |
+| --- | --- | --- |
+| Claude Code | yes | `CLAUDE_CONFIG_DIR=<dir>` holds settings and the sign-in (`<dir>\.credentials.json`). Sign in with `claude auth login`; in an empty folder `claude auth status` answers `loggedIn: false`. |
+| Codex | yes | `CODEX_HOME=<dir>` holds `auth.json`, `models_cache.json` and `config.toml`. Sign in with `codex login` (`codex login --device-auth` signs in by a code instead of a browser callback); in an empty folder `codex login status` prints «Not logged in» and exits 1. |
+| Cursor | **no** | `CURSOR_CONFIG_DIR` moves only `cli-config.json`. The login token is read from a fixed path (`%APPDATA%\Cursor\auth.json` on Windows, `~/.cursor/auth.json` on macOS): with an empty `CURSOR_CONFIG_DIR`, `agent status` still sees the default login. Overriding `APPDATA` would move the whole Windows environment of the child process, so Orbit does not do it. |
+| Antigravity | **no** | The sign-in lives in the system credential store (Windows Credential Manager, fixed target `gemini:antigravity`); no variable or flag relocates it, and `agy` has no `login` command. |
+
+Ollama and the compatible endpoint are not subscriptions. A saved or sent instance of Cursor or Antigravity is never run: its health entry is `supported: false` with the reason, and a turn on it fails before anything is spawned.
+
+**Where the instances live.** `settings.subscriptions` in the window's state (saved with the rest of it; `normalize` makes it valid, and an old saved state gets `[]` and nothing else changes). The window sends the instances to the desktop only inside `providerOptions`: `instanceOptions()` adds an entry named by each id (the base provider's CLI options as defaults, the instance's own over them, then `base`, `label` and `accountDir`) to the map every call already takes (`providers:health`, `quota:get`, the run's `start`). The runtime reads them back with `instancesFromOptions(providerOptions)`; there is no registry, and the id alone tells the base (`baseOf('claude-2') === 'claude'`).
+
+**Running one.** `runProvider` with `providerId: 'claude-2'` runs the base adapter with `accountEnv(id, options)` added to the CLI's environment: `CLAUDE_CONFIG_DIR` for Claude Code, `CODEX_HOME` for Codex, on both Codex transports (exec and App Server); Orbit's own variables (the MCP token, `NO_PROXY`, the restart variables) still win. Events and results carry the instance id. An instance without a folder, or of a provider with no account variable, throws before anything is spawned: it never falls back to the default account, whose quota it would spend under another name. A Codex App Server process remembers the account it was started for; resuming a thread on another account closes it and opens a new one. A session never moves between accounts (a failover starts a fresh session), so a Claude session folder under `CLAUDE_CONFIG_DIR` stays with its account.
+
+**Health and quota.** `inspectProviders` returns the six usual entries and then one per instance (`base`, `label`), probed with its own environment and CLI path. An account that is not signed in is `available: false, authenticated: false` with a hint to sign in *this* account. A new Codex folder has no `models_cache.json` until its first run, so the default account's list stands in for it. `quota:get` answers one snapshot per instance, and `QuotaMonitor` keeps readings and refusal marks per id: the base provider's reader runs with the instance's environment. A signed-out Claude folder answers `/usage` with zero-usage stats and no limit lines, so the reader checks `claude auth status` first and reports `unavailable` («Войдите в этот аккаунт») rather than an empty reading. A refusal that the transport tagged with the base (`claude`) is attributed to the account that ran.
+
+**Failover.** `failover.replacements` ranks the *same model on another account of the agent's own provider* before everything else (pool order, tier distance, headroom, other vendors); among those the most headroom wins and the default account wins ties. Only when no account of that provider has room do the usual rules choose (for example Codex). Tier baselines, the local-model rule, reasoning levels, the transport choice and the Google no-reasoning rule follow the base provider. A pool entry `claude/opus` also admits `claude-2` with opus, `claude-2/opus` only that account; the run's own provider and its other accounts are always allowed. `skip` (a provider that could not answer a moment ago), `failedCandidates` and pinning stay exact per id, so a sign-in failure of `claude-2` does not bar `claude`.
+
+**Routing and `spawn_agent`.** The routing table (`model-routing.json`) names providers; each candidate expands over its accounts, the one with the most quota left first (the default account on ties), before the next provider of the table. `providerId: 'claude'` with a `kind` means any Claude account, `providerId: 'claude-2'` exactly that account; an instance id the run does not have is refused (`unknown_provider`, naming the run's accounts). `avoidProviders: ['claude']` keeps every Claude account out of routing and failover, `['claude-2']` only that one. The root's prompt gets one `EXTRA SUBSCRIPTIONS` line when the run has instances, and none otherwise.
+
+**Sign-in and folders** (`electron/accounts.mts`, wired in `main.cjs`: `accounts:prepare`, `accounts:login`, `accounts:remove`). *Prepare* picks the id and creates `<data folder>/accounts/<id>`: the first `<base>-N` (N from 2) that is not in use, has no folder (a folder kept by a removed account holds its sign-in and must never become another account) and was not handed out before by this process (the runtime still remembers a removed account's quota readings and refusal marks under its id). *Login* opens a visible console window with the account variable in the spawn environment (never in the command line): Windows `cmd /c start "Orbit · Вход: …" cmd /k "<cli>" auth login`, macOS Terminal, Linux `x-terminal-emulator`; the CLI is the owner's path setting or the path the provider check found (the new window has Orbit's PATH only), and a command containing `" & | < > ^ % ! ( ) ; $` is refused. Orbit never reads a password or a token; they stay in the CLI's folder. *Remove* takes the instance out of the settings (with its pool entries, model and options); the folder is deleted only when the owner asked, it is Orbit's own (strictly inside `accounts/` after links are resolved) and main's own dialog confirms, with «keep» as the default.
+
+**Verification.** `tests/subscription-instances.test.cjs` (the window and `instances.mts` agree), `tests/subscriptions-ui.test.cjs` (state migration is a no-op and survives a JSON round trip, add and remove transitions, lists, login command), `tests/accounts.test.cjs` (managed-folder guard including `..`, a sibling prefix and a junction; the login launch per platform and a real Windows spawn), `tests/main-load.test.cjs` (the three channels end to end), `tests/subscription-instances-providers.test.cjs` and `tests/quota-instances.test.cjs` (the environment reaches fake `claude` and `codex` on every transport, refusals, health entries, per-account readings), `tests/failover-instances.test.cjs`, `tests/model-routing-instances.test.cjs` and `tests/runtime-instances.test.cjs` (exhausted `claude` → `claude-2` with the same model before Codex, pool and avoid rules, `spawn_agent` by instance id, a run without instances unchanged). Not verified live: the console window with the real CLIs' browser sign-in, and a real second paid account.
 
 ## Runtime contract
 
@@ -518,3 +556,38 @@ Cursor в Full access запускается в Agent (без `--mode ask`), с 
 Источники протоколов: [Antigravity headless](https://antigravity.google/docs/cli/headless/), [custom agents](https://antigravity.google/docs/subagents/), [установка и вход](https://antigravity.google/docs/cli/install/), [Cursor параметры](https://cursor.com/docs/cli/reference/parameters), [Cursor форматы ответа](https://cursor.com/docs/cli/reference/output-format).
 
 Проверки адаптеров используют документированные события и управляемые CLI-транспорты без расхода подписки. Реальные облачные вызовы требуют установленных CLI и выполненного входа; их успешность не следует из локальных тестов.
+
+# Вторая подписка того же провайдера
+
+Можно подключить несколько аккаунтов одного провайдера: два Claude, два ChatGPT (Codex). У каждого своя квота, свой вход и своя строка в окне «Квоты». Orbit использует их все: когда квота одного аккаунта кончается, агент переходит на следующий аккаунт **того же провайдера и с той же моделью**, и только потом на другого вендора. Технические подробности: раздел «Several accounts of one provider» выше.
+
+**Что нужно:** CLI провайдера уже установлен (первый аккаунт работает). Cursor и Antigravity второй аккаунт не поддерживают: у их CLI нет отдельной папки для входа (Cursor читает токен из фиксированного пути, Antigravity хранит вход в системном хранилище Windows), поэтому в форме они недоступны, а Orbit не подделывает изоляцию.
+
+**Вторая подписка Claude Code**
+
+1. «Настройки» → список провайдеров → **«+ Добавить подписку»** (та же кнопка есть в окне «Квоты»).
+2. Провайдер — «Claude Code», название — любое понятное вам, например «Рабочий» → **«Создать и войти»**. Orbit создаст папку аккаунта (`…\accounts\claude-2` в папке данных Orbit) и откроет консольное окно «Orbit · Вход: Claude Code».
+3. В окне выполняется `claude auth login`, откроется браузер. Войдите **вторым** аккаунтом. Если в браузере уже открыт первый аккаунт, сначала выйдите из него или откройте ссылку входа в приватном окне: иначе вы войдёте в тот же аккаунт ещё раз и квота не удвоится. (Вручную то же самое: в любой консоли `set CLAUDE_CONFIG_DIR=<папка аккаунта>`, затем `claude`, команда `/login`.)
+4. Вернитесь в Orbit и нажмите **«Проверить»**. Карточка «Claude Code · Рабочий» покажет «Вход выполнен», а аккаунт появится в списке провайдеров, в выборе провайдера у чата, в модели смешанного роя и в окне «Квоты» со своими лимитами. Пароли и токены Orbit не видит: они остаются в папке аккаунта, куда пишет сам CLI.
+
+**Вторая подписка Codex (ChatGPT)**
+
+1. Те же шаги 1–2, провайдер — «Codex».
+2. В окне выполняется `codex login`: браузер, вход вторым аккаунтом ChatGPT. Если вход через браузер не завершается, в том же окне выполните `codex login --device-auth` (вход по коду). (Вручную: `set CODEX_HOME=<папка аккаунта>`, затем `codex login`.)
+3. «Проверить» → «Вход выполнен».
+
+**Как Orbit использует вторую подписку.** Ничего настраивать не нужно.
+
+- *Автозамена.* Когда квота `claude` на исходе или исчерпана, агент переходит на `claude-2` с той же моделью (журнал и файлы сохраняются, новая модель получает записку о передаче), и только если у всех аккаунтов провайдера лимит кончился, подбирается другой вендор (например Codex). Включается и настраивается в разделе «Квоты», как раньше.
+- *Таблица выбора моделей и помощники.* Для работы по виду (`kind`) выбирается аккаунт с наибольшим остатком квоты; `spawn_agent {providerId: 'claude-2'}` запускает помощника именно на втором аккаунте, `providerId: 'claude'` вместе с `kind` разрешает любой аккаунт Claude, `avoidProviders: ['claude']` исключает все аккаунты Claude.
+- *Пул моделей.* Запись «Claude · opus» допускает и `claude-2` с opus; запись «Claude Code · Рабочий» — только этот аккаунт. Аккаунты провайдера, на котором идёт запуск, допустимы всегда.
+- *Своя модель и CLI.* У каждой подписки свои выбранная модель и уровень рассуждений; путь к CLI по умолчанию берётся у основного провайдера.
+
+**Удаление.** «Удалить» на карточке подписки убирает её из Orbit (вместе с записями пула и настройками). Галочка «Удалить также папку аккаунта (там хранится вход)» выключена по умолчанию; папку удаляют только если её создал Orbit и вы подтвердите в отдельном окне (по умолчанию — «Оставить папку»). Папка, которую вы указали сами, не удаляется никогда. Оставленная папка удалённой подписки хранит её вход, поэтому новая подписка никогда не берёт её номер: следующая получит свободный номер (`claude-3`).
+
+**Ограничения.**
+
+- Новая папка аккаунта чистая: настройки основного аккаунта (`config.toml` Codex, `settings.json` Claude Code, хуки, плагины) в неё не копируются. Пароли и токены Orbit не копирует вовсе.
+- Окно входа получает PATH самого Orbit и путь к CLI, который нашла проверка провайдера; путь со скобками, кавычками, `&`, `%`, `;` и подобным Orbit в консольную строку не подставляет.
+- Не более 20 дополнительных подписок. Меняются они в окне Orbit; для уже идущего запуска набор подписок фиксируется при его старте.
+- Не проверено вживую: консольное окно входа с настоящими CLI и второй оплаченный аккаунт (проверены тестами на подставных CLI и вручную исследованием CLI: `CLAUDE_CONFIG_DIR` и `CODEX_HOME` действительно дают пустой вход в пустой папке).

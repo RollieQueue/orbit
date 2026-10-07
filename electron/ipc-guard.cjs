@@ -58,6 +58,8 @@ function guardIpc(handler, options = {}) {
   }
 }
 
+// img-src has orbit-skill: so the window can show the images of a skill or trained-agent package (gallery), read-only; no other
+// directive lists it.
 /** @param {GuardOptions} [options] @returns {string} */
 function contentSecurityPolicy({ isDev = false } = {}) {
   if (isDev) {
@@ -65,7 +67,7 @@ function contentSecurityPolicy({ isDev = false } = {}) {
       "default-src 'self'",
       "script-src 'self' 'unsafe-inline'",
       "style-src 'self' 'unsafe-inline'",
-      "img-src 'self' data:",
+      "img-src 'self' data: orbit-skill:",
       "font-src 'self' data:",
       "connect-src 'self' http://127.0.0.1:5173 ws://127.0.0.1:5173 ws://127.0.0.1:* http://127.0.0.1:*",
       "base-uri 'none'",
@@ -77,7 +79,7 @@ function contentSecurityPolicy({ isDev = false } = {}) {
     "default-src 'self'",
     "script-src 'self'",
     "style-src 'self' 'unsafe-inline'",
-    "img-src 'self' data:",
+    "img-src 'self' data: orbit-skill:",
     "font-src 'self' data:",
     "connect-src 'self'",
     "base-uri 'none'",

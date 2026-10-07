@@ -70,6 +70,22 @@ test('CSP disables remote script sources in production', () => {
   assert.match(dev, /127\.0\.0\.1:5173/)
 })
 
+test('CSP lets the window show package images (orbit-skill:) and widens nothing else', () => {
+  for (const isDev of [false, true]) {
+    const directives = new Map(contentSecurityPolicy({ isDev }).split('; ').map(item => [item.split(' ')[0], item.split(' ').slice(1)]))
+    assert.deepEqual(directives.get('img-src'), ["'self'", 'data:', 'orbit-skill:'])
+    for (const name of ['default-src', 'script-src', 'style-src', 'font-src', 'connect-src', 'base-uri', 'form-action', 'frame-ancestors']) {
+      assert.ok(!directives.get(name)?.includes('orbit-skill:'), `${name} must not allow orbit-skill: (isDev=${isDev})`)
+    }
+    assert.equal(directives.has('frame-src'), false)
+    assert.equal(directives.has('object-src'), false)
+  }
+  assert.equal(contentSecurityPolicy({ isDev: false }).includes("script-src 'self';"), true)
+  assert.equal(contentSecurityPolicy({ isDev: false }).includes("connect-src 'self';"), true)
+  assert.equal(contentSecurityPolicy({ isDev: true }).includes("script-src 'self' 'unsafe-inline';"), true)
+  assert.match(contentSecurityPolicy({ isDev: true }), /connect-src 'self' http:\/\/127\.0\.0\.1:5173 ws:\/\/127\.0\.0\.1:5173 ws:\/\/127\.0\.0\.1:\* http:\/\/127\.0\.0\.1:\*;/)
+})
+
 test('every main-process IPC channel is registered through the sender guard', () => {
   const read = (file) => require('node:fs').readFileSync(require('node:path').join(__dirname, '..', 'electron', file), 'utf8')
   const handlers = read('ipc-handlers.cjs')

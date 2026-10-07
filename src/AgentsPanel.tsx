@@ -51,7 +51,7 @@ function agentTree(items: Agent[], options: TreeOptions, parentId: string | null
           {!!files && files.wrote.length + files.read.length > 0 && <small>Файлы: изменил {files.wrote.length}, читал {files.read.length}</small>}
           {!!agent.handovers?.length && <small className="handover-badge" title={handoverTitle(agent)}>⇄ Сменил подписку: {agent.handovers.length}</small>}
           {(tokens !== undefined || !!agent.isolation) && <small className="agent-row-meta">
-            {tokens !== undefined && <span className="agent-tokens" title={usageTitle(agent.usage)}>Токены: {tokenCount(tokens)}</span>}
+            {tokens !== undefined && <span className="agent-tokens" title={usageTitle(agent.usage)}>Токены: {tokenCount(tokens)} · из кэша: {tokenCount(agent.usage?.cachedInputTokens ?? 0)}</span>}
             {agent.isolation && <span className={`isolation-badge ${agent.isolation.conflicts?.length ? 'conflict' : ''}`} title={isolationTitle(agent.isolation)}>Изолированная копия{heldLabel(agent.isolation)}</span>}
           </small>}
         </span>

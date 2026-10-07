@@ -3,7 +3,7 @@ import type { Attachment, ChatThread, ImprovementLoop, Message, Project, Restart
 import { addFiles, discardChatFiles, discardFiles, pendingAttachments, saveFiles } from './attachments'
 import { errorText, remoteErrorText } from './format'
 import { closedKeysOf, loopNote, loopPrompt, loopStartFailed, loopView, newestPlanRun, nextLoopStep } from './improvement-loop'
-import { providers } from './providers'
+import { providers, registerExtraProviders } from './providers'
 import { handoverText } from './QuotaPanel'
 import { reasoningLevels } from './ReasoningPicker'
 import { activeRunIds, applyRunEvent, interruptLost, isActiveStatus, linkResumed, restoreRuns, snapshotBase, type RunMap } from './run-events'
@@ -14,6 +14,7 @@ import {
   setChatLoop, setGlobalMemory as setGlobalMemoryIn, settlingRestartText, sharingEntries, sharingKey, stampSaved, stopLoop, loopStateNote, titleChat, uid, withSettings,
   type RestoredMessage, type RestoredWakeup,
 } from './state-store'
+import { instanceOptions, providerList } from './subscriptions'
 import { useQuotas } from './useQuotas'
 import { holdLoopStep, nextWakeupStep, wakeupFailed, wakeupMessage, wakeupPrompt } from './wakeups'
 
@@ -49,8 +50,11 @@ export function useOrbitState() {
   const [runtimeStatus, setRuntimeStatus] = useState<RuntimeStatus | null>(null)
   // Counts the runtime's comebacks after a restart or crash: a new runtime process knows nothing the window told the old one.
   const [runtimeEpoch, setRuntimeEpoch] = useState(0)
-  const providerOptionsRef = useRef(state.settings.providerOptions)
-  providerOptionsRef.current = state.settings.providerOptions
+  // The window sends the extra subscriptions to the desktop only inside the provider options (src/subscriptions.ts).
+  const wireOptions = instanceOptions(state.settings.subscriptions, state.settings.providerOptions)
+  const providerOptionsRef = useRef(wireOptions)
+  providerOptionsRef.current = wireOptions
+  registerExtraProviders(providerList(state.settings.subscriptions).filter(provider => provider.base))
   const { quotas, quotaBusy, refreshQuotas, scheduleQuotaRefresh } = useQuotas(providerOptionsRef, setNotice)
 
   // ---- Runtime events and the start-up load ----
@@ -126,7 +130,7 @@ export function useOrbitState() {
     }
     const unsubscribeStatus = api.onRuntimeStatus(status => applyStatus(status, true))
     void api.getRuntimeStatus().then(status => applyStatus(status, false)).catch(() => undefined)
-    void api.checkProviders(state.settings.providerOptions)
+    void api.checkProviders(providerOptionsRef.current)
       .then(result => { if (mounted) setHealth(result) })
       .catch(error => { if (mounted) setNotice(`Не удалось проверить провайдеры: ${errorText(error)}`) })
     void Promise.allSettled([api.loadState(), api.listRuns()]).then(results => {
@@ -143,6 +147,17 @@ export function useOrbitState() {
     })
     return () => { mounted = false; unsubscribe(); unsubscribeNotices(); unsubscribeStatus() }
   }, [])
+
+  // The list of extra subscriptions changed (one added or removed here, or the desktop's saved copy brought another): the
+  // health and the quotas are read again so that the new account appears (not signed in yet) and a removed one leaves.
+  const subscriptionsKey = JSON.stringify(state.settings.subscriptions || [])
+  const checkedSubscriptions = useRef(subscriptionsKey)
+  useEffect(() => {
+    if (!ready || !window.orbit || checkedSubscriptions.current === subscriptionsKey) return
+    checkedSubscriptions.current = subscriptionsKey
+    void window.orbit.checkProviders(providerOptionsRef.current).then(setHealth).catch(() => undefined)
+    void refreshQuotas(true)
+  }, [ready, subscriptionsKey])
 
   // ---- Persistence: the desktop file is the source of truth; the mirror serves the next start-up's first render ----
   useEffect(() => {
@@ -201,7 +216,7 @@ export function useOrbitState() {
   const usedModels = Object.values(runs).filter(run => run.providerId === providerId && run.model).map(run => run.model!)
   const modelChoices = [...new Set([...(currentHealth?.models || []), ...(currentHealth?.model ? [currentHealth.model] : []), ...usedModels])]
   const effortLevels = reasoningLevels(providerId, state.settings.models[providerId] || '', currentHealth)
-  const savedEffort = state.settings.providerOptions?.[providerId]?.reasoningEffort || ''
+  const savedEffort = wireOptions[providerId]?.reasoningEffort || ''
   const selectedEffort = effortLevels.includes(savedEffort) ? savedEffort : ''
 
   // ---- Actions ----
@@ -241,8 +256,9 @@ export function useOrbitState() {
   // the chat's pending wake-ups (the runtime learns them only from here: its prompt lists them, the per-chat limit counts them).
   function taskPayload(target: Project, chatId: string, prompt: string, history: StartTaskPayload['history'], extra: Partial<StartTaskPayload> = {}): StartTaskPayload {
     const wakeups = target.chats.find(c => c.id === chatId)?.wakeups
+    const { subscriptions: _subscriptions, ...settings } = state.settings
     return {
-      projectId: target.id, chatId, prompt, history, workspace: target.workspace.path, ...state.settings,
+      projectId: target.id, chatId, prompt, history, workspace: target.workspace.path, ...settings, providerOptions: wireOptions,
       memoryEnabled: true, globalMemoryEnabled: target.globalMemoryEnabled ?? state.settings.memoryEnabled, reasoningEffort: selectedEffort,
       model: state.settings.models[providerId]?.trim() || undefined, ...(wakeups?.length ? { wakeups } : {}), ...extra,
     }
@@ -491,7 +507,7 @@ export function useOrbitState() {
   async function refreshProviders() {
     if (!window.orbit || checking) return
     setChecking(true)
-    try { setHealth(await window.orbit.checkProviders(state.settings.providerOptions)) }
+    try { setHealth(await window.orbit.checkProviders(wireOptions)) }
     catch (error) { setNotice(errorText(error)) }
     finally { setChecking(false) }
   }

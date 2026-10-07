@@ -1,4 +1,5 @@
 import defaults from '../electron/reasoning-defaults.json'
+import { baseOf } from './subscriptions'
 
 export const effortLabels: Record<string, string> = {
   none: 'Без размышлений', enabled: 'Включено', minimal: 'Минимальное', low: 'Низкое', medium: 'Среднее', high: 'Высокое',
@@ -9,7 +10,7 @@ const NO_LEVELS = 'У модели нет подтверждённых наст�
 const hasReasoningControl = (providerId: string) => providerId !== 'antigravity'
 export function reasoningLevels(providerId: string, model: string, health?: ProviderHealth): string[] {
   if (!hasReasoningControl(providerId)) return []
-  return health?.reasoningLevels?.[model] ?? (defaults as Record<string, string[]>)[providerId] ?? []
+  return health?.reasoningLevels?.[model] ?? (defaults as Record<string, string[]>)[baseOf(providerId)] ?? []
 }
 
 type ReasoningPickerProps = { providerId: string; model: string; health?: ProviderHealth; value: string; onChange: (value: string) => void; label?: string }

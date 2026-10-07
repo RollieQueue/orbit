@@ -2,7 +2,7 @@ import type { AccessMode, AppState, ChatThread, ImprovementLoop, LoopStopReason,
 import { mergeMessage, type RunMap } from './run-events'
 import { loopNote, loopNoteId, stopNote, stoppedLoop } from './improvement-loop'
 import { sanitizeWakeups } from './wakeups'
-import { providers } from './providers'
+import { providerList, sanitizeInstances, withoutDeadMembers } from './subscriptions'
 import { attachmentNote } from './attachments'
 
 // The renderer's persistent state (projects, chats, settings) and everything that restores or transforms it.
@@ -21,7 +21,7 @@ export type RestoredMessage = { projectId: string; chatId: string; message: Mess
 export type RestoredWakeup = { projectId: string; chatId: string; added?: Wakeup; removed?: string }
 
 export const defaults: Settings = {
-  providerId: 'codex', models: {}, limitVersion: 2, improvementMode: false, skillLearning: true, providerPool: [], providerOptions: {},
+  providerId: 'codex', models: {}, limitVersion: 2, improvementMode: false, skillLearning: true, providerPool: [], providerOptions: {}, subscriptions: [],
   quotaFailover: { enabled: true, switchAtPercent: 90, allowWeaker: false }, memoryEnabled: true, accessMode: 'workspace-write',
   approvalPolicy: 'on-request', reasoningEffort: '', agentInstructions: '',
   limits: { maxAgents: null, maxDepth: null, maxConcurrent: null, maxTurns: null, maxTotalTurns: null },
@@ -54,7 +54,8 @@ export function normalize(value: Partial<AppState>): AppState {
     for (const key of Object.keys(legacyLimits) as (keyof typeof legacyLimits)[]) if (settings.limits[key] === legacyLimits[key]) settings.limits[key] = null
     settings.limitVersion = 2
   }
-  if (!providers.some(p => p.id === settings.providerId)) settings.providerId = 'codex'
+  settings.subscriptions = sanitizeInstances(value.settings?.subscriptions)
+  if (!providerList(settings.subscriptions).some(p => p.id === settings.providerId)) settings.providerId = 'codex'
   if (!['never', 'on-request', 'auto-review'].includes(settings.approvalPolicy)) settings.approvalPolicy = 'on-request'
   const savedFailover = value.settings?.quotaFailover, savedPercent = Number(savedFailover?.switchAtPercent)
   settings.quotaFailover = {
@@ -70,8 +71,8 @@ export function normalize(value: Partial<AppState>): AppState {
   // Google models have reasoning built in; values saved by older versions must not linger or be resent.
   const google = settings.providerOptions.antigravity
   if (google?.reasoningEffort) settings.providerOptions.antigravity = { ...google, reasoningEffort: '' }
-  settings.providerPool = (settings.providerPool || []).map(member =>
-    member.providerId === 'antigravity' && member.reasoningEffort ? { ...member, reasoningEffort: '' } : member)
+  settings.providerPool = withoutDeadMembers((settings.providerPool || []).map(member =>
+    member.providerId === 'antigravity' && member.reasoningEffort ? { ...member, reasoningEffort: '' } : member), settings.subscriptions)
   const activeProjectId = projects.some(p => p.id === value.activeProjectId) ? value.activeProjectId! : projects[0]?.id || ''
   return { version: 3, projects, activeProjectId, settings, savedAt: value.savedAt }
 }

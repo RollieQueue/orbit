@@ -3,7 +3,6 @@ import type { ChatThread, Project, QuotaSnapshot, RuntimeStatus } from './types'
 import { Icon } from './Icon'
 import type { Panel } from './Modal'
 import { errorText, plural } from './format'
-import { providers } from './providers'
 import { isActiveStatus, type RunMap } from './run-events'
 import { runtimeIndicator } from './runtime-status'
 import { RESTART_WAIT_TEXT } from './state-store'
@@ -68,7 +67,7 @@ export function Sidebar({
 }: SidebarProps) {
   const index = useProjectIndex(project?.workspace.path, libraryRevision, onNotice)
   // The quota dot summarises the connected subscriptions: any exhausted, any close to the limit, otherwise fine.
-  const quotaStates = providers.filter(p => connected[p.id]).map(p => quotas[p.id]?.state)
+  const quotaStates = Object.keys(connected).filter(id => connected[id]).map(id => quotas[id]?.state)
   const quotaDot = quotaStates.includes('exhausted') ? 'error'
     : quotaStates.includes('warning') ? 'waiting' : quotaStates.some(s => s === 'ok') ? 'done' : 'idle'
   const indexText = index.busy || index.info?.indexing ? 'Индексируем…'

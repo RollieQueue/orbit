@@ -34,6 +34,7 @@ const RUNTIME_CHANNELS: readonly string[] = [
 // Call channels main answers itself: dialogs, `shell`, `app`, health and restarts.
 const SHELL_CHANNELS: readonly string[] = [
   'workspace:pick', 'workspace:inspect', 'workspace:clone', 'shell:open', 'shell:open-path', 'app:ping', 'app:relaunch', 'app:fullscreen', 'runtime:restart', 'runtime:status',
+  'accounts:prepare', 'accounts:login', 'accounts:remove',
 ]
 // Push channels the runtime emits; main passes each on with `webContents.send(channel, payload)`.
 const EVENT_CHANNELS: readonly string[] = ['runtime:event', 'quota:update', 'restart:notice']

@@ -39,6 +39,12 @@ const { RUNTIME_CHANNELS, SHELL_CHANNELS } = require('./runtime-protocol.mts')
  *   out of full screen; returns whether it was full screen before.
  * @property {(target: string) => Promise<string>} [openPath] Opens a file or folder of Orbit's attachments or skills with
  *   the system's default app; answers the error text (empty on success) and throws for any other path.
+ * @property {(base: unknown, taken: unknown) => { id: string, dir: string } | Promise<{ id: string, dir: string }>} [prepareAccount] Picks the id of a new extra
+ *   subscription (never one in `taken` or with a folder), creates its folder under Orbit's data folder and answers both; throws when the provider cannot have a second account.
+ * @property {(request: unknown) => Promise<{ ok: boolean, error?: string }>} [loginAccount] Opens the CLI's own sign-in in a console
+ *   window with the account's environment.
+ * @property {(sender: import('electron').WebContents, request: unknown) => Promise<{ deleted: boolean, reason?: string, error?: string }>} [removeAccount]
+ *   Deletes an account folder only when asked, Orbit made it and the user confirms in a dialog of main's own.
  * @property {(reason: string) => Promise<RuntimeRestartResult>} restartRuntime
  * @property {() => Promise<unknown>} [whenStarted] settles once the start of this process has its health report; the
  *   window's runtime restart waits for it, as the --restart-runtime signal does
@@ -121,6 +127,19 @@ function createIpcHandlers(ctx) {
     return ctx.restartRuntime('window')
   })
   handle('runtime:status', () => ctx.runtimeStatus())
+  // Extra subscription accounts (electron/accounts.mts does the work, main.cjs wires it): each call is validated again where it is answered.
+  handle('accounts:prepare', (_event, base, taken) => {
+    if (!ctx.prepareAccount) throw new Error('Accounts are not available here')
+    return ctx.prepareAccount(base, taken)
+  })
+  handle('accounts:login', (_event, request) => {
+    if (!ctx.loginAccount) throw new Error('Accounts are not available here')
+    return ctx.loginAccount(request)
+  })
+  handle('accounts:remove', (event, request) => {
+    if (!ctx.removeAccount) throw new Error('Accounts are not available here')
+    return ctx.removeAccount(event.sender, request)
+  })
 
   const own = [...handlers.keys()]
   if (own.length !== SHELL_CHANNELS.length || own.some(channel => !SHELL_CHANNELS.includes(channel))) {

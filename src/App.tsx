@@ -10,7 +10,8 @@ import { QuotaPanel } from './QuotaPanel'
 import { SettingsPanel } from './SettingsPanel'
 import { Sidebar } from './Sidebar'
 import { SkillsPanel } from './SkillsPanel'
-import { providers } from './providers'
+import { providerList } from './subscriptions'
+import { AddSubscription } from './AddSubscription'
 import { useInspector } from './useInspector'
 import { useOrbitState } from './useOrbitState'
 import { useQuotaPolling } from './useQuotas'
@@ -63,15 +64,17 @@ export default function App() {
     />}
     {panel && <Modal panel={panel} onClose={() => setPanel(null)}>
       {panel === 'quota' && (desktop
-        ? <QuotaPanel providers={providers} connected={orbit.connected} quotas={quotas} busy={orbit.quotaBusy} onRefresh={() => void orbit.refreshQuotas(true)}
+        ? <QuotaPanel providers={providerList(state.settings.subscriptions)} connected={orbit.connected} quotas={quotas} busy={orbit.quotaBusy} onRefresh={() => void orbit.refreshQuotas(true)}
           failover={state.settings.quotaFailover!} onFailover={patch => updateSettings({ quotaFailover: { ...state.settings.quotaFailover!, ...patch } })}
-          agents={currentRun?.agents || []} currentProviderId={state.settings.providerId} workspace={project?.workspace.path || ''} />
+          agents={currentRun?.agents || []} currentProviderId={state.settings.providerId} workspace={project?.workspace.path || ''}
+          addSubscription={<AddSubscription settings={state.settings} health={orbit.health} checking={orbit.checking} desktop={desktop} onSettings={updateSettings}
+            onRefresh={() => void orbit.refreshProviders()} onNotice={setNotice} />} />
         : <p className="inline-notice">Квоты подписок доступны в настольном приложении.</p>)}
       {panel === 'add' && <AddProjectPanel desktop={desktop} busy={orbit.projectBusy} remote={remote} onRemote={setRemote} onAdd={orbit.addProject}
         onDone={() => { setPanel(null); setRemote(''); setProjectMenu(false) }} />}
       {panel === 'settings' && <SettingsPanel settings={state.settings} health={orbit.health} checking={orbit.checking} desktop={desktop}
         modelChoices={orbit.modelChoices} runtimeStatus={orbit.runtimeStatus} onRefresh={() => void orbit.refreshProviders()} onSettings={updateSettings}
-        onRestartRuntime={orbit.restartRuntime} />}
+        onRestartRuntime={orbit.restartRuntime} onNotice={setNotice} />}
       {panel === 'memory' && <MemoryPanel desktop={desktop} project={project} chat={chat} entries={library.memory} stats={library.stats}
         loading={library.loading} onChanged={orbit.bumpLibrary} onError={setNotice} />}
       {panel === 'capabilities' && <SkillsPanel desktop={desktop} workspace={project?.workspace.path || ''} skills={library.capabilities}

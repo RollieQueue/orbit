@@ -13,6 +13,7 @@ import { ranOnFields } from './agents.mts'
 import { stopHelper } from './pause.mts'
 import { decideHeld } from './isolation.mts'
 import * as knowledge from './knowledge.mts'
+import * as agentTools from './agent-tools.mts'
 import { executeConnectorTool } from './connector-tools.mts'
 import * as restart from './restart.mts'
 import * as improvement from './improvement.mts'
@@ -203,6 +204,7 @@ async function executeTool(runtime: OrbitRuntimeLike, run: RunRecord, agent: Age
   if (name === 'schedule_wakeup') return wakeups.schedule(runtime, run, agent, args)
   if (name === 'cancel_wakeup') return wakeups.cancel(runtime, run, agent, args)
   if (name === 'model_evaluate' || name === 'memory_search' || name === 'memory_save' || name === 'memory_forget' || name.startsWith('capability_')) return knowledge.executeKnowledgeTool(runtime, run, agent, name, args)
+  if (name === 'agent_save' || name === 'agent_read') return agentTools.executeAgentTool(runtime, run, agent, name, args)
   if (name.startsWith('connector_')) return executeConnectorTool(runtime, run, agent, name, args, signal)
   if (name === 'restart_orbit') return restart.executeRestart(runtime, run, agent, args)
   if (run.approvalPolicy === 'on-request' && ['write_file', 'edit_file', 'run_command'].includes(name) && run.accessMode !== 'read-only') {

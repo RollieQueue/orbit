@@ -9,6 +9,8 @@ const { createIpcHandlers, registerIpcHandlers } = require('./ipc-handlers.cjs')
 const { createRuntimeClient, utilityFork } = require('./runtime-client.cjs')
 const { ERROR_CODES } = require('./runtime-protocol.mts')
 const git = require('./git.mts')
+const accounts = require('./accounts.mts')
+const { baseOf, isInstanceId, supportsAccounts } = require('./instances.mts')
 const { SKILL_SCHEME, SKILLS_DIR, resolvePackageFile, mimeType } = require('./skill-files.mts')
 const { envProxyConfig, followEnvProxy } = require('./window-proxy.cjs')
 
@@ -861,6 +863,62 @@ function createWindow(generation) {
   })
 }
 
+// ---- Extra subscription accounts (electron/accounts.mts; the window's «Добавить подписку») ----
+
+// The id of an extra subscription of a provider that can have one; throws what the window shows otherwise.
+/** @param {unknown} base @param {unknown} id @returns {string} */
+function checkedAccount(base, id) {
+  if (typeof base !== 'string' || typeof id !== 'string' || !isInstanceId(id) || baseOf(id) !== base) throw new Error('Некорректная подписка')
+  if (!supportsAccounts(base)) throw new Error('У этого CLI нет отдельной папки конфигурации: вторая подписка невозможна')
+  return id
+}
+
+// The CLI's own sign-in in a visible console window with the account's environment. Orbit starts it and walks away: it
+// never sees a password or a token. Answers once the window's process started (or failed to).
+/** @param {unknown} request @returns {Promise<{ ok: boolean, error?: string }>} */
+async function loginAccount(request) {
+  /** @type {Record<string, unknown>} */
+  const { id, base, dir, command } = request && typeof request === 'object' ? /** @type {Record<string, unknown>} */ (request) : {}
+  checkedAccount(base, id)
+  if (typeof dir !== 'string' || !path.isAbsolute(dir)) throw new Error('У подписки нет папки аккаунта')
+  if (command !== undefined && typeof command !== 'string') throw new Error('Некорректный путь к CLI')
+  try { fs.mkdirSync(dir, { recursive: true }) } catch { /* The CLI reports an unusable folder itself. */ }
+  try {
+    const launch = accounts.loginLaunch(String(base), { command, dir, platform: process.platform })
+    await new Promise((resolve, reject) => {
+      const child = spawn(launch.file, launch.args, { env: { ...process.env, ...launch.env }, windowsVerbatimArguments: launch.verbatim, ...launch.spawnOptions })
+      child.once('error', reject)
+      child.once('spawn', () => { child.unref(); resolve(undefined) })
+    })
+    return { ok: true }
+  } catch (error) { return { ok: false, error: error instanceof Error ? error.message : String(error) } }
+}
+
+// Takes an account out; its folder is deleted only when the window asked for it, Orbit made the folder (a managed
+// directory under the data folder) AND the user confirms in this dialog (the default button keeps the folder).
+/** @param {import('electron').WebContents} sender @param {unknown} request @returns {Promise<{ deleted: boolean, reason?: string, error?: string }>} */
+async function removeAccount(sender, request) {
+  /** @type {Record<string, unknown>} */
+  const { id, dir, deleteFiles } = request && typeof request === 'object' ? /** @type {Record<string, unknown>} */ (request) : {}
+  if (typeof id !== 'string' || !isInstanceId(id)) throw new Error('Некорректная подписка')
+  if (deleteFiles !== true) return { deleted: false, reason: 'not-requested' }
+  const userData = app.getPath('userData')
+  if (typeof dir !== 'string' || !accounts.isManagedDir(userData, dir)) return { deleted: false, reason: 'unmanaged' }
+  if (!fs.existsSync(dir)) return { deleted: false, reason: 'missing' }
+  const owner = BrowserWindow.fromWebContents(sender)
+  /** @type {import('electron').MessageBoxOptions} */
+  const options = {
+    type: 'warning', buttons: ['Оставить папку', 'Удалить папку'], defaultId: 0, cancelId: 0, noLink: true,
+    title: 'Удалить папку аккаунта?', message: 'Удалить папку аккаунта вместе с сохранённым входом?', detail: `${dir}
+
+Войти в этот аккаунт снова придётся заново.`,
+  }
+  const answer = owner && !owner.isDestroyed() ? await dialog.showMessageBox(owner, options) : await dialog.showMessageBox(options)
+  if (answer.response !== 1) return { deleted: false, reason: 'declined' }
+  try { return accounts.removeAccountDir(userData, dir) ? { deleted: true } : { deleted: false, reason: 'missing' } }
+  catch (error) { return { deleted: false, reason: 'failed', error: error instanceof Error ? error.message : String(error) } }
+}
+
 // Renderer-callable channels: electron/ipc-contract.cjs lists them; main answers its own (ipc-handlers.cjs) and
 // forwards the runtime's to the runtime process. The registration throws before the window exists if they disagree,
 // and every handler runs behind the sender guard.
@@ -883,6 +941,12 @@ registerIpcHandlers(ipcMain, createIpcHandlers({
     if (!target || !inside) throw new Error('Only Orbit attachments and skill packages can be opened')
     return shell.openPath(resolved)
   },
+  prepareAccount: (base, taken) => {
+    if (typeof base !== 'string' || !supportsAccounts(base)) throw new Error('У этого CLI нет отдельной папки конфигурации: вторая подписка невозможна')
+    return accounts.prepareNewAccount(app.getPath('userData'), base, Array.isArray(taken) ? taken.filter(item => typeof item === 'string').slice(0, 200) : [])
+  },
+  loginAccount: (request) => loginAccount(request),
+  removeAccount: (sender, request) => removeAccount(sender, request),
   // The window's runtime restart waits for the start's report, as the --restart-runtime signal does; there is nothing
   // to wait for when restartRuntime refuses anyway (no runtime yet, or it runs inside main).
   whenStarted: () => (client && runtimeMode === 'child' ? started : Promise.resolve()),

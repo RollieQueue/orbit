@@ -3,7 +3,7 @@
 // post-answer checks; executeAgent chooses between them and handles budgets, draft answers, errors and cancellation.
 import { randomUUID, createHash } from 'node:crypto'
 import { targetLabel } from '../failover.mts'
-import { TERMINAL, AGENT_TERMINAL, ceiling, USER, WORK_TOOLS, MUTATING_TOOLS, SKILL_READ_CHARS, bounded, agentConnectors, TurnBudgetError, abortError } from './util.mts'
+import { TERMINAL, AGENT_TERMINAL, ceiling, USER, WORK_TOOLS, MUTATING_TOOLS, readChars, bounded, agentConnectors, TurnBudgetError, abortError } from './util.mts'
 import { ToolProtocolError, hasToolCalls, parseResponse } from './envelope.mts'
 import { sessionGuide, evaluationReminder, skillReminder } from './prompts.mts'
 import { maskToolArguments } from '../connectors.mts'
@@ -185,7 +185,7 @@ async function envelopeLoop(runtime: OrbitRuntimeLike, run: RunRecord, agent: Ag
         }
         return runtime.completeAgent(run, agent, response.content)
       }
-      runtime.remember(agent, { type: 'assistant', content: response.content, tool_calls: response.calls.map(call => ({ ...call, arguments: ['write_file', 'edit_file', 'memory_save', 'context_save', 'capability_install'].includes(call.name) ? { path: call.arguments.path, key: call.arguments.key, summary: 'Payload omitted after execution; use result and shared context.' } : maskToolArguments(call.name, call.arguments) as typeof call.arguments })) })
+      runtime.remember(agent, { type: 'assistant', content: response.content, tool_calls: response.calls.map(call => ({ ...call, arguments: ['write_file', 'edit_file', 'memory_save', 'context_save', 'capability_install', 'agent_save'].includes(call.name) ? { path: call.arguments.path, key: call.arguments.key, summary: 'Payload omitted after execution; use result and shared context.' } : maskToolArguments(call.name, call.arguments) as typeof call.arguments })) })
       // A response carrying tool calls is a protocol turn, not an answer to
       // the user. Keep its optional progress note in the agent trace so the
       // next tool result/turn remains the only thing published to chat.
@@ -225,7 +225,7 @@ async function envelopeLoop(runtime: OrbitRuntimeLike, run: RunRecord, agent: Ag
           if (WORK_TOOLS.has(call.name)) agent.workDone++
         }
         runtime.recordLedger(agent, call.name, `#${agent.turns} ${describeCall(call, observation as Record<string, unknown>, failure, id => run.agentNodes.get(id)?.name || id)}${repeat ? ` (identical repeat of #${earlier.turn})` : ''}`)
-        runtime.remember(agent, { type: 'tool_result', tool_call_id: call.id, name: call.name, result: bounded(observation, call.name === 'capability_read' ? Math.max(run.limits.maxOutputChars, SKILL_READ_CHARS) : run.limits.maxOutputChars), ...(repeat ? { note: `Identical repeat of the call from turn ${earlier.turn}: nothing changed since then. Do not repeat it.` } : {}) })
+        runtime.remember(agent, { type: 'tool_result', tool_call_id: call.id, name: call.name, result: bounded(observation, readChars(call.name, run.limits.maxOutputChars)), ...(repeat ? { note: `Identical repeat of the call from turn ${earlier.turn}: nothing changed since then. Do not repeat it.` } : {}) })
         runtime.trace(run, agent.id, 'observation', `${call.name}: ${bounded(observation, 4000)}`)
         runtime.trimTranscript(run, agent)
       }

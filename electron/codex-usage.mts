@@ -24,8 +24,16 @@ function readTokens(value: unknown): CodexTokens | null {
   if (input === undefined && output === undefined) return null
   return { input_tokens: input ?? 0, cached_input_tokens: pick('cached_input_tokens', 'cachedInputTokens') ?? 0, output_tokens: output ?? 0 }
 }
-function remember(thread: string, total: CodexTokens): void {
-  totals.delete(thread); totals.set(thread, total)
+function remember(thread: string, total: CodexTokens, reset = false): void {
+  const earlier = reset ? undefined : totals.get(thread)
+  // Stdout can finish before the rollout's last rows arrive. Late/replayed smaller totals must not lower the baseline
+  // and cause the next copy of an already counted report to be charged again.
+  const latest = earlier ? {
+    input_tokens: Math.max(earlier.input_tokens, total.input_tokens),
+    cached_input_tokens: Math.max(earlier.cached_input_tokens, total.cached_input_tokens),
+    output_tokens: Math.max(earlier.output_tokens, total.output_tokens),
+  } : total
+  totals.delete(thread); totals.set(thread, latest)
   if (totals.size > THREADS_LIMIT) totals.delete(totals.keys().next().value!)
 }
 // What `total` adds to `base`; a counter that went down adds nothing, and so does a repeated report (null: no event).
@@ -40,7 +48,7 @@ function growth(total: CodexTokens, base: CodexTokens): CodexTokens | null {
 
 // `codex exec` began a new thread: it has used nothing yet, so even a first turn that is cut off before its total arrives
 // leaves a known start for the turns that resume the thread.
-export function startedThread(thread: string): void { remember(thread, ZERO) }
+export function startedThread(thread: string): void { remember(thread, ZERO, true) }
 
 // `turn.completed` of exec: what the turn used. A thread this process never saw before the turn (resumed after an Orbit
 // restart) has an unknown total before it, and counting the lifetime total would charge the agent for earlier work, so

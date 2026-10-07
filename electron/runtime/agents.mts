@@ -5,10 +5,12 @@ import { setMaxListeners } from 'node:events'
 import { saveNote } from '../shared-context.mts'
 import * as chatMemory from '../chat-memory.mts'
 import { ROUTING_KINDS } from '../model-routing.mts'
-import { isPinned } from '../failover.mts'
+import { isPinned, poolAllows, poolMembers } from '../failover.mts'
+import { baseOf, matchesProvider } from '../instances.mts'
 import { RANK, offeredLevels, clampEffort } from '../reasoning-levels.mts'
 import type { AgentDirectoryEntry, AgentRecord, FailedOver, HandoverReason, EffortSource, AgentResult, ChildResultEntry, FollowupResult, IsolationPrepared, ModelTarget, OrbitRuntimeLike, PublicAgent, RoutedSpawn, RunRecord, SpawnResult, TeamDigest, ToolArgs, TurnWaiter, WorkedModel } from '../types.mts'
-import { TERMINAL, AGENT_TERMINAL, ceiling, USER, newMailMark, withoutGoogleReasoning, answerLimit, REPORT_CHARS, publicAgent, agentConnectors, agentTokens, bounded, clip, abortError } from './util.mts'
+import { TERMINAL, AGENT_TERMINAL, ceiling, USER, newMailMark, withoutGoogleReasoning, answerLimit, REPORT_CHARS, publicAgent, agentConnectors, agentTokens, bounded, clip, abortError, unknownSubscription, avoided } from './util.mts'
+import { applyProfile, freeName, markAgentUse, profileResult } from './agent-tools.mts'
 
 // The reasoning level of a helper and why. The first rule that names one wins: the level the caller passed to spawn_agent, the
 // user's provider pool entry for the model (its empty level means "auto"), the routing table's level for the kind of work,
@@ -22,7 +24,7 @@ function decideEffort(run: RunRecord, spec: ToolArgs, providerId: string, model:
   const offered = offeredLevels(providerId, model, entry)
   const why = { caller: 'as asked', pool: asked ? 'your provider pool setting' : 'your provider pool: the provider default', routing: `routing table for ${spec.kind || 'this kind of work'}`, parent: 'same level as the parent, same model', settings: 'provider settings', '': 'none set: the provider default' }[source]
   // A provider the catalog does not list and Orbit has no default levels for (Ollama, Cursor before the list is known) keeps what was asked: its own check decides.
-  if (!asked || (!entry && !offered.length && providerId !== 'antigravity')) return { level: asked, source, note: why }
+  if (!asked || (!entry && !offered.length && baseOf(providerId) !== 'antigravity')) return { level: asked, source, note: why }
   const { level, clamped } = clampEffort(asked, offered)
   if (!clamped) return { level, source, note: why }
   const where = `${providerId}${model ? `/${model}` : ''}`
@@ -38,10 +40,10 @@ function createAgent(runtime: OrbitRuntimeLike, run: RunRecord, parent: AgentRec
   const providerId = spec.providerId || parent?.providerId || run.providerId
   const model = spec.model || (sameProvider ? parent?.model || run.model : '')
   const selectedRequestModel = spec.model || (sameProvider ? parent?.requestedModel || (parent ? '' : run.model) : '') || ''
-  const poolMatches = run.providerPool.filter(item => item.providerId === providerId && item.model === selectedRequestModel)
+  const poolMatches = poolMembers(run.providerPool, providerId).filter(item => item.model === selectedRequestModel)
   const poolMember = poolMatches.find(item => item.reasoningEffort === spec.reasoningEffort) || poolMatches[0]
   const inheritedEffort = sameProvider && (!spec.model || spec.model === parent?.requestedModel || spec.model === parent?.model) ? parent?.reasoningEffort : undefined
-  const effort: EffortChoice = parent ? decideEffort(run, spec, providerId, selectedRequestModel || model, poolMember?.reasoningEffort, routedEffort, inheritedEffort) : { level: withoutGoogleReasoning(providerId, run.reasoningEffort), source: run.reasoningEffort && providerId !== 'antigravity' ? 'settings' : '', note: 'the run level' }
+  const effort: EffortChoice = parent ? decideEffort(run, spec, providerId, selectedRequestModel || model, poolMember?.reasoningEffort, routedEffort, inheritedEffort) : { level: withoutGoogleReasoning(providerId, run.reasoningEffort), source: run.reasoningEffort && baseOf(providerId) !== 'antigravity' ? 'settings' : '', note: 'the run level' }
   const agent: AgentRecord = {
     id: parent ? `agent-${randomUUID()}` : 'root', parentId: parent?.id || null, depth: parent ? parent.depth + 1 : 0,
     name: bounded(spec.name || 'Agent', 80), role: 'Agent', task: String(spec.task || ''), reason: bounded(spec.reason, 2000),
@@ -58,6 +60,8 @@ function createAgent(runtime: OrbitRuntimeLike, run: RunRecord, parent: AgentRec
     mailMark: newMailMark(), usage: null,
     // A helper works where its parent does (inside an isolated copy, when the parent has one); `extra` may give it its own.
     ...(parent?.workspace ? { workspace: parent.workspace } : {}), ...extra,
+    // A helper started as a trained agent (spawn_agent {profile}): its playbook block leads its task in every prompt.
+    ...(parent && spec.trained ? { profile: { id: spec.trained.id, name: spec.trained.name, role: spec.trained.role }, profilePrompt: spec.trained.prompt, profileReminder: spec.trained.reminder } : {}),
     ...(parent && isPinned(spec, parent.providerId) ? { failover: 'none' as const } : {}),
     ...(parent && avoided(spec).length ? { avoidProviders: avoided(spec) } : {}),
     ...(parent && connectorNames(spec).length ? { connectors: connectorNames(spec) } : {}),
@@ -75,8 +79,6 @@ function createAgent(runtime: OrbitRuntimeLike, run: RunRecord, parent: AgentRec
   runtime.recordCommunication(run, parent || USER, agent, agent.task, { kind: 'spawn', reason: agent.reason })
   return agent
 }
-// The providers a caller ruled out for the helper (spawn_agent avoidProviders), trimmed and without repeats.
-const avoided = (spec: ToolArgs): string[] => Array.isArray(spec.avoidProviders) ? [...new Set(spec.avoidProviders.map(id => String(id).trim()).filter(Boolean))] : []
 // The connector names a spawn passes to the helper (spawn_agent connectors, checked by vetSpawn), without repeats, in the order given.
 const connectorNames = (spec: ToolArgs): string[] => Array.isArray(spec.connectors) ? [...new Set(spec.connectors.map(name => String(name).trim()).filter(Boolean))] : []
 function scheduleAgent(runtime: OrbitRuntimeLike, run: RunRecord, agent: AgentRecord): Promise<AgentResult> {
@@ -96,12 +98,22 @@ const ISOLATIONS = ['', 'worktree', 'orbit']
 async function spawnSubAgent(runtime: OrbitRuntimeLike, runId: string, parentId: string, spec: ToolArgs = {}): Promise<SpawnResult> {
   const run = runtime.runs.get(runId)
   const parent = run?.agentNodes.get(parentId)
+  // spawn_agent {profile}: the helper runs as a trained agent. Its name, kind and level default to the agent's, and everything below
+  // (routing, effort, vetting) sees the completed spec. `trained` is the runtime's own field: a caller's is dropped.
+  let profiled: { entry: Parameters<typeof profileResult>[0] } | null = null
+  if (spec.trained !== undefined) { const { trained: _caller, ...clean } = spec; spec = clean }
+  if (run && parent && spec.profile !== undefined && spec.profile !== null && spec.profile !== '') {
+    const applied = applyProfile(runtime, run, spec)
+    if ('ok' in applied) return applied
+    spec = applied.spec; profiled = { entry: applied.entry }
+  }
   const isolation = spec.isolation === undefined || spec.isolation === null ? '' : String(spec.isolation)
   if (!ISOLATIONS.includes(isolation)) return { ok: false, reason: 'invalid_isolation', instruction: "isolation is one of '' (the helper shares your workspace), 'worktree' (its own git copy of your workspace) or 'orbit' (its own git copy of Orbit's repository)" }
   // A session call runs inside its caller's turn. A pause that cut the turn meanwhile lost this call's result for the
   // model, so no helper is made behind its back: the resumed model decides again.
   const turn = parent?.activeTurn
   let routedSpec = spec, routed: RoutedSpawn | null = null, listed = false
+  const refused = run && parent ? unknownSubscription(run, parent, spec) : null; if (refused) return refused // before the routing waits for anything
   if (run && parent && ROUTING_KINDS.includes(String(spec.kind)) && !spec.model && !TERMINAL.has(run.status) && !['done', 'error', 'cancelled'].includes(parent.status)
     && String(spec.task || '').trim() && String(spec.reason || '').trim() && !(spec.name && [...run.agentNodes.values()].some(agent => agent.name === bounded(spec.name, 80)))) {
     ({ spec: routedSpec, routed } = await runtime.routeSpawn(run, parent, spec)); listed = true
@@ -131,10 +143,13 @@ async function spawnSubAgent(runtime: OrbitRuntimeLike, runId: string, parentId:
   }
   const result = registerSubAgent(runtime, runId, parentId, routedSpec, routed, prepared)
   if (prepared && copyRun && (!result.ok || result.reused)) await runtime.discardIsolation(copyRun, prepared.id)
+  // A helper that started as a trained agent counts as a use of it (once per run) and the result says how to rate it.
+  const answer = profiled && result.ok && !result.reused ? { ...result, profile: profileResult(profiled.entry) } : result
+  if (answer !== result) markAgentUse(runtime, run!, profiled!.entry.id)
   // `routed.reasoningEffort` is already in the result as the helper's level.
-  if (!routed || !result.ok || result.reused) return result
+  if (!routed || !result.ok || result.reused) return answer
   const { reasoningEffort: _level, ...shown } = routed
-  return { ...result, routed: shown }
+  return { ...answer, routed: shown }
 }
 // "Model for review work: claude/opus (passed over codex/gpt-6-astra: quota 93% used)", for the delegation trace.
 function routedLine({ kind, model, skipped }: RoutedSpawn): string {
@@ -153,7 +168,7 @@ function vetSpawn(runtime: OrbitRuntimeLike, runId: string, parentId: string, sp
   if (spec.reasoningEffort && !['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra', 'enabled'].includes(spec.reasoningEffort)) return { ok: false, reason: 'invalid_reasoning_effort' }
   if (spec.failover && !['auto', 'none'].includes(String(spec.failover))) return { ok: false, reason: 'invalid_failover', instruction: "failover is 'none' (the helper never changes subscription: when its own is out of quota or fails, it stops with an error you see in wait_agent) or 'auto' (Orbit may move it to another subscription; wait_agent then shows failedOver)" }
   if (spec.avoidProviders !== undefined && spec.avoidProviders !== null && (!Array.isArray(spec.avoidProviders) || spec.avoidProviders.some(id => typeof id !== 'string'))) return { ok: false, reason: 'invalid_avoid_providers', instruction: 'avoidProviders is a list of provider ids (for example ["claude"]) the helper must never run on or be moved to' }
-  if (spec.providerId && avoided(spec).includes(spec.providerId)) return { ok: false, reason: 'invalid_avoid_providers', instruction: `providerId ${spec.providerId} is also in avoidProviders` }
+  if (spec.providerId && avoided(spec).some(reference => matchesProvider(reference, spec.providerId!))) return { ok: false, reason: 'invalid_avoid_providers', instruction: `providerId ${spec.providerId} is also in avoidProviders` }
   if (spec.kind && !ROUTING_KINDS.includes(String(spec.kind))) return { ok: false, reason: 'unknown_kind', instruction: `kind is one of: ${ROUTING_KINDS.join(', ')}` }
   if (spec.merge && !['auto', 'hold'].includes(String(spec.merge))) return { ok: false, reason: 'invalid_merge', instruction: "merge is 'auto' (Orbit merges the helper's changes when it finishes) or 'hold' (it does not: you decide with merge_agent)" }
   if (spec.merge === 'hold' && !spec.isolation) return { ok: false, reason: 'invalid_merge', instruction: "merge 'hold' needs isolation ('worktree' or 'orbit'): without a copy of its own there is nothing to hold" }
@@ -179,8 +194,10 @@ function vetSpawn(runtime: OrbitRuntimeLike, runId: string, parentId: string, sp
     const inherited = (prior?.connectors ?? []).filter(name => passable.includes(name))
     if (inherited.length) spec = { ...spec, connectors: inherited }
   } else spec = { ...spec, connectors: asked }
-  if (run.providerPool.length && spec.providerId && spec.providerId !== run.providerId && !run.providerPool.some(item => item.providerId === spec.providerId && (!spec.model || !item.model || item.model === spec.model))) return { ok: false, reason: 'provider_model_not_in_configured_pool' }
-  if (spec.providerId && spec.providerId !== parent.providerId && !spec.model) spec = { ...spec, model: run.providerPool.find(item => item.providerId === spec.providerId)?.model || '' }
+  if (spec.providerId && !poolAllows(run.providerPool, spec.providerId, spec.model, run.providerId)) return { ok: false, reason: 'provider_model_not_in_configured_pool' }
+  if (spec.providerId && spec.providerId !== parent.providerId && !spec.model) spec = { ...spec, model: poolMembers(run.providerPool, spec.providerId)[0]?.model || '' }
+  // A helper that runs as a trained agent with no name of its own takes a free one (never a reuse), chosen here, in the synchronous registration.
+  if (!spec.name && spec.trained?.autoName) spec = { ...spec, name: freeName(run, spec.trained.name) }
   const existing = spec.name && [...run.agentNodes.values()].find(agent => agent.name === bounded(spec.name, 80))
   if (existing) return { ok: true, reused: true, agentId: existing.id, status: existing.status, instruction: 'Participant already exists. Use send_message to continue its conversation, or choose a distinct name for different work.' }
   if (parent.depth >= ceiling(run.limits, 'maxDepth')) return { ok: false, reason: 'depth_limit' }

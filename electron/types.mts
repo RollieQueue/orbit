@@ -128,6 +128,11 @@ export interface ToolArgs {
   title?: string; scope?: string; type?: string; confidence?: number; outcome?: string; note?: string; description?: string; whenToUse?: string; instructions?: string; source?: string
   key?: string; summary?: string; status?: string; tasks?: ImprovementTaskInput[]; taskType?: string; assessment?: string; evidence?: string
   continueWith?: string; verify?: boolean; handoff?: string
+  // spawn_agent: a trained agent (id, unique id prefix or exact name) the helper runs as. agent_save: the profile's own fields (round, gallery: lists, validated by trained-agents.mts).
+  profile?: string; role?: string; trainingMinutes?: number
+  // Internal (agents.spawnSubAgent sets it from `profile`, a caller's own is dropped): the trained agent a helper runs as and the prompt block that carries its playbook.
+  // `reminder` rides on resumed session turns; `autoName` = the caller named no helper, so a free name is chosen at registration.
+  trained?: { id: string; name: string; role: string; prompt: string; reminder: string; autoName?: boolean }
   // connector_add: a stdio server (command, args, env) or an HTTP one (url, headers); env and headers are lists of "KEY=value" / "Name: value".
   url?: string; env?: string[]; headers?: string[]; enabled?: boolean
   // spawn_agent: '' (the helper shares its parent's workspace), 'worktree' (an isolated git copy of it) or 'orbit' (of Orbit's own repository).
@@ -185,6 +190,8 @@ export interface AgentRecord {
   providerId: string; model: string; memoryProfile: MemoryProfile; reasoningEffort: string; requestedModel: string
   // Which rule gave the helper its level (agents.decideEffort), and the short reason spawn_agent reports (internal).
   effortSource?: EffortSource; effortNote?: string
+  // spawn_agent {profile}: the trained agent this helper runs as (public); `profilePrompt` (its playbook block, internal) leads the helper's task in every prompt, follow-ups included.
+  profile?: { id: string; name: string; role: string }; profilePrompt?: string; profileReminder?: string
   // spawn_agent's failover options: 'none' pins the agent to its subscription; avoidProviders are never moved to (failover.mts).
   failover?: 'none'; avoidProviders?: string[]
   // The names of the connectors (external MCP servers) spawn_agent passed to this helper; absent = none. The root gets every enabled one. Names only, never launch data.
@@ -218,7 +225,7 @@ export interface AgentIsolation { kind: 'worktree' | 'orbit'; path: string; base
 // record starts with, or why there is none.
 export type IsolationPrepared = { ok: true; id: string; fields: Partial<AgentRecord> } | { ok: false; reason: string; instruction?: string }
 // The fields that stay inside the runtime; snapshots and events carry the rest (util.INTERNAL_AGENT_FIELDS).
-export type InternalAgentField = 'inbox' | 'seenChildren' | 'requestedModel' | 'transcript' | 'previousWork' | 'ledger' | 'ledgerDropped' | 'workDone' | 'failedCandidates' | 'trial' | 'partialTurn' | 'quotaWarned' | 'draftAnswer' | 'activeTurn' | 'stream' | 'sessionToken' | 'sessionCursor' | 'transcriptChars' | 'pausedSession' | 'mailMark' | 'effortNote' | 'report'
+export type InternalAgentField = 'inbox' | 'seenChildren' | 'requestedModel' | 'transcript' | 'previousWork' | 'ledger' | 'ledgerDropped' | 'workDone' | 'failedCandidates' | 'trial' | 'partialTurn' | 'quotaWarned' | 'draftAnswer' | 'activeTurn' | 'stream' | 'sessionToken' | 'sessionCursor' | 'transcriptChars' | 'pausedSession' | 'mailMark' | 'effortNote' | 'report' | 'profilePrompt' | 'profileReminder'
 export type PublicAgent = Omit<AgentRecord, InternalAgentField>
 // What an agent's execution resolves to (completeAgent), or the error a scheduled agent ended with.
 export interface AgentResult { agentId: string; generation: number; status: AgentStatus; result?: string; error?: string; budgetLimited?: boolean }
@@ -233,6 +240,8 @@ export interface SpawnResult {
   ok: boolean; reason?: string; instruction?: string; reused?: boolean; agentId?: string; status?: AgentStatus
   name?: string; providerId?: string; model?: string; reasoningEffort?: string; effortSource?: EffortSource; effort?: string
   isolation?: AgentIsolation; routed?: RoutedSpawn; failover?: 'none'; avoidProviders?: string[]
+  // spawn_agent {profile}: the trained agent the helper runs as, and how to rate it.
+  profile?: { id: string; name: string; role: string; note: string }
 }
 // An agent that changed subscription, as callers see it (wait_agent, list_agents): the model it started on, the one it runs
 // on now, how often it moved, and why the first move happened. `steps` lists every switch (wait_agent only).
@@ -253,13 +262,15 @@ export interface ProviderBuffer { id: string; text: string; kind: string; agentI
 
 // ---- Runs ---------------------------------------------------------------------------------------------------------
 export interface FailoverConfig { enabled: boolean; switchAtPercent: number; allowWeaker: boolean }
-export interface ProviderOptions { reasoningEffort?: string; command?: string; transport?: string; legacyEnvelope?: boolean; [extra: string]: unknown }
+// An entry named by a subscription instance's id ("claude-2", see instances.mts) also carries `base`, `label` and `accountDir`.
+export interface ProviderOptions { reasoningEffort?: string; command?: string; transport?: string; legacyEnvelope?: boolean; base?: string; label?: string; accountDir?: string; [extra: string]: unknown }
 // A note as shared-context.mts writes it (project-context's ContextNote): `files` maps a path to its signature, null when missing.
 export interface SharedNote { key: string; summary: string; files: Record<string, string | null>; updatedAt: string; stale?: boolean }
 export interface SharedContext { notes?: SharedNote[]; updatedAt?: string }
 export interface ProjectPacket { overview: unknown; notes: SharedNote[]; updatedAt?: string }
 // No index signature: providers.mts ProviderHealth (an interface, the catalog main.cjs passes) must fit it.
-export interface CatalogEntry { id: string; available?: boolean; models?: string[]; reasoningLevels?: Record<string, string[]> }
+// `base` and `label` are set on the entry of a subscription instance ("claude-2" -> base "claude", instances.mts).
+export interface CatalogEntry { id: string; available?: boolean; models?: string[]; reasoningLevels?: Record<string, string[]>; base?: string; label?: string }
 export interface RunRecord {
   pauseWaiters: Set<() => void>
   runId: string; projectId: string; chatId: string; prompt: string; workspace: string; providerId: string; model: string
@@ -274,7 +285,7 @@ export interface RunRecord {
   activeTurns: number; turnQueue: TurnWaiter[]; operations: Set<Promise<unknown>>; providerBuffers: Map<string, ProviderBuffer>; finishedAt: string | null; summary: RunSummary | null; error: string | null
   fileActivity: FileActivityLike; changes: ChangeLogLike; changeQueue: Promise<void>; changePending: number; commands: { running: number; serial: number; writes: number }
   priorRuns: ChatRunView[]; priorDigest: string | null
-  memoryTouched: Set<string>; skillUse: Map<string, { name: string; rated: boolean }>; skillLearning: boolean; skillReminded: boolean; skillSaved: boolean
+  memoryTouched: Set<string>; skillUse: Map<string, { name: string; rated: boolean }>; agentUse: Set<string>; skillLearning: boolean; skillReminded: boolean; skillSaved: boolean
   router: TeamRouterLike
   // Set after the record is made: the index scan, the run timer, the coalesced persistence timer and its failure mark.
   indexReady?: Promise<unknown>; indexSettled?: boolean; timer?: ReturnType<typeof setTimeout>; persistTimer?: ReturnType<typeof setTimeout> | null; persistenceError?: boolean
@@ -442,21 +453,37 @@ export interface SkillFile { path: string; size: number }
 export interface SkillPackage { id: string; dir: string }
 // A file of a package as an install passes it: its path in the package and its text.
 export interface SkillFileInput { path: string; content: string }
+// A trained agent (electron/trained-agents.mts) is a capability with an `agent` field: a specialist profile whose playbook is the
+// capability's `instructions`. `score` of a round is the judges' mean (0..10), `scores` the per-criterion marks.
+export type AgentKind = 'code' | 'review' | 'lookup' | 'text'
+export interface TrainingRound { at: string; round: number; concepts: string[]; score: number; scores?: Record<string, number>; judges?: string[]; notes?: string }
+export interface AgentGalleryItem { file: string; caption?: string }
+export interface AgentProfile {
+  role: string; kind?: AgentKind; reasoningEffort?: string; status: 'training' | 'trained'
+  rounds: TrainingRound[]; gallery: AgentGalleryItem[]; trainingMinutes?: number
+}
+// An agent as agent_read's list and the AGENTS block of a prompt show it.
+export interface AgentSummary {
+  id: string; name: string; role: string; status: AgentProfile['status']; scope: SkillScope; rounds: number; lastScore?: number; uses: number
+  reliability: number; kind?: AgentKind; reasoningEffort?: string; relevant?: boolean
+}
 export interface SkillView {
   id: string; name: string; description?: string; whenToUse?: string; scope: SkillScope; version?: number; uses?: number; reliability?: number
   lessons?: string[]; successes?: number; failures?: number; workspace?: string; source?: string; relevant?: boolean
-  enabled?: boolean; files?: SkillFile[]; params?: SkillParam[]; triggers?: SkillTrigger[]; commands?: SkillCommand[]; package?: SkillPackage
+  enabled?: boolean; files?: SkillFile[]; params?: SkillParam[]; triggers?: SkillTrigger[]; commands?: SkillCommand[]; package?: SkillPackage; agent?: AgentProfile
 }
 export interface SkillEntry extends SkillView { instructions: string }
 export interface SkillSuggestion { skills: SkillView[]; total: number }
 export interface SkillSaveInput {
   id?: string; name: string; description?: string; whenToUse?: string; instructions: string; scope: SkillScope; workspace?: string; source?: string
   files?: SkillFileInput[]; removeFiles?: string[]; fromDir?: string; params?: unknown[]; triggers?: unknown[]; commands?: unknown[]
+  // Present = a trained agent: {role, kind?, reasoningEffort?, status?, round?, gallery?, trainingMinutes?} as agent_save gives it.
+  agent?: Record<string, unknown>
 }
 // A file the user attached to a chat message (electron/attachments.mts) and the upload the window sends to save one.
 export interface Attachment { id: string; name: string; type: string; size: number; path: string }
 export interface AttachmentUpload { name: string; type: string; data: string }
-export interface SkillSaveResult { entry: SkillEntry; merged?: boolean; improved?: string; evicted?: number }
+export interface SkillSaveResult { entry: SkillEntry; merged?: boolean; improved?: string; evicted?: number; notes?: string[] }
 export interface SkillFeedbackInput { outcome?: string; note?: string; includeGlobal?: boolean }
 export interface MaintainOptions { workspace: string; chatId?: string; crossProject: boolean; projects: string[] }
 
@@ -484,6 +511,10 @@ export interface CapabilityStoreLike {
   setEnabled?(id: string, enabled: boolean, workspace: string): SkillView
   suggest?(query: string, workspace: string, limit: number, includeGlobal: boolean): SkillSuggestion
   recordUse?(id: string, workspace: string, includeGlobal: boolean): string | null
+  // Trained agents (enabled ones only, except findAgent): by id, unique id prefix or exact name; ranked for a prompt; all of them.
+  findAgent?(reference: string, workspace: string, includeGlobal: boolean): SkillEntry | null
+  agents?(workspace: string, includeGlobal: boolean): AgentSummary[]
+  suggestAgents?(query: string, workspace: string, limit: number, includeGlobal: boolean): { agents: AgentSummary[]; total: number }
   maintain?(options: Omit<MaintainOptions, 'chatId'>): unknown
   flush?(): void
 }

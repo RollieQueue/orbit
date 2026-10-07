@@ -5,8 +5,9 @@ import { Icon } from './Icon'
 import { ModelPicker } from './ModelPicker'
 import { QuotaChip } from './QuotaPanel'
 import { ReasoningPicker } from './ReasoningPicker'
-import { providerName, providers } from './providers'
+import { providerName } from './providers'
 import { RESTART_WAIT_TEXT, accessChoice, accessPatch, modelPatch, reasoningPatch } from './state-store'
+import { providerList } from './subscriptions'
 
 export type ComposerProps = {
   settings: Settings; project?: Project; chat?: ChatThread; currentHealth?: ProviderHealth; modelChoices: string[]; selectedEffort: string
@@ -75,7 +76,7 @@ export function Composer({
           <button type="button" className="attach-button" aria-label="Прикрепить файлы" title="Прикрепить документы и изображения (можно перетащить или вставить из буфера)"
             disabled={!enabled} onClick={() => picker.current?.click()}><Icon name="paperclip" size={16} /></button>
           <select aria-label="Провайдер" value={settings.providerId} onChange={event => onSettings({ providerId: event.target.value })}>
-            {providers.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
+            {providerList(settings.subscriptions).map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
           </select>
           <ModelPicker key={settings.providerId} value={model} models={modelChoices} onChange={next => onSettings(modelPatch(settings, next))} />
           <ReasoningPicker providerId={settings.providerId} model={model} health={currentHealth} value={selectedEffort}

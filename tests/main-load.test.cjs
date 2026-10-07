@@ -97,6 +97,7 @@ function loadMain({ lock = true, ready = false, healthFile = '0', mode, argv = [
   // first when a test sets it.
   class FakeWindow {
     static getAllWindows() { return windows.filter(win => !win.destroyed) }
+    static fromWebContents() { return windows.find(win => !win.destroyed) || null }
     constructor(options) {
       const events = new EventEmitter()
       Object.assign(this, { options, destroyed: false, sent: [], reloads: 0, failPings: 0, beforePing: null })
@@ -235,7 +236,63 @@ test('in child mode main loads only shell files, also once the runtime runs: a r
   // The shell's ES modules must not pull runtime modules in through their own imports either.
   for (const file of local.filter(name => name.endsWith('.mts'))) {
     const imports = fs.readFileSync(path.join(repo, file), 'utf8').match(/^import (?!type\b)[^\n]*from '\.[^']*'/gm) || []
-    assert.deepEqual(imports, [], `${file} imports electron/ modules at run time`)
+    // What a shell module imports must be a shell file too (accounts.mts uses the id rules of instances.mts).
+    const runtimeImports = imports.filter(line => !SHELL_FILES.includes(`electron/${/from '\.\/([^']*)'/.exec(line)?.[1]}`))
+    assert.deepEqual(runtimeImports, [], `${file} imports electron/ runtime modules at run time`)
+  }
+})
+
+test('extra subscription accounts: main creates the folder, opens the CLI sign-in with the account env, and deletes a folder only when asked, its own and confirmed', async () => {
+  const userData = fs.mkdtempSync(path.join(os.tmpdir(), 'orbit-main-accounts-'))
+  const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'orbit-main-accounts-outside-'))
+  const main = loadMain({ ready: true, userData })
+  try {
+    await until(() => main.forks.length === 1 && main.windows.length === 1, 'main is up')
+    const call = (channel, ...args) => main.handlers.get(channel)(trusted, ...args)
+    const created = await call('accounts:prepare', 'claude', ['claude', 'codex'])
+    const folder = created.dir
+    assert.equal(created.id, 'claude-2')
+    assert.equal(folder, path.join(userData, 'accounts', 'claude-2'))
+    assert.ok(fs.statSync(folder).isDirectory())
+    // Ids and folders are never reused: not while taken, not while the folder exists (a removed account's login), not after this process issued it.
+    assert.equal((await call('accounts:prepare', 'claude', ['claude', 'claude-2'])).id, 'claude-3')
+    fs.rmSync(path.join(userData, 'accounts', 'claude-3'), { recursive: true })
+    assert.equal((await call('accounts:prepare', 'claude', ['claude'])).id, 'claude-4', 'claude-2 has a folder, claude-3 was issued before')
+    for (const [base, taken] of [['cursor', []], ['antigravity', []], [1, []], ['claude/..', []], ['ollama', []]]) {
+      await assert.rejects(async () => call('accounts:prepare', base, taken), /./, `${base}`)
+    }
+    assert.deepEqual(fs.readdirSync(path.join(userData, 'accounts')).sort(), ['claude-2', 'claude-4'], 'nothing else was created')
+    // The sign-in: a console window of the CLI's own login; the account variable travels in the spawn environment.
+    const login = call('accounts:login', { id: 'claude-2', base: 'claude', dir: folder })
+    await until(() => main.spawned.length === 1, 'the sign-in window is started')
+    main.spawned[0].child.emit('spawn')
+    assert.deepEqual(await login, { ok: true })
+    const [launch] = main.spawned
+    assert.equal(launch.options.env.CLAUDE_CONFIG_DIR, folder)
+    assert.ok(launch.options.detached && launch.options.windowsHide === false)
+    assert.ok(launch.args.join(' ').includes('auth') && launch.args.join(' ').includes('login'))
+    await assert.rejects(async () => call('accounts:login', { id: 'cursor-2', base: 'cursor', dir: folder }), /./)
+    await assert.rejects(async () => call('accounts:login', { id: 'claude-2', base: 'claude', dir: 'relative' }), /папки аккаунта/)
+    const unsafe = await call('accounts:login', { id: 'claude-2', base: 'claude', dir: folder, command: 'claude" & calc' })
+    assert.equal(unsafe.ok, false)
+    assert.equal(main.spawned.length, 1, 'an unsafe command starts nothing')
+    // Removal: the folder goes only when asked, Orbit made it AND the dialog's answer says delete (the stub answers "delete").
+    assert.deepEqual(await call('accounts:remove', { id: 'claude-2', dir: folder, deleteFiles: false }), { deleted: false, reason: 'not-requested' })
+    assert.deepEqual(await call('accounts:remove', { id: 'claude-2', dir: outside, deleteFiles: true }), { deleted: false, reason: 'unmanaged' })
+    assert.deepEqual(await call('accounts:remove', { id: 'claude-2', dir: path.join(userData, 'accounts-evil'), deleteFiles: true }), { deleted: false, reason: 'unmanaged' })
+    assert.deepEqual(await call('accounts:remove', { id: 'claude-2', dir: path.join(userData, 'accounts'), deleteFiles: true }), { deleted: false, reason: 'unmanaged' })
+    assert.equal(main.dialogs.length, 0, 'no question was asked for what is refused beforehand')
+    assert.ok(fs.existsSync(folder) && fs.existsSync(outside))
+    assert.deepEqual(await call('accounts:remove', { id: 'claude-2', dir: folder, deleteFiles: true }), { deleted: true })
+    assert.equal(main.dialogs.length, 1)
+    assert.equal(main.dialogs[0].defaultId, 0, 'the default button keeps the folder')
+    assert.ok(!fs.existsSync(folder))
+    assert.deepEqual(await call('accounts:remove', { id: 'claude-2', dir: folder, deleteFiles: true }), { deleted: false, reason: 'missing' })
+    await assert.rejects(async () => call('accounts:remove', { id: 'claude', dir: folder, deleteFiles: true }), /./)
+  } finally {
+    await main.exported.shutdownRuntime('quit')
+    fs.rmSync(userData, { recursive: true, force: true })
+    fs.rmSync(outside, { recursive: true, force: true })
   }
 })
 

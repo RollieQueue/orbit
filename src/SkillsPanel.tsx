@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import type { Capability, ConnectorTestResult, ConnectorView, LibraryStats, SkillParam, SkillParamValue } from './types'
 import './skill-stage.css'
 import { Icon } from './Icon'
@@ -7,6 +7,9 @@ import { Markdown, errorText } from './format'
 import { completionPages } from './skill-triggers'
 import { SKILL_ORDERS, groupSkills, parseOrder, sortSkills } from './skill-groups'
 import type { SkillOrder } from './skill-groups'
+import { AgentsTab, PanelTabs } from './AgentCards'
+import { parseTab, splitCapabilities } from './agent-view'
+import type { PanelTab } from './agent-view'
 
 type CardProps = { entry: Capability; workspace: string; onSaved: () => void; onError: (message: string) => void; onPreview?: (skill: Capability) => void }
 const dayOf = (time: string) => new Date(time).toLocaleDateString('ru-RU')
@@ -239,11 +242,15 @@ type SkillsPanelProps = {
 
 const ORDER_KEY = 'orbit.skills.order'
 const loadOrder = (): SkillOrder => { try { return parseOrder(window.localStorage.getItem(ORDER_KEY)) } catch { return 'type' } }
+const TAB_KEY = 'orbit.skills.tab'
+const loadTab = (): PanelTab => { try { return parseTab(window.localStorage.getItem(TAB_KEY)) } catch { return 'skills' } }
 
-// Project and shared skills and the connectors. By type (the default): headed groups of what Orbit built for itself;
+// Two tabs: the skills (project and shared) with the connectors, and the trained agents. Skills: by type (the default): headed groups of what Orbit built for itself;
 // otherwise one list, pinned first, then by use or by date, with the connectors in a section of their own on top.
-export function SkillsPanel({ desktop, workspace, skills, stats, loading, onChanged, onError, onPreview }: SkillsPanelProps) {
+export function SkillsPanel({ desktop, workspace, skills: capabilities, stats, loading, onChanged, onError, onPreview }: SkillsPanelProps) {
   const [order, setOrder] = useState<SkillOrder>(loadOrder)
+  const [tab, setTab] = useState<PanelTab>(loadTab)
+  const { skills, agents } = useMemo(() => splitCapabilities(capabilities), [capabilities])
   const [connectors, setConnectors] = useState<ConnectorView[] | null>(null)
   const loadConnectors = useCallback(() => {
     if (!desktop || !window.orbit) return
@@ -256,6 +263,10 @@ export function SkillsPanel({ desktop, workspace, skills, stats, loading, onChan
     setOrder(next)
     try { window.localStorage.setItem(ORDER_KEY, next) } catch { /* the choice is not kept */ }
   }
+  const chooseTab = (next: PanelTab) => {
+    setTab(next)
+    try { window.localStorage.setItem(TAB_KEY, next) } catch { /* the choice is not kept */ }
+  }
   const tiers = stats && [
     { name: 'Проект', stat: stats.skills.project }, { name: 'Общие', stat: stats.skills.global }, { name: 'Применялись', text: String(stats.skills.used) },
   ]
@@ -265,7 +276,7 @@ export function SkillsPanel({ desktop, workspace, skills, stats, loading, onChan
   const connectorCards = connectors === null ? <p className="muted">Загружаем коннекторы…</p> : connectors.length
     ? connectors.map(connector => <ConnectorCard key={`${connector.scope}-${connector.name}-${connector.enabled}`} connector={connector} workspace={workspace} onChanged={loadConnectors} onError={onError} />)
     : <p className="muted">Коннекторов нет: агент добавляет внешние серверы MCP (браузер, базы данных, GitHub) командой connector_add.</p>
-  return <>
+  const skillsTab = <>
     <p className="modal-intro">
       Навык — надстройка, которую Orbit делает себе сам, в любой форме: проверенная процедура (например, поднять изолированное окружение), страница
       с анимацией по завершении задачи, набор скриптов и команд. Инструкции агент находит по задаче, применяет, оценивает результат и дописывает подводные
@@ -293,4 +304,6 @@ export function SkillsPanel({ desktop, workspace, skills, stats, loading, onChan
       <p>Навыков пока нет. Агент создаёт их по мере работы, когда находит повторяемую процедуру; вы также можете добавить свой.</p>
     </div>}
   </>
+  return <PanelTabs tab={tab} agentCount={agents.length} onTab={chooseTab} skills={skillsTab}
+    agents={<AgentsTab agents={agents} workspace={workspace} loading={loading} onSaved={onChanged} onError={onError} />} />
 }

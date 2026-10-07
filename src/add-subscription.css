@@ -1,0 +1,17 @@
+.add-subscription-open{margin-top:12px}
+.add-subscription{border:1px solid #3d4941;border-radius:9px;background:#222a25;padding:4px 16px 12px;margin-top:12px}
+.add-subscription-form{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.2fr) auto;gap:0 12px;align-items:end}
+.add-subscription-form label{margin-bottom:0}.add-subscription-form .primary-button{height:38px}
+.add-subscription-error{color:#e0a9a9;font-size:11px;line-height:1.7;margin-top:10px}
+.add-subscription-status{display:flex;flex-direction:column;gap:6px;margin-top:14px;font-size:12px;color:#b9c9b9}
+.add-subscription-status .ok,.subscription-status.ok{color:#b4d7bd}
+.add-subscription-status small{color:#88998e}
+.provider-instance{display:flex;flex-direction:column;margin-left:18px;border-left:2px solid #3d4941;padding-left:10px}
+.provider-instance .provider-card{border-bottom-left-radius:0;border-bottom-right-radius:0}
+.subscription-actions{border:1px solid #363c42;border-top:0;border-radius:0 0 9px 9px;background:#1f2327;padding:8px 13px 10px;display:flex;flex-direction:column;gap:6px}
+.subscription-status{font-size:10px;color:#a3a8b0;line-height:1.7;overflow-wrap:anywhere}
+.subscription-buttons{display:flex;gap:16px}.text-button.danger{color:#d9a3a3}
+.subscription-remove{border-top:1px solid #363c42;padding-top:8px;font-size:11px;color:#b8c0c8;line-height:1.7}
+.subscription-remove p{margin:0 0 6px}.subscription-remove .field-hint{margin:4px 0 8px}
+.quota-card.instance{margin-left:18px;border-left:2px solid #3d4941}
+@media(max-width:700px){.add-subscription-form{grid-template-columns:1fr}.add-subscription-form label{margin-bottom:12px}}

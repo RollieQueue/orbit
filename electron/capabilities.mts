@@ -8,17 +8,22 @@ import { oneLine } from './text.mts'
 import { skillPackageDir, skillPackageId } from './skill-files.mts'
 import { applyPackage, checkCommands, checkParams, checkSourceDir, checkTriggers, checkValues, planPackage, readFolder, removePackage, reviveCommands, reviveFiles, reviveParams, reviveTriggers } from './skill-packages.mts'
 import type { Manifest } from './skill-packages.mts'
-import type { SkillCommand, SkillFile, SkillPackage, SkillParam, SkillTrigger } from './types.mts'
+import { PLAYBOOK_CHARS, checkAgent, lastScore, reviveAgent, trainedConcepts } from './trained-agents.mts'
+import type { AgentProfile, AgentSummary, SkillCommand, SkillFile, SkillPackage, SkillParam, SkillTrigger } from './types.mts'
 
 // Skills: what agents built or learned to do and can do again. A skill is a versioned add-on of any form: a procedure, or a
 // package (pages, scripts, assets in its own folder, electron/skill-packages.mts) with parameters, triggers and commands.
 // Beyond the text it carries what makes the library improve by use instead of just growing: how often it was used, whether
 // it worked, and the pitfalls agents ran into. Retrieval ranks by relevance and track record; the library is
-// capped per scope and what nobody uses, or what keeps failing, is pruned.
+// capped per scope and what nobody uses, or what keeps failing, is pruned. A trained agent (electron/trained-agents.mts) is an
+// entry of the same store with an `agent` field: it keeps the versions, scopes, package and track record, but it is not a skill:
+// skill lists, suggestions, searches, caps and maintenance leave it alone, and it has caps and retrieval of its own.
 const DAY = 86400000
 type SkillScope = 'project' | 'global'
 type SkillOutcome = 'worked' | 'partial' | 'failed'
 const LIMITS: Record<SkillScope, number> = { project: 60, global: 100 }
+// Agents are protected from eviction, so a new one that does not fit is refused.
+const AGENT_LIMITS: Record<SkillScope, number> = { project: 20, global: 20 }
 const AGENT_INSTRUCTION_CHARS = 12000, USER_INSTRUCTION_CHARS = 24000
 const REVISIONS = 10, LESSONS = 8, PROJECTS_SEEN = 20
 // A skill an agent saves that says (nearly) what an existing one says improves it. The bar is high: "Release Node package"
@@ -40,6 +45,8 @@ interface Skill {
   // Agents see only enabled skills. The package's files live in skillPackageDir(userData, id); the lists here are its current
   // state (revisions keep the text only). Params hold the user's values next to the defaults.
   enabled: boolean; files: SkillFile[]; params: SkillParam[]; triggers: SkillTrigger[]; commands: SkillCommand[]
+  // Present on a trained agent: its role, defaults, training record and gallery; the playbook is `instructions`.
+  agent?: AgentProfile
   // An older version's stamp, read only where `updatedAt` may be missing.
   updated?: string
 }
@@ -50,24 +57,28 @@ const isStoredSkill = (value: unknown): value is StoredSkill => !!value && typeo
 interface SkillInput {
   id?: unknown; scope?: unknown; workspace?: unknown; name?: unknown; description?: unknown; whenToUse?: unknown; instructions?: unknown; source?: unknown
   files?: unknown; removeFiles?: unknown; fromDir?: unknown; params?: unknown; triggers?: unknown; commands?: unknown
+  // An object (role, kind, reasoningEffort, status, round, gallery, trainingMinutes) makes the save a trained agent's (agent_save).
+  agent?: unknown
 }
 // A skill as lists and search results show it: without the instructions and revisions, with its reliability and, when it has files, where they are.
 interface SkillSummary extends Omit<Skill, 'instructions' | 'revisions'> { reliability: number; package?: SkillPackage }
 interface SkillRank { entry: Skill; relevance: number; matched: number; score: number }
 interface SkillSuggestion { skills: Array<SkillSummary & { relevant: boolean }>; total: number }
-interface SaveResult { entry: Skill; merged: boolean; improved?: string; evicted: number }
+interface SaveResult { entry: Skill; merged: boolean; improved?: string; evicted: number; notes?: string[] }
 interface MaintainReport { expired: number; merged: number; evicted: number; shared: number }
 interface MaintainOptions { workspace?: string | null; crossProject?: boolean; projects?: string[] | null }
 type Editor = (entry: Skill, patch: Partial<Skill>) => void
 interface Print { stamp?: string; text: Set<string>; title: Set<string> }
 
 const shortId = (id: string): string => id.length <= 14 ? id : id.slice(0, 12)
-const groupKey = (entry: Pick<Skill, 'scope' | 'workspace'>): string => `${entry.scope}|${entry.workspace || ''}`
+// The caps and the maintenance work per scope, project and kind: agents and skills never share a count.
+const groupKey = (entry: Pick<Skill, 'scope' | 'workspace' | 'agent'>): string => `${entry.scope}|${entry.workspace || ''}|${entry.agent ? 'agent' : 'skill'}`
+const limitOf = (entry: Pick<Skill, 'scope' | 'agent'>): number => (entry.agent ? AGENT_LIMITS : LIMITS)[entry.scope]
 const authored = (entry: Skill): boolean => entry.source === 'user'
 // A package is something the user may rely on (a page Orbit shows, commands agents run), so it is protected like a pinned or
 // user-written skill: never expired, evicted or merged.
 const hasPackage = (entry: Pick<Skill, 'files' | 'triggers' | 'commands'>): boolean => entry.files.length > 0 || entry.triggers.length > 0 || entry.commands.length > 0
-const isProtected = (entry: Skill): boolean => entry.pinned === true || authored(entry) || hasPackage(entry)
+const isProtected = (entry: Skill): boolean => entry.pinned === true || authored(entry) || hasPackage(entry) || !!entry.agent
 const reliability = (entry: { successes?: number; failures?: number }): number => ((entry.successes || 0) + 1) / ((entry.successes || 0) + (entry.failures || 0) + 2)
 const fingerprint = (name: string, text: string): Print => ({ text: uniqueTerms(`${name} ${text}`), title: uniqueTerms(name) })
 const isPrint = (value: Skill | Print): value is Print => Boolean((value as Print).text)
@@ -108,11 +119,15 @@ class CapabilityStore {
       lessons: Array.isArray(entry.lessons) ? entry.lessons : [], usedIn: Array.isArray(entry.usedIn) ? entry.usedIn : [], pinned: entry.pinned === true,
       enabled: entry.enabled !== false, files: reviveFiles(entry.files), params: reviveParams(entry.params),
       triggers: reviveTriggers(entry.triggers), commands: reviveCommands(entry.commands),
+      ...(entry.agent !== undefined ? { agent: reviveAgent(entry.agent) } : {}),
     } as Skill
     return revived
   }
   indexable(entry: Skill): boolean { return entry.scope === 'global' || (entry.scope === 'project' && !!entry.workspace) }
-  fields(entry: Skill): IndexField[] { return [[entry.name, 3], [entry.whenToUse, 2], [entry.description, 2], [entry.instructions, 1]] }
+  fields(entry: Skill): IndexField[] {
+    const fields: IndexField[] = [[entry.name, 3], [entry.whenToUse, 2], [entry.description, 2], [entry.instructions, 1]]
+    return entry.agent ? [...fields, [trainedConcepts(entry.agent), 1]] : fields
+  }
 
   // `includeGlobal` false is a project that switched shared memory off: it neither sees nor touches the shared library.
   visible(workspace: string | null | undefined, includeGlobal = true): Skill[] {
@@ -165,13 +180,13 @@ class CapabilityStore {
   }
   search(query: unknown, workspace: string | null | undefined, limit = 8, includeGlobal = true): SkillSummary[] {
     const empty = !uniqueTerms(query).size
-    return this.rank(query, this.distinct(workspace, includeGlobal).filter(entry => entry.enabled !== false)).filter(item => empty || item.matched > 0).sort((a, b) => b.score - a.score)
+    return this.rank(query, this.distinct(workspace, includeGlobal).filter(entry => entry.enabled !== false && !entry.agent)).filter(item => empty || item.matched > 0).sort((a, b) => b.score - a.score)
       .slice(0, Math.max(1, Math.min(20, Number(limit) || 8))).map(item => this.present(item.entry))
   }
   // For a prompt: the skills that match the task, then a few proven ones so the agent knows the library has more.
   // Disabled skills are hidden from agents, and a skill with a trigger and no commands is app behaviour (a page Orbit shows), not a procedure an agent could follow.
   suggest(query: unknown, workspace: string | null | undefined, limit = 6, includeGlobal = true): SkillSuggestion {
-    const ranked = this.rank(query, this.distinct(workspace, includeGlobal).filter(entry => entry.enabled !== false && !(entry.triggers.length && !entry.commands.length)))
+    const ranked = this.rank(query, this.distinct(workspace, includeGlobal).filter(entry => entry.enabled !== false && !entry.agent && !(entry.triggers.length && !entry.commands.length)))
     const relevant = ranked.filter(item => item.matched >= 1).sort((a, b) => b.score - a.score).slice(0, limit)
     const proven = ranked.filter(item => item.matched < 1 && item.entry.uses > 0 && reliability(item.entry) >= 0.5).sort((a, b) => this.value(b.entry) - this.value(a.entry)).slice(0, Math.min(3, limit - relevant.length))
     return { skills: [...relevant, ...proven].map(item => ({ ...this.present(item.entry), relevant: item.matched >= 1 })), total: ranked.length }
@@ -184,6 +199,41 @@ class CapabilityStore {
     const wanted = String(id || '')
     const prefixed = wanted.length >= 6 ? visible.filter(entry => entry.id.startsWith(wanted)) : []
     return prefixed.length === 1 ? prefixed[0] : null
+  }
+  // A trained agent by id, a unique id prefix (six characters or more) or its exact name (the project's one when both scopes have it).
+  findAgent(reference: unknown, workspace: string | null | undefined, includeGlobal = true): Skill | null {
+    const wanted = String(reference ?? '').trim()
+    const agents = wanted ? this.visible(workspace, includeGlobal).filter(entry => entry.agent) : []
+    const exact = agents.find(entry => entry.id === wanted)
+    if (exact) return exact
+    const prefixed = wanted.length >= 6 ? agents.filter(entry => entry.id.startsWith(wanted)) : []
+    if (prefixed.length === 1) return prefixed[0]
+    const named = agents.filter(entry => entry.name === wanted)
+    return named.find(entry => entry.scope === 'project') ?? named[0] ?? null
+  }
+  summarize(entry: Skill & { agent: AgentProfile }): AgentSummary {
+    const last = lastScore(entry.agent)
+    return {
+      id: entry.id, name: entry.name, role: entry.agent.role, status: entry.agent.status, scope: entry.scope, rounds: entry.agent.rounds.length,
+      ...(last !== undefined ? { lastScore: last } : {}), uses: entry.uses || 0, reliability: Math.round(reliability(entry) * 100) / 100,
+      ...(entry.agent.kind ? { kind: entry.agent.kind } : {}), ...(entry.agent.reasoningEffort ? { reasoningEffort: entry.agent.reasoningEffort } : {}),
+    }
+  }
+  // The agents an agent may use (switched-off ones are invisible to agents).
+  usableAgents(workspace: string | null | undefined, includeGlobal = true): (Skill & { agent: AgentProfile })[] {
+    return this.distinct(workspace, includeGlobal).filter((entry): entry is Skill & { agent: AgentProfile } => !!entry.agent && entry.enabled !== false)
+  }
+  // The project's first, then by use and the last score.
+  agents(workspace: string | null | undefined, includeGlobal = true): AgentSummary[] {
+    return this.usableAgents(workspace, includeGlobal).map(entry => this.summarize(entry))
+      .sort((a, b) => Number(b.scope === 'project') - Number(a.scope === 'project') || b.uses - a.uses || (b.lastScore ?? -1) - (a.lastScore ?? -1))
+  }
+  // For a prompt: the agents that match the task first (by relevance), then the best judged ones; `total` counts all of them.
+  suggestAgents(query: unknown, workspace: string | null | undefined, limit = 6, includeGlobal = true): { agents: AgentSummary[]; total: number } {
+    const candidates = this.usableAgents(workspace, includeGlobal)
+    const ranked = this.rank(query, candidates).map(item => ({ ...item, summary: this.summarize(item.entry as Skill & { agent: AgentProfile }) }))
+    ranked.sort((a, b) => Number(b.matched >= 1) - Number(a.matched >= 1) || (b.matched >= 1 ? b.score - a.score : 0) || (b.summary.lastScore ?? -1) - (a.summary.lastScore ?? -1) || b.summary.uses - a.summary.uses)
+    return { agents: ranked.slice(0, Math.max(1, limit)).map(item => ({ ...item.summary, ...(item.matched >= 1 ? { relevant: true } : {}) })), total: candidates.length }
   }
   read(id: unknown, workspace: string | null | undefined, includeGlobal = true): Skill & { package?: SkillPackage } {
     const entry = this.find(id, workspace, includeGlobal)
@@ -201,9 +251,9 @@ class CapabilityStore {
 
   overflow(entries: Skill[], keep: Skill): string[] {
     const group = entries.filter(entry => groupKey(entry) === groupKey(keep))
-    if (group.length <= LIMITS[keep.scope]) return []
+    if (group.length <= limitOf(keep)) return []
     return group.filter(entry => entry !== keep && !isProtected(entry)).map(entry => ({ entry, value: this.value(entry) }))
-      .sort((a, b) => a.value - b.value || String(a.entry.updated || a.entry.updatedAt).localeCompare(String(b.entry.updated || b.entry.updatedAt))).slice(0, group.length - LIMITS[keep.scope]).map(item => item.entry.id)
+      .sort((a, b) => a.value - b.value || String(a.entry.updated || a.entry.updatedAt).localeCompare(String(b.entry.updated || b.entry.updatedAt))).slice(0, group.length - limitOf(keep)).map(item => item.entry.id)
   }
 
   // origin 'agent' is bounded, and a skill that says what an existing one says improves that one instead of duplicating it.
@@ -221,10 +271,15 @@ class CapabilityStore {
     const workspace = scope === 'project' ? this.key(input.workspace) : ''
     if (scope === 'project' && !workspace) throw new Error('Project capability requires a workspace')
     const byId = input.id ? this.entries.find(entry => entry.id === input.id) : undefined
+    // A trained agent (an `agent` object in the input) and a skill share the store but never overwrite each other.
+    const agentInput = input.agent !== undefined && input.agent !== null ? input.agent : undefined
+    if (agentInput !== undefined && (typeof agentInput !== 'object' || Array.isArray(agentInput))) throw new Error('A trained agent profile must be an object')
+    const isAgent = agentInput !== undefined
+    if (byId && !!byId.agent !== isAgent) throw new Error(byId.agent ? `"${byId.name}" is a trained agent: change it with agent_save` : `"${byId.name}" is a skill, not a trained agent: change it with capability_install`)
     const name = redact(input.name || manifest.name || byId?.name || input.id).trim().slice(0, 120)
-    const instructions = redact(input.instructions || manifest.instructions || byId?.instructions).trim().slice(0, guarded ? AGENT_INSTRUCTION_CHARS : USER_INSTRUCTION_CHARS)
-    if (!name || !instructions) throw new Error('Capability name and instructions are required')
-    let existing: Skill | undefined = input.id ? byId : this.visible(workspace).find(entry => entry.name === name && entry.scope === scope)
+    const instructions = redact(input.instructions || manifest.instructions || byId?.instructions).trim().slice(0, isAgent ? PLAYBOOK_CHARS : guarded ? AGENT_INSTRUCTION_CHARS : USER_INSTRUCTION_CHARS)
+    if (!name || !instructions) throw new Error(isAgent ? 'Trained agent name and playbook (instructions) are required' : 'Capability name and instructions are required')
+    let existing: Skill | undefined = input.id ? byId : this.visible(workspace).find(entry => entry.name === name && entry.scope === scope && !!entry.agent === isAgent)
     if (existing && (existing.scope !== scope || (existing.workspace || '') !== workspace)) {
       throw new Error('Cannot replace a capability from another project or scope')
     }
@@ -234,51 +289,59 @@ class CapabilityStore {
     const filled = (value: unknown): boolean => Array.isArray(value) && value.length > 0
     let merged = false
     // A package is never the target or the source of a twin merge: two near-identical pages or command sets are two behaviours.
-    if (!existing && guarded && !folder && !filled(input.files) && !filled(given('triggers')) && !filled(given('commands'))) {
+    if (!existing && guarded && !isAgent && !folder && !filled(input.files) && !filled(given('triggers')) && !filled(given('commands'))) {
       const probe = fingerprint(name, `${input.whenToUse || ''} ${input.description || ''} ${instructions}`)
       const twin = this.entries.find(item => !hasPackage(item) && groupKey(item) === groupKey({ scope, workspace }) && this.near(probe, item, MERGE_NAME, MERGE_TEXT))
       if (twin) { existing = twin; merged = true }
     }
     // An agent that names a package skill without its id could clear the page or commands of one the user relies on.
+    if (guarded && existing && !input.id && isAgent) throw new Error(`A trained agent named "${existing.name}" already exists; to change it pass its id "${existing.id}", or save yours under another name`)
     if (guarded && existing && !input.id && hasPackage(existing)) throw new Error(`A skill named "${existing.name}" already is a package (files, a page or commands); to change it pass its id "${existing.id}", or save yours under another name`)
     const id = existing?.id || (typeof input.id === 'string' && input.id.trim() ? input.id.slice(0, 120) : randomUUID())
     const dir = skillPackageDir(this.userData, id)
     const plan = planPackage(existing?.files ?? [], { source: folder, files: input.files, removeFiles: input.removeFiles })
-    const params = given('params') === undefined ? existing?.params ?? [] : checkParams(given('params'), existing?.params ?? [])
-    const triggers = checkTriggers(given('triggers') ?? existing?.triggers ?? [], file => plan.files.some(item => item.path === file))
-    const commands = given('commands') === undefined ? existing?.commands ?? [] : checkCommands(given('commands'))
+    // An agent has no parameters, triggers or commands: its package is scripts, references and pictures its playbook points to.
+    const params = isAgent ? [] : given('params') === undefined ? existing?.params ?? [] : checkParams(given('params'), existing?.params ?? [])
+    const triggers = isAgent ? [] : checkTriggers(given('triggers') ?? existing?.triggers ?? [], file => plan.files.some(item => item.path === file))
+    const commands = isAgent ? [] : given('commands') === undefined ? existing?.commands ?? [] : checkCommands(given('commands'))
     const now = new Date(this.clock()).toISOString()
+    const checked = isAgent ? checkAgent(agentInput as Record<string, unknown>, existing?.agent, plan.files, now, manifest.role) : null
     const kept: Partial<Skill> = { ...existing }
     delete kept.dupOf
+    const whenToUse = redact(given('whenToUse') ?? existing?.whenToUse ?? '').slice(0, 300)
+    // Revisions keep the text. A change of an agent's training record, gallery or status (a round, a picture) is not a new text, so it
+    // takes no revision and the playbook's history is not pushed out by rounds.
+    const keepsText = isAgent && !!existing && existing.name === name && existing.whenToUse === whenToUse && existing.instructions === instructions
     const entry: Skill = {
       ...kept,
       id, name,
-      description: redact(given('description') ?? existing?.description ?? '').slice(0, 600),
-      whenToUse: redact(given('whenToUse') ?? existing?.whenToUse ?? '').slice(0, 300), instructions,
+      description: checked ? checked.agent.role : redact(given('description') ?? existing?.description ?? '').slice(0, 600),
+      whenToUse, instructions,
       scope, ...(workspace ? { workspace } : {}),
       // A skill the user wrote stays theirs (protected from pruning) when an agent improves it; the agent's edit is noted next to it.
       source: guarded && existing && authored(existing) ? existing.source : source,
       editedBy: guarded && existing && authored(existing) ? source : undefined,
       version: (existing?.version || 0) + 1, updatedAt: now,
-      revisions: existing ? [...(existing.revisions || []), {
+      revisions: !existing ? [] : keepsText ? existing.revisions || [] : [...(existing.revisions || []), {
         version: existing.version, name: existing.name, description: existing.description, whenToUse: existing.whenToUse,
         instructions: existing.instructions, updatedAt: existing.updatedAt,
-      }].slice(-REVISIONS) : [],
+      }].slice(-REVISIONS),
       created: existing?.created || now, lastUsed: existing?.lastUsed || now, uses: existing?.uses || 0, successes: existing?.successes || 0, failures: existing?.failures || 0,
       lessons: existing?.lessons || [], usedIn: existing?.usedIn || [], pinned: existing?.pinned === true,
-      enabled: existing?.enabled !== false, files: plan.files, params, triggers, commands,
+      enabled: existing?.enabled !== false, files: plan.files, params, triggers, commands, ...(checked ? { agent: checked.agent } : {}),
     }
     const entries = existing ? this.entries.map(item => item === existing ? entry : item) : [entry, ...this.entries]
     const evicted = this.overflow(entries, entry)
     // Protected skills (packages, pinned, the user's) are never evicted: a new skill that would still not fit is refused, not squeezed in.
-    if (!existing && entries.filter(item => groupKey(item) === groupKey(entry)).length - evicted.length > LIMITS[scope]) {
+    if (!existing && entries.filter(item => groupKey(item) === groupKey(entry)).length - evicted.length > limitOf(entry)) {
+      if (isAgent) throw new Error(`Trained agent limit: at most ${limitOf(entry)} ${scope === 'global' ? 'shared' : 'project'} agents; remove one in the Skills panel or improve an existing agent by its id`)
       throw new Error(`Skill limit: at most ${LIMITS[scope]} ${scope === 'global' ? 'shared' : 'project'} skills, and the rest are protected (packages, pinned or the user's); remove one or improve an existing skill by its id`)
     }
     // Leftovers of an earlier skill with this id must not become part of a new one.
     if (!existing && plan.writes.size) removePackage(dir)
     const undo = plan.writes.size || plan.deletes.length ? applyPackage(dir, plan) : (): void => {}
     try { this.commit(evicted.length ? entries.filter(item => !evicted.includes(item.id)) : entries, [entry], evicted) } catch (error) { undo(); throw error }
-    return { entry: { ...clone(entry), ...this.packageOf(entry) }, merged, ...(merged ? { improved: existing?.name } : {}), evicted: evicted.length }
+    return { entry: { ...clone(entry), ...this.packageOf(entry) }, merged, ...(merged ? { improved: existing?.name } : {}), evicted: evicted.length, ...(checked?.notes.length ? { notes: checked.notes } : {}) }
   }
   install(input: SkillInput, options?: { origin?: 'user' | 'agent' }): Skill { return this.save(input, options).entry }
 
@@ -352,7 +415,7 @@ class CapabilityStore {
     const revision = entry.revisions.find(item => item.version === version)
     if (!revision) throw new Error('Capability revision was not found')
     const { name, description, whenToUse, instructions } = revision
-    return this.install({ id: entry.id, name, description, whenToUse, instructions, scope: entry.scope, workspace: entry.workspace, source: entry.source })
+    return this.install({ id: entry.id, name, description, whenToUse, instructions, scope: entry.scope, workspace: entry.workspace, source: entry.source, ...(entry.agent ? { agent: {} } : {}) })
   }
 
   // The user's values for a skill's parameters (the skills panel). Not a new version: it is the skill's settings, not its text.
@@ -364,10 +427,11 @@ class CapabilityStore {
     return this.present(next)
   }
 
-  stats(workspace: string | null | undefined): { project: { count: number; limit: number }; global: { count: number; limit: number }; used: number } {
-    const visible = this.visible(workspace)
-    const scope = (name: SkillScope) => { const items = visible.filter(entry => entry.scope === name); return { count: items.length, limit: LIMITS[name] } }
-    return { project: scope('project'), global: scope('global'), used: visible.filter(entry => entry.uses > 0).length }
+  // Skill counts and caps; the trained agents have their own (`agents`) and are not part of the skills' numbers.
+  stats(workspace: string | null | undefined): { project: { count: number; limit: number }; global: { count: number; limit: number }; used: number; agents: { project: { count: number; limit: number }; global: { count: number; limit: number } } } {
+    const visible = this.visible(workspace), skills = visible.filter(entry => !entry.agent)
+    const scope = (name: SkillScope, agents = false) => { const items = visible.filter(entry => entry.scope === name && !!entry.agent === agents); return { count: items.length, limit: (agents ? AGENT_LIMITS : LIMITS)[name] } }
+    return { project: scope('project'), global: scope('global'), used: skills.filter(entry => entry.uses > 0).length, agents: { project: scope('project', true), global: scope('global', true) } }
   }
 
   // Prune what is not earning its place, keep the caps, and promote what proved itself in several projects.
@@ -391,7 +455,7 @@ class CapabilityStore {
     for (const group of groups.values()) {
       for (let i = 0; i < group.length; i++) for (let j = i + 1; j < group.length; j++) {
         const a = work.get(group[i].id), b = work.get(group[j].id)
-        if (!a || !b || hasPackage(a) || hasPackage(b) || (isProtected(a) && isProtected(b)) || !this.near(a, b, MERGE_NAME, DUPLICATE_TEXT)) continue
+        if (!a || !b || a.agent || b.agent || hasPackage(a) || hasPackage(b) || (isProtected(a) && isProtected(b)) || !this.near(a, b, MERGE_NAME, DUPLICATE_TEXT)) continue
         const keeper = isProtected(a) !== isProtected(b) ? (isProtected(a) ? a : b) : this.value(a) >= this.value(b) ? a : b
         const other = keeper === a ? b : a
         edit(keeper, {
@@ -403,9 +467,9 @@ class CapabilityStore {
     }
     for (const group of groups.values()) {
       const list = group.filter(entry => work.has(entry.id))
-      if (!list.length || list.length <= LIMITS[list[0].scope]) continue
+      if (!list.length || list.length <= limitOf(list[0])) continue
       const victims = list.filter(entry => !isProtected(entry)).map(entry => ({ entry, value: this.value(work.get(entry.id)!) })).sort((a, b) => a.value - b.value || String(a.entry.updated || a.entry.updatedAt).localeCompare(String(b.entry.updated || b.entry.updatedAt)))
-      for (const { entry } of victims.slice(0, list.length - LIMITS[list[0].scope])) drop(entry, 'evicted')
+      for (const { entry } of victims.slice(0, list.length - limitOf(list[0]))) drop(entry, 'evicted')
     }
     if (crossProject) this.share(live(), edit, created, report, allowed)
     if (touched.size || gone.size || created.length) {

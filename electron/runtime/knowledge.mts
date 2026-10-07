@@ -96,15 +96,16 @@ async function executeKnowledgeTool(runtime: OrbitRuntimeLike, run: RunRecord, a
       ...(files?.length ? { files: files.length } : {}), ...(lessons?.length ? { pitfalls: lessons.slice(0, 3) } : {}),
     })
     // A skill the user switched off is invisible to agents: it is not found, read, rated or suggested.
-    const switchedOff = (skill: Pick<SkillView, 'enabled'> | null | undefined): void => { if (skill && skill.enabled === false) throw new Error('This skill is switched off') }
+    const switchedOff = (skill: Pick<SkillView, 'enabled' | 'agent'> | null | undefined): void => { if (skill && skill.enabled === false) throw new Error(`This ${skill.agent ? 'trained agent' : 'skill'} is switched off`) }
     // A skill the user switched off is invisible to agents (the list is filtered before the cap, so off skills take no place).
-    if (name === 'capability_list') return (await store.list(run.workspace, shared)).filter(skill => skill.enabled !== false).slice(0, 60).map(brief)
+    if (name === 'capability_list') return (await store.list(run.workspace, shared)).filter(skill => skill.enabled !== false && !skill.agent).slice(0, 60).map(brief)
     if (name === 'capability_search') {
       if (!String(args.query || '').trim()) throw new Error('A search query is required')
       return store.search(String(args.query), run.workspace, Number(args.limit) || 8, shared).map(brief)
     }
     if (name === 'capability_read') {
       const skill = await store.read(String(args.id || ''), run.workspace, shared)
+      if (skill.agent) throw new Error(`"${skill.name}" is a trained agent, not a skill: agent_read {id} reads it and spawn_agent {profile} runs a helper as it`)
       switchedOff(skill)
       // Loading it again in the same run is not another use.
       if (!run.skillUse.has(skill.id)) { store.recordUse?.(skill.id, run.workspace, shared); run.skillUse.set(skill.id, { name: skill.name, rated: false }) }
@@ -119,8 +120,9 @@ async function executeKnowledgeTool(runtime: OrbitRuntimeLike, run: RunRecord, a
     if (name === 'capability_feedback') {
       switchedOff(store.find(String(args.id || ''), run.workspace, shared))
       const result = store.feedback(String(args.id || ''), run.workspace, { outcome: args.outcome, note: args.note, includeGlobal: shared })
-      run.skillUse.set(result.id, { name: result.name, rated: true })
-      return { ok: true, id: result.id, name: result.name, uses: result.uses, reliability: result.reliability, ...(result.lessonDropped ? { note: 'The pitfall was not stored: a shared skill cannot name this project' } : {}) }
+      // A trained agent is rated the same way, but it is not a skill: the skill-learning reminder never tracks it.
+      if (!result.agent) run.skillUse.set(result.id, { name: result.name, rated: true })
+      return { ok: true, id: result.id, name: result.name, uses: result.uses, reliability: result.reliability, ...(result.agent ? { agent: true } : {}), ...(result.lessonDropped ? { note: 'The pitfall was not stored: a shared skill cannot name this project' } : {}) }
     }
     if (name === 'capability_install') {
       const known = args.id ? store.find(String(args.id), run.workspace, shared) : null

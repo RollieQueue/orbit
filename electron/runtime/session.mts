@@ -12,13 +12,14 @@ import * as providers from '../providers.mts'
 // Used only for an identity check against the runtime's runProvider.
 const defaultRunProvider: unknown = providers.runProvider
 import { maskToolArguments } from '../connectors.mts'
-import { TERMINAL, AGENT_TERMINAL, WORK_TOOLS, MUTATING_TOOLS, SKILL_READ_CHARS, abortable, bounded, clip, diagnostics } from './util.mts'
+import { TERMINAL, AGENT_TERMINAL, WORK_TOOLS, MUTATING_TOOLS, readChars, abortable, bounded, clip, diagnostics } from './util.mts'
 import { describeCall } from './ledger.mts'
 import { restartOffered } from './restart.mts'
 // Type only: the module itself (with the MCP SDK and zod, most of the runtime's load time) is imported by ensureMcp on
 // the first session, so a runtime that never opens one never loads it.
 import type { createMcpServer } from '../mcp-server.mts'
 import * as toolRegistry from '../tool-registry.mts'
+import { baseOf } from '../instances.mts'
 // Session mode: tools that block on the team release the agent's model slot while they wait.
 const WAIT_TOOLS = new Set(['wait_agent', 'wait_message', 'followup_agent'])
 // A wait serves the turn that called it: it ends with that turn (finished, cut off, failed), and takes what it found
@@ -50,7 +51,7 @@ const parkedCalls = new WeakMap<AgentRecord, AgentCalls>()
 const retaking = new WeakMap<ActiveTurn, Promise<void>>()
 function callLimit(agent: AgentRecord): number {
   if (agent.transport !== 'session' || typeof providers.mcpCallLimit !== 'function') return 0
-  const limit = Number(providers.mcpCallLimit(agent.providerId))
+  const limit = Number(providers.mcpCallLimit(baseOf(agent.providerId)))
   return Number.isFinite(limit) && limit > 0 ? limit : 0
 }
 // "The same call again": the tool and its arguments in a stable order, whatever timeout it asks for.
@@ -176,7 +177,7 @@ function decideTransport(runtime: OrbitRuntimeLike, run: RunRecord, providerId: 
   const builtIn = runtime.runProvider === defaultRunProvider && typeof providers.transportFor === 'function' ? providers.transportFor : null
   const decide = runtime.transportFor || builtIn
   if (!decide) return 'envelope'
-  try { return decide(providerId, { ...(run.providerOptions[providerId] || {}), accessMode: run.accessMode, approvalPolicy: run.approvalPolicy, model: model || '' }) === 'session' ? 'session' : 'envelope' }
+  try { return decide(baseOf(providerId), { ...(run.providerOptions[providerId] || {}), accessMode: run.accessMode, approvalPolicy: run.approvalPolicy, model: model || '' }) === 'session' ? 'session' : 'envelope' }
   catch (error) { diagnostics(runtime, run, `transportFor ${providerId}`, error); return 'envelope' }
 }
 // The in-process MCP server, created on the first session and started once; `false` after a failure. Its module is
@@ -340,7 +341,7 @@ async function dispatchMcp(runtime: OrbitRuntimeLike, token: SessionToken, name:
     : `${describeCall(call, observation as Record<string, unknown>, failure, id => run.agentNodes.get(id)?.name || id)}${answer !== observation ? ` (cut at ${span(limit)}, still running)` : ''}`
   runtime.recordLedger(agent, call.name, `#${agent.turns} ${logged}`)
   // What the user wrote to the agent during this turn rides on the result, whole (userMail marks it read).
-  const text = bounded(answer, call.name === 'capability_read' ? Math.max(run.limits.maxOutputChars, SKILL_READ_CHARS) : run.limits.maxOutputChars)
+  const text = bounded(answer, readChars(call.name, run.limits.maxOutputChars))
     + (turn && agent.activeTurn === turn && !signal.aborted ? runtime.userMail(run, agent) : '')
   runtime.remember(agent, { type: 'tool_result', tool_call_id: call.id, name: call.name, result: text, via: 'mcp' })
   runtime.trimTranscript(run, agent)

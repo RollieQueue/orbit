@@ -13,6 +13,7 @@ import { attachmentsFolder } from './attachments.mts'
 import { claudeStreamLimit } from './quota.mts'
 import type { ClaudeRateLimitInfo, QuotaPartial, QuotaTaggedError } from './quota.mts'
 import { execTurnUsage, startedThread } from './codex-usage.mts'
+import { createCodexRolloutMeter } from './codex-rollout-usage.mts'
 import { report } from './diagnostics.mts'
 import { processWatch } from './process-reaper.mts'
 import type { ProcessScope } from './process-reaper.mts'
@@ -20,6 +21,8 @@ import REASONING_DEFAULTS from './reasoning-defaults.json' with { type: 'json' }
 // codex-server.mts imports loopbackNoProxy from this file; both sides use the other only inside functions, so the ESM cycle is harmless.
 import * as codexServer from './codex-server.mts'
 import * as subscriptions from './subscription-providers.mts'
+import { accountEnv, baseOf, instancesFromOptions, BASE_NAMES } from './instances.mts'
+import type { BaseProvider, InstanceOptions, SubscriptionInstance } from './instances.mts'
 import type { SubscriptionId } from './subscription-providers.mts'
 
 // ---- Shared shapes -----------------------------------------------------------------------------------------------
@@ -58,7 +61,8 @@ type ProviderEventListener = (event: ProviderEvent) => void
 interface ApprovalRequest { tool: string; arguments: Record<string, unknown> }
 type ApprovalHandler = (request: ApprovalRequest) => unknown
 // Per-provider settings as saved by the UI (`providerOptions[providerId]`).
-interface ProviderOptions { command?: string; transport?: string; proxyMode?: string; proxyUrl?: string }
+// An instance's entry ("claude-2") also names its base provider, the owner's label and its account folder (instances.mts).
+interface ProviderOptions { command?: string; transport?: string; proxyMode?: string; proxyUrl?: string; base?: string; label?: string; accountDir?: string }
 // What the MCP server reports about an agent's Orbit tool calls in flight.
 interface SessionActivity { pending?: number }
 type SessionActivityCheck = () => SessionActivity | null | undefined
@@ -90,7 +94,8 @@ interface ProviderRunOptions extends LaunchOptions {
 // A native run always has a workspace (runProvider fills in the process cwd).
 interface NativeRunOptions extends ProviderRunOptions { workspace: string }
 interface ProviderResult { providerId: string; client: string; text: string; model: string; access?: string; transport?: Transport; sessionId?: string | null; usage?: unknown; reasoningEffort?: string }
-interface ProviderHealth { id: string; supported: boolean; available: boolean; installed?: boolean; authenticated?: boolean | null; models?: string[]; reasoningLevels?: Record<string, string[]>; detail: string; executable?: string; model?: string }
+// `base`/`label`: set for a subscription instance ("claude-2" is Claude Code's second account).
+interface ProviderHealth { id: string; base?: string; label?: string; supported: boolean; available: boolean; installed?: boolean; authenticated?: boolean | null; models?: string[]; reasoningLevels?: Record<string, string[]>; detail: string; executable?: string; model?: string }
 type InspectOptions = Record<string, ProviderOptions | undefined>
 interface CliLaunch { executable: string; args: string[]; env: NodeJS.ProcessEnv }
 interface CliResult { stdout: string; stderr: string }
@@ -890,6 +895,7 @@ function buildCodexSessionArgs(options: LaunchOptions & { workspace: string }, s
 // A session id refused below carries this code: the runtime drops it once and starts a fresh session (loops.mts).
 const refusedId = (message: string): Error => Object.assign(new Error(message), { code: 'ORBIT_SESSION_ID' })
 function normalizeSession(providerId: string, session: SessionOptions | null | undefined): NormalizedSession {
+  providerId = baseOf(providerId)
   if (!session || typeof session !== 'object') throw new Error('Session transport needs session options')
   const resume = session.resume === true
   const id = typeof session.id === 'string' && session.id.trim() ? session.id.trim() : null
@@ -949,16 +955,23 @@ async function runClaudeSession(options: NativeRunOptions, session: NormalizedSe
 
 async function runCodexSession(options: NativeRunOptions, session: NormalizedSession): Promise<ProviderResult> {
   if (options.approvalPolicy === 'on-request') return codexServer.runCodexSessionTurn(options, session, launchHelpers(options, busyCheck))
-  const parser = createCodexParser(options.onEvent, options.model, undefined, { resumed: session.resume })
+  const extra = extraEnvOf(options)
+  const meter = createCodexRolloutMeter(extra.CODEX_HOME || process.env.CODEX_HOME || path.join(os.homedir(), '.codex'), Date.now(),
+    usage => emit(options.onEvent, { providerId: 'codex', kind: 'usage', usage }))
+  const parser = createCodexParser(event => {
+    if (event.kind === 'session') meter.start(event.sessionId)
+    emit(options.onEvent, event)
+  }, options.model, undefined, { resumed: session.resume })
   const command = options.providerOptions?.command || process.env.ORBIT_CODEX_COMMAND || 'codex'
   try {
     await runCli(command, buildCodexSessionArgs(options, session), {
-      cwd: options.workspace, input: options.prompt, signal: options.signal, env: { ...extraEnvOf(options), ...(session.token ? { ORBIT_MCP_TOKEN: session.token, ...loopbackNoProxy() } : {}) }, scope: options.processScope,
+      cwd: options.workspace, input: options.prompt, signal: options.signal, env: { ...extra, ...(session.token ? { ORBIT_MCP_TOKEN: session.token, ...loopbackNoProxy() } : {}) }, scope: options.processScope,
       timeoutMs: options.timeoutMs ?? null, inactivityMs: options.inactivityMs, isBusy: busyCheck(session),
-      onLine: parser.line,
+      onLine: line => { meter.flush(); return parser.line(line) },
       onDiagnostic: (text) => emit(options.onEvent, { providerId: 'codex', kind: 'observation', text, source: 'stderr' }),
     })
   } catch (error) { rethrowParsed(parser, error) }
+  finally { meter.close() }
   const parsed = parser.finish()
   return { providerId: 'codex', client: 'Codex CLI', transport: 'session', sessionId: parsed.sessionId || (session.resume ? session.id : null), text: parsed.text, model: parsed.model, access: selectedAccess(options) }
 }
@@ -974,6 +987,7 @@ function runSession(providerId: string, options: NativeRunOptions): Promise<Prov
 // passes (its account was out of quota): `transport: 'session'` in the Cursor provider options, or ORBIT_CURSOR_SESSION=1.
 // ORBIT_LEGACY_ENVELOPE=1 forces the envelope everywhere; `transport: 'envelope'` does for one run or one provider.
 function transportFor(providerId: string, options: Pick<ProviderRunOptions, 'transport' | 'legacyEnvelope' | 'providerOptions' | 'accessMode' | 'approvalPolicy'> = {}): Transport {
+  providerId = baseOf(providerId)
   if (process.env.ORBIT_LEGACY_ENVELOPE === '1' || options.transport === 'envelope' || options.legacyEnvelope === true || options.providerOptions?.transport === 'envelope') return 'envelope'
   if (SESSION_PROVIDERS.has(providerId)) return 'session'
   if (!isSubscriptionId(providerId) || options.accessMode !== 'danger-full-access' || options.approvalPolicy === 'on-request') return 'envelope'
@@ -984,7 +998,7 @@ function transportFor(providerId: string, options: Pick<ProviderRunOptions, 'tra
 // How long one Orbit tool call of this provider's session may take before Orbit answers "still running" (0: no limit).
 // ORBIT_MCP_CALL_LIMIT_MS may lower it, never raise it past the client's own limit.
 function mcpCallLimit(providerId: string): number {
-  const limit = MCP_CALL_LIMITS[providerId] || 0
+  const limit = MCP_CALL_LIMITS[baseOf(providerId)] || 0
   const lower = Number(process.env.ORBIT_MCP_CALL_LIMIT_MS)
   return limit && Number.isFinite(lower) && lower >= 10 && lower < limit ? lower : limit
 }
@@ -1233,35 +1247,49 @@ async function runCompatible(options: ProviderRunOptions): Promise<ProviderResul
   finally { request.dispose() }
 }
 
-async function commandProbe(command: string, args: string[]): Promise<({ ok: true } & CliResult) | { ok: false; detail: string }> {
+async function commandProbe(command: string, args: string[], env?: Record<string, string>): Promise<({ ok: true } & CliResult) | { ok: false; detail: string }> {
   try {
-    const result = await runCli(command, args, { timeoutMs: 7000 })
+    const result = await runCli(command, args, { timeoutMs: 7000, ...(env ? { env } : {}) })
     return { ok: true, ...result }
   } catch (error) { return { ok: false, detail: (error as Error).message } }
 }
 
-async function inspectNative(id: 'codex' | 'claude', options: ProviderOptions = {}): Promise<ProviderHealth> {
+function codexModelsCache(home: string): CodexModelsCache | null {
+  try { return JSON.parse(fs.readFileSync(path.join(home, 'models_cache.json'), 'utf8')) as CodexModelsCache } catch (error) { report('providers: codex models_cache.json unreadable (model discovery is optional; manual selection remains)', error); return null }
+}
+
+// `instance`: a second account of the provider ("claude-2"): the same probes with that account's environment, its entry named by the instance id.
+async function inspectNative(id: 'codex' | 'claude', options: ProviderOptions = {}, instance?: SubscriptionInstance): Promise<ProviderHealth> {
+  const login = id === 'claude' ? 'claude auth login' : 'codex login'
+  const identity = instance ? { id: instance.id, base: id, label: instance.label } : { id }
+  let env: Record<string, string> | undefined
+  if (instance) {
+    try { env = accountEnv(instance.id, options as InstanceOptions) } catch (error) { return { ...identity, supported: false, available: false, authenticated: false, detail: (error as Error).message } }
+  }
   // Stable CLI aliases follow the subscriber's current model catalog.
   let models = id === 'claude' ? ['sonnet', 'opus', 'haiku'] : []
   let reasoningLevels: Record<string, string[]> = {}
   if (id === 'codex') {
-    try {
-      const cache = JSON.parse(fs.readFileSync(path.join(process.env.CODEX_HOME || path.join(os.homedir(), '.codex'), 'models_cache.json'), 'utf8')) as CodexModelsCache
+    const defaultHome = process.env.CODEX_HOME || path.join(os.homedir(), '.codex')
+    // A new account has no model cache until its first run: the default account's list still tells failover which models exist.
+    const cache = codexModelsCache(env?.CODEX_HOME || defaultHome) || (env?.CODEX_HOME ? codexModelsCache(defaultHome) : null)
+    if (cache) {
       models = (cache.models || []).filter((model): model is CodexCachedModel & { slug: string } => model.visibility === 'list' && typeof model.slug === 'string').map(model => model.slug)
       reasoningLevels = Object.fromEntries((cache.models || []).filter((model): model is CodexCachedModel & { slug: string } => model.slug !== undefined && models.includes(model.slug)).map((model): [string, string[]] => [model.slug, (model.supported_reasoning_levels || []).map(level => level.effort)]))
-    } catch (error) { report('providers: codex models_cache.json unreadable (model discovery is optional; manual selection remains)', error) }
+    }
   }
   const command = options.command || process.env[id === 'codex' ? 'ORBIT_CODEX_COMMAND' : 'ORBIT_CLAUDE_COMMAND'] || id
-  const version = await commandProbe(command, ['--version'])
-  if (!version.ok) return { id, available: false, installed: false, authenticated: false, models, detail: id === 'claude' ? 'Claude Code CLI не найден. Установка: https://code.claude.com/docs/en/setup. Вход по подписке: claude auth login' : 'Codex CLI not detected', supported: true }
-  const auth = await commandProbe(command, id === 'codex' ? ['login', 'status'] : ['auth', 'status'])
+  const version = await commandProbe(command, ['--version'], env)
+  if (!version.ok) return { ...identity, available: false, installed: false, authenticated: false, models, detail: id === 'claude' ? 'Claude Code CLI не найден. Установка: https://code.claude.com/docs/en/setup. Вход по подписке: claude auth login' : 'Codex CLI not detected', supported: true }
+  const auth = await commandProbe(command, id === 'codex' ? ['login', 'status'] : ['auth', 'status'], env)
   let authenticated: boolean | null = auth.ok
   if (id === 'claude' && auth.ok) {
     try { const status = JSON.parse(auth.stdout); authenticated = status.loggedIn ?? status.logged_in ?? null } catch { authenticated = null }
   }
   const versionText = (version.stdout || version.stderr).trim().split(/\r?\n/)[0].slice(0, 100)
+  const signIn = instance ? `Войдите в этот аккаунт (${instance.label}): ${login} с его папкой; Orbit открывает вход из Настройки → «Войти»` : `Войдите: ${login}`
   // Auth probes may return account identifiers. Only expose readiness, never raw output.
-  return { id, models, reasoningLevels, supported: true, installed: true, available: authenticated !== false, authenticated, detail: `${versionText} · ${authenticated === true ? 'Вход выполнен' : authenticated === false ? `Войдите: ${id === 'claude' ? 'claude auth login' : 'codex login'}` : 'Авторизация не проверена'}`, executable: resolveCommand(command) }
+  return { ...identity, models, reasoningLevels, supported: true, installed: true, available: authenticated !== false, authenticated, detail: `${versionText} · ${authenticated === true ? 'Вход выполнен' : authenticated === false ? signIn : 'Авторизация не проверена'}`, executable: resolveCommand(command) }
 }
 
 async function ollamaReasoningLevels(model: string, signal: AbortSignal): Promise<string[]> {
@@ -1288,8 +1316,19 @@ async function inspectOllama(): Promise<ProviderHealth> {
 
 async function inspectProviders(options: InspectOptions = {}): Promise<ProviderHealth[]> {
   pathLookups.clear()
-  const native = await Promise.all([inspectNative('codex', options.codex), inspectNative('claude', options.claude), inspectOllama(), ...(['antigravity', 'cursor'] as const).map(id => subscriptions.inspect(id, { runCli }, options[id]))])
-  return [...native, inspectCustom()]
+  // Each subscription instance is probed like its base provider, with its own account's environment, in parallel with the rest.
+  const instances = instancesFromOptions(options as Record<string, InstanceOptions | undefined>).map(instance => {
+    const base = baseOf(instance.id)
+    const entry = { ...options[base], ...options[instance.id] }
+    if (base === 'claude' || base === 'codex') return inspectNative(base, entry, instance)
+    const name = BASE_NAMES[base as BaseProvider]
+    return Promise.resolve<ProviderHealth>({ id: instance.id, base, label: instance.label, supported: false, available: false, authenticated: false, detail: `${name} has no setting for a second account: only one ${name} subscription can be used` })
+  })
+  const [native, extra] = await Promise.all([
+    Promise.all([inspectNative('codex', options.codex), inspectNative('claude', options.claude), inspectOllama(), ...(['antigravity', 'cursor'] as const).map(id => subscriptions.inspect(id, { runCli }, options[id]))]),
+    Promise.all(instances),
+  ])
+  return [...native, inspectCustom(), ...extra]
 }
 
 function inspectCustom(): ProviderHealth {
@@ -1302,6 +1341,18 @@ function inspectCustom(): ProviderHealth {
 async function runProvider(options: ProviderRunOptions): Promise<ProviderResult> {
   if (typeof options.prompt !== 'string' || !options.prompt.trim()) throw new Error('A non-empty provider prompt is required')
   if (options.signal?.aborted) throw cancelledError('Provider')
+  const { providerId } = options
+  const base = baseOf(providerId)
+  if (base === providerId) return runBase(options)
+  // A second account ("claude-2") runs its base provider's adapter with the account's own directory in the CLI's environment.
+  // accountEnv refuses an instance that has no folder (or whose CLI has no account setting): never the default account's quota.
+  const account = accountEnv(providerId, options.providerOptions as InstanceOptions | undefined)
+  const { onEvent } = options
+  const result = await runBase({ ...options, providerId: base, extraEnv: { ...extraEnvOf(options), ...account }, onEvent: onEvent ? event => onEvent(event.providerId === providerId ? event : { ...event, providerId }) : onEvent })
+  return { ...result, providerId }
+}
+
+async function runBase(options: ProviderRunOptions): Promise<ProviderResult> {
   const { providerId } = options
   if (isSubscriptionId(providerId)) {
     if (options.session && transportFor(providerId, options) === 'session') return subscriptions.runSession(providerId, { ...options, workspace: options.workspace || process.cwd() }, normalizeSession(providerId, options.session), { runCli, busyCheck, loopbackNoProxy })

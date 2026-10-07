@@ -176,6 +176,17 @@ export type SkillCommand = { name: string; run: string; description?: string }
 export type SkillFile = { path: string; size: number }
 // `id` is the host of orbit-skill://<id>/<file> (electron/skill-files.mts), `dir` the package folder.
 export type SkillPackage = { id: string; dir: string }
+// A trained agent is a capability with an `agent` field (electron/trained-agents.mts): a specialist profile whose playbook is the
+// capability's `instructions`, with a package folder (scripts, references, gallery images), a training record and the usual
+// track record (uses, successes, failures, lessons). spawn_agent {profile} runs a helper as it.
+export type AgentKind = 'code' | 'review' | 'lookup' | 'text'
+// One training round: `score` is the judges' mean (0..10), `scores` the per-criterion marks (criterion -> 0..10).
+export type TrainingRound = { at: string; round: number; concepts: string[]; score: number; scores?: Record<string, number>; judges?: string[]; notes?: string }
+export type AgentGalleryItem = { file: string; caption?: string }
+export type AgentProfile = {
+  role: string; kind?: AgentKind; reasoningEffort?: string; status: 'training' | 'trained'
+  rounds: TrainingRound[]; gallery: AgentGalleryItem[]; trainingMinutes?: number
+}
 export type Capability = {
   id: string
   name: string
@@ -200,6 +211,7 @@ export type Capability = {
   triggers?: SkillTrigger[]
   commands?: SkillCommand[]
   package?: SkillPackage
+  agent?: AgentProfile
   lastUsed?: string
   editedBy?: string
   revisions?: { version: number; name: string; description: string; instructions: string; updatedAt: string }[]
@@ -335,7 +347,14 @@ export type RunLimits = {
   maxMessages?: number | null; maxToolCalls?: number | null; timeoutMs?: number | null; runTimeoutMs?: number | null
   maxContextChars?: number; maxOutputChars?: number
 }
-export type ProviderOption = { command?: string; reasoningEffort?: string; proxyMode?: 'system' | 'inherit' | 'custom' | 'direct'; proxyUrl?: string }
+// base/label/accountDir are the identity fields of a subscription instance's entry (src/subscriptions.ts instanceOptions); the rest are CLI options.
+export type ProviderOption = {
+  command?: string; reasoningEffort?: string; proxyMode?: 'system' | 'inherit' | 'custom' | 'direct'; proxyUrl?: string
+  base?: string; label?: string; accountDir?: string
+}
+// A second (third, ...) account of one provider: `id` is its provider id ("claude-2"), `base` the provider whose CLI runs it, `dir` its own configuration folder.
+export type BaseProvider = 'claude' | 'codex' | 'antigravity' | 'cursor'
+export type SubscriptionInstance = { id: string; base: BaseProvider; label: string; dir: string }
 export type PoolMember = { providerId: string; model: string; purpose?: string; reasoningEffort?: string }
 export type ImprovementTask = { id: string; title: string; status: 'pending' | 'working' | 'done' | 'blocked'; evidence: string }
 export type Settings = {
@@ -352,6 +371,7 @@ export type Settings = {
   skillLearning?: boolean
   providerOptions?: Record<string, ProviderOption>
   providerPool?: PoolMember[]
+  subscriptions?: SubscriptionInstance[]
   quotaFailover?: QuotaFailover
 }
 export type AppState = { version: number; projects: Project[]; activeProjectId: string; settings: Settings; savedAt?: number }

@@ -1,5 +1,6 @@
 import type { PoolMember, ProviderOption, RunLimits, Settings } from './types'
 import { ReasoningPicker } from './ReasoningPicker'
+import { baseOf } from './subscriptions'
 
 type LimitField = { key: keyof RunLimits; label: string; min: number }
 const limitFields: LimitField[] = [
@@ -27,6 +28,8 @@ export function SwarmSettings({ settings, update, providers, health }: SwarmSett
   const pool = settings.providerPool || []
   const options = settings.providerOptions || {}
   const { providerId } = settings
+  // An extra subscription runs its base provider's CLI: the CLI path, the login line and the connection settings are the base's.
+  const base = baseOf(providerId)
   const setLimit = (field: LimitField, raw: string) => {
     const value = raw === '' ? null : Number(raw)
     const valid = value === null || (Number.isSafeInteger(value) && value >= field.min && (!field.key.endsWith('Ms') || value <= MAX_MS))
@@ -110,18 +113,18 @@ export function SwarmSettings({ settings, update, providers, health }: SwarmSett
     })}
     <button type="button" className="secondary-button" onClick={addMember}>Добавить модель в рой</button>
     <p className="field-hint">Рассуждения задаются отдельно для каждой модели роя. Настройки применяются к новым задачам.</p>
-    {cliProviders.includes(providerId) && <>
+    {cliProviders.includes(base) && <>
       <h3>Параметры CLI</h3>
       <label>Путь к CLI
-        <input placeholder={cliCommand[providerId]} value={options[providerId]?.command || ''}
+        <input placeholder={cliCommand[base]} value={options[providerId]?.command || ''}
           onChange={event => setOption(providerId, { command: event.target.value })} />
       </label>
-      <p className="field-hint">Вход выполняется в официальном CLI: {cliLogin[providerId]}. После входа нажмите «Проверить».</p>
-      {providerId === 'claude' && <p className="field-hint">
+      <p className="field-hint">Вход выполняется в официальном CLI: {cliLogin[base]}{base !== providerId && ' (для этой подписки — кнопка «Войти» в списке провайдеров)'}. После входа нажмите «Проверить».</p>
+      {base === 'claude' && <p className="field-hint">
         Для подписки Claude войдите через claude auth login своим Claude-аккаунтом. API-ключ не нужен. Модель можно оставить автоматической или
         выбрать sonnet, opus, haiku; доступность зависит от подписки.
       </p>}
-      {providerId === 'antigravity' && <>
+      {base === 'antigravity' && <>
         <label>Соединение Google CLI
           <select value={options.antigravity?.proxyMode || 'system'}
             onChange={event => setOption('antigravity', { proxyMode: event.target.value as ProxyMode })}>

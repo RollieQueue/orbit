@@ -4,6 +4,8 @@ import { proxyEnvironment } from './provider-network.mts'
 // providers.mts imports this file for its parsers and this file spawns CLIs through providers' helpers: an ESM cycle,
 // harmless because both sides touch the other only inside functions. The thunk keeps the call sites as they were.
 import * as providersModule from './providers.mts'
+import { accountEnv, baseOf } from './instances.mts'
+import type { InstanceOptions } from './instances.mts'
 
 // Subscription quotas, read from what each CLI itself reports. Orbit never reads or copies OAuth tokens and never
 // calls a vendor's private HTTP API: Codex answers a protocol request, Claude Code and Antigravity answer their own
@@ -33,7 +35,8 @@ interface QuotaLevel { usedPercent: number | null; window: QuotaWindow | null; e
 interface QuotaRefusal { providerId: string; resetsAt: number | null; message: string }
 interface QuotaUpdate { providerId: string; snapshot: QuotaSnapshot | null }
 // A provider's saved options as the readers use them: the CLI command and, for Antigravity, the proxy settings.
-interface QuotaReaderOptions { command?: string; proxyMode?: string; proxyUrl?: string; signal?: AbortSignal; timeoutMs?: number }
+// `env`: the account variables of a subscription instance (CLAUDE_CONFIG_DIR, CODEX_HOME), set by the monitor from `accountDir` (instances.mts).
+interface QuotaReaderOptions { command?: string; proxyMode?: string; proxyUrl?: string; signal?: AbortSignal; timeoutMs?: number; env?: Record<string, string>; base?: string; label?: string; accountDir?: string }
 type QuotaReader = (options?: QuotaReaderOptions) => Promise<QuotaReading>
 interface QuotaMark { until: number; known: boolean; reason: string }
 // An error a transport has already recognised as a quota refusal (the stream said so); the classifier trusts it.
@@ -250,10 +253,10 @@ async function cliText(command: string, args: string[], { env, timeoutMs = 30000
 }
 const commandOf = (id: string, options: QuotaReaderOptions | undefined, env: string): string => options?.command || process.env[env] || id
 
-async function codexRpc<T = unknown>(command: string, method: string, { signal, timeoutMs = 20000 }: { signal?: AbortSignal; timeoutMs?: number } = {}): Promise<T> {
+async function codexRpc<T = unknown>(command: string, method: string, { signal, timeoutMs = 20000, env }: { signal?: AbortSignal; timeoutMs?: number; env?: Record<string, string> } = {}): Promise<T> {
   const { resolveLaunch, terminateProcess, createLineReader } = providers()
   const launch = resolveLaunch(command, ['app-server'])
-  const child = spawn(launch.executable, launch.args, { cwd: os.tmpdir(), env: launch.env, windowsHide: true, shell: false, detached: process.platform !== 'win32', stdio: ['pipe', 'pipe', 'pipe'] })
+  const child = spawn(launch.executable, launch.args, { cwd: os.tmpdir(), env: env ? { ...launch.env, ...env } : launch.env, windowsHide: true, shell: false, detached: process.platform !== 'win32', stdio: ['pipe', 'pipe', 'pipe'] })
   const pending = new Map<number | string, PendingRequest>()
   let sequence = 0, closed = false, stderr = ''
   const settleAll = (error: Error) => { closed = true; for (const item of pending.values()) item.reject(error); pending.clear() }
@@ -302,14 +305,23 @@ async function codexRpc<T = unknown>(command: string, method: string, { signal, 
 }
 async function readCodex(options: QuotaReaderOptions = {}): Promise<QuotaReading> {
   const command = commandOf('codex', options, 'ORBIT_CODEX_COMMAND')
-  return parseCodexLimits(await codexRpc<CodexRateLimitsResult>(command, 'account/rateLimits/read', { signal: options.signal, timeoutMs: options.timeoutMs }))
+  return parseCodexLimits(await codexRpc<CodexRateLimitsResult>(command, 'account/rateLimits/read', { signal: options.signal, timeoutMs: options.timeoutMs, env: options.env }))
 }
 async function readClaude(options: QuotaReaderOptions = {}): Promise<QuotaReading> {
   const command = commandOf('claude', options, 'ORBIT_CLAUDE_COMMAND')
   const [usage, auth] = await Promise.allSettled([
-    cliText(command, ['-p', '/usage', '--output-format', 'json', '--no-session-persistence'], { signal: options.signal }),
-    cliText(command, ['auth', 'status'], { timeoutMs: 15000, signal: options.signal }),
+    cliText(command, ['-p', '/usage', '--output-format', 'json', '--no-session-persistence'], { signal: options.signal, env: options.env }),
+    cliText(command, ['auth', 'status'], { timeoutMs: 15000, signal: options.signal, env: options.env }),
   ])
+  // A signed-out account folder answers /usage with zero-usage session stats and no limit lines: that must not read as "no windows, fine".
+  // Only a subscription instance (options.env) is checked, so the default account's reading stays as it was.
+  // The real `claude auth status` of a signed-out folder prints its JSON and exits 1, so a rejection carries the same text.
+  if (options.env) {
+    let loggedIn: unknown = null
+    const said = auth.status === 'fulfilled' ? auth.value : String(thrown(auth.reason).message ?? '')
+    try { const status = JSON.parse(said); loggedIn = status.loggedIn ?? status.logged_in } catch { /* Not JSON: nothing is claimed. */ }
+    if (loggedIn === false) throw new Error('Войдите в этот аккаунт: claude auth login с его папкой (Orbit открывает вход из Настройки → «Войти»).')
+  }
   if (usage.status === 'rejected') throw usage.reason
   let text: unknown = usage.value
   try { text = JSON.parse(usage.value).result ?? usage.value } catch { /* Plain text output is parsed as it is. */ }
@@ -345,9 +357,10 @@ const UNAVAILABLE_HINTS: Record<string, string | undefined> = {
 // What a reader threw: an Error, usually with a `code` when the CLI itself was not found.
 const thrown = (error: unknown): { code?: unknown; message?: unknown } => isRecord(error) ? error : {}
 function unavailable(id: string, error: unknown): QuotaReading {
+  const base = baseOf(id)
   const missing = thrown(error).code === 'ENOENT'
-  const hint = missing ? 'CLI не найден. Установите его и выполните вход, см. «Настройки → Провайдеры».' : UNAVAILABLE_HINTS[id] || ''
-  return { windows: [], state: 'unavailable', detail: [hint, missing ? '' : first(thrown(error).message).slice(0, 200)].filter(Boolean).join(' '), source: id }
+  const hint = missing ? 'CLI не найден. Установите его и выполните вход, см. «Настройки → Провайдеры».' : UNAVAILABLE_HINTS[base] || ''
+  return { windows: [], state: 'unavailable', detail: [hint, missing ? '' : first(thrown(error).message).slice(0, 200)].filter(Boolean).join(' '), source: base }
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -414,7 +427,9 @@ function classifyQuotaError(error: unknown, providerId = '', now = Date.now()): 
   // Whatever was thrown: an Error (possibly tagged by a transport), or a bare string.
   const failure = error as QuotaTaggedError
   const message = String(failure.message ?? error)
-  if (failure.quota) return { providerId: failure.quota.providerId || providerId, resetsAt: failure.quota.resetsAt ?? resetFromMessage(message, now), message: message.slice(0, 500) }
+  // A transport tags the provider whose adapter ran ("claude"); when the caller ran a second account of it, that account refused.
+  const tagged = failure.quota?.providerId
+  if (failure.quota) return { providerId: tagged && baseOf(providerId) === tagged ? providerId : tagged || providerId, resetsAt: failure.quota.resetsAt ?? resetFromMessage(message, now), message: message.slice(0, 500) }
   if (failure.name === 'AbortError' || failure.name === 'TimeoutError') return null
   if (CONTEXT_LIMIT.test(message) && !STRONG_QUOTA.test(message)) return null
   if (!QUOTA_PATTERNS.some(pattern => pattern.test(message))) return null
@@ -484,13 +499,16 @@ class QuotaMonitor {
     return Object.fromEntries(entries.filter((entry): entry is [string, QuotaSnapshot] => Boolean(entry[1])))
   }
   async refresh(id: string, options: QuotaReaderOptions = {}): Promise<CachedReading> {
-    const reader: QuotaReader | undefined = readers[id]
+    const reader: QuotaReader | undefined = readers[baseOf(id)]
     const now = this.clock()
     const previous = this.cache.get(id)
     let snapshot: CachedReading
     try {
       if (!reader) throw new Error(`Unknown provider ${id}`)
-      snapshot = { providerId: id, ...(await reader(options)), fetchedAt: this.clock(), checkedAt: this.clock() }
+      // A subscription instance is read as its base provider with its own account's environment; accountEnv refuses one with
+      // no folder, and the default account's figures must never stand in for it.
+      const env = accountEnv(id, options as InstanceOptions)
+      snapshot = { providerId: id, ...(await reader(Object.keys(env).length ? { ...options, env: { ...options.env, ...env } } : options)), fetchedAt: this.clock(), checkedAt: this.clock() }
       // A fallback cooldown ends as soon as the account is measurably below its limits again.
       const mark = this.marks.get(id)
       if (mark && !mark.known && snapshot.windows?.length && snapshot.windows.every(window => window.usedPercent < 100)) this.marks.delete(id)

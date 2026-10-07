@@ -1,4 +1,5 @@
 import REASONING from './reasoning-defaults.json' with { type: 'json' }
+import { baseOf } from './instances.mts'
 
 // The reasoning levels of a model and the nearest one to a request. Pure; failover, model routing and spawn_agent share it.
 // A level is only ever sent where the target offers it: asking for more than a model has gives its top level, never an error.
@@ -15,10 +16,11 @@ interface ClampedEffort { level: string; clamped: boolean }
 
 // The levels `model` offers on `providerId`: its own list in the provider catalog, else the provider's default list
 // (reasoning-defaults.json). Antigravity has its reasoning built into the model names and offers none; a model whose list
-// is empty has none either.
+// is empty has none either. An extra subscription (claude-2) offers what its base provider does.
 function offeredLevels(providerId: string, model: string | null | undefined, entry?: LevelCatalogEntry | null): string[] {
-  if (providerId === 'antigravity') return []
-  return entry?.reasoningLevels?.[String(model || '')] || defaults[providerId] || []
+  const base = baseOf(providerId)
+  if (base === 'antigravity') return []
+  return entry?.reasoningLevels?.[String(model || '')] || defaults[base] || []
 }
 // The level to send for `wanted`: itself when offered, else the nearest offered one below, else the nearest above. Nothing
 // is offered (or nothing was asked): ''. `clamped` says that a level was asked for and another (or none) is sent.
@@ -37,12 +39,12 @@ function topLevel(offered: readonly string[]): string {
 // One line for the root's prompt: the levels each connected provider (of `only`, when given) offers, models with the same list grouped. With the
 // provider health list it is exact per model; without it the defaults of reasoning-defaults.json stand in.
 function levelsLine(catalog: readonly (LevelCatalogEntry & { available?: boolean; models?: string[] })[] | null | undefined, only?: ReadonlySet<string>): string {
-  const ids = (catalog?.length ? catalog.filter(entry => entry.available !== false).map(entry => entry.id) : Object.keys(defaults)).filter(id => !only || only.has(id))
+  const ids = (catalog?.length ? catalog.filter(entry => entry.available !== false).map(entry => entry.id) : Object.keys(defaults)).filter(id => !only || only.has(id) || only.has(baseOf(id)))
   const parts: string[] = []
   for (const id of ids) {
     const entry = catalog?.find(item => item.id === id)
     const groups = new Map<string, string[]>()
-    for (const model of entry?.models?.length && id !== 'antigravity' ? entry.models.slice(0, 24) : ['']) {
+    for (const model of entry?.models?.length && baseOf(id) !== 'antigravity' ? entry.models.slice(0, 24) : ['']) {
       const key = offeredLevels(id, model, entry).join('/') || 'none'
       groups.set(key, [...(groups.get(key) || []), model])
     }

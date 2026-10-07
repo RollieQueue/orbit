@@ -1,0 +1,53 @@
+/* The tabs of the Skills panel and the «Агенты» tab (AgentCards.tsx): trained agents, their training record and gallery. */
+
+.panel-tabs{display:flex;gap:4px;margin:-6px 0 18px;border-bottom:1px solid var(--line)}
+.panel-tabs [role="tab"]{padding:9px 14px;font-size:12px;font-weight:600;color:var(--muted);border-bottom:2px solid transparent;margin-bottom:-1px}
+.panel-tabs [role="tab"]:hover{color:#c3d0c7}
+.panel-tabs [role="tab"][aria-selected="true"]{color:var(--accent);border-bottom-color:var(--accent)}
+.panel-tabs [role="tab"]:focus-visible{outline:2px solid #6f8a7a;outline-offset:-2px;border-radius:6px 6px 0 0}
+[role="tabpanel"][hidden]{display:none}
+
+.agent-entry details{margin-top:10px;font-size:12px}
+.agent-entry summary{cursor:pointer;color:#a7c5b0;font-size:11px}
+.agent-status{font-size:9px;line-height:1;padding:3px 7px;border-radius:9px;margin-left:8px;border:1px solid #3b4d44;background:#26322d;color:#bbdcca}
+.agent-status.training{border-color:#5a4d2f;background:#322c1e;color:#ceb889}
+.agent-subhead{margin:14px 0 8px;font-size:10px;letter-spacing:1.2px;font-weight:700;color:#7c808c}
+
+.agent-training{margin-top:12px}
+.agent-summary{margin:0 0 6px;font-size:12px;color:#c3d0c7}
+.agent-chart{display:block;width:100%;max-width:440px;height:auto}
+.agent-chart-grid{stroke:var(--line);stroke-width:1}
+.agent-chart-label{fill:var(--muted);font-size:10px}
+.agent-chart-line{fill:none;stroke:var(--accent);stroke-width:2;stroke-linejoin:round;stroke-linecap:round}
+.agent-chart-dot{fill:#212727;stroke:var(--accent);stroke-width:2}
+
+.agent-rounds-scroll{margin-top:8px;overflow-x:auto;border:1px solid #2f3836;border-radius:7px}
+.agent-rounds table{border-collapse:collapse;width:100%;min-width:640px;font-size:11px;line-height:1.5;color:#a9bbb0}
+.agent-rounds th{text-align:left;font-weight:600;font-size:10px;color:var(--muted);padding:6px 9px;border-bottom:1px solid #2f3836;white-space:nowrap}
+.agent-rounds td{vertical-align:top;padding:7px 9px;border-bottom:1px solid #293130}
+.agent-rounds tr:last-child td{border-bottom:0}
+.agent-score{font-weight:700;color:var(--accent);white-space:nowrap}
+.agent-criteria{display:flex;flex-wrap:wrap;gap:4px;margin:0;padding:0;list-style:none}
+.agent-criteria li{font-size:10px;line-height:1;padding:3px 6px;border-radius:8px;background:#26322d;color:#bbdcca;border:1px solid #3b4d44;white-space:nowrap}
+.agent-judges{margin:0;padding:0;list-style:none;white-space:nowrap}
+.agent-notes{min-width:200px;max-width:340px;white-space:pre-wrap;overflow-wrap:anywhere}
+
+.agent-gallery ul{display:grid;grid-template-columns:repeat(auto-fill,minmax(104px,1fr));gap:10px;margin:0;padding:0;list-style:none}
+.agent-gallery li{min-width:0}
+.agent-gallery small{display:block;margin-top:4px;font-size:10px;color:#73807a;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.agent-thumb{display:block;width:100%;aspect-ratio:1;padding:0;border:1px solid #343b40;border-radius:7px;background:#111619;overflow:hidden;cursor:zoom-in}
+.agent-thumb:hover{border-color:#6f8a7a}
+.agent-thumb:focus-visible{outline:2px solid #6f8a7a;outline-offset:1px}
+.agent-thumb img{display:block;width:100%;height:100%;object-fit:cover}
+.agent-missing{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:4px;aspect-ratio:1;border:1px dashed #3b4440;border-radius:7px;background:#1a201f;color:#73807a;font-size:10px}
+
+.agent-lightbox{position:fixed;inset:0;z-index:70;background:#000000e6;display:flex;flex-direction:column}
+.agent-lightbox-bar{display:flex;align-items:center;gap:14px;padding:10px 14px 10px 22px;font-size:12px;color:#c3ccc6;flex-shrink:0}
+.agent-lightbox-bar>span{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.agent-lightbox-bar small{color:#8c9690}
+.agent-lightbox-stage{flex:1;min-height:0;display:flex;align-items:center;justify-content:center;gap:12px;padding:0 14px 14px}
+.agent-lightbox-stage img{flex:0 1 auto;min-width:0;max-width:100%;max-height:100%;object-fit:contain;border-radius:4px;box-shadow:0 12px 60px #000a}
+.agent-lightbox-missing{width:min(320px,60vw);aspect-ratio:4/3}
+.agent-lightbox-nav{flex-shrink:0;width:42px;height:42px;border-radius:50%;font-size:26px;line-height:1;color:#dfe8e2;background:#ffffff14}
+.agent-lightbox-nav:hover,.agent-lightbox-nav:focus-visible{background:#ffffff2e;outline:0}
+.agent-lightbox-caption{margin:0;padding:0 24px 18px;text-align:center;font-size:12px;line-height:1.6;color:#c3ccc6}

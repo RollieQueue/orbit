@@ -4,8 +4,9 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { randomBytes } from 'node:crypto'
 import { clip } from '../text.mts'
+import { baseOf, instancesFromOptions, isInstanceId, providerLabel } from '../instances.mts'
 import type { ConnectorLaunch } from '../connectors.mts'
-import type { AgentRecord, InternalAgentField, OrbitRuntimeLike, PublicAgent, RunLimits, RunRecord } from '../types.mts'
+import type { AgentRecord, InternalAgentField, OrbitRuntimeLike, PublicAgent, RunLimits, RunRecord, SpawnResult, ToolArgs } from '../types.mts'
 
 const TERMINAL = new Set(['completed', 'failed', 'cancelled', 'restarting'])
 const AGENT_TERMINAL = new Set(['done', 'error', 'cancelled'])
@@ -13,9 +14,12 @@ const ceiling = (limits: RunLimits, key: keyof RunLimits): number => limits[key]
 const MESSAGE_TOOLS = new Set(['send_message', 'broadcast_message', 'ask_team'])
 // What counts as doing something rather than talking: it reopens a discussion the router closed.
 const WORK_TOOLS = new Set(['write_file', 'edit_file', 'spawn_agent', 'followup_agent'])
-const MUTATING_TOOLS = new Set(['write_file', 'edit_file', 'spawn_agent', 'followup_agent', 'memory_save', 'memory_forget', 'context_save', 'capability_install', 'capability_feedback', 'connector_add', 'connector_remove', 'improvement_plan', 'model_evaluate', 'merge_agent', 'schedule_wakeup', 'cancel_wakeup', ...MESSAGE_TOOLS])
-// A skill an agent loads on purpose is read whole (an agent's skill is at most 12 000 characters, the user's 24 000).
-const SKILL_READ_CHARS = 28000
+const MUTATING_TOOLS = new Set(['write_file', 'edit_file', 'spawn_agent', 'followup_agent', 'memory_save', 'memory_forget', 'context_save', 'capability_install', 'capability_feedback', 'agent_save', 'connector_add', 'connector_remove', 'improvement_plan', 'model_evaluate', 'merge_agent', 'schedule_wakeup', 'cancel_wakeup', ...MESSAGE_TOOLS])
+// A skill an agent loads on purpose is read whole (an agent's skill is at most 12 000 characters, the user's 24 000), and so is a
+// trained agent's playbook (40 000 characters, JSON escaping and the training record on top): cut, it could not be revised safely.
+const SKILL_READ_CHARS = 28000, AGENT_READ_CHARS = 56000
+const FULL_READS: ReadonlySet<string> = new Set(['capability_read', 'agent_read'])
+const readChars = (tool: string, maxOutputChars: number): number => tool === 'capability_read' ? Math.max(maxOutputChars, SKILL_READ_CHARS) : tool === 'agent_read' ? Math.max(maxOutputChars, AGENT_READ_CHARS) : maxOutputChars
 const MCP_TOOL_PREFIX = 'mcp__orbit__'
 // The user as a sender of communications: the root's task, and messages written to an agent while a run works.
 const USER = Object.freeze({ id: 'user', name: 'Вы' })
@@ -26,10 +30,22 @@ const USER = Object.freeze({ id: 'user', name: 'Вы' })
 const newMailMark = (): string => randomBytes(5).toString('hex')
 const isMailMark = (value: unknown): value is string => typeof value === 'string' && /^[0-9a-f]{10}$/.test(value)
 const mailTag = (agent: Pick<AgentRecord, 'mailMark'>): string => `[orbit:${agent.mailMark}]`
-const INTERNAL_AGENT_FIELDS: readonly InternalAgentField[] = ['inbox', 'seenChildren', 'requestedModel', 'transcript', 'previousWork', 'ledger', 'ledgerDropped', 'workDone', 'failedCandidates', 'trial', 'partialTurn', 'quotaWarned', 'draftAnswer', 'activeTurn', 'stream', 'sessionToken', 'sessionCursor', 'transcriptChars', 'pausedSession', 'mailMark', 'effortNote', 'report']
+const INTERNAL_AGENT_FIELDS: readonly InternalAgentField[] = ['inbox', 'seenChildren', 'requestedModel', 'transcript', 'previousWork', 'ledger', 'ledgerDropped', 'workDone', 'failedCandidates', 'trial', 'partialTurn', 'quotaWarned', 'draftAnswer', 'activeTurn', 'stream', 'sessionToken', 'sessionCursor', 'transcriptChars', 'pausedSession', 'mailMark', 'effortNote', 'report', 'profilePrompt', 'profileReminder']
+// spawn_agent providerId naming an extra subscription (claude-2) this run does not have: refused with the ones it has, because
+// running it anyway would use the default account's quota under another name. Any other id keeps the rules it always had.
+function unknownSubscription(run: RunRecord, parent: AgentRecord, spec: ToolArgs): SpawnResult | null {
+  const id = spec.providerId
+  if (!id || !isInstanceId(id)) return null
+  const extra = instancesFromOptions(run.providerOptions)
+  if ([...extra.map(item => item.id), run.providerId, parent.providerId].includes(id)) return null
+  const have = extra.length ? `This run's extra subscriptions: ${extra.map(item => `${item.id} (${providerLabel(item.id, run.providerOptions[item.id])})`).join(', ')}.` : 'This run has no extra subscriptions.'
+  return { ok: false, reason: 'unknown_provider', instruction: `providerId ${id} is not a subscription of this run. ${have} Use one of those, or a provider id such as ${baseOf(id)} (its default account).` }
+}
+// The providers a caller ruled out for the helper (spawn_agent avoidProviders), trimmed and without repeats.
+const avoided = (spec: ToolArgs): string[] => Array.isArray(spec.avoidProviders) ? [...new Set(spec.avoidProviders.map(id => String(id).trim()).filter(Boolean))] : []
 // Google models (Antigravity) have reasoning built in: Orbit never sends an effort for them,
 // whatever was persisted in settings, the provider pool or a spawn request.
-const withoutGoogleReasoning = (providerId: string, effort: string): string => providerId === 'antigravity' ? '' : effort
+const withoutGoogleReasoning = (providerId: string, effort: string): string => baseOf(providerId) === 'antigravity' ? '' : effort
 // The observation limit protects the model's context. The root's final answer is for the user, so it gets
 // a far larger allowance instead of being silently cut at the size of a tool observation.
 // The longest report of a helper that the run record keeps (AgentRecord.report): `result` is cut to one observation, this is what team_history and context_read page.
@@ -109,4 +125,4 @@ function diagnostics(runtime: Pick<OrbitRuntimeLike, 'trace'>, run: RunRecord, w
   try { runtime.trace(run, agentId, 'diagnostic', `${where}: ${(error as Error | null | undefined)?.message || String(error)}`) } catch { /* Reporting a failure must not add one. */ }
 }
 
-export { TERMINAL, AGENT_TERMINAL, ceiling, WORK_TOOLS, MUTATING_TOOLS, SKILL_READ_CHARS, MCP_TOOL_PREFIX, USER, newMailMark, isMailMark, mailTag, withoutGoogleReasoning, answerLimit, REPORT_CHARS, publicAgent, agentConnectors, agentTokens, isRecord, oneOf, bounded, clip, TurnBudgetError, abortError, overlappingWorkspaces, agentWorkspace, sameFolder, logicalWorkspace, abortable, diagnostics, markProviderFailure, fromProvider }
+export { TERMINAL, AGENT_TERMINAL, ceiling, WORK_TOOLS, MUTATING_TOOLS, SKILL_READ_CHARS, AGENT_READ_CHARS, FULL_READS, readChars, MCP_TOOL_PREFIX, USER, newMailMark, isMailMark, mailTag, withoutGoogleReasoning, unknownSubscription, avoided, answerLimit, REPORT_CHARS, publicAgent, agentConnectors, agentTokens, isRecord, oneOf, bounded, clip, TurnBudgetError, abortError, overlappingWorkspaces, agentWorkspace, sameFolder, logicalWorkspace, abortable, diagnostics, markProviderFailure, fromProvider }

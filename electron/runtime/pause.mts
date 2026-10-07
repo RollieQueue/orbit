@@ -1,5 +1,6 @@
 // User controls hold an agent and its descendants without discarding their work or cancelling the run.
 import { AGENT_TERMINAL, abortError, bounded, clip } from './util.mts'
+import { baseOf } from '../instances.mts'
 import type { AgentControlResult, AgentRecord, AgentResult, OrbitRuntimeLike, RunRecord, ToolArgs } from '../types.mts'
 
 const STOPPED_BY_USER = 'Stopped by the user from the Orbit window. Not a failure of the task: do not start the same work again unless the user asks; continue with what you have and say what was left undone.'
@@ -152,7 +153,7 @@ function interruptedSession(runtime: OrbitRuntimeLike, agent: AgentRecord, error
   else if (!error.spoke) agent.sessionCursor = cursorBeforeTurn
   agent.pausedSession = agent.sessionId
   if (!agent.sessionId) runtime.remember(agent, { type: 'instruction', content: error.note })
-  else if (error.spoke && KEEPS_CUT_PROMPT.has(agent.providerId)) for (const id of delivered) held.add(id)
+  else if (error.spoke && KEEPS_CUT_PROMPT.has(baseOf(agent.providerId))) for (const id of delivered) held.add(id)
   return error.note
 }
 

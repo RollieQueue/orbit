@@ -5,6 +5,7 @@ import { randomUUID } from 'node:crypto'
 import { classifyQuotaError, assess } from '../quota.mts'
 import { replacements, handoverNote, targetLabel, unreachable, isPinned } from '../failover.mts'
 import { candidates, route } from '../model-routing.mts'
+import { baseOf, instancesFromOptions, matchesProvider } from '../instances.mts'
 import type { AgentRecord, CatalogEntry, HandoverReason, HandoverRecord, HandoverRequest, InterruptedTurn, ModelTarget, OrbitRuntimeLike, RoutedSpawn, RunRecord, ToolArgs } from '../types.mts'
 import { withoutGoogleReasoning, publicAgent, bounded, clip, TurnBudgetError, diagnostics, fromProvider } from './util.mts'
 import { closeAgentSession } from './session.mts'
@@ -27,6 +28,8 @@ const routeWait = (): number => { const raw = process.env.ORBIT_ROUTE_WAIT_MS?.t
 // explicit HANDOVER note, and the record of what a cut-off turn left half done.
 // Every path below runs only when failoverActive() held, so `runtime.quota` is set there (hence its `!`).
 function failoverActive(runtime: OrbitRuntimeLike, run: RunRecord): boolean { return !!runtime.quota && run.failover.enabled }
+// The ids of the run's extra subscriptions (claude-2), which `providerOptions` carries as entries of their own.
+const instanceIds = (run: RunRecord): string[] => instancesFromOptions(run.providerOptions).map(instance => instance.id)
 async function providerCatalog(runtime: OrbitRuntimeLike, run: RunRecord): Promise<CatalogEntry[]> {
   if (!runtime.catalog) return []
   // The promise itself is cached, so agents switching at the same moment share one provider inspection.
@@ -88,14 +91,15 @@ async function handover(runtime: OrbitRuntimeLike, run: RunRecord, agent: AgentR
     return false
   }
   const catalog = await runtime.providerCatalog(run)
-  const ids = new Set([agent.providerId, ...catalog.filter(entry => entry.available !== false).map(entry => entry.id), ...run.providerPool.map(member => member.providerId)])
+  const instances = instanceIds(run)
+  const ids = new Set([agent.providerId, ...catalog.filter(entry => entry.available !== false).map(entry => entry.id), ...run.providerPool.map(member => member.providerId), ...instances])
   // Candidates are judged on fresh figures; one slow probe does not hold the agent for long.
   await Promise.all([...ids].map(id => runtime.quota!.get(id, { maxAgeMs: CATALOG_MAX_AGE_MS, waitMs: QUOTA_WAIT_MS, options: run.providerOptions[id] || {} })))
   if (runtime.agentSignal(run, agent).aborted) return false
   const now = runtime.clock()
   const skip = new Set([...run.brokenProviders].filter(([, until]) => until > now).map(([id]) => id))
   // run.models is the renderer's model choice per provider: model names by provider id.
-  const context = { agent, catalog, pool: run.providerPool, models: run.models as Record<string, string | undefined>, quota: runtime.quota, config: run.failover, now, skip }
+  const context = { agent, catalog, pool: run.providerPool, models: run.models as Record<string, string | undefined>, quota: runtime.quota, config: run.failover, now, skip, instances }
   // Ahead of a refusal only comfortable headroom justifies the change; after one, anything with a little left beats stopping.
   const [choice] = replacements(context).concat(reason === 'approaching' ? [] : replacements({ ...context, relaxed: true }))
   if (!choice) {
@@ -201,8 +205,11 @@ async function recoverStall(runtime: OrbitRuntimeLike, run: RunRecord, agent: Ag
 // gets the model it would get without a kind.
 async function routeSpawn(runtime: OrbitRuntimeLike, run: RunRecord, parent: AgentRecord, spec: ToolArgs): Promise<{ spec: ToolArgs; routed: RoutedSpawn }> {
   const kind = String(spec.kind)
-  const ids = [...new Set(candidates(kind).map(candidate => candidate.providerId))].filter(id => !spec.providerId || id === spec.providerId)
-  if (!ids.length) return { spec, routed: { kind, model: null, note: `The routing table has no ${kind} candidate on ${spec.providerId}; the helper got the model it gets without a kind.` } }
+  // The table names providers; each one's accounts (the run's extra subscriptions of it) are refreshed with it.
+  const bases = [...new Set(candidates(kind).map(candidate => candidate.providerId))].filter(id => !spec.providerId || baseOf(spec.providerId) === id)
+  if (!bases.length) return { spec, routed: { kind, model: null, note: `The routing table has no ${kind} candidate on ${spec.providerId}; the helper got the model it gets without a kind.` } }
+  const accounts = [...new Set([parent.providerId, run.providerId, ...run.providerPool.map(member => member.providerId), ...instanceIds(run)])]
+  const ids = [...new Set([...bases, ...accounts.filter(id => baseOf(id) !== id && bases.includes(baseOf(id)))])].filter(id => !spec.providerId || matchesProvider(spec.providerId, id))
   const timers: NodeJS.Timeout[] = []
   const late = new Promise<null>(resolve => { timers.push(setTimeout(resolve, routeWait(), null)) })
   const [list] = await Promise.all([
@@ -213,7 +220,7 @@ async function routeSpawn(runtime: OrbitRuntimeLike, run: RunRecord, parent: Age
   const now = runtime.clock()
   const { choice, skipped } = route({
     kind, providerId: spec.providerId, catalog: list?.length ? list : null,
-    known: new Set([parent.providerId, run.providerId, ...run.providerPool.map(member => member.providerId)]),
+    known: new Set([...accounts, parent.providerId, run.providerId]),
     pool: run.providerPool, runProviderId: run.providerId, quota: runtime.quota, threshold: run.failover.switchAtPercent, now,
     skip: new Set([...run.brokenProviders].filter(([, until]) => until > now).map(([id]) => id)),
     ...(spec.avoidProviders?.length ? { avoid: new Set(spec.avoidProviders) } : {}),

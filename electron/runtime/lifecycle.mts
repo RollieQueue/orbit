@@ -17,6 +17,7 @@ import { restartNote, prepareContinuation } from './restart.mts'
 import { loadPlan } from './improvement.mts'
 import { loadWakeups } from './wakeups.mts'
 import { MAX_RUN_FILES, attachmentBlock } from '../attachments.mts'
+import { baseOf } from '../instances.mts'
 
 const DEFAULT_LIMITS: Readonly<RunLimits> = Object.freeze({ maxAgents: null, maxDepth: null, maxConcurrent: null, maxTurns: null, maxTotalTurns: null, maxMessages: null, maxToolCalls: null, maxOutputChars: 12000, maxContextChars: 120000, timeoutMs: null, runTimeoutMs: null })
 // Shared (cross-project) housekeeping looks at every project, so it runs at most this often.
@@ -78,9 +79,9 @@ async function start(runtime: OrbitRuntimeLike, payload: StartPayload = {}): Pro
   if (payload.approvalPolicy && !oneOf(['never', 'on-request', 'auto-review'], payload.approvalPolicy)) throw new Error('Unknown approval policy')
   // Google models ignore effort entirely, so a stale value saved for them must never block a start.
   const efforts = [
-    payload.providerId === 'antigravity' ? '' : payload.reasoningEffort,
-    ...Object.entries(payload.providerOptions || {}).map(([id, item]) => id === 'antigravity' ? '' : item?.reasoningEffort),
-    ...(payload.providerPool || []).map(item => item?.providerId === 'antigravity' ? '' : item?.reasoningEffort),
+    baseOf(payload.providerId) === 'antigravity' ? '' : payload.reasoningEffort,
+    ...Object.entries(payload.providerOptions || {}).map(([id, item]) => baseOf(id) === 'antigravity' ? '' : item?.reasoningEffort),
+    ...(payload.providerPool || []).map(item => baseOf(item?.providerId ?? '') === 'antigravity' ? '' : item?.reasoningEffort),
   ]
   for (const effort of efforts) {
     if (effort && !['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra', 'enabled'].includes(effort)) throw new Error('Unknown reasoning effort')
@@ -110,7 +111,7 @@ async function start(runtime: OrbitRuntimeLike, payload: StartPayload = {}): Pro
     agentNodes: new Map(), agentControllers: new Map(), agentOperations: new Map(), tasks: new Map(), traces: [], messages: [], communications: [], messageWaiters: new Map(), controller: new AbortController(),
     activeTurns: 0, turnQueue: [], operations: new Set(), providerBuffers: new Map(), finishedAt: null, summary: null, error: null,
     fileActivity: new FileActivity(workspace), changes: new ChangeLog(workspace), changeQueue: Promise.resolve(), changePending: 0, commands: { running: 0, serial: 0, writes: 0 }, priorRuns: [], priorDigest: null,
-    memoryTouched: new Set(), skillUse: new Map(), skillLearning: payload.skillLearning !== false, skillReminded: false, skillSaved: false,
+    memoryTouched: new Set(), skillUse: new Map(), agentUse: new Set(), skillLearning: payload.skillLearning !== false, skillReminded: false, skillSaved: false,
     // The router needs the record it serves, so it is made right below.
     router: null!,
   }

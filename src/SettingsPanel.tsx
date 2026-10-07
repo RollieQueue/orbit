@@ -3,14 +3,16 @@ import type { RuntimeStatus, Settings } from './types'
 import { Icon } from './Icon'
 import { ModelPicker } from './ModelPicker'
 import { SwarmSettings } from './SwarmSettings'
-import { providers, type ProviderInfo } from './providers'
+import type { ProviderInfo } from './providers'
 import { runtimeSummary } from './runtime-status'
 import { accessChoice, accessPatch, modelPatch } from './state-store'
+import { AddSubscription, SubscriptionActions } from './AddSubscription'
+import { instanceOf, providerList } from './subscriptions'
 
 type SettingsPanelProps = {
   settings: Settings; health: ProviderHealth[]; checking: boolean; desktop: boolean; modelChoices: string[]
   runtimeStatus: RuntimeStatus | null
-  onRefresh: () => void; onSettings: (patch: Partial<Settings>) => void; onRestartRuntime: () => Promise<RuntimeRestartResult>
+  onRefresh: () => void; onSettings: (patch: Partial<Settings>) => void; onRestartRuntime: () => Promise<RuntimeRestartResult>; onNotice: (text: string) => void
 }
 
 // The runtime process (agents, stores, providers): its state and a restart that keeps the window open.
@@ -57,8 +59,10 @@ function ProviderCard({ provider, status, selected, onPick }: { provider: Provid
 }
 
 // Provider cards with their health, the model per provider, the user's instructions and the swarm limits.
-export function SettingsPanel({ settings, health, checking, desktop, modelChoices, runtimeStatus, onRefresh, onSettings, onRestartRuntime }: SettingsPanelProps) {
+export function SettingsPanel({ settings, health, checking, desktop, modelChoices, runtimeStatus, onRefresh, onSettings, onRestartRuntime, onNotice }: SettingsPanelProps) {
   const model = settings.models[settings.providerId] || ''
+  const providers = providerList(settings.subscriptions)
+  const shared = { settings, health, checking, desktop, onSettings, onRefresh, onNotice }
   return <>
     <p className="modal-intro">Агент использует выбранный провайдер. Подключения и авторизация CLI берутся из вашего окружения.</p>
     <div className="settings-section-heading">
@@ -68,9 +72,14 @@ export function SettingsPanel({ settings, health, checking, desktop, modelChoice
       </button>
     </div>
     <div className="provider-list">
-      {providers.map(provider => <ProviderCard key={provider.id} provider={provider} status={health.find(p => p.id === provider.id)}
-        selected={settings.providerId === provider.id} onPick={() => onSettings({ providerId: provider.id })} />)}
+      {providers.map(provider => {
+        const card = <ProviderCard key={provider.id} provider={provider} status={health.find(p => p.id === provider.id)}
+          selected={settings.providerId === provider.id} onPick={() => onSettings({ providerId: provider.id })} />
+        const instance = instanceOf(settings, provider.id)
+        return instance ? <div className="provider-instance" key={provider.id}>{card}<SubscriptionActions {...shared} instance={instance} /></div> : card
+      })}
     </div>
+    <AddSubscription {...shared} />
     <p className="field-hint">{providers.find(p => p.id === settings.providerId)?.help}</p>
     <div className="settings-model">
       <span>Модель</span>

@@ -12,7 +12,12 @@ const REPORTER = require('node:url').pathToFileURL(path.join(repo, 'scripts', 't
 
 function sampleFolder(t, files) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'orbit-test-reporter-'))
-  t.after(() => fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 }))
+  // Windows can keep the folder locked for a moment after the child runner exits (EBUSY, measured 2026-10-02 under load):
+  // the cleanup retries longer and never fails the test, since a leftover temp folder is harmless.
+  t.after(() => {
+    try { fs.rmSync(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 }) }
+    catch (error) { if (!['EBUSY', 'EPERM', 'ENOTEMPTY'].includes(error.code)) throw error }
+  })
   for (const [name, text] of Object.entries(files)) fs.writeFileSync(path.join(dir, name), text)
   return dir
 }

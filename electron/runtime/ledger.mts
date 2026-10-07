@@ -48,6 +48,8 @@ function describeCall(call: ToolCall, observation: Loose, failure: string | null
   else if (call.name === 'capability_search') outcome = `${Array.isArray(observation) ? observation.length : 0} skills`
   else if (call.name === 'capability_read') { subject = ` ${clip(observation.name, 60)}`; outcome = `loaded v${observation.version}` }
   else if (call.name === 'capability_install') { subject = ` ${clip(observation.name, 60)}`; outcome = `${observation.merged ? 'improved' : 'saved'} as ${observation.scope} v${observation.version}${observation.demoted ? ' (kept in the project)' : ''}` }
+  else if (call.name === 'agent_save') { subject = ` ${clip(observation.name, 60)}`; outcome = `saved as ${observation.scope} v${observation.version}, ${observation.rounds} rounds, ${observation.package?.files ?? 0} files${observation.demoted ? ' (kept in the project)' : ''}` }
+  else if (call.name === 'agent_read') { subject = observation.name ? ` ${clip(observation.name, 60)}` : ''; outcome = observation.name ? `loaded v${observation.version}` : `${observation.agents?.length ?? 0} agents` }
   else if (call.name === 'capability_feedback') { subject = ` ${clip(observation.name, 60)}`; outcome = `${args.outcome}, now ${Math.round((observation.reliability ?? 0) * 100)}% reliable` }
   else if (call.name === 'connector_add') { subject = ` ${clip(args.name, 40)}`; outcome = `${observation.replaced ? 'replaced' : 'registered'} (${observation.scope} ${observation.transport})` }
   else if (call.name === 'connector_remove') outcome = `removed ${clip(observation.removed, 40)} (${observation.scope})`

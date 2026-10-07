@@ -7,6 +7,8 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { stripDiffs } from './run-store.mts'
 import { PROVIDER_IDS } from './quota.mts'
+import { withInstances } from './instances.mts'
+import type { InstanceOptions } from './instances.mts'
 import { applyPatch, removeWorktree } from './worktree.mts'
 import { runGit } from './git.mts'
 import { workspaceKey } from './storage.mts'
@@ -169,10 +171,11 @@ function createRuntimeApi(ctx: RuntimeApiContext): Map<string, RuntimeHandler> {
   })
   // The inspection in use: a fixture installed before start-up (smoke:desktop) answers instead of the CLIs.
   handle('providers:health', (options) => inspectProviders(options as InspectOptions | undefined))
-  handle('quota:get', (providerOptions, force) => quota.all(PROVIDER_IDS, {
-    options: providerOptions && typeof providerOptions === 'object' ? providerOptions as Record<string, QuotaReaderOptions | undefined> : {},
-    force: force === true,
-  }))
+  // Every subscription instance the options carry ("claude-2") gets its own snapshot next to its base provider's.
+  handle('quota:get', (providerOptions, force) => {
+    const options = providerOptions && typeof providerOptions === 'object' ? providerOptions as Record<string, QuotaReaderOptions | undefined> : {}
+    return quota.all(withInstances(PROVIDER_IDS, options as Record<string, InstanceOptions | undefined>), { options, force: force === true })
+  })
   // Lines of code and spent tokens of a project over time, for skill pages in the quota window.
   handle('stats:project', (workspace) => projectStats(userData, text(workspace) ?? ''))
   // The only path into electron/worktree.mts; unused by the renderer today, kept for the write-lane flow.

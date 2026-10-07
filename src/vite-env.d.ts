@@ -5,6 +5,9 @@ type ApplyArtifactPayload = { workspace: string; patchPath: string; worktreePath
 type ApplyArtifactResult = { ok: boolean; reason?: string; detail?: string }
 type QuotaUpdate = { providerId: string; snapshot: import('./types').QuotaSnapshot | null }
 type RuntimeRestartResult = { ok: boolean; ms: number; pid: number | null; error?: string }
+type AccountLoginRequest = { id: string; base: string; dir: string; command?: string }
+type AccountRemoveRequest = { id: string; dir: string; deleteFiles: boolean }
+type AccountRemoveResult = { deleted: boolean; reason?: 'not-requested' | 'declined' | 'unmanaged' | 'missing' | 'failed'; error?: string }
 // The preload bridge (electron/preload.cjs) to Orbit's main process; absent when the renderer runs in a plain browser.
 interface OrbitBridge {
   pickWorkspace: () => Promise<GitContext | null>
@@ -56,6 +59,9 @@ interface OrbitBridge {
   setFullScreen: (on: boolean) => Promise<boolean>
   restartRuntime: () => Promise<RuntimeRestartResult>
   getRuntimeStatus: () => Promise<import('./types').RuntimeStatus>
+  prepareAccount: (base: string, taken: string[]) => Promise<{ id: string; dir: string }>
+  loginAccount: (request: AccountLoginRequest) => Promise<{ ok: boolean; error?: string }>
+  removeAccount: (request: AccountRemoveRequest) => Promise<AccountRemoveResult>
   onQuotaUpdate: (handler: (update: QuotaUpdate) => void) => () => void
   onRuntimeEvent: (handler: (event: RuntimeEvent) => void) => () => void
   onRestartNotice: (handler: (notice: import('./types').RestartNotice) => void) => () => void
@@ -82,6 +88,9 @@ interface ProjectIndexStatus {
 }
 interface ProviderHealth {
   id: string
+  // Set for an extra subscription (id 'claude-2'): the provider whose CLI runs it, and the owner's name for it.
+  base?: string
+  label?: string
   reasoningLevels?: Record<string, string[]>
   models?: string[]
   model?: string

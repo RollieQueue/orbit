@@ -11,6 +11,7 @@ import { watchTurn, clearSilentTurns, isStall } from './watchdog.mts'
 import type { TurnWatch } from './watchdog.mts'
 import { messageNote, stopSteer } from './steer.mts'
 import { describeStopped } from '../process-reaper.mts'
+import { baseOf } from '../instances.mts'
 import type { StoppedProcess } from '../process-reaper.mts'
 import type { AgentRecord, AgentUsage, OrbitRuntimeLike, ProviderEvent, ProviderResult, RunRecord, SessionInfo, StreamState, ToolImage, TraceImage, TurnTiming, UsageFigures } from '../types.mts'
 // The root agent's answer in progress is published at most four times a second.
@@ -23,7 +24,7 @@ const progressTimers = new WeakMap<AgentRecord, ReturnType<typeof setTimeout>>()
 // on 2.1.284: a sonnet session of tool calls only gets it, `CLAUDE_CODE_SILENT_TURN_REMINDER=0` turns it off). A helper's
 // reader is its parent, who takes the result, not status lines: in the batch of 2026-10-01 each reminder cost a helper
 // a text step, about a minute, three times per long helper. The root keeps it: the user does read the root.
-const quietHelperEnv = (agent: AgentRecord): Record<string, string> => agent.id !== 'root' && agent.providerId === 'claude' ? { CLAUDE_CODE_SILENT_TURN_REMINDER: '0' } : {}
+const quietHelperEnv = (agent: AgentRecord): Record<string, string> => agent.id !== 'root' && baseOf(agent.providerId) === 'claude' ? { CLAUDE_CODE_SILENT_TURN_REMINDER: '0' } : {}
 function publishProgress(runtime: OrbitRuntimeLike, run: RunRecord, agent: AgentRecord): void {
   if (progressTimers.has(agent)) return
   const timer = setTimeout(() => {
@@ -235,7 +236,7 @@ async function providerTurn(runtime: OrbitRuntimeLike, run: RunRecord, agent: Ag
     // The record names the turn's session as its provider knows it: the one resumed, or Claude's, started under Orbit's id
     // (--session-id). Codex, Cursor and Antigravity name their own: none until their stream does (below), as the id Orbit
     // proposes is not theirs. A cut first turn's repeat and a restart's continuation resume it (resume.rootSession).
-    timing = { turn: agent.turns, transport: agent.transport, startedAt: new Date().toISOString(), firstEventAt: null, endedAt: null, promptChars: 0, nativeToolCalls: 0, orbitToolCalls: 0, sessionId: session && (session.resume || agent.providerId === 'claude') ? session.id || null : null }
+    timing = { turn: agent.turns, transport: agent.transport, startedAt: new Date().toISOString(), firstEventAt: null, endedAt: null, promptChars: 0, nativeToolCalls: 0, orbitToolCalls: 0, sessionId: session && (session.resume || baseOf(agent.providerId) === 'claude') ? session.id || null : null }
     agent.turnTimings.push(timing)
     runtime.updateAgent(run, agent, { status: 'working', detail: 'Provider is executing', startedAt: agent.startedAt || new Date().toISOString() })
     // `delivered`: the mail this turn's prompt carries; during a session turn it is no longer pending (see pendingMail).

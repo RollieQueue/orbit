@@ -2,6 +2,7 @@ import { assess } from './quota.mts'
 import type { QuotaAssessable, QuotaLevel } from './quota.mts'
 import TIERS from './model-tiers.json' with { type: 'json' }
 import { offeredLevels, clampEffort } from './reasoning-levels.mts'
+import { baseOf, isInstanceId, matchesProvider, sameBase } from './instances.mts'
 
 // Replacing an agent whose subscription is running out: which model may take over, and what the newcomer is told.
 // Pure functions; the runtime decides when to call them and applies the result.
@@ -18,7 +19,8 @@ interface PoolMember { providerId: string; model?: string; reasoningEffort?: str
 interface FailoverAgent { providerId: string; model?: string | null; requestedModel?: string | null; reasoningEffort?: string | null; failedCandidates?: Set<string>; failover?: 'none'; avoidProviders?: string[] }
 // Only the cached reading is consulted here; the runtime refreshes the monitor before asking.
 interface QuotaPeeker { peek(id: string): QuotaAssessable | null }
-interface ReplacementsInput { agent: FailoverAgent; catalog?: CatalogEntry[]; pool?: PoolMember[]; models?: Record<string, string | undefined>; quota?: QuotaPeeker | null; config: FailoverConfig; now?: number; relaxed?: boolean; skip?: Set<string> }
+// `instances`: the ids of the run's extra subscriptions (claude-2), used as providers when there is no health list to name them.
+interface ReplacementsInput { agent: FailoverAgent; catalog?: CatalogEntry[]; pool?: PoolMember[]; models?: Record<string, string | undefined>; quota?: QuotaPeeker | null; config: FailoverConfig; now?: number; relaxed?: boolean; skip?: Set<string>; instances?: readonly string[] }
 interface Replacement { providerId: string; model: string; tier: number; inPool: boolean; key: string; usedPercent: number | null; reasoningEffort: string }
 interface Target { providerId: string; model?: string | null }
 type HandoverReason = 'approaching' | 'exhausted' | 'replacement-failed' | 'stalled' | 'failed'
@@ -41,6 +43,7 @@ const RULES = tiers.rules.map(rule => ({ tier: rule.tier, pattern: new RegExp(ru
 const EXCLUDED = (tiers.excluded || []).map(rule => new RegExp(rule.match, 'i'))
 // Local models and arbitrary endpoints have no comparable quality; they are replacements only when the user listed them.
 const LOCAL = new Set(['ollama', 'custom'])
+const isLocal = (providerId: string): boolean => LOCAL.has(baseOf(providerId))
 const MAX_CATALOG_MODELS = 40
 // A provider that publishes no quota ranks after measured healthy ones and before nearly empty ones.
 const UNMEASURED_USED = 45
@@ -64,7 +67,8 @@ function tierOf(model: unknown): number {
 // A model the user ruled out (model-tiers.json `excluded`, such as Claude Fable): a replacement only from their own pool.
 const excluded = (model: unknown): boolean => { const name = String(model || '').toLowerCase(); return !!name && EXCLUDED.some(pattern => pattern.test(name)) }
 // The tier the agent being replaced is judged by.
-const baselineTier = (providerId: string, model: unknown): number => tierOf(model) || tiers.baseline[providerId] || 2
+// An extra subscription (claude-2) is judged like its base provider.
+const baselineTier = (providerId: string, model: unknown): number => tierOf(model) || tiers.baseline[baseOf(providerId)] || 2
 // spawn_agent's failover option: 'none' pins the helper to its subscription, 'auto' allows the usual replacement. Left out, a
 // helper the caller sent to another subscription than its own for a review is pinned (a judge of another vendor that quietly
 // moved to the producer's would judge nothing).
@@ -77,31 +81,47 @@ const targetLabel = (target: Target): string => `${target.providerId}${target.mo
 // than the model has gives its top level. Antigravity has none; Cursor offers the levels its model-name variants spell out
 // (the catalog lists them per model). The user's pool entry for the target is used as it is.
 function effortFor(providerId: string, model: string, wanted: string | null | undefined, entry: CatalogEntry | undefined, poolEffort: string | null | undefined): string {
-  if (poolEffort !== undefined && poolEffort !== null) return providerId === 'antigravity' ? '' : poolEffort
+  if (poolEffort !== undefined && poolEffort !== null) return baseOf(providerId) === 'antigravity' ? '' : poolEffort
   return clampEffort(wanted, offeredLevels(providerId, model, entry)).level
 }
 
+// The pool members that admit `providerId`: those naming it exactly, then (for an extra subscription) those naming its base
+// provider, so a pool entry "claude/opus" also admits claude-2 with opus while "claude-2/opus" admits only claude-2.
+const poolMembers = <T extends { providerId: string }>(pool: readonly T[], providerId: string): T[] =>
+  [...pool.filter(member => member.providerId === providerId), ...(isInstanceId(providerId) ? pool.filter(member => member.providerId === baseOf(providerId)) : [])]
+
+// Whether the user's provider pool lets a helper run `providerId` (with `model`, when given): an empty pool allows everything; the run's own
+// provider and the other accounts of it are always allowed (the owner added them to be used); another provider only as the pool lists it
+// (an entry for claude/opus also admits claude-2 with opus; one for claude-2/opus admits only claude-2).
+const poolAllows = (pool: readonly PoolMember[], providerId: string, model: string | null | undefined, runProviderId: string): boolean =>
+  !pool.length || sameBase(providerId, runProviderId) || poolMembers(pool, providerId).some(member => !model || !member.model || member.model === model)
+
 // Ranked replacements for `agent`, best first. `quota` is a QuotaMonitor (only cached readings are used here) and
-// `catalog` the provider health list ({ id, available, models, reasoningLevels }).
+// `catalog` the provider health list ({ id, available, models, reasoningLevels }); an extra subscription of the same
+// provider (claude-2) is an entry of it like any other and competes by the models and quota it has itself.
 // `relaxed` also admits providers that are close to the limit but not out of it (after a refusal, anything beats stopping).
-// `skip` names providers that just failed to answer at all (region, sign-in, network): none of their models is tried.
-function replacements({ agent, catalog = [], pool = [], models = {}, quota, config, now = Date.now(), relaxed = false, skip = new Set<string>() }: ReplacementsInput): Replacement[] {
+// `skip` names providers that just failed to answer at all (region, sign-in, network): none of their models is tried; it
+// matches exactly (a sign-in failure of claude-2 does not bar claude), unlike `agent.avoidProviders` (a base id covers its accounts).
+function replacements({ agent, catalog = [], pool = [], models = {}, quota, config, now = Date.now(), relaxed = false, skip = new Set<string>(), instances = [] }: ReplacementsInput): Replacement[] {
   // A pinned agent never changes provider, and one that avoids providers is never offered those.
   if (agent.failover === 'none') return []
-  const avoided = new Set(agent.avoidProviders || [])
+  const avoided = agent.avoidProviders || []
   const baseline = baselineTier(agent.providerId, agent.model || agent.requestedModel)
   const floor = baseline - (config.allowWeaker ? 1 : 0)
   const entries = new Map(catalog.map(entry => [entry.id, entry]))
-  // Without a health list the user's own pool is all that is known.
-  const providerIds = catalog.length ? catalog.filter(entry => entry.available !== false).map(entry => entry.id) : [...new Set(pool.map(member => member.providerId))]
+  // Without a health list the user's own pool (and the extra subscriptions it admits) is all that is known.
+  const providerIds = catalog.length ? catalog.filter(entry => entry.available !== false).map(entry => entry.id) : [...pool.map(member => member.providerId), ...instances.filter(id => poolMembers(pool, id).length)]
   const own = new Set([targetKey(agent.providerId, agent.requestedModel), targetKey(agent.providerId, agent.model)])
+  // What the agent runs now: the same model on another account of the same provider takes over before anything else.
+  const running = new Set([agent.model, agent.requestedModel].map(model => String(model || '').toLowerCase()).filter(Boolean))
   const found: Replacement[] = []
   for (const providerId of [...new Set(providerIds)]) {
-    if (skip.has(providerId) || avoided.has(providerId)) continue
-    const members = pool.filter(member => member.providerId === providerId)
-    if (LOCAL.has(providerId) && !members.length) continue
+    if (skip.has(providerId) || avoided.some(reference => matchesProvider(reference, providerId))) continue
+    const members = poolMembers(pool, providerId)
+    if (isLocal(providerId) && !members.length) continue
     const entry = entries.get(providerId)
-    const names = [...members.map(member => member.model || ''), ...(models[providerId] ? [models[providerId]] : []), ...(entry?.models || []).slice(0, MAX_CATALOG_MODELS)]
+    const asked = models[providerId] ?? models[baseOf(providerId)]
+    const names = [...members.map(member => member.model || ''), ...(asked ? [asked] : []), ...(entry?.models || []).slice(0, MAX_CATALOG_MODELS)]
     for (const model of [...new Set(names)]) {
       const key = targetKey(providerId, model)
       if (own.has(key) || agent.failedCandidates?.has(key)) continue
@@ -115,9 +135,17 @@ function replacements({ agent, catalog = [], pool = [], models = {}, quota, conf
       found.push({ providerId, model, tier, inPool, key, usedPercent: level.usedPercent, reasoningEffort: effortFor(providerId, model, agent.reasoningEffort, entry, member?.reasoningEffort) })
     }
   }
-  // The user's own pool first, then the closest quality (equal, then better, then weaker), then the most headroom.
+  // The same model on another account of the agent's provider first (the most headroom, the default account on ties); then the
+  // user's own pool, then the closest quality (equal, then better, then weaker), then the most headroom.
   const distance = (item: Replacement): number => !item.tier ? 0.5 : item.tier === baseline ? 0 : item.tier > baseline ? 1 + (item.tier - baseline) / 10 : 3 + (baseline - item.tier)
-  return found.sort((a, b) => Number(b.inPool) - Number(a.inPool) || distance(a) - distance(b) || (a.usedPercent ?? UNMEASURED_USED) - (b.usedPercent ?? UNMEASURED_USED) || a.providerId.localeCompare(b.providerId) || a.model.localeCompare(b.model))
+  const sameAccountModel = (item: Replacement): boolean => sameBase(item.providerId, agent.providerId) && running.has(item.model.toLowerCase())
+  const headroom = (item: Replacement): number => item.usedPercent ?? UNMEASURED_USED
+  return found.sort((a, b) => {
+    const twin = Number(sameAccountModel(b)) - Number(sameAccountModel(a))
+    if (twin) return twin
+    if (sameAccountModel(a)) return headroom(a) - headroom(b) || Number(isInstanceId(a.providerId)) - Number(isInstanceId(b.providerId)) || a.providerId.localeCompare(b.providerId) || a.model.localeCompare(b.model)
+    return Number(b.inPool) - Number(a.inPool) || distance(a) - distance(b) || headroom(a) - headroom(b) || a.providerId.localeCompare(b.providerId) || a.model.localeCompare(b.model)
+  })
 }
 
 const clock = (time: number | null | undefined): string => Number.isFinite(time) ? new Date(time as number).toISOString().replace('T', ' ').slice(0, 16) + ' UTC' : 'unknown'
@@ -163,4 +191,4 @@ function handoverNote({ agent, from, to, reason, level, error, interrupted, team
 }
 
 export type { ModelTiers, FailoverConfig, CatalogEntry, PoolMember, FailoverAgent, QuotaPeeker, ReplacementsInput, Replacement, Target, HandoverReason, HandoverLevel, HandoverNoteInput, InterruptedTurn }
-export { normalizeFailover, isPinned, tierOf, baselineTier, excluded, replacements, effortFor, handoverNote, reasonText, unreachable, targetKey, targetLabel, DEFAULTS, LOCAL }
+export { normalizeFailover, isPinned, tierOf, baselineTier, excluded, replacements, effortFor, handoverNote, reasonText, unreachable, targetKey, targetLabel, poolMembers, poolAllows, isLocal, UNMEASURED_USED, DEFAULTS, LOCAL }

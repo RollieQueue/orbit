@@ -36,6 +36,9 @@ const TYPES = {
   ApplyArtifactResult: '{ ok: boolean; reason?: string; detail?: string }',
   QuotaUpdate: `{ providerId: string; snapshot: ${T('QuotaSnapshot')} | null }`,
   RuntimeRestartResult: '{ ok: boolean; ms: number; pid: number | null; error?: string }',
+  AccountLoginRequest: '{ id: string; base: string; dir: string; command?: string }',
+  AccountRemoveRequest: '{ id: string; dir: string; deleteFiles: boolean }',
+  AccountRemoveResult: "{ deleted: boolean; reason?: 'not-requested' | 'declined' | 'unmanaged' | 'missing' | 'failed'; error?: string }",
 }
 
 const workspace = { name: 'workspace', type: 'string' }
@@ -114,6 +117,13 @@ const CALLS = [
   // reports its state. Both are answered by main itself (electron/runtime-client.cjs), never forwarded to the runtime.
   { method: 'restartRuntime', channel: 'runtime:restart', args: [], returns: 'RuntimeRestartResult' },
   { method: 'getRuntimeStatus', channel: 'runtime:status', args: [], returns: T('RuntimeStatus') },
+  // Extra subscription accounts (several of one provider): a new account's id and folder under Orbit's data folder (main picks the first
+  // id that is neither in `taken` nor has a folder, and creates the folder), the CLI's own sign-in in a visible console window with that account's
+  // environment (Orbit never sees a password or a token), and the removal of an account: its folder is deleted only when
+  // asked, Orbit made it AND the user confirms in a dialog of main's own.
+  { method: 'prepareAccount', channel: 'accounts:prepare', args: [{ name: 'base', type: 'string' }, { name: 'taken', type: 'string[]' }], returns: '{ id: string; dir: string }' },
+  { method: 'loginAccount', channel: 'accounts:login', args: [{ name: 'request', type: 'AccountLoginRequest' }], returns: '{ ok: boolean; error?: string }' },
+  { method: 'removeAccount', channel: 'accounts:remove', args: [{ name: 'request', type: 'AccountRemoveRequest' }], returns: 'AccountRemoveResult' },
 ]
 
 // main → renderer messages (webContents.send(channel, payload)); the handler receives the payload.

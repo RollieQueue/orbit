@@ -191,6 +191,10 @@ async function runCodexServer(options: CodexServerOptions, helpers: CliHelpers):
 // `turn/start` on that thread. Orbit tools reach the process as an MCP server through config overrides on its
 // command line, the bearer token through its environment. Nothing is killed at a tool call.
 const sessions = new Map<string, CodexSessionApi>()
+// The account (CODEX_HOME of a subscription instance, '' for the default) each live process was started for: a thread of one
+// account is never continued on another account's process.
+const sessionAccounts = new WeakMap<CodexSessionApi, string>()
+const accountOf = (options: Pick<CodexServerOptions, 'extraEnv'>): string => options.extraEnv?.CODEX_HOME ?? ''
 
 // The same overrides as `codex exec` gets (providers.codexMcpArgs), per-call tool timeout included.
 function mcpOverrides(session: Pick<NormalizedSession, 'mcpUrl' | 'token' | 'connectors'> | null | undefined): string[] {
@@ -371,6 +375,7 @@ async function openCodexSession(options: CodexServerOptions, session: Normalized
     threadId = thread.thread.id
     actualModel = thread.model || thread.thread?.model || actualModel
     sessions.set(threadId, api)
+    sessionAccounts.set(api, accountOf(options))
     armSessionIdle()
     return api
   } catch (error) {
@@ -386,6 +391,8 @@ async function runCodexSessionTurn(options: CodexServerOptions & { prompt: strin
   if (options.signal?.aborted) throw cancelledError()
   let live = session.resume && session.id ? sessions.get(session.id) : null
   if (live?.closed) { sessions.delete(session.id as string); live = null }
+  // The turn runs on another account than the live process was started for (failover between two Codex accounts): that process is closed, a new one opens.
+  if (live && sessionAccounts.get(live) !== accountOf(options)) { await live.close(); live = null }
   if (live?.busy) throw new Error('The Codex session is still running an earlier turn')
   const opened = !live
   if (!live) live = await openCodexSession(options, session, helpers)
